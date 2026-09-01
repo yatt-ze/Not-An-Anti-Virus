@@ -13,7 +13,7 @@ mod persistence;
 mod quarantine_xattr;
 mod strings;
 
-pub use codesign::UnsignedBinaryRule;
+pub use codesign::{AdHocSignedRule, UnsignedBinaryRule};
 pub use entropy::HighEntropyRule;
 pub use package::{InstallerScriptRule, UnsignedPackageRule};
 pub use persistence::LaunchdPersistenceRule;
@@ -50,6 +50,7 @@ pub fn default_ruleset() -> Vec<Box<dyn Rule>> {
         Box::new(HighEntropyRule::default()),
         Box::new(SuspiciousStringsRule),
         Box::new(UnsignedBinaryRule),
+        Box::new(AdHocSignedRule),
         Box::new(QuarantineXattrRule),
         Box::new(LaunchdPersistenceRule),
         Box::new(InstallerScriptRule),

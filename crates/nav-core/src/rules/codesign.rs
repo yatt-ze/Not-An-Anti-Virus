@@ -96,6 +96,53 @@ impl Rule for UnsignedBinaryRule {
     }
 }
 
+/// Weight for a binary carrying a hand-applied ad-hoc signature — no real
+/// identity, but not as bare as `unsigned-binary`'s "no signature at all".
+const ADHOC_MANUAL_WEIGHT: i32 = 3;
+
+/// Notes a binary signed ad-hoc *by hand* (`codesign -s -`), as distinct
+/// from the linker-applied ad-hoc signature every Apple Silicon binary
+/// carries by default. The latter is scored nowhere — see `DvStatus`.
+pub struct AdHocSignedRule;
+
+impl Default for AdHocSignedRule {
+    fn default() -> Self {
+        AdHocSignedRule
+    }
+}
+
+impl Rule for AdHocSignedRule {
+    fn id(&self) -> &'static str {
+        "adhoc-signed-binary"
+    }
+
+    fn category(&self) -> SignalCategory {
+        SignalCategory::ProvenanceConcern
+    }
+
+    fn evaluate(&self, ctx: &ScanContext) -> Result<Option<MatchedSignal>, RuleOutcome> {
+        if !ctx.is_file_backed() {
+            return Err(RuleOutcome::NotApplicable);
+        }
+        let content = ctx.content.as_ref().ok_or(RuleOutcome::NotApplicable)?;
+        if !crate::macho::is_macho_magic(content) {
+            return Ok(None);
+        }
+
+        if run_codesign_dv(&ctx.path)? == DvStatus::AdHocManual {
+            Ok(Some(MatchedSignal {
+                id: "adhoc-signed-binary".to_string(),
+                weight: ADHOC_MANUAL_WEIGHT,
+                description: "binary carries a hand-applied ad-hoc signature (no identity)"
+                    .to_string(),
+                category: SignalCategory::ProvenanceConcern,
+            }))
+        } else {
+            Ok(None)
+        }
+    }
+}
+
 /// Runs `codesign -dv` and classifies the result. The classification logic
 /// (`classify_dv`) is platform-independent and unit-tested directly; only the
 /// process spawn is behind the platform gate.
@@ -204,6 +251,15 @@ mod tests {
              CodeDirectory v=20400 size=... flags=0x2(adhoc) hashes=...\n\
              Signature=adhoc\n";
         assert_eq!(classify_dv(true, stderr), Ok(DvStatus::AdHocManual));
+    }
+
+    /// Same gate as `unsigned-binary` — a non-code-object is never ad-hoc.
+    #[test]
+    fn things_that_are_not_code_objects_are_not_adhoc_signed() {
+        assert!(matches!(
+            AdHocSignedRule.evaluate(&ctx("readme.txt", b"just some notes\n")),
+            Ok(None)
+        ));
     }
 
     #[test]
