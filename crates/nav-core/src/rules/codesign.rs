@@ -235,6 +235,156 @@ fn spawn_codesign_verify(_path: &std::path::Path) -> Result<String, RuleOutcome>
     Err(RuleOutcome::NotApplicable)
 }
 
+/// Weight for a real-identity-signed binary that hasn't been notarized.
+/// Small — plenty of legitimate CLI tools and direct-distribution software
+/// (most of the Homebrew/Rust/Go corpus §12 tests against) never goes
+/// through notarization at all.
+const UNNOTARIZED_WEIGHT: i32 = 2;
+
+/// Negative: notarization is a *contributing* negative signal (§5.2), not an
+/// automatic benign override, so it nudges the score down rather than
+/// zeroing or capping it.
+const NOTARIZED_WEIGHT: i32 = -3;
+
+/// Notes a real-identity-signed binary that has not been notarized by Apple.
+pub struct UnnotarizedSignedRule;
+
+impl Default for UnnotarizedSignedRule {
+    fn default() -> Self {
+        UnnotarizedSignedRule
+    }
+}
+
+impl Rule for UnnotarizedSignedRule {
+    fn id(&self) -> &'static str {
+        "signed-not-notarized"
+    }
+
+    fn category(&self) -> SignalCategory {
+        SignalCategory::ProvenanceConcern
+    }
+
+    fn evaluate(&self, ctx: &ScanContext) -> Result<Option<MatchedSignal>, RuleOutcome> {
+        if !ctx.is_file_backed() {
+            return Err(RuleOutcome::NotApplicable);
+        }
+        let content = ctx.content.as_ref().ok_or(RuleOutcome::NotApplicable)?;
+        if !crate::macho::is_macho_magic(content) {
+            return Ok(None);
+        }
+        // Notarization presupposes a real identity to submit for notarization.
+        if run_codesign_dv(&ctx.path)? != DvStatus::Signed {
+            return Ok(None);
+        }
+
+        match run_spctl_source(&ctx.path)?.as_deref() {
+            Some(source) if notarization_from_source(source) == Some(false) => {
+                Ok(Some(MatchedSignal {
+                    id: "signed-not-notarized".to_string(),
+                    weight: UNNOTARIZED_WEIGHT,
+                    description: "binary is signed but has not been notarized by Apple".to_string(),
+                    category: SignalCategory::ProvenanceConcern,
+                }))
+            }
+            _ => Ok(None),
+        }
+    }
+}
+
+/// Notes a binary that Apple has notarized — a contributing negative signal
+/// (§5.2), not an automatic benign override, so a notarized binary exhibiting
+/// otherwise-suspicious behavior is still scoreable.
+pub struct NotarizedRule;
+
+impl Default for NotarizedRule {
+    fn default() -> Self {
+        NotarizedRule
+    }
+}
+
+impl Rule for NotarizedRule {
+    fn id(&self) -> &'static str {
+        "notarized-binary"
+    }
+
+    fn category(&self) -> SignalCategory {
+        SignalCategory::Informational
+    }
+
+    fn evaluate(&self, ctx: &ScanContext) -> Result<Option<MatchedSignal>, RuleOutcome> {
+        if !ctx.is_file_backed() {
+            return Err(RuleOutcome::NotApplicable);
+        }
+        let content = ctx.content.as_ref().ok_or(RuleOutcome::NotApplicable)?;
+        if !crate::macho::is_macho_magic(content) {
+            return Ok(None);
+        }
+        if run_codesign_dv(&ctx.path)? != DvStatus::Signed {
+            return Ok(None);
+        }
+
+        match run_spctl_source(&ctx.path)?.as_deref() {
+            Some(source) if notarization_from_source(source) == Some(true) => {
+                Ok(Some(MatchedSignal {
+                    id: "notarized-binary".to_string(),
+                    weight: NOTARIZED_WEIGHT,
+                    description: "binary is signed and notarized by Apple".to_string(),
+                    category: SignalCategory::Informational,
+                }))
+            }
+            _ => Ok(None),
+        }
+    }
+}
+
+/// `Some(true)` notarized, `Some(false)` signed but not notarized, `None` for
+/// any other `spctl` source (Apple System, Mac App Store, …) — notarization
+/// isn't a meaningful concept for those, so this stays silent rather than
+/// guessing (§10, §11.8).
+fn notarization_from_source(source: &str) -> Option<bool> {
+    match source {
+        "Notarized Developer ID" => Some(true),
+        // Older macOS reports plain "Developer ID" for accepted-but-unnotarized
+        // assessments; newer macOS spells the rejected case out explicitly.
+        "Developer ID" | "Unnotarized Developer ID" => Some(false),
+        _ => None,
+    }
+}
+
+/// Runs `spctl -a -t exec` and pulls out its `source=` line, if any.
+fn run_spctl_source(path: &std::path::Path) -> Result<Option<String>, RuleOutcome> {
+    let output = spawn_spctl_assess(path)?;
+    Ok(parse_spctl_source(&output).map(str::to_string))
+}
+
+fn parse_spctl_source(output: &str) -> Option<&str> {
+    output
+        .lines()
+        .find_map(|l| l.trim().strip_prefix("source="))
+}
+
+#[cfg(target_os = "macos")]
+fn spawn_spctl_assess(path: &std::path::Path) -> Result<String, RuleOutcome> {
+    use std::process::Command;
+
+    // `spctl -a` writes its assessment (including `source=`) to stderr.
+    let output = Command::new("spctl")
+        .arg("-a")
+        .arg("-t")
+        .arg("exec")
+        .arg("-vv")
+        .arg(path)
+        .output()
+        .map_err(|_| RuleOutcome::NotApplicable)?;
+
+    Ok(String::from_utf8_lossy(&output.stderr).into_owned())
+}
+
+#[cfg(not(target_os = "macos"))]
+fn spawn_spctl_assess(_path: &std::path::Path) -> Result<String, RuleOutcome> {
+    Err(RuleOutcome::NotApplicable)
+}
+
 /// Runs `codesign -dv` and classifies the result. The classification logic
 /// (`classify_dv`) is platform-independent and unit-tested directly; only the
 /// process spawn is behind the platform gate.
@@ -383,6 +533,52 @@ mod tests {
         assert!(!indicates_revocation(
             "test-binary: a sealed resource is missing or invalid\n"
         ));
+    }
+
+    #[test]
+    fn things_that_are_not_code_objects_are_not_scored_for_notarization() {
+        assert!(matches!(
+            UnnotarizedSignedRule.evaluate(&ctx("readme.txt", b"just some notes\n")),
+            Ok(None)
+        ));
+        assert!(matches!(
+            NotarizedRule.evaluate(&ctx("readme.txt", b"just some notes\n")),
+            Ok(None)
+        ));
+    }
+
+    #[test]
+    fn parse_spctl_source_reads_the_source_line() {
+        let out = "/tmp/App.app: accepted\n\
+             source=Notarized Developer ID\n\
+             origin=Developer ID Application: Example Corp (TEAMID1234)\n";
+        assert_eq!(parse_spctl_source(out), Some("Notarized Developer ID"));
+    }
+
+    #[test]
+    fn parse_spctl_source_is_none_without_a_source_line() {
+        assert_eq!(parse_spctl_source("/tmp/x: rejected\n"), None);
+    }
+
+    #[test]
+    fn notarization_from_source_classifies_known_sources() {
+        assert_eq!(
+            notarization_from_source("Notarized Developer ID"),
+            Some(true)
+        );
+        assert_eq!(notarization_from_source("Developer ID"), Some(false));
+        assert_eq!(
+            notarization_from_source("Unnotarized Developer ID"),
+            Some(false)
+        );
+    }
+
+    /// Apple System and Mac App Store binaries aren't a "signed but not
+    /// notarized" case — the concept doesn't apply, so stay silent.
+    #[test]
+    fn notarization_from_source_is_none_for_apple_and_app_store_sources() {
+        assert_eq!(notarization_from_source("Apple System"), None);
+        assert_eq!(notarization_from_source("Mac App Store"), None);
     }
 
     #[test]
