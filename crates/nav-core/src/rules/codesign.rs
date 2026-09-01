@@ -143,6 +143,98 @@ impl Rule for AdHocSignedRule {
     }
 }
 
+/// Weight for a revoked code-signing certificate. Apple revokes Developer ID
+/// certs almost exclusively in response to confirmed abuse, so — unlike a
+/// bare `unsigned-binary` — this is a narrow, high-specificity signal (§5.1)
+/// rather than a broad "trust me less" category.
+const REVOKED_CERT_WEIGHT: i32 = 14;
+
+/// Notes a binary whose (real, non-ad-hoc) signing certificate has been
+/// revoked since it was signed. Only meaningful for a real identity — an
+/// unsigned or ad-hoc binary has no certificate to revoke, so this rule
+/// doesn't even ask about those.
+pub struct RevokedSignatureRule;
+
+impl Default for RevokedSignatureRule {
+    fn default() -> Self {
+        RevokedSignatureRule
+    }
+}
+
+impl Rule for RevokedSignatureRule {
+    fn id(&self) -> &'static str {
+        "revoked-code-signature"
+    }
+
+    fn category(&self) -> SignalCategory {
+        SignalCategory::TrustReduction
+    }
+
+    fn evaluate(&self, ctx: &ScanContext) -> Result<Option<MatchedSignal>, RuleOutcome> {
+        if !ctx.is_file_backed() {
+            return Err(RuleOutcome::NotApplicable);
+        }
+        let content = ctx.content.as_ref().ok_or(RuleOutcome::NotApplicable)?;
+        if !crate::macho::is_macho_magic(content) {
+            return Ok(None);
+        }
+
+        // Revocation is a property of a real certificate; unsigned/ad-hoc
+        // binaries have none, so don't spend a `codesign --verify` call on them.
+        if run_codesign_dv(&ctx.path)? != DvStatus::Signed {
+            return Ok(None);
+        }
+
+        if run_codesign_verify(&ctx.path)? {
+            Ok(Some(MatchedSignal {
+                id: "revoked-code-signature".to_string(),
+                weight: REVOKED_CERT_WEIGHT,
+                description: "code-signing certificate has been revoked".to_string(),
+                category: SignalCategory::TrustReduction,
+            }))
+        } else {
+            Ok(None)
+        }
+    }
+}
+
+/// Runs `codesign --verify` and reports whether the failure was specifically
+/// a revoked certificate, as opposed to any other reason verification failed
+/// (modified resource, broken seal, …) — those aren't this rule's claim to make.
+fn run_codesign_verify(path: &std::path::Path) -> Result<bool, RuleOutcome> {
+    let stderr = spawn_codesign_verify(path)?;
+    Ok(indicates_revocation(&stderr))
+}
+
+fn indicates_revocation(stderr: &str) -> bool {
+    // Covers both the literal CSSMERR_TP_CERT_REVOKED constant `codesign`
+    // reports and any future rewording that still says "revoked".
+    stderr.to_lowercase().contains("revoked")
+}
+
+#[cfg(target_os = "macos")]
+fn spawn_codesign_verify(path: &std::path::Path) -> Result<String, RuleOutcome> {
+    use std::process::Command;
+
+    // `--verify` writes its report to stderr too; exit status alone doesn't
+    // distinguish "revoked" from "tampered" from "missing resource".
+    let output = Command::new("codesign")
+        .arg("--verify")
+        .arg("--deep")
+        .arg("--strict")
+        .arg("-v")
+        .arg(path)
+        .output()
+        .map_err(|_| RuleOutcome::NotApplicable)?;
+
+    Ok(String::from_utf8_lossy(&output.stderr).into_owned())
+}
+
+#[cfg(not(target_os = "macos"))]
+fn spawn_codesign_verify(_path: &std::path::Path) -> Result<String, RuleOutcome> {
+    Err(RuleOutcome::NotApplicable)
+}
+
 /// Runs `codesign -dv` and classifies the result. The classification logic
 /// (`classify_dv`) is platform-independent and unit-tested directly; only the
 /// process spawn is behind the platform gate.
@@ -259,6 +351,37 @@ mod tests {
         assert!(matches!(
             AdHocSignedRule.evaluate(&ctx("readme.txt", b"just some notes\n")),
             Ok(None)
+        ));
+    }
+
+    #[test]
+    fn things_that_are_not_code_objects_are_not_revoked() {
+        assert!(matches!(
+            RevokedSignatureRule.evaluate(&ctx("readme.txt", b"just some notes\n")),
+            Ok(None)
+        ));
+    }
+
+    #[test]
+    fn indicates_revocation_matches_the_real_error_constant() {
+        assert!(indicates_revocation(
+            "test-binary: CSSMERR_TP_CERT_REVOKED\n"
+        ));
+    }
+
+    #[test]
+    fn indicates_revocation_is_false_for_a_clean_verify() {
+        assert!(!indicates_revocation(
+            "test-binary: valid on disk\ntest-binary: satisfies its Designated Requirement\n"
+        ));
+    }
+
+    /// A verify failure for an unrelated reason (tampered resource, broken
+    /// seal, …) is not this rule's claim to make — don't say "revoked".
+    #[test]
+    fn indicates_revocation_is_false_for_an_unrelated_verify_failure() {
+        assert!(!indicates_revocation(
+            "test-binary: a sealed resource is missing or invalid\n"
         ));
     }
 
