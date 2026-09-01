@@ -1,0 +1,18 @@
+[package]
+name = "navctl"
+description = "NAV CLI — on-demand scans run in-process against nav-core, plus (once navd is present) status, event tail, quarantine, and config commands over the daemon socket."
+version.workspace = true
+edition.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "navctl"
+path = "src/main.rs"
+
+[dependencies]
+nav-core = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+clap = { workspace = true }
+anyhow = { workspace = true }

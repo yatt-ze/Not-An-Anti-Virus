@@ -1,0 +1,11 @@
+[package]
+name = "navnotify"
+description = "NAV per-user notification agent — background-only LaunchAgent, no window, relays verdicts from navd to Notification Center. Not yet implemented — see design doc §9.2, §12 Phase 0b."
+version.workspace = true
+edition.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "navnotify"
+path = "src/main.rs"

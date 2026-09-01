@@ -1,0 +1,15 @@
+[package]
+name = "nav-core"
+description = "NAV heuristics/scoring engine — static analysis rules, signal model, and scan orchestration. Linked directly by navctl and navd; no daemon, socket, or privilege required to run a scan."
+version.workspace = true
+edition.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+xattr = "1"

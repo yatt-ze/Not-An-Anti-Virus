@@ -1,0 +1,56 @@
+# libFuzzer harness for nav-core's attacker-controlled-input parsers
+# (design doc §11.9, §12 Phase 0a). Deliberately its own workspace: the fuzz
+# package needs a nightly toolchain and the libFuzzer runtime, so it must not
+# be pulled into `cargo build/clippy/test --workspace` on stable CI.
+[package]
+name = "nav-core-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+nav-core = { path = ".." }
+
+[[bin]]
+name = "parse_macho"
+path = "fuzz_targets/parse_macho.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "parse_plist"
+path = "fuzz_targets/parse_plist.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "inflate"
+path = "fuzz_targets/inflate.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "parse_cpio"
+path = "fuzz_targets/parse_cpio.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "parse_xar"
+path = "fuzz_targets/parse_xar.rs"
+test = false
+doc = false
+bench = false
+
+# Empty table: makes this package its own workspace root so the parent
+# workspace (crates listed explicitly in ../../../Cargo.toml) never tries to
+# build it. See the comment above.
+[workspace]

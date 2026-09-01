@@ -1,0 +1,14 @@
+[package]
+name = "navd"
+description = "NAV privileged daemon (root) — event sources, correlator, and the full monitoring/notification/quarantine pipeline. Links nav-core for automatic and FDA-gated scanning. Not yet implemented — see design doc §12, Phase 0b onward."
+version.workspace = true
+edition.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "navd"
+path = "src/main.rs"
+
+[dependencies]
+nav-core = { workspace = true }

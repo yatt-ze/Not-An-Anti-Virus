@@ -1,0 +1,6 @@
+#!/bin/sh
+# SampleHelper — a benign example bundle executable for the FP harness.
+# Prints its version and exits. No network, no persistence, no obfuscation.
+set -eu
+echo "SampleHelper 1.0.0"
+exit 0

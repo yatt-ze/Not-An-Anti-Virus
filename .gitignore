@@ -1,0 +1,18 @@
+# Rust / Cargo build output
+/target/
+**/*.rs.bk
+
+# Cargo.lock is tracked for this workspace (it ships binaries) — do not ignore it.
+
+# Coverage / profiling
+*.profraw
+*.profdata
+
+# Editor / IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# macOS
+.DS_Store
