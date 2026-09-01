@@ -1,0 +1,117 @@
+# Instructions for agents working in this repository
+
+This file is for AI agents (Claude Code and others). Humans should read
+`README.md` and `docs/design.md` instead.
+
+## Source of truth
+
+The living design document for NAV is split across several files, with
+`docs/design.md` as the index:
+
+| File | Sections |
+|---|---|
+| `docs/design.md` | front matter, document map, §1–§3 (philosophy, architecture, tech stack) |
+| `docs/design/scanner.md` | §5–§8 (heuristics engine, containers, verdict tiers, CLI surface) |
+| `docs/design/platform.md` | §4, §9 (event sources, daemon comms & notification) |
+| `docs/design/gaps-and-requirements.md` | §10–§11 (known gaps, cross-cutting requirements) |
+| `docs/design/roadmap.md` | §12–§14 (phased roadmap, locked & open decisions) |
+| `docs/design-changelog.md` | revision history |
+
+**Section numbers are global and stable** — `§5.2`, `§11.9`, etc. mean the
+same thing regardless of which file holds them, and are still the form to
+cite in code comments and commit messages. The `docs/design.md` map is the
+lookup table.
+
+The design is authoritative over architecture, naming, scope, and phasing
+(§12). If a task conflicts with it, the doc wins — flag the conflict to the
+user rather than silently diverging from it, and don't build ahead of the
+current phase (e.g. don't start Phase 2 behavioral-pipeline work while
+Phase 0a is still the active scope) without being asked to.
+
+If a change you're making represents a real design decision (not just an
+implementation detail), update the relevant design file in the same commit
+and add a dated entry to the top of `docs/design-changelog.md`, matching
+that file's existing changelog style (and bump the `**Status:**` version in
+`docs/design.md`). Don't let the doc drift out of sync with the code.
+
+## Comments
+
+Comments are read far more often than they're written. Keep them short and
+factual — people have to get through this stuff.
+
+- A doc comment (`///` / `//!`) states **what** the item does, its
+  **inputs**, its **output / errors**, and any **invariant the caller must
+  respect**. That is usually 1–5 lines. It is not the place for design
+  history, review anecdotes ("a bug found in review was…"), or a narration
+  of how the body works.
+- One crisp line for a genuine gotcha — a format quirk, an ordering
+  constraint, a footgun — earns its place. A paragraph on the same gotcha
+  does not.
+- Rationale lives in the design doc, not the source. Cite the section
+  (`§6.2`) at most; don't transcribe it.
+- Inline `//` comments explain a non-obvious *why*, not a restatement of the
+  next line. If a block needs prose to follow, try renaming/restructuring
+  first.
+- Delete redundant doc comments (`/// The name.` above `fn name()`).
+
+## Commit discipline
+
+This is the main thing this file exists to say: **commit small, and commit
+on functional boundaries.**
+
+- **One logical change per commit.** A new rule, a bug fix, a refactor, a
+  doc update — each is its own commit. Don't bundle "add rule X" with
+  "also reformat unrelated file Y" or "also bump a dependency."
+- **Every commit should leave the repo in a working state** — it builds,
+  and `cargo test --workspace` passes on that commit, not just at the tip
+  of the branch. Don't split a change into a commit that lands broken code
+  and a later commit that fixes it.
+- **Commit messages explain what and why, not just what.** Reference the
+  relevant design doc section (`§5.2`, `§11.1`, etc.) when the change
+  implements or touches something the doc specifies. Look at `git log` for
+  the tone/format already in use.
+- **Don't mix refactors with behavior changes.** If you need to reshape
+  code to make a feature easy to add, do the reshape as its own
+  no-behavior-change commit first, then add the feature on top.
+- Generated/build artifacts (`target/`) are already gitignored — don't
+  force-add them. `Cargo.lock` **is** tracked (this workspace ships
+  binaries) — commit it when it changes.
+
+## Before every commit
+
+Run, in order, and fix everything before committing — this is exactly what
+CI (`.github/workflows/ci.yml`) checks, so a failure here is a failure
+there:
+
+```sh
+cargo fmt --all
+cargo clippy --workspace --all-targets -- -D warnings
+cargo test --workspace
+```
+
+## Adding or changing a heuristic rule in `nav-core`
+
+- A rule reports `Ok(None)` when it ran and found nothing, `Ok(Some(signal))`
+  when it matched, and `Err(RuleOutcome::NotApplicable)` when it genuinely
+  couldn't be evaluated (wrong platform, unreadable file). Never fold
+  "couldn't check" into "checked and it's clean" — see design doc §10/§11.8.
+- Rule `id()` strings are part of the public surface (scripts, the FP
+  harness, and eventually `navctl rules test --json` consumers key off
+  them) — treat renaming one as a breaking change, not a free-form edit.
+- A single generic signal must not alone be able to push a verdict to
+  high severity (§5.1's invariant, enforced today in `scan.rs`'s
+  `classify()`) — keep new high-weight rules narrowly scoped and specific,
+  or make sure they only contribute alongside another category.
+- Add at least one fixture under `crates/nav-core/fixtures/benign/` or
+  `fixtures/suspicious/` that exercises the new rule, in the same commit.
+  `crates/nav-core/tests/fp_harness.rs` picks up new fixtures automatically
+  — no code changes needed, but a rule with zero fixture coverage is an
+  untested rule.
+
+## Scope discipline
+
+Don't add daemon/socket/root/FDA/network-capture code paths as a side
+effect of an unrelated task — that's Phase 0b+ and depends on feasibility
+spikes described in `docs/design/roadmap.md` §12 that haven't happened yet. If a
+task seems to require it, say so and check with the user before building
+it, rather than assuming it's now in scope.
