@@ -25,12 +25,33 @@ enum DvStatus {
     Signed,
 }
 
+/// `CS_LINKER_SIGNED`, from `<Security/CSCommon.h>`'s `CodeDirectory` flag bits.
+const CS_LINKER_SIGNED: u32 = 0x20000;
+
+/// True if `codesign -dv` output indicates the linker-applied ad-hoc
+/// signature, as opposed to a hand-applied one. Prefers parsing the numeric
+/// `flags=0x<hex>` token and testing `CS_LINKER_SIGNED`, since a `codesign`
+/// that renders flags without the `(...,linker-signed)` text suffix would
+/// otherwise be misread as a hand-applied sign; falls back to the textual
+/// `"linker-signed"` match when the flags token is missing or malformed.
+fn is_linker_signed(stderr: &str) -> bool {
+    let numeric_match = stderr
+        .split("flags=0x")
+        .nth(1)
+        .and_then(|rest| rest.split(|c: char| !c.is_ascii_hexdigit()).next())
+        .and_then(|hex| u32::from_str_radix(hex, 16).ok())
+        .map(|flags| flags & CS_LINKER_SIGNED != 0)
+        .unwrap_or(false);
+
+    numeric_match || stderr.contains("linker-signed")
+}
+
 /// Parses `codesign -dv --verbose=4` output. `codesign -dv` writes its report
 /// to stderr, not stdout, regardless of exit status.
 fn classify_dv(success: bool, stderr: &str) -> Result<DvStatus, RuleOutcome> {
     if success {
         return Ok(if stderr.contains("Signature=adhoc") {
-            if stderr.contains("linker-signed") {
+            if is_linker_signed(stderr) {
                 DvStatus::AdHocLinkerSigned
             } else {
                 DvStatus::AdHocManual
@@ -599,5 +620,47 @@ mod tests {
              CodeDirectory v=20400 size=... flags=0x20002(adhoc,linker-signed) hashes=...\n\
              Signature=adhoc\n";
         assert_eq!(classify_dv(true, stderr), Ok(DvStatus::AdHocLinkerSigned));
+    }
+
+    #[test]
+    fn is_linker_signed_matches_the_named_form() {
+        assert!(is_linker_signed(
+            "flags=0x20002(adhoc,linker-signed) hashes=877+0"
+        ));
+    }
+
+    /// A `codesign` that renders flags numerically, without the
+    /// `(...,linker-signed)` text suffix, must still be recognized — this is
+    /// the case the old text-only `.contains("linker-signed")` check missed.
+    #[test]
+    fn classify_dv_linker_signed_from_numeric_flags_only() {
+        let stderr = "Executable=/tmp/x\n\
+             CodeDirectory v=20400 size=... flags=0x20002 hashes=...\n\
+             Signature=adhoc\n";
+        assert_eq!(classify_dv(true, stderr), Ok(DvStatus::AdHocLinkerSigned));
+    }
+
+    #[test]
+    fn classify_dv_manual_adhoc_from_numeric_flags_only() {
+        let stderr = "Executable=/tmp/x\n\
+             CodeDirectory v=20400 size=... flags=0x2 hashes=...\n\
+             Signature=adhoc\n";
+        assert_eq!(classify_dv(true, stderr), Ok(DvStatus::AdHocManual));
+    }
+
+    #[test]
+    fn is_linker_signed_is_false_without_the_bit_or_the_text() {
+        assert!(!is_linker_signed("flags=0x2(adhoc) hashes=877+0"));
+        assert!(!is_linker_signed("flags=0x2 hashes=877+0"));
+    }
+
+    #[test]
+    fn is_linker_signed_falls_back_to_text_when_flags_token_is_malformed() {
+        assert!(is_linker_signed("flags=0xZZ(adhoc,linker-signed)"));
+    }
+
+    #[test]
+    fn is_linker_signed_is_false_when_flags_token_is_absent() {
+        assert!(!is_linker_signed("Signature=adhoc\n"));
     }
 }
