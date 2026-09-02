@@ -211,6 +211,8 @@ mod tests {
             truncated: false,
             file_len: Some(4096),
             source: crate::context::ContentSource::File,
+            codesign_dv_cache: std::sync::OnceLock::new(),
+            spctl_cache: std::sync::OnceLock::new(),
         };
         assert!(HighEntropyRule::default().evaluate(&ctx).unwrap().is_none());
     }
@@ -225,6 +227,8 @@ mod tests {
             truncated: false,
             file_len: None,
             source: crate::context::ContentSource::File,
+            codesign_dv_cache: std::sync::OnceLock::new(),
+            spctl_cache: std::sync::OnceLock::new(),
         };
         let signal = HighEntropyRule::default().evaluate(&ctx).unwrap();
         assert!(signal.is_some(), "script with embedded blob should score");
@@ -240,6 +244,8 @@ mod tests {
             truncated: false,
             file_len: None,
             source: crate::context::ContentSource::File,
+            codesign_dv_cache: std::sync::OnceLock::new(),
+            spctl_cache: std::sync::OnceLock::new(),
         };
         let signal = HighEntropyRule::default().evaluate(&ctx).unwrap();
         assert!(

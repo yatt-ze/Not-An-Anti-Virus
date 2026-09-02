@@ -83,7 +83,7 @@ impl Rule for UnsignedBinaryRule {
             return Ok(None);
         }
 
-        if run_codesign_dv(&ctx.path)? == DvStatus::Unsigned {
+        if run_codesign_dv(ctx)? == DvStatus::Unsigned {
             Ok(Some(MatchedSignal {
                 id: "unsigned-binary".to_string(),
                 weight: 4,
@@ -129,7 +129,7 @@ impl Rule for AdHocSignedRule {
             return Ok(None);
         }
 
-        if run_codesign_dv(&ctx.path)? == DvStatus::AdHocManual {
+        if run_codesign_dv(ctx)? == DvStatus::AdHocManual {
             Ok(Some(MatchedSignal {
                 id: "adhoc-signed-binary".to_string(),
                 weight: ADHOC_MANUAL_WEIGHT,
@@ -181,7 +181,7 @@ impl Rule for RevokedSignatureRule {
 
         // Revocation is a property of a real certificate; unsigned/ad-hoc
         // binaries have none, so don't spend a `codesign --verify` call on them.
-        if run_codesign_dv(&ctx.path)? != DvStatus::Signed {
+        if run_codesign_dv(ctx)? != DvStatus::Signed {
             return Ok(None);
         }
 
@@ -273,11 +273,11 @@ impl Rule for UnnotarizedSignedRule {
             return Ok(None);
         }
         // Notarization presupposes a real identity to submit for notarization.
-        if run_codesign_dv(&ctx.path)? != DvStatus::Signed {
+        if run_codesign_dv(ctx)? != DvStatus::Signed {
             return Ok(None);
         }
 
-        match run_spctl_source(&ctx.path)?.as_deref() {
+        match run_spctl_source(ctx)?.as_deref() {
             Some(source) if notarization_from_source(source) == Some(false) => {
                 Ok(Some(MatchedSignal {
                     id: "signed-not-notarized".to_string(),
@@ -319,11 +319,11 @@ impl Rule for NotarizedRule {
         if !crate::macho::is_macho_magic(content) {
             return Ok(None);
         }
-        if run_codesign_dv(&ctx.path)? != DvStatus::Signed {
+        if run_codesign_dv(ctx)? != DvStatus::Signed {
             return Ok(None);
         }
 
-        match run_spctl_source(&ctx.path)?.as_deref() {
+        match run_spctl_source(ctx)?.as_deref() {
             Some(source) if notarization_from_source(source) == Some(true) => {
                 Ok(Some(MatchedSignal {
                     id: "notarized-binary".to_string(),
@@ -351,9 +351,13 @@ fn notarization_from_source(source: &str) -> Option<bool> {
     }
 }
 
-/// Runs `spctl -a -t exec` and pulls out its `source=` line, if any.
-fn run_spctl_source(path: &std::path::Path) -> Result<Option<String>, RuleOutcome> {
-    let output = spawn_spctl_assess(path)?;
+/// Runs `spctl -a -t exec` and pulls out its `source=` line, if any. The
+/// spawn is cached on `ctx` (§5.2) so notarization rules sharing a scan
+/// don't each spawn their own `spctl`.
+fn run_spctl_source(ctx: &ScanContext) -> Result<Option<String>, RuleOutcome> {
+    let output = ctx
+        .spctl_assessment(|| spawn_spctl_assess(&ctx.path).ok())
+        .ok_or(RuleOutcome::NotApplicable)?;
     Ok(parse_spctl_source(&output).map(str::to_string))
 }
 
@@ -387,9 +391,13 @@ fn spawn_spctl_assess(_path: &std::path::Path) -> Result<String, RuleOutcome> {
 
 /// Runs `codesign -dv` and classifies the result. The classification logic
 /// (`classify_dv`) is platform-independent and unit-tested directly; only the
-/// process spawn is behind the platform gate.
-fn run_codesign_dv(path: &std::path::Path) -> Result<DvStatus, RuleOutcome> {
-    let (success, stderr) = spawn_codesign_dv(path)?;
+/// process spawn is behind the platform gate. The spawn itself is cached on
+/// `ctx` (§5.2) so the five rules sharing a scan spawn `codesign` once, not
+/// once each.
+fn run_codesign_dv(ctx: &ScanContext) -> Result<DvStatus, RuleOutcome> {
+    let (success, stderr) = ctx
+        .codesign_dv(|| spawn_codesign_dv(&ctx.path).ok())
+        .ok_or(RuleOutcome::NotApplicable)?;
     classify_dv(success, &stderr)
 }
 
@@ -429,6 +437,8 @@ mod tests {
             truncated: false,
             file_len: Some(body.len() as u64),
             source: ContentSource::File,
+            codesign_dv_cache: std::sync::OnceLock::new(),
+            spctl_cache: std::sync::OnceLock::new(),
         }
     }
 
