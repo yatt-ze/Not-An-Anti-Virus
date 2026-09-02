@@ -1,0 +1,13 @@
+{
+  "theme": "system",
+  "autosave": true,
+  "check_interval_minutes": 120,
+  "recent_files": [
+    "report-q1.csv",
+    "report-q2.csv"
+  ],
+  "window": {
+    "width": 1024,
+    "height": 768
+  }
+}
