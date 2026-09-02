@@ -1,0 +1,207 @@
+{
+  "benign/CHANGELOG.md": {
+    "score": 0,
+    "recommendation": "no-action",
+    "rule_ids": []
+  },
+  "benign/ElectronDemo.app": {
+    "score": 0,
+    "recommendation": "no-action",
+    "rule_ids": []
+  },
+  "benign/NamedDiff.app": {
+    "score": 0,
+    "recommendation": "no-action",
+    "rule_ids": []
+  },
+  "benign/SampleHelper.app": {
+    "score": 8,
+    "recommendation": "no-action",
+    "rule_ids": [
+      "launchd-persistence-plist"
+    ]
+  },
+  "benign/admin_reset_prefs.sh": {
+    "score": 0,
+    "recommendation": "no-action",
+    "rule_ids": []
+  },
+  "benign/admin_toggle_wifi.sh": {
+    "score": 0,
+    "recommendation": "no-action",
+    "rule_ids": []
+  },
+  "benign/app_settings.json": {
+    "score": 0,
+    "recommendation": "no-action",
+    "rule_ids": []
+  },
+  "benign/build.sh": {
+    "score": 0,
+    "recommendation": "no-action",
+    "rule_ids": []
+  },
+  "benign/com.example.devtool.plist": {
+    "score": 8,
+    "recommendation": "no-action",
+    "rule_ids": [
+      "launchd-persistence-plist"
+    ]
+  },
+  "benign/com.example.helper.plist": {
+    "score": 0,
+    "recommendation": "no-action",
+    "rule_ids": []
+  },
+  "benign/com.example.menubar.plist": {
+    "score": 0,
+    "recommendation": "no-action",
+    "rule_ids": []
+  },
+  "benign/compressed_archive.tar.gz": {
+    "score": 0,
+    "recommendation": "no-action",
+    "rule_ids": []
+  },
+  "benign/csv_report.py": {
+    "score": 0,
+    "recommendation": "no-action",
+    "rule_ids": []
+  },
+  "benign/formula.rb": {
+    "score": 3,
+    "recommendation": "no-action",
+    "rule_ids": [
+      "suspicious-strings"
+    ]
+  },
+  "benign/formula_cmake.rb": {
+    "score": 0,
+    "recommendation": "no-action",
+    "rule_ids": []
+  },
+  "benign/formula_git_clone.rb": {
+    "score": 0,
+    "recommendation": "no-action",
+    "rule_ids": []
+  },
+  "benign/installer_nested.pkg": {
+    "score": 6,
+    "recommendation": "no-action",
+    "rule_ids": [
+      "unsigned-installer-package"
+    ]
+  },
+  "benign/installer_no_scripts.pkg": {
+    "score": 6,
+    "recommendation": "no-action",
+    "rule_ids": [
+      "unsigned-installer-package"
+    ]
+  },
+  "benign/installer_ordinary.pkg": {
+    "score": 6,
+    "recommendation": "no-action",
+    "rule_ids": [
+      "unsigned-installer-package"
+    ]
+  },
+  "benign/macho_like_but_incomplete": {
+    "score": 4,
+    "recommendation": "no-action",
+    "rule_ids": [
+      "unsigned-binary"
+    ]
+  },
+  "benign/readme.txt": {
+    "score": 0,
+    "recommendation": "no-action",
+    "rule_ids": []
+  },
+  "benign/tiny_hello_arm64": {
+    "score": 0,
+    "recommendation": "no-action",
+    "rule_ids": []
+  },
+  "suspicious/com.apple.softwareupdate.plist": {
+    "score": 36,
+    "recommendation": "notify",
+    "rule_ids": [
+      "launchd-persistence-plist",
+      "suspicious-strings"
+    ]
+  },
+  "suspicious/dropper.sh": {
+    "score": 23,
+    "recommendation": "notify",
+    "rule_ids": [
+      "suspicious-strings"
+    ]
+  },
+  "suspicious/dropper_base64_exec.sh": {
+    "score": 13,
+    "recommendation": "no-action",
+    "rule_ids": [
+      "suspicious-strings"
+    ]
+  },
+  "suspicious/dropper_curl_pipe_bash.sh": {
+    "score": 13,
+    "recommendation": "no-action",
+    "rule_ids": [
+      "suspicious-strings"
+    ]
+  },
+  "suspicious/dropper_osascript_fetch.sh": {
+    "score": 9,
+    "recommendation": "no-action",
+    "rule_ids": [
+      "suspicious-strings"
+    ]
+  },
+  "suspicious/installer_applescript_preinstall.pkg": {
+    "score": 15,
+    "recommendation": "notify",
+    "rule_ids": [
+      "installer-script-suspicious",
+      "unsigned-installer-package"
+    ]
+  },
+  "suspicious/installer_curl_pipe_preinstall.pkg": {
+    "score": 15,
+    "recommendation": "notify",
+    "rule_ids": [
+      "installer-script-suspicious",
+      "unsigned-installer-package"
+    ]
+  },
+  "suspicious/packed_payload.sh": {
+    "score": 31,
+    "recommendation": "notify",
+    "rule_ids": [
+      "high-entropy-content",
+      "suspicious-strings"
+    ]
+  },
+  "suspicious/packed_payload_variant.py": {
+    "score": 15,
+    "recommendation": "notify",
+    "rule_ids": [
+      "high-entropy-content"
+    ]
+  },
+  "suspicious/persistence_beacon.plist": {
+    "score": 26,
+    "recommendation": "notify",
+    "rule_ids": [
+      "launchd-persistence-plist"
+    ]
+  },
+  "suspicious/tcc_keychain_exfil.sh": {
+    "score": 21,
+    "recommendation": "notify",
+    "rule_ids": [
+      "suspicious-strings"
+    ]
+  }
+}
