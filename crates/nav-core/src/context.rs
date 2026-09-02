@@ -4,6 +4,7 @@
 
 use std::io::Read;
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 
 /// Cap on how much of a file is read into memory for content rules. Static
 /// analysis never needs the whole file, and an unbounded read of hostile input
@@ -36,6 +37,13 @@ pub struct ScanContext {
     pub truncated: bool,
     pub file_len: Option<u64>,
     pub source: ContentSource,
+    /// Memoized `codesign -dv` spawn (§5.2) — `None` means the spawn failed
+    /// or the platform can't run it. Several rules ask about the same file.
+    /// `pub(crate)` so test helpers elsewhere can build a `ScanContext` by
+    /// struct literal; use [`ScanContext::codesign_dv`] to read it.
+    pub(crate) codesign_dv_cache: OnceLock<Option<(bool, String)>>,
+    /// Memoized `spctl` assessment spawn (§5.2), same reasoning as above.
+    pub(crate) spctl_cache: OnceLock<Option<String>>,
 }
 
 impl ScanContext {
@@ -61,6 +69,8 @@ impl ScanContext {
             truncated,
             file_len,
             source: ContentSource::File,
+            codesign_dv_cache: OnceLock::new(),
+            spctl_cache: OnceLock::new(),
         }
     }
 
@@ -80,6 +90,8 @@ impl ScanContext {
             truncated,
             file_len: Some(len),
             source: ContentSource::Embedded,
+            codesign_dv_cache: OnceLock::new(),
+            spctl_cache: OnceLock::new(),
         }
     }
 
@@ -90,5 +102,22 @@ impl ScanContext {
 
     pub fn readable(&self) -> bool {
         self.content.is_some()
+    }
+
+    /// Runs `spawn` at most once per scan and returns the cached
+    /// `codesign -dv` result. `None` means the spawn failed or doesn't
+    /// apply on this platform.
+    pub fn codesign_dv(
+        &self,
+        spawn: impl FnOnce() -> Option<(bool, String)>,
+    ) -> Option<(bool, String)> {
+        self.codesign_dv_cache.get_or_init(spawn).clone()
+    }
+
+    /// Runs `spawn` at most once per scan and returns the cached `spctl`
+    /// assessment output. `None` means the spawn failed or doesn't apply
+    /// on this platform.
+    pub fn spctl_assessment(&self, spawn: impl FnOnce() -> Option<String>) -> Option<String> {
+        self.spctl_cache.get_or_init(spawn).clone()
     }
 }

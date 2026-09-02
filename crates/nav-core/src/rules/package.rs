@@ -171,6 +171,8 @@ mod tests {
             truncated: false,
             file_len: Some(body.len() as u64),
             source: ContentSource::File,
+            codesign_dv_cache: std::sync::OnceLock::new(),
+            spctl_cache: std::sync::OnceLock::new(),
         }
     }
 

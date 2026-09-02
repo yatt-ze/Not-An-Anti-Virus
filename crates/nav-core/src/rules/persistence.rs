@@ -305,6 +305,8 @@ mod tests {
             truncated: false,
             file_len: Some(body.len() as u64),
             source: crate::context::ContentSource::File,
+            codesign_dv_cache: std::sync::OnceLock::new(),
+            spctl_cache: std::sync::OnceLock::new(),
         }
     }
 
@@ -447,6 +449,8 @@ mod tests {
             truncated: true,
             file_len: Some(64 * 1024 * 1024),
             source: crate::context::ContentSource::File,
+            codesign_dv_cache: std::sync::OnceLock::new(),
+            spctl_cache: std::sync::OnceLock::new(),
         };
         assert!(matches!(
             LaunchdPersistenceRule.evaluate(&c),
@@ -492,6 +496,8 @@ mod tests {
             truncated: false,
             file_len: None,
             source: crate::context::ContentSource::File,
+            codesign_dv_cache: std::sync::OnceLock::new(),
+            spctl_cache: std::sync::OnceLock::new(),
         };
         assert!(matches!(
             LaunchdPersistenceRule.evaluate(&c),
