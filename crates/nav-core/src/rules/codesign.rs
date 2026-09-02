@@ -174,6 +174,12 @@ const REVOKED_CERT_WEIGHT: i32 = 14;
 /// revoked since it was signed. Only meaningful for a real identity — an
 /// unsigned or ad-hoc binary has no certificate to revoke, so this rule
 /// doesn't even ask about those.
+///
+/// Chain revocation (OCSP) is primarily Gatekeeper/`spctl`'s job; `codesign
+/// --verify`'s revocation reporting is best-effort and depends on
+/// cached/online revocation state. This rule only reports a revocation
+/// `codesign` actually surfaces — a clean verify is not proof the cert is
+/// un-revoked (§10/§11.8).
 pub struct RevokedSignatureRule;
 
 impl Default for RevokedSignatureRule {
@@ -221,7 +227,9 @@ impl Rule for RevokedSignatureRule {
 
 /// Runs `codesign --verify` and reports whether the failure was specifically
 /// a revoked certificate, as opposed to any other reason verification failed
-/// (modified resource, broken seal, …) — those aren't this rule's claim to make.
+/// (modified resource, broken seal, …) — those aren't this rule's claim to
+/// make. Best-effort: depends on `codesign`'s own cached/online revocation
+/// state, so `false` means "not reported," not "confirmed un-revoked."
 fn run_codesign_verify(path: &std::path::Path) -> Result<bool, RuleOutcome> {
     let stderr = spawn_codesign_verify(path)?;
     Ok(indicates_revocation(&stderr))
