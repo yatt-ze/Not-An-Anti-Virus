@@ -1,0 +1,8 @@
+#!/bin/sh
+# ElectronDemo — stand-in for an Electron app's native launcher stub for the
+# FP harness. A real Electron binary is a compiled Mach-O; this fixture only
+# needs to exercise the bundle-shape (Contents/Frameworks/Electron
+# Framework.framework, Contents/Resources/app.asar) without any of the
+# packaged JS payload.
+echo "ElectronDemo 1.0.0"
+exit 0

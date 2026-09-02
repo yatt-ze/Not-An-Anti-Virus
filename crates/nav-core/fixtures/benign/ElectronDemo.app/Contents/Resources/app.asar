@@ -1,0 +1,2 @@
+placeholder-asar-archive-stub: not a real packaged app, just enough bytes
+for the FP harness to see an Electron-shaped Resources/app.asar entry.
