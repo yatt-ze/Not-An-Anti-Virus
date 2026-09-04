@@ -10,9 +10,13 @@
 //! threshold, making scoring nondeterministic, or (via the golden snapshot)
 //! silently changing a fixture's score, recommendation, or fired rule ids.
 
-use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
+
+// Only the macOS-gated golden-snapshot test uses BTreeMap; an unconditional
+// import is dead code off-macOS and trips clippy's `-D warnings`.
+#[cfg(target_os = "macos")]
+use std::collections::BTreeMap;
 
 use nav_core::{scan_target, Recommendation, TargetScan};
 
