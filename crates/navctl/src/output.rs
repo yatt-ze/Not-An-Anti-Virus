@@ -273,6 +273,7 @@ fn budget_limit_label(limit: BudgetLimit) -> &'static str {
         BudgetLimit::Files => "max-files",
         BudgetLimit::TotalBytes => "max-total-bytes",
         BudgetLimit::Depth => "max-depth",
+        BudgetLimit::Entries => "max-entries",
     }
 }
 

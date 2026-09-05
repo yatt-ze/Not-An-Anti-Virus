@@ -38,6 +38,12 @@ pub struct ScanBudget {
     pub max_total_bytes: u64,
     /// Maximum directory-recursion depth below the named target.
     pub max_depth: usize,
+    /// Maximum directory entries examined during traversal — files,
+    /// directories, and skipped special files alike. Bounds the *breadth* of
+    /// the walk, the work `max_files`/`max_total_bytes` miss: a tree of
+    /// pathologically many empty directories scores no files and reads no
+    /// bytes, so only an entry ceiling bounds it.
+    pub max_entries: usize,
 }
 
 impl Default for ScanBudget {
@@ -48,6 +54,7 @@ impl Default for ScanBudget {
             max_files: 50_000,
             max_total_bytes: 4 * 1024 * 1024 * 1024, // 4 GiB read
             max_depth: 64,
+            max_entries: 1_000_000,
         }
     }
 }
@@ -58,6 +65,7 @@ pub enum BudgetLimit {
     Files,
     TotalBytes,
     Depth,
+    Entries,
 }
 
 /// Whether a target scan fit inside its [`ScanBudget`].
@@ -248,11 +256,20 @@ fn collect_files(
 ) -> io::Result<(Vec<PathBuf>, Option<BudgetLimit>)> {
     let mut out = Vec::new();
     let mut limit_hit = None;
+    // Every directory entry examined, across the whole walk — bounds breadth
+    // (and, since each queued directory was itself one such entry, the stack)
+    // so an all-empty-directory tree can't run unbounded past `max_files`.
+    let mut entries_seen = 0usize;
     // Depth is measured relative to `root`, which sits at depth 0.
     let mut stack = vec![(root.to_path_buf(), 0usize)];
 
     'walk: while let Some((dir, depth)) = stack.pop() {
         for entry in std::fs::read_dir(&dir)? {
+            entries_seen += 1;
+            if entries_seen > budget.max_entries {
+                limit_hit = Some(BudgetLimit::Entries);
+                break 'walk;
+            }
             let entry = entry?;
             // `DirEntry::file_type` does not traverse a symlink.
             let file_type = entry.file_type()?;
@@ -474,6 +491,24 @@ mod tests {
             scan.budget,
             BudgetOutcome::Exhausted(BudgetLimit::TotalBytes)
         );
+    }
+
+    #[test]
+    fn empty_directory_breadth_is_bounded_by_the_entry_budget() {
+        let dir = TempDir::new("budget-entries");
+        // No files at all — just empty subdirectories, which score no files
+        // and read no bytes, so only the entry ceiling can bound them.
+        for i in 0..10 {
+            fs::create_dir(dir.path().join(format!("d{i}"))).unwrap();
+        }
+        let budget = ScanBudget {
+            max_entries: 3,
+            ..ScanBudget::default()
+        };
+        let scan = scan_target_with_budget(dir.path(), true, &budget).unwrap();
+        assert!(scan.results.is_empty());
+        assert_eq!(scan.budget, BudgetOutcome::Exhausted(BudgetLimit::Entries));
+        assert!(!scan.coverage_complete());
     }
 
     #[test]
