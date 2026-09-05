@@ -106,17 +106,27 @@ pub struct ScanContext {
 
 impl ScanContext {
     pub fn load(path: &Path) -> Self {
-        let meta = std::fs::metadata(path).ok();
-        let file_len = meta.as_ref().map(|m| m.len());
-        let identity = meta.as_ref().map(ObjectIdentity::from_metadata);
-
-        let content = std::fs::File::open(path).ok().and_then(|mut f| {
+        // Open first, then derive identity and length from the *opened* file
+        // (fstat on the handle) and read the bytes through that same handle, so
+        // the captured identity describes the object whose bytes were actually
+        // scanned — not a separate pre-open `stat` an attacker could race in
+        // the gap before the read (§11.7). A path swapped before the open is
+        // simply a different object opened, read, and identified consistently.
+        let opened = std::fs::File::open(path).ok().and_then(|mut f| {
+            let md = f.metadata().ok()?;
+            let identity = ObjectIdentity::from_metadata(&md);
             let mut buf = Vec::new();
-            let cap = MAX_CONTENT_BYTES as u64;
-            let mut limited = (&mut f).take(cap);
-            limited.read_to_end(&mut buf).ok()?;
-            Some(buf)
+            (&mut f)
+                .take(MAX_CONTENT_BYTES as u64)
+                .read_to_end(&mut buf)
+                .ok()?;
+            Some((buf, identity, md.len()))
         });
+
+        let (content, identity, file_len) = match opened {
+            Some((buf, identity, len)) => (Some(buf), Some(identity), Some(len)),
+            None => (None, None, None),
+        };
 
         let truncated = match (&content, file_len) {
             (Some(c), Some(len)) => (c.len() as u64) < len,
@@ -264,6 +274,21 @@ mod tests {
             None
         );
 
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// The captured identity describes the object that was actually opened and
+    /// read — its `size` matches both the reported length and the bytes read,
+    /// because all three come from the one `fstat` on the handle the read went
+    /// through, not a separate pre-open `stat` (§11.7).
+    #[test]
+    fn identity_is_derived_from_the_opened_and_read_object() {
+        let path = temp_file("fd-identity", b"twelve bytes");
+        let ctx = ScanContext::load(&path);
+        let id = ctx.identity.expect("a readable file has an identity");
+        assert_eq!(id.size, ctx.file_len.expect("length from the same fstat"));
+        assert_eq!(id.size, ctx.content.as_ref().unwrap().len() as u64);
+        assert!(!ctx.truncated);
         let _ = std::fs::remove_file(&path);
     }
 
