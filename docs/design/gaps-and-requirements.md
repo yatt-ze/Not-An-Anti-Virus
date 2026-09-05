@@ -40,6 +40,8 @@ document map and section index. Section numbers are global; this file holds §10
 
 Now targeted for Phase 0a, not Phase 1 (see §12). Start small (e.g., ~20 known-benign fixtures, ~10 synthetic suspicious fixtures, a malformed/fuzzed-input corpus) and expand continuously, rather than waiting for a large corpus before starting. Track more than pass/fail: final score, matched rule IDs, runtime, memory, files traversed. A rule change should fail CI if it pushes a known-benign sample over the alert threshold, introduces an unexpectedly high-severity signal, or produces nondeterministic output.
 
+**Quantitative acceptance gate (NAV-015).** "Low false-positive rate is the primary success metric" (§1, §12 go/no-go) is enforced as a measured, asserted number, not left as a stated priority: the harness computes and reports the corpus's benign false-positive rate, suspicious signal coverage, verdict mix (high-risk/notify counts), partial/indeterminate count, and per-fixture runtime p50/p95, and asserts two corpus-size-independent criteria — benign false-positive rate is exactly 0%, and suspicious signal coverage is 100% (no deliberately-suspicious fixture scored silently clean). Runtime percentiles are reported but not asserted (environment-dependent, would flake CI). Peak memory stays deliberately untracked: cargo runs every test as a thread in one shared process with one allocator, so a per-fixture number would misattribute concurrent allocation — an honestly-absent metric beats a wrong one, and an honest external benchmark is the right home for it later.
+
 ### 11.2 Ruleset Rollback
 
 `navctl rules rollback`, since there's no cloud-based auto-tuning safety net; a bad rule update needs a fast, user-triggerable reversion path.
