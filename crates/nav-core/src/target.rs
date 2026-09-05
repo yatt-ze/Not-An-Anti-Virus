@@ -9,6 +9,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 use crate::bundle::{self, BundleLayout};
+use crate::context::MAX_CONTENT_BYTES;
 use crate::model::{Recommendation, ScanCompleteness, ScanResult};
 use crate::scan::scan_file;
 
@@ -20,6 +21,54 @@ pub enum TargetKind {
     /// A macOS `.app` bundle — a directory, but scanned as one logical unit
     /// with a resolved main executable (see [`crate::bundle`]).
     Bundle,
+}
+
+/// Ceilings on a whole-target scan, so a directory or bundle with
+/// pathologically many, deep, or large files can't become unbounded work
+/// (NAV-004/011, §11). These are the target-level counterpart to the per-file
+/// read cap (§3) and per-container extraction limits (§6.2), which still apply
+/// independently. Hitting a ceiling is treated as incomplete coverage, never
+/// as a clean result (§10/§11.8).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ScanBudget {
+    /// Maximum number of files scored in one target scan.
+    pub max_files: usize,
+    /// Maximum summed input across the target, each file counted at the bytes
+    /// actually read for it (its length clipped to the §3 per-file cap).
+    pub max_total_bytes: u64,
+    /// Maximum directory-recursion depth below the named target.
+    pub max_depth: usize,
+}
+
+impl Default for ScanBudget {
+    /// Generous enough for a large but legitimate tree, low enough that a
+    /// hostile or runaway target is bounded. Tunable later via `navctl config`.
+    fn default() -> Self {
+        Self {
+            max_files: 50_000,
+            max_total_bytes: 4 * 1024 * 1024 * 1024, // 4 GiB read
+            max_depth: 64,
+        }
+    }
+}
+
+/// Which budget ceiling stopped a target scan.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BudgetLimit {
+    Files,
+    TotalBytes,
+    Depth,
+}
+
+/// Whether a target scan fit inside its [`ScanBudget`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BudgetOutcome {
+    /// The whole target was traversed and scored within budget.
+    Within,
+    /// A ceiling was hit, so the target was only partially scanned — the
+    /// result must be read as incomplete coverage even if every scored file
+    /// was individually `Complete` (§11.8).
+    Exhausted(BudgetLimit),
 }
 
 /// The outcome of scanning a target path: every file that was scanned, plus
@@ -36,6 +85,8 @@ pub struct TargetScan {
     /// Bundle members traversed but not scored (see
     /// [`bundle::is_inert_bundle_resource`]).
     pub skipped: Vec<PathBuf>,
+    /// Whether the scan fit inside its budget, or was cut short (and how).
+    pub budget: BudgetOutcome,
 }
 
 impl TargetScan {
@@ -63,6 +114,14 @@ impl TargetScan {
             .map(|r| r.recommendation)
             .unwrap_or(Recommendation::NoAction)
     }
+
+    /// Whether the whole target was covered. `false` when a [`ScanBudget`]
+    /// ceiling cut the traversal short, so the target result is partial even
+    /// if every scored file was individually `Complete` — "couldn't finish"
+    /// is not "clean" (§11.8).
+    pub fn coverage_complete(&self) -> bool {
+        self.budget == BudgetOutcome::Within
+    }
 }
 
 /// Severity ordering for picking the worst result. An incomplete scan that
@@ -86,6 +145,17 @@ fn severity_rank(r: &ScanResult) -> u8 {
 /// - Any other directory scans every file under it (recursively when
 ///   `recursive`), in sorted order.
 pub fn scan_target(path: &Path, recursive: bool) -> io::Result<TargetScan> {
+    scan_target_with_budget(path, recursive, &ScanBudget::default())
+}
+
+/// Like [`scan_target`], but with an explicit [`ScanBudget`]. A ceiling hit
+/// during traversal or scanning stops the scan and records
+/// [`BudgetOutcome::Exhausted`] rather than silently dropping coverage.
+pub fn scan_target_with_budget(
+    path: &Path,
+    recursive: bool,
+    budget: &ScanBudget,
+) -> io::Result<TargetScan> {
     // Follow a symlink named as the target itself (the user's intent); ones
     // met mid-traversal are not followed (see `collect_files`).
     let meta = std::fs::metadata(path)?;
@@ -97,43 +167,87 @@ pub fn scan_target(path: &Path, recursive: bool) -> io::Result<TargetScan> {
             results: vec![scan_file(path)],
             primary: None,
             skipped: Vec::new(),
+            budget: BudgetOutcome::Within,
         });
     }
 
     if let Some(layout) = BundleLayout::detect(path) {
         // A bundle is always traversed in full; `recursive` doesn't apply.
-        let all = collect_files(path, true)?;
+        let (all, collect_limit) = collect_files(path, true, budget)?;
         let (to_scan, skipped): (Vec<PathBuf>, Vec<PathBuf>) = all
             .into_iter()
             .partition(|p| !bundle::is_inert_bundle_resource(p));
-        let results = to_scan.iter().map(|f| scan_file(f)).collect();
+        let (results, byte_limit) = scan_within_bytes(&to_scan, budget);
         return Ok(TargetScan {
             root: path.to_path_buf(),
             kind: TargetKind::Bundle,
             results,
             primary: layout.main_executable,
             skipped,
+            budget: outcome(collect_limit, byte_limit),
         });
     }
 
-    let files = collect_files(path, recursive)?;
-    let results = files.iter().map(|f| scan_file(f)).collect();
+    let (files, collect_limit) = collect_files(path, recursive, budget)?;
+    let (results, byte_limit) = scan_within_bytes(&files, budget);
     Ok(TargetScan {
         root: path.to_path_buf(),
         kind: TargetKind::Directory,
         results,
         primary: None,
         skipped: Vec::new(),
+        budget: outcome(collect_limit, byte_limit),
     })
+}
+
+/// Fold the collection-time and scan-time budget limits into one outcome. A
+/// structural limit (files/depth) is reported ahead of a byte limit, since it
+/// bounds what was even discovered.
+fn outcome(collect_limit: Option<BudgetLimit>, byte_limit: Option<BudgetLimit>) -> BudgetOutcome {
+    match collect_limit.or(byte_limit) {
+        Some(limit) => BudgetOutcome::Exhausted(limit),
+        None => BudgetOutcome::Within,
+    }
+}
+
+/// Scan `files` in order until the summed read (each file's length clipped to
+/// the §3 per-file cap) would exceed `max_total_bytes`. Returns the results
+/// scored and `Some(TotalBytes)` if the cap stopped it short.
+fn scan_within_bytes(
+    files: &[PathBuf],
+    budget: &ScanBudget,
+) -> (Vec<ScanResult>, Option<BudgetLimit>) {
+    let mut results = Vec::new();
+    let mut used: u64 = 0;
+    for f in files {
+        let read_len = std::fs::metadata(f)
+            .map(|m| m.len().min(MAX_CONTENT_BYTES as u64))
+            .unwrap_or(0);
+        // Always allow the first file through, so one large file still scans.
+        if !results.is_empty() && used.saturating_add(read_len) > budget.max_total_bytes {
+            return (results, Some(BudgetLimit::TotalBytes));
+        }
+        used = used.saturating_add(read_len);
+        results.push(scan_file(f));
+    }
+    (results, None)
 }
 
 /// Depth-first file collection under `root`, sorted for determinism (§11.1).
 /// Directory symlinks are not followed (traversal cycles, scan escape).
-fn collect_files(root: &Path, recursive: bool) -> io::Result<Vec<PathBuf>> {
+/// Stops early if the budget's file-count or depth ceiling is reached,
+/// returning which limit was hit so the target can be marked partial.
+fn collect_files(
+    root: &Path,
+    recursive: bool,
+    budget: &ScanBudget,
+) -> io::Result<(Vec<PathBuf>, Option<BudgetLimit>)> {
     let mut out = Vec::new();
-    let mut stack = vec![root.to_path_buf()];
+    let mut limit_hit = None;
+    // Depth is measured relative to `root`, which sits at depth 0.
+    let mut stack = vec![(root.to_path_buf(), 0usize)];
 
-    while let Some(dir) = stack.pop() {
+    'walk: while let Some((dir, depth)) = stack.pop() {
         for entry in std::fs::read_dir(&dir)? {
             let entry = entry?;
             // `DirEntry::file_type` does not traverse a symlink.
@@ -142,9 +256,17 @@ fn collect_files(root: &Path, recursive: bool) -> io::Result<Vec<PathBuf>> {
 
             if file_type.is_dir() {
                 if recursive {
-                    stack.push(path);
+                    if depth < budget.max_depth {
+                        stack.push((path, depth + 1));
+                    } else {
+                        limit_hit.get_or_insert(BudgetLimit::Depth);
+                    }
                 }
             } else if file_type.is_file() {
+                if out.len() >= budget.max_files {
+                    limit_hit = Some(BudgetLimit::Files);
+                    break 'walk;
+                }
                 out.push(path);
             }
             // Symlinks, sockets, fifos, devices: skip.
@@ -152,7 +274,7 @@ fn collect_files(root: &Path, recursive: bool) -> io::Result<Vec<PathBuf>> {
     }
 
     out.sort();
-    Ok(out)
+    Ok((out, limit_hit))
 }
 
 #[cfg(test)]
@@ -282,6 +404,72 @@ mod tests {
         let dir = TempDir::new("missing");
         let err = scan_target(&dir.path().join("nope"), false).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::NotFound);
+    }
+
+    #[test]
+    fn default_budget_leaves_a_small_target_complete() {
+        let dir = TempDir::new("budget-ok");
+        fs::write(dir.path().join("a.txt"), b"a").unwrap();
+        fs::write(dir.path().join("b.txt"), b"b").unwrap();
+        let scan = scan_target(dir.path(), true).unwrap();
+        assert_eq!(scan.budget, BudgetOutcome::Within);
+        assert!(scan.coverage_complete());
+    }
+
+    #[test]
+    fn file_count_ceiling_marks_the_target_partial() {
+        let dir = TempDir::new("budget-files");
+        for i in 0..5 {
+            fs::write(dir.path().join(format!("f{i}.txt")), b"x").unwrap();
+        }
+        let budget = ScanBudget {
+            max_files: 2,
+            ..ScanBudget::default()
+        };
+        let scan = scan_target_with_budget(dir.path(), true, &budget).unwrap();
+        assert_eq!(scan.results.len(), 2);
+        assert_eq!(scan.budget, BudgetOutcome::Exhausted(BudgetLimit::Files));
+        assert!(!scan.coverage_complete());
+    }
+
+    #[test]
+    fn depth_ceiling_marks_the_target_partial_and_stops_descent() {
+        let dir = TempDir::new("budget-depth");
+        fs::write(dir.path().join("top.txt"), b"t").unwrap();
+        fs::create_dir(dir.path().join("sub")).unwrap();
+        fs::write(dir.path().join("sub/deep.txt"), b"d").unwrap();
+
+        let budget = ScanBudget {
+            max_depth: 0,
+            ..ScanBudget::default()
+        };
+        let scan = scan_target_with_budget(dir.path(), true, &budget).unwrap();
+        // Only the top-level file is scored; the depth-1 file is out of budget.
+        assert!(scan.results.iter().any(|r| r.path.ends_with("top.txt")));
+        assert!(!scan
+            .results
+            .iter()
+            .any(|r| r.path.ends_with("sub/deep.txt")));
+        assert_eq!(scan.budget, BudgetOutcome::Exhausted(BudgetLimit::Depth));
+    }
+
+    #[test]
+    fn total_bytes_ceiling_still_scans_the_first_file() {
+        let dir = TempDir::new("budget-bytes");
+        fs::write(dir.path().join("a.bin"), vec![0u8; 4096]).unwrap();
+        fs::write(dir.path().join("b.bin"), vec![0u8; 4096]).unwrap();
+        // A cap below one file's size: the first file always gets through, the
+        // second trips the ceiling.
+        let budget = ScanBudget {
+            max_total_bytes: 100,
+            ..ScanBudget::default()
+        };
+        let scan = scan_target_with_budget(dir.path(), true, &budget).unwrap();
+        assert_eq!(scan.results.len(), 1);
+        assert_eq!(
+            scan.budget,
+            BudgetOutcome::Exhausted(BudgetLimit::TotalBytes)
+        );
     }
 
     #[test]

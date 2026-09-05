@@ -10,8 +10,8 @@ use std::path::Path;
 use std::process::ExitCode;
 
 use nav_core::{
-    scan_target, EvidenceConfidence, Recommendation, ScanCompleteness, ScanResult, TargetKind,
-    TargetScan,
+    scan_target, BudgetLimit, BudgetOutcome, EvidenceConfidence, Recommendation, ScanCompleteness,
+    ScanResult, TargetKind, TargetScan,
 };
 use serde::Serialize;
 
@@ -174,6 +174,9 @@ fn print_rules_test_multi(scan: &TargetScan) {
             scan.results.len()
         );
     }
+    if let Some(note) = budget_note(scan) {
+        println!("{note}");
+    }
     println!();
     println!(
         "Worst finding — {}",
@@ -234,9 +237,40 @@ fn multi_json(scan: &TargetScan) -> serde_json::Value {
         "kind": kind,
         "primary": scan.primary,
         "skipped_resources": scan.skipped,
+        "coverage_complete": scan.coverage_complete(),
+        "budget_limit": budget_limit_str(scan),
         "recommendation": scan.recommendation(),
         "results": scan.results,
     })
+}
+
+/// A human-readable warning when a scan budget cut the target short, or `None`
+/// when the whole target was covered. Coverage that stops short is surfaced,
+/// never silently dropped (§11.8).
+fn budget_note(scan: &TargetScan) -> Option<String> {
+    match scan.budget {
+        BudgetOutcome::Within => None,
+        BudgetOutcome::Exhausted(limit) => Some(format!(
+            "  [PARTIAL COVERAGE: scan budget reached ({}) — more of this target was not scanned]",
+            budget_limit_label(limit)
+        )),
+    }
+}
+
+/// Machine-readable budget-limit tag for `--json`, or `None` if within budget.
+fn budget_limit_str(scan: &TargetScan) -> Option<&'static str> {
+    match scan.budget {
+        BudgetOutcome::Within => None,
+        BudgetOutcome::Exhausted(limit) => Some(budget_limit_label(limit)),
+    }
+}
+
+fn budget_limit_label(limit: BudgetLimit) -> &'static str {
+    match limit {
+        BudgetLimit::Files => "max-files",
+        BudgetLimit::TotalBytes => "max-total-bytes",
+        BudgetLimit::Depth => "max-depth",
+    }
 }
 
 /// Render `path` relative to `root` when it sits under it, for compact output.
@@ -307,6 +341,7 @@ mod tests {
             primary: None,
             skipped: Vec::new(),
             results: vec![sample_result()],
+            budget: nav_core::BudgetOutcome::Within,
         };
         let value = multi_json(&scan);
         assert_eq!(value["schema_version"], JSON_SCHEMA_VERSION);
