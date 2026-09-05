@@ -3,7 +3,8 @@
 #   cargo clippy --workspace --all-targets -- -D warnings
 #   cargo test --workspace
 # plus a build of the nightly-only fuzz targets (crates/nav-core/fuzz is a
-# separate workspace by design, so it is not covered by --workspace).
+# separate workspace by design, so it is not covered by --workspace), and a
+# supply-chain advisory-DB check (§11, NAV-017).
 name: CI
 
 on:
@@ -49,6 +50,15 @@ jobs:
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - name: test
         run: cargo test --workspace --locked
+
+  audit:
+    name: cargo audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: rustsec/audit-check@v2
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
 
   fuzz-build:
     name: fuzz targets build
