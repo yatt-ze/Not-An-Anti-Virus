@@ -250,6 +250,7 @@ mod tests {
             content: Some(b"benign".to_vec()),
             truncated,
             file_len: Some(u64::MAX),
+            identity: None,
             source: ContentSource::File,
             codesign_dv_cache: OnceLock::new(),
             spctl_cache: OnceLock::new(),
