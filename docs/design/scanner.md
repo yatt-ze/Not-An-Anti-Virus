@@ -67,6 +67,8 @@ Recommendation: notify + suggest quarantine (no auto-action without opt-in)
 
 This is an illustrative target. The engine today emits one signal *per rule* (e.g. `launchd-persistence-plist`, `high-entropy-content`), not the fused cross-rule terms shown above (`unsigned + launch-agent-write`) — a combined "unsigned binary AND a persistence-plist sibling in the same bundle" signal is the §5.4 interaction-term work, still to come.
 
+A scan is `Complete` only when the whole object was actually examined. Reading that stops short of the whole file — the 8 MiB bounded content read (§3), or a container member whose extraction hit a §6.2 limit — yields at most `Partial`, never `Complete`, so relevant content placed past the read boundary is never mistaken for absent. This is a global fact folded in centrally (from the context's truncation flag), not something each rule has to re-check.
+
 `--json` output mirrors this structure (score, matched signals with id/weight/description, recommendation) rather than being a separate schema — worth writing this down explicitly once the scoring engine's internal signal representation is finalized, since §8 promises `--json` everywhere and this is the command most likely to get scripted against.
 
 ### 5.6 Domain Reputation (Local-First, Cloud Opt-In)

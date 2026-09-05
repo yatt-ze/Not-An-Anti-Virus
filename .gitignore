@@ -16,3 +16,6 @@
 
 # macOS
 .DS_Store
+
+# agent worktrees (Claude Code)
+.claude/worktrees/

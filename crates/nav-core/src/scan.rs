@@ -68,9 +68,13 @@ pub fn scan_context(ctx: &ScanContext, rules: &[Box<dyn Rule>]) -> ScanResult {
         }
     }
 
+    // Truncation is a global completeness fact, not something individual rules
+    // track: a file read only up to the §-content cap (or a container member
+    // whose extraction stopped at a §6.2 limit) was not fully examined, so it
+    // can never be `Complete` even when every rule that ran found nothing.
     let completeness = if !ctx.readable() {
         ScanCompleteness::Indeterminate
-    } else if not_applicable_count > 0 {
+    } else if ctx.truncated || not_applicable_count > 0 {
         ScanCompleteness::Partial
     } else {
         ScanCompleteness::Complete
@@ -178,6 +182,37 @@ mod tests {
         );
         assert!(!r.signals.iter().any(|s| s.id == "unsigned-binary"));
         assert!(!r.signals.iter().any(|s| s.id == "quarantine-xattr-present"));
+    }
+
+    /// Truncation alone downgrades completeness: a readable file examined only
+    /// up to the content cap is `Partial`, never `Complete`, even when no rule
+    /// objected — otherwise content placed past the read boundary reads as
+    /// absent (NAV-001 / §5.5).
+    #[test]
+    fn truncation_alone_prevents_a_complete_scan() {
+        use crate::context::{ContentSource, ScanContext};
+        use std::sync::OnceLock;
+
+        let ctx = |truncated: bool| ScanContext {
+            path: "big.bin".into(),
+            content: Some(b"benign".to_vec()),
+            truncated,
+            file_len: Some(u64::MAX),
+            source: ContentSource::File,
+            codesign_dv_cache: OnceLock::new(),
+            spctl_cache: OnceLock::new(),
+        };
+
+        // No rules object, so truncation is the only thing that can lower it.
+        let no_rules: [Box<dyn Rule>; 0] = [];
+        assert_eq!(
+            scan_context(&ctx(false), &no_rules).completeness,
+            ScanCompleteness::Complete
+        );
+        assert_eq!(
+            scan_context(&ctx(true), &no_rules).completeness,
+            ScanCompleteness::Partial
+        );
     }
 
     /// An extraction that stopped at a budget must not be scored as if the
