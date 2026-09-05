@@ -77,17 +77,34 @@ pub struct MachOImage {
     pub entitlements: Option<Vec<u8>>,
 }
 
-/// Parse `data` as a Mach-O image. `Some` only if it begins with a thin or fat
-/// header this parser can walk within bounds; `None` for non-Mach-O input,
+/// Parse `data` as a single Mach-O image: the thin image, or the **first**
+/// walkable slice of a fat/universal binary. `None` for non-Mach-O input,
 /// truncated stubs, or a Java `.class` (which shares fat's `0xCAFEBABE`).
+///
+/// For a fat binary this returns only one slice, which is fine for callers
+/// that need a single representative view (entropy's `__TEXT` sampling). A
+/// caller establishing a *verdict* on the binary must use [`parse_all`]
+/// instead — judging a universal binary on one slice lets a malicious slice
+/// hide behind a benign one (§5.2).
 pub fn parse(data: &[u8]) -> Option<MachOImage> {
-    match be_u32(data, 0)? {
-        FAT_MAGIC => parse_fat(data, false),
-        FAT_MAGIC_64 => parse_fat(data, true),
-        magic => {
-            let (is_64, be) = thin_kind(magic)?;
-            parse_thin(data, 0, is_64, be, false)
-        }
+    parse_all(data).into_iter().next()
+}
+
+/// Parse **every** Mach-O image in `data`: a single thin image, or all
+/// architecture slices of a fat/universal binary this parser can walk, in
+/// fat-table order. Empty for non-Mach-O input, a truncated stub, or a fat
+/// container with no walkable slice (incl. a Java `.class`). Structure rules
+/// iterate this so a fat binary is judged on all its slices, not just the
+/// first (§5.2).
+pub fn parse_all(data: &[u8]) -> Vec<MachOImage> {
+    match be_u32(data, 0) {
+        Some(FAT_MAGIC) => parse_fat_all(data, false),
+        Some(FAT_MAGIC_64) => parse_fat_all(data, true),
+        Some(magic) => match thin_kind(magic) {
+            Some((is_64, be)) => parse_thin(data, 0, is_64, be, false).into_iter().collect(),
+            None => Vec::new(),
+        },
+        None => Vec::new(),
     }
 }
 
@@ -114,39 +131,44 @@ fn thin_kind(magic: u32) -> Option<(bool, bool)> {
     }
 }
 
-fn parse_fat(data: &[u8], is_64: bool) -> Option<MachOImage> {
+/// Walk every arch of a fat/universal binary, collecting the slices this
+/// parser can read (in fat-table order). A zero/implausible `nfat_arch` also
+/// rejects a Java `.class` (its version number sits where `nfat_arch` would).
+fn parse_fat_all(data: &[u8], is_64: bool) -> Vec<MachOImage> {
+    let mut out = Vec::new();
     // fat_header (always big-endian): magic(4), nfat_arch(4).
-    let nfat = be_u32(data, 4)?;
-    // A zero/implausible count also rejects a Java `.class` (version number
-    // where nfat_arch would be).
-    if nfat == 0 || nfat > MAX_FAT_ARCHES {
-        return None;
-    }
-
-    // fat_arch: cputype(4), cpusubtype(4), offset, size, align[, reserved].
-    let arch_stride: usize = if is_64 { 32 } else { 20 };
+    let nfat = match be_u32(data, 4) {
+        Some(n) if n != 0 && n <= MAX_FAT_ARCHES => n,
+        _ => return out,
+    };
     for i in 0..nfat as usize {
-        let arch_off = 8usize.checked_add(i.checked_mul(arch_stride)?)?;
-        let obj_off = if is_64 {
-            be_u64(data, arch_off.checked_add(8)?)?
-        } else {
-            be_u32(data, arch_off.checked_add(8)?)? as u64
-        };
-
-        let base = match usize::try_from(obj_off) {
-            Ok(b) if b < data.len() => b,
-            // Slice starts beyond the bytes we hold (or overflows usize) —
-            // can't read this member; try the next arch.
-            _ => continue,
-        };
-
-        if let Some((is_64_thin, be)) = be_u32(data, base).and_then(thin_kind) {
-            if let Some(img) = parse_thin(data, base, is_64_thin, be, true) {
-                return Some(img);
-            }
+        if let Some(img) = fat_member(data, is_64, i) {
+            out.push(img);
         }
     }
-    None
+    out
+}
+
+/// Parse fat arch `i`'s slice, or `None` if its table entry or object offset
+/// can't be read within bounds (a bad entry skips just that arch).
+fn fat_member(data: &[u8], is_64: bool, i: usize) -> Option<MachOImage> {
+    // fat_arch: cputype(4), cpusubtype(4), offset, size, align[, reserved].
+    let arch_stride: usize = if is_64 { 32 } else { 20 };
+    let arch_off = 8usize.checked_add(i.checked_mul(arch_stride)?)?;
+    let obj_off = if is_64 {
+        be_u64(data, arch_off.checked_add(8)?)?
+    } else {
+        be_u32(data, arch_off.checked_add(8)?)? as u64
+    };
+
+    // Slice must start within the bytes we hold (and not overflow usize).
+    let base = match usize::try_from(obj_off) {
+        Ok(b) if b < data.len() => b,
+        _ => return None,
+    };
+
+    let (is_64_thin, be) = be_u32(data, base).and_then(thin_kind)?;
+    parse_thin(data, base, is_64_thin, be, true)
 }
 
 fn parse_thin(data: &[u8], base: usize, is_64: bool, be: bool, is_fat: bool) -> Option<MachOImage> {
@@ -430,10 +452,40 @@ impl<'a> Reader<'a> {
 #[cfg(test)]
 pub(crate) mod tests_support {
     use super::{
-        CSMAGIC_EMBEDDED_ENTITLEMENTS, CSMAGIC_EMBEDDED_SIGNATURE, LC_CODE_SIGNATURE,
+        CSMAGIC_EMBEDDED_ENTITLEMENTS, CSMAGIC_EMBEDDED_SIGNATURE, FAT_MAGIC, LC_CODE_SIGNATURE,
         LC_LOAD_DYLIB, LC_RPATH, LC_SEGMENT_64,
     };
     use std::ops::Range;
+
+    /// Wrap already-built thin images as the slices of a 32-bit fat/universal
+    /// binary (`fat_arch` table + payloads). Offsets are 16-byte aligned, as a
+    /// real `lipo` output would be.
+    pub(crate) fn synth_fat(members: &[&[u8]]) -> Vec<u8> {
+        let header_len = 8 + 20 * members.len();
+        let mut offsets = Vec::with_capacity(members.len());
+        let mut cursor = header_len;
+        for m in members {
+            let aligned = (cursor + 15) & !15;
+            offsets.push(aligned);
+            cursor = aligned + m.len();
+        }
+
+        let mut v = Vec::new();
+        v.extend_from_slice(&FAT_MAGIC.to_be_bytes());
+        v.extend_from_slice(&(members.len() as u32).to_be_bytes());
+        for (i, m) in members.iter().enumerate() {
+            v.extend_from_slice(&0x0100_0007u32.to_be_bytes()); // cputype
+            v.extend_from_slice(&(i as u32).to_be_bytes()); // cpusubtype (distinct)
+            v.extend_from_slice(&(offsets[i] as u32).to_be_bytes()); // offset
+            v.extend_from_slice(&(m.len() as u32).to_be_bytes()); // size
+            v.extend_from_slice(&0u32.to_be_bytes()); // align
+        }
+        for (i, m) in members.iter().enumerate() {
+            v.resize(offsets[i], 0); // pad to this slice's offset
+            v.extend_from_slice(m);
+        }
+        v
+    }
 
     fn seg_name(name: &[u8]) -> [u8; 16] {
         let mut b = [0u8; 16];
@@ -621,8 +673,27 @@ pub(crate) mod tests_support {
 
 #[cfg(test)]
 mod tests {
-    use super::tests_support::{synth_macho_64, synth_macho_64_full};
+    use super::tests_support::{synth_fat, synth_macho_64, synth_macho_64_full};
     use super::*;
+
+    #[test]
+    fn parse_all_walks_every_fat_slice() {
+        let (a, _, _) = synth_macho_64_full(b"aaaa", &["/usr/lib/a.dylib"], &[], false, None);
+        let (b, _, _) = synth_macho_64_full(b"bbbb", &["/tmp/b.dylib"], &[], false, None);
+        let fat = synth_fat(&[&a, &b]);
+
+        let imgs = parse_all(&fat);
+        assert_eq!(imgs.len(), 2, "both slices must be walked");
+        assert!(imgs[0].is_fat && imgs[1].is_fat);
+        assert_eq!(imgs[0].dylibs, vec!["/usr/lib/a.dylib".to_string()]);
+        assert_eq!(imgs[1].dylibs, vec!["/tmp/b.dylib".to_string()]);
+
+        // `parse` still yields the first slice for single-view callers.
+        assert_eq!(
+            parse(&fat).unwrap().dylibs,
+            vec!["/usr/lib/a.dylib".to_string()]
+        );
+    }
 
     #[test]
     fn parses_thin_64_and_locates_text() {

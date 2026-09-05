@@ -60,42 +60,61 @@ impl Rule for MachOStructureRule {
             return Ok(None);
         }
         // Recognized Mach-O magic that the parser couldn't walk within its
-        // bounds (truncated header, malformed load commands) — "couldn't
-        // check," not "clean" (§10/§11.8).
-        let image = macho::parse(content).ok_or(RuleOutcome::NotApplicable)?;
-
-        let mut findings: Vec<(i32, String)> = Vec::new();
-
-        let bad_paths: Vec<&str> = image
-            .dylibs
-            .iter()
-            .chain(image.rpaths.iter())
-            .map(String::as_str)
-            .filter(|p| is_writable_or_transient(p))
-            .collect();
-        if !bad_paths.is_empty() {
-            findings.push((
-                TRANSIENT_LOCATION_WEIGHT,
-                format!(
-                    "loads from a writable/transient location: {}",
-                    bad_paths.join(", ")
-                ),
-            ));
+        // bounds (truncated header, malformed load commands, or a fat container
+        // with no walkable slice) — "couldn't check," not "clean" (§10/§11.8).
+        let images = macho::parse_all(content);
+        if images.is_empty() {
+            return Err(RuleOutcome::NotApplicable);
         }
 
-        match entitlements_finding(&image, ctx.truncated) {
-            Ok(Some(f)) => findings.push(f),
-            Ok(None) => {}
-            // Couldn't determine entitlements (truncated signature region,
-            // malformed blob). Only fatal to this evaluation if it was our
-            // only shot at a finding — a real path anomaly already found
-            // stands on its own.
-            Err(outcome) if findings.is_empty() => return Err(outcome),
-            Err(_) => {}
+        // Judge a fat binary on all its slices: a malicious arm64 slice must
+        // not disappear behind a clean x86_64 one (§5.2). Load-path anomalies
+        // are unioned across slices; each slice's entitlements are scored on
+        // its own signed/unsigned status.
+        let mut bad_paths: Vec<&str> = Vec::new();
+        let mut findings: Vec<(i32, String)> = Vec::new();
+        let mut entitlements_gap = false;
+
+        for image in &images {
+            for p in image
+                .dylibs
+                .iter()
+                .chain(image.rpaths.iter())
+                .map(String::as_str)
+            {
+                if is_writable_or_transient(p) && !bad_paths.contains(&p) {
+                    bad_paths.push(p);
+                }
+            }
+            match entitlements_finding(image, ctx.truncated) {
+                Ok(Some(f)) => findings.push(f),
+                Ok(None) => {}
+                // Couldn't determine this slice's entitlements (truncated
+                // signature region, malformed blob). Only fatal if nothing
+                // else scores — a real finding stands on its own.
+                Err(_) => entitlements_gap = true,
+            }
+        }
+
+        if !bad_paths.is_empty() {
+            findings.insert(
+                0,
+                (
+                    TRANSIENT_LOCATION_WEIGHT,
+                    format!(
+                        "loads from a writable/transient location: {}",
+                        bad_paths.join(", ")
+                    ),
+                ),
+            );
         }
 
         if findings.is_empty() {
-            return Ok(None);
+            return if entitlements_gap {
+                Err(RuleOutcome::NotApplicable)
+            } else {
+                Ok(None)
+            };
         }
 
         let weight = findings
@@ -207,7 +226,7 @@ fn is_writable_or_transient(path: &str) -> bool {
 mod tests {
     use super::*;
     use crate::context::{ContentSource, ScanContext};
-    use crate::macho::tests_support::synth_macho_64_full;
+    use crate::macho::tests_support::{synth_fat, synth_macho_64_full};
     use std::path::PathBuf;
 
     fn ctx_for(content: Vec<u8>) -> ScanContext {
@@ -402,6 +421,28 @@ mod tests {
         assert!(!is_writable_or_transient("/usr/lib/libSystem.B.dylib"));
         assert!(!is_writable_or_transient("/Library/Frameworks/x"));
         assert!(!is_writable_or_transient("libFoo.dylib")); // relative, not judged
+    }
+
+    #[test]
+    fn a_malicious_fat_slice_is_not_hidden_behind_a_clean_slice() {
+        // Slice 1: ordinary system/@-relative loader paths, nothing to flag.
+        let (clean, _, _) = synth_macho_64_full(
+            b"clean",
+            &["/usr/lib/libSystem.B.dylib"],
+            &["@rpath/libFoo.dylib"],
+            true,
+            None,
+        );
+        // Slice 2: an rpath into /tmp — the evasion is putting this second.
+        let (evil, _, _) = synth_macho_64_full(b"evil", &[], &["/tmp/evil-rpath"], false, None);
+        let fat = synth_fat(&[&clean, &evil]);
+
+        let sig = MachOStructureRule
+            .evaluate(&ctx_for(fat))
+            .unwrap()
+            .expect("the malicious second slice must still fire");
+        assert!(sig.description.contains("writable/transient"));
+        assert!(sig.description.contains("/tmp/evil-rpath"));
     }
 
     #[test]
