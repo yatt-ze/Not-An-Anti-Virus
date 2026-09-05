@@ -1,6 +1,6 @@
 # NAV ("Not an Anti-Virus") — System Design Document
 
-**Status:** Living document, v0.25
+**Status:** Living document, v0.26
 **Purpose:** Reference for all future design/planning conversations on this project. Update this doc as decisions change rather than re-deriving them from scratch.
 **Naming:** Project is called **NAV** — "Not an Anti-Virus." Deliberately undersells itself: positioned as a heuristic behavioral monitor, not a signature-based antivirus product, consistent with the honest-coverage-gaps stance in §10. Binaries: `navctl` (CLI), `navtop` (TUI, phase 2). Daemon: `navd`. Per-user notification agent: `navnotify` (background-only, no window — see §9.2). Socket: `/var/run/navd.sock`. Config: `~/.config/navctl/config.toml` (user), `/etc/navd/config.toml` (daemon).
 **"No GUI app" clarified:** the constraint is no *openable* application (nothing with a Dock icon/window the user launches, like a Safari-style app). A background-only per-user LaunchAgent with no UI beyond posting to Notification Center is acceptable — this is how `navnotify` is designed (§9.2).

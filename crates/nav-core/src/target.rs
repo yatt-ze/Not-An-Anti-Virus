@@ -160,6 +160,10 @@ pub fn scan_target_with_budget(
     // met mid-traversal are not followed (see `collect_files`).
     let meta = std::fs::metadata(path)?;
 
+    // A directly named single file has nothing to traverse, so the budget
+    // (which bounds *traversal* — file count, depth, aggregate size) doesn't
+    // apply; the file is already bounded by the §3 per-file read cap. Coverage
+    // is complete by construction (§11.12).
     if meta.is_file() {
         return Ok(TargetScan {
             root: path.to_path_buf(),

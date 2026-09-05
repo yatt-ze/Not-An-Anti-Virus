@@ -45,16 +45,24 @@ pub fn run_scan(path: &Path, recursive: bool, json: bool) -> ExitCode {
         return exit::code(exit::OPERATIONAL_ERROR);
     }
 
-    let mut worst = exit::CLEAN;
     for result in &scan.results {
         if json {
             println!("{}", with_schema_version(result));
         } else {
             print_scan_summary(result);
         }
-        worst = worst.max(exit::for_result(result));
     }
-    exit::code(worst)
+    // Budget-exhausted coverage goes to stderr (keeping the --json stream on
+    // stdout parseable as one object per file) and is folded into the exit
+    // code below — a target cut short is not a clean target (§8, §11.8/§11.12).
+    if let BudgetOutcome::Exhausted(limit) = scan.budget {
+        eprintln!(
+            "navctl: partial coverage — scan budget reached ({}); more of {} was not scanned",
+            budget_limit_label(limit),
+            path.display()
+        );
+    }
+    exit::code(exit::for_target(&scan))
 }
 
 pub fn run_rules_test(path: &Path, recursive: bool, json: bool) -> ExitCode {
@@ -100,12 +108,7 @@ pub fn run_rules_test(path: &Path, recursive: bool, json: bool) -> ExitCode {
         print_rules_test_multi(&scan);
     }
 
-    scan.results
-        .iter()
-        .map(exit::for_result)
-        .max()
-        .map(exit::code)
-        .unwrap()
+    exit::code(exit::for_target(&scan))
 }
 
 pub fn run_rules_list() -> ExitCode {
@@ -345,5 +348,30 @@ mod tests {
         };
         let value = multi_json(&scan);
         assert_eq!(value["schema_version"], JSON_SCHEMA_VERSION);
+    }
+
+    /// A budget-exhausted target is never a clean exit, even when every file it
+    /// managed to scan was individually complete and clean — "couldn't finish"
+    /// is not "clean" at the target level (§8, §11.8/§11.12).
+    #[test]
+    fn partial_coverage_makes_the_target_exit_indeterminate() {
+        let mk = |budget| TargetScan {
+            root: PathBuf::from("/tmp"),
+            kind: TargetKind::Directory,
+            primary: None,
+            skipped: Vec::new(),
+            results: vec![sample_result()], // complete + NoAction
+            budget,
+        };
+        assert_eq!(
+            exit::for_target(&mk(BudgetOutcome::Within)),
+            exit::CLEAN,
+            "a fully covered clean target exits clean"
+        );
+        assert_eq!(
+            exit::for_target(&mk(BudgetOutcome::Exhausted(BudgetLimit::Files))),
+            exit::INDETERMINATE,
+            "a target cut short by the budget is indeterminate, not clean"
+        );
     }
 }

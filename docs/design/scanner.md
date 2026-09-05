@@ -197,4 +197,6 @@ Design principles: `--json` everywhere for scriptability, versioned via a top-le
 | 3 | Indeterminate or incomplete (e.g. scan halted, evidence insufficient) |
 | 4 | Operational error |
 
+Completeness dominates the verdict here: any incomplete result maps to `3`, whether the incompleteness is per-file (`ScanCompleteness` short of `Complete`) or target-level (a directory/bundle whose traversal hit a §11.12 scan-budget ceiling). A directory scan cut short by the budget therefore returns `3` and prints a partial-coverage warning, never `0`, even when every file it managed to reach was individually clean — the target-level counterpart to the per-file rule, applied uniformly across `navctl scan` and `navctl rules test`.
+
 **`navtop`** (phase 2, optional): `htop`-style live TUI dashboard — event stream, daemon resource usage, quarantine queue, drill-down into `rules test`-style breakdowns.
