@@ -71,6 +71,8 @@ A scan is `Complete` only when the whole object was actually examined. Reading t
 
 `--json` output mirrors this structure (score, matched signals with id/weight/description, recommendation) rather than being a separate schema — worth writing this down explicitly once the scoring engine's internal signal representation is finalized, since §8 promises `--json` everywhere and this is the command most likely to get scripted against.
 
+`Recommendation` is only action-safe when `Scan completeness` reads `Complete` — a `Partial`/`Indeterminate` result must not be acted on as if it were, so a caller reading a `ScanResult` gates on `ScanResult::is_actionable()` rather than `recommendation` alone (NAV-005).
+
 ### 5.6 Domain Reputation (Local-First, Cloud Opt-In)
 
 For hostnames obtained via packet-capture SNI parsing (§4.1), reputation scoring is structured behind a trait so the default stays fully local and offline:
