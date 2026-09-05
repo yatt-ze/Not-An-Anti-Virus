@@ -8,6 +8,7 @@ use crate::model::{MatchedSignal, SignalCategory};
 
 mod codesign;
 mod entropy;
+mod macho_structure;
 mod package;
 mod persistence;
 mod quarantine_xattr;
@@ -17,6 +18,7 @@ pub use codesign::{
     AdHocSignedRule, NotarizedRule, RevokedSignatureRule, UnnotarizedSignedRule, UnsignedBinaryRule,
 };
 pub use entropy::HighEntropyRule;
+pub use macho_structure::MachOStructureRule;
 pub use package::{InstallerScriptRule, UnsignedPackageRule};
 pub use persistence::LaunchdPersistenceRule;
 pub use quarantine_xattr::QuarantineXattrRule;
@@ -60,6 +62,7 @@ pub fn default_ruleset() -> Vec<Box<dyn Rule>> {
         Box::new(LaunchdPersistenceRule),
         Box::new(InstallerScriptRule),
         Box::new(UnsignedPackageRule),
+        Box::new(MachOStructureRule),
     ]
 }
 
