@@ -1,12 +1,14 @@
-//! Minimal, defensive Mach-O parsing (§5.2, §12 Phase 0a): recognize a thin or
-//! fat/universal image and locate the file range of `__TEXT,__text`, so the
-//! entropy rule can score packed *code* rather than whole files.
+//! Minimal, defensive Mach-O parsing (§5.2, §12 Phase 0a): recognizes a thin
+//! or fat/universal image and extracts the structural facts the
+//! `macho-loader-anomaly` rule and the entropy rule need — the file range of
+//! `__TEXT,__text`, dylib/rpath load paths, whether a code signature is
+//! present, and any embedded entitlements plist.
 //!
 //! Parses attacker-controlled input under the §3/§11.9 discipline — no panics,
 //! no unbounded reads, every offset bounds-checked, no external crate. Not a
-//! general Mach-O reader: it walks only as far as `__TEXT,__text` and returns
-//! `None` for anything it can't recognize or bound, so the caller falls
-//! through to the script/text rules.
+//! general Mach-O reader: it walks the load command table and a signature
+//! SuperBlob it can bound, and returns `None`/empty for anything it can't
+//! recognize or bound.
 
 use std::ops::Range;
 
@@ -23,14 +25,32 @@ const FAT_MAGIC_64: u32 = 0xcafe_babf;
 
 const LC_SEGMENT: u32 = 0x1;
 const LC_SEGMENT_64: u32 = 0x19;
+const LC_LOAD_DYLIB: u32 = 0x0c;
+const LC_LAZY_LOAD_DYLIB: u32 = 0x20;
+const LC_LOAD_WEAK_DYLIB: u32 = 0x8000_0018;
+const LC_REEXPORT_DYLIB: u32 = 0x8000_001f;
+const LC_LOAD_UPWARD_DYLIB: u32 = 0x8000_0023;
+const LC_RPATH: u32 = 0x8000_001c;
+const LC_CODE_SIGNATURE: u32 = 0x1d;
+
+// Code signature SuperBlob magics (`<Security/CSCommon.h>` / cs_blobs.h) —
+// always big-endian, independent of the Mach-O's own endianness.
+const CSMAGIC_EMBEDDED_SIGNATURE: u32 = 0xfade_0cc0;
+const CSMAGIC_EMBEDDED_ENTITLEMENTS: u32 = 0xfade_7171;
 
 // Loop ceilings — far above any real Mach-O, but bound work on hostile input.
 const MAX_FAT_ARCHES: u32 = 64;
 const MAX_NCMDS: u32 = 4096;
 const MAX_NSECTS: u32 = 4096;
+const MAX_DYLIBS: usize = 4096;
+const MAX_RPATHS: usize = 256;
+const MAX_LC_STR_BYTES: usize = 4096;
+const MAX_CS_BLOBS: u32 = 256;
+const MAX_ENTITLEMENTS_BYTES: usize = 256 * 1024;
 
-/// A recognized Mach-O image and the one thing this parser exists to find:
-/// the file range of `__TEXT,__text`.
+/// A recognized Mach-O image: `__TEXT,__text`'s file range plus the loader
+/// facts (`dylibs`/`rpaths`/`has_code_signature`/`entitlements`) the
+/// structural-anomaly rule scores.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MachOImage {
     /// True if this image was selected out of a fat/universal binary.
@@ -42,6 +62,19 @@ pub struct MachOImage {
     /// a caller with a bounded read must clip against what it holds. `None` if
     /// `__TEXT` has no on-disk content.
     pub text_range: Option<Range<u64>>,
+    /// Load paths from `LC_LOAD_DYLIB` and its weak/lazy/upward/reexport
+    /// variants, in load-command order. Capped at `MAX_DYLIBS`.
+    pub dylibs: Vec<String>,
+    /// Paths from `LC_RPATH`, in load-command order. Capped at `MAX_RPATHS`.
+    pub rpaths: Vec<String>,
+    /// Whether an `LC_CODE_SIGNATURE` load command is present — independent
+    /// of whether its signature blob could actually be read.
+    pub has_code_signature: bool,
+    /// Entitlements plist bytes recovered from the embedded code signature.
+    /// `None` means "couldn't determine," never "no entitlements": it covers
+    /// no signature, no entitlements blob in the SuperBlob, and a signature
+    /// region lying past the bytes this parser holds (a truncated capture).
+    pub entitlements: Option<Vec<u8>>,
 }
 
 /// Parse `data` as a Mach-O image. `Some` only if it begins with a thin or fat
@@ -133,6 +166,12 @@ fn parse_thin(data: &[u8], base: usize, is_64: bool, be: bool, is_fat: bool) -> 
     // and what we captured, so a truncated read can't run off the end.
     let limit = cmds_start.checked_add(sizeofcmds)?.min(data.len());
 
+    let mut text_range = None;
+    let mut dylibs = Vec::new();
+    let mut rpaths = Vec::new();
+    let mut has_code_signature = false;
+    let mut entitlements = None;
+
     let mut off = cmds_start;
     for _ in 0..ncmds {
         if off.checked_add(8)? > limit {
@@ -149,24 +188,126 @@ fn parse_thin(data: &[u8], base: usize, is_64: bool, be: bool, is_fat: bool) -> 
         }
 
         let is_segment = (is_64 && cmd == LC_SEGMENT_64) || (!is_64 && cmd == LC_SEGMENT);
-        if is_segment {
-            if let Some(range) = text_segment_range(&r, off, is_64, base) {
-                return Some(MachOImage {
-                    is_fat,
-                    is_64,
-                    text_range: Some(range),
-                });
+        if is_segment && text_range.is_none() {
+            text_range = text_segment_range(&r, off, is_64, base);
+        } else if is_dylib_load_command(cmd) {
+            if dylibs.len() < MAX_DYLIBS {
+                if let Some(path) = read_lc_str(&r, off, cmd_end, MAX_LC_STR_BYTES) {
+                    dylibs.push(path);
+                }
+            }
+        } else if cmd == LC_RPATH {
+            if rpaths.len() < MAX_RPATHS {
+                if let Some(path) = read_lc_str(&r, off, cmd_end, MAX_LC_STR_BYTES) {
+                    rpaths.push(path);
+                }
+            }
+        } else if cmd == LC_CODE_SIGNATURE {
+            has_code_signature = true;
+            // linkedit_data_command: cmd(4), cmdsize(4), dataoff(4), datasize(4).
+            if let (Some(dataoff), Some(datasize)) =
+                (r.u32(off.checked_add(8)?), r.u32(off.checked_add(12)?))
+            {
+                entitlements = extract_entitlements(data, base, dataoff, datasize);
             }
         }
+
         off = cmd_end;
     }
 
-    // A valid Mach-O we walked cleanly, but with no scorable `__TEXT` content.
     Some(MachOImage {
         is_fat,
         is_64,
-        text_range: None,
+        text_range,
+        dylibs,
+        rpaths,
+        has_code_signature,
+        entitlements,
     })
+}
+
+/// True for `LC_LOAD_DYLIB` and its weak/lazy/upward/reexport variants — all
+/// share the `dylib_command` layout (an `lc_str` path at offset 8).
+fn is_dylib_load_command(cmd: u32) -> bool {
+    matches!(
+        cmd,
+        LC_LOAD_DYLIB
+            | LC_LOAD_WEAK_DYLIB
+            | LC_REEXPORT_DYLIB
+            | LC_LAZY_LOAD_DYLIB
+            | LC_LOAD_UPWARD_DYLIB
+    )
+}
+
+/// Read an `lc_str` string field (a `dylib_command`'s name or a
+/// `rpath_command`'s path): a u32 offset at `cmd_off+8`, relative to
+/// `cmd_off`, NUL-terminated, running no further than `cmd_end`. `None` if
+/// the offset lands outside `[cmd_off, cmd_end)`. Lossy UTF-8, capped at
+/// `max_len` bytes so a missing NUL can't read unbounded content.
+fn read_lc_str(r: &Reader, cmd_off: usize, cmd_end: usize, max_len: usize) -> Option<String> {
+    let rel = r.u32(cmd_off.checked_add(8)?)? as usize;
+    let start = cmd_off.checked_add(rel)?;
+    if start >= cmd_end {
+        return None;
+    }
+    let cap_end = cmd_end.min(start.checked_add(max_len)?);
+    let bytes = r.data.get(start..cap_end)?;
+    let len = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
+    Some(String::from_utf8_lossy(&bytes[..len]).into_owned())
+}
+
+/// Recover the entitlements plist embedded in a Mach-O's code-signature
+/// SuperBlob. `dataoff`/`datasize` are the `LC_CODE_SIGNATURE` fields (Mach-O
+/// endianness); the SuperBlob itself is always big-endian. `base` is where
+/// this image begins in `data`. `None` if there's no entitlements blob, the
+/// SuperBlob is malformed, or the signature region lies past the bytes held
+/// (a truncated capture) — the caller must not read `None` as "no
+/// entitlements".
+fn extract_entitlements(data: &[u8], base: usize, dataoff: u32, datasize: u32) -> Option<Vec<u8>> {
+    let sig_off = base.checked_add(dataoff as usize)?;
+    let sig_end = sig_off.checked_add(datasize as usize)?;
+    if sig_end > data.len() {
+        return None; // signature region past the bytes we hold
+    }
+    if be_u32(data, sig_off)? != CSMAGIC_EMBEDDED_SIGNATURE {
+        return None;
+    }
+    let count = be_u32(data, sig_off.checked_add(8)?)?;
+    if count > MAX_CS_BLOBS {
+        return None;
+    }
+
+    for i in 0..count as usize {
+        // CS_BlobIndex: type(4), offset(4) — offset relative to `sig_off`.
+        let entry_off = sig_off.checked_add(12)?.checked_add(i.checked_mul(8)?)?;
+        if entry_off.checked_add(8)? > sig_end {
+            break;
+        }
+        let rel_off = be_u32(data, entry_off.checked_add(4)?)?;
+        let blob_off = sig_off.checked_add(rel_off as usize)?;
+        if blob_off.checked_add(8)? > sig_end {
+            continue;
+        }
+        if be_u32(data, blob_off)? != CSMAGIC_EMBEDDED_ENTITLEMENTS {
+            continue;
+        }
+        // Blob: magic(4), length(4, total incl. header), payload.
+        let blob_len = be_u32(data, blob_off.checked_add(4)?)? as usize;
+        if blob_len < 8 {
+            continue;
+        }
+        let payload_len = (blob_len - 8).min(MAX_ENTITLEMENTS_BYTES);
+        let payload_start = blob_off.checked_add(8)?;
+        let payload_end = payload_start
+            .checked_add(payload_len)?
+            .min(sig_end)
+            .min(data.len());
+        if payload_end <= payload_start {
+            continue;
+        }
+        return Some(data[payload_start..payload_end].to_vec());
+    }
+    None
 }
 
 /// If the segment command at `off` is `__TEXT`, return the absolute file range
@@ -284,27 +425,123 @@ impl<'a> Reader<'a> {
     }
 }
 
-/// Test-only Mach-O construction, shared with the entropy rule's tests.
+/// Test-only Mach-O construction, shared with the entropy rule's tests and
+/// the `macho-loader-anomaly` rule's tests.
 #[cfg(test)]
 pub(crate) mod tests_support {
-    use super::LC_SEGMENT_64;
+    use super::{
+        CSMAGIC_EMBEDDED_ENTITLEMENTS, CSMAGIC_EMBEDDED_SIGNATURE, LC_CODE_SIGNATURE,
+        LC_LOAD_DYLIB, LC_RPATH, LC_SEGMENT_64,
+    };
     use std::ops::Range;
+
+    fn seg_name(name: &[u8]) -> [u8; 16] {
+        let mut b = [0u8; 16];
+        b[..name.len()].copy_from_slice(name);
+        b
+    }
 
     /// Build a minimal valid little-endian 64-bit Mach-O with one `__TEXT`
     /// segment holding one `__text` section of `text_payload`. Returns the
     /// image and the absolute `__text` range within it.
     pub(crate) fn synth_macho_64(text_payload: &[u8]) -> (Vec<u8>, Range<u64>) {
-        fn seg_name(name: &[u8]) -> [u8; 16] {
-            let mut b = [0u8; 16];
-            b[..name.len()].copy_from_slice(name);
-            b
+        let (bytes, range, _sig_placeholder) =
+            synth_macho_64_full(text_payload, &[], &[], false, None);
+        (bytes, range)
+    }
+
+    /// Build a `dylib_command` (or `LC_RPATH`, sharing the same `lc_str`
+    /// shape) for `path`, padded to a 4-byte cmdsize.
+    fn lc_str_command(cmd: u32, path: &str) -> Vec<u8> {
+        let name_off = 12u32; // rpath_command's fixed header length
+        let extra_off = if cmd == LC_RPATH { 12 } else { 24 };
+        let header_len = extra_off;
+        let str_bytes = path.as_bytes();
+        let content_len = str_bytes.len() + 1; // + NUL
+        let padded = content_len.div_ceil(4) * 4;
+        let cmdsize = header_len + padded;
+
+        let mut v = Vec::new();
+        v.extend_from_slice(&cmd.to_le_bytes());
+        v.extend_from_slice(&(cmdsize as u32).to_le_bytes());
+        if cmd == LC_RPATH {
+            v.extend_from_slice(&name_off.to_le_bytes()); // path offset
+        } else {
+            v.extend_from_slice(&24u32.to_le_bytes()); // dylib.name offset
+            v.extend_from_slice(&0u32.to_le_bytes()); // timestamp
+            v.extend_from_slice(&0u32.to_le_bytes()); // current_version
+            v.extend_from_slice(&0u32.to_le_bytes()); // compatibility_version
+        }
+        v.extend_from_slice(str_bytes);
+        v.resize(v.len() + (padded - content_len) + 1, 0); // NUL + padding
+        assert_eq!(v.len(), cmdsize);
+        v
+    }
+
+    /// A code-signature SuperBlob holding zero or one entitlements blobs, and
+    /// the `LC_CODE_SIGNATURE` command pointing at it (`dataoff` filled in by
+    /// the caller once the file offset is known).
+    fn build_signature_blob(entitlements_xml: Option<&[u8]>) -> Vec<u8> {
+        let mut sb = Vec::new();
+        let count: u32 = entitlements_xml.is_some().into();
+        let index_len = 12usize + 8 * count as usize;
+
+        let mut blobs = Vec::new();
+        let mut index = Vec::new();
+        if let Some(xml) = entitlements_xml {
+            let blob_off = index_len as u32;
+            index.extend_from_slice(&5u32.to_be_bytes()); // CSSLOT_ENTITLEMENTS
+            index.extend_from_slice(&blob_off.to_be_bytes());
+
+            blobs.extend_from_slice(&CSMAGIC_EMBEDDED_ENTITLEMENTS.to_be_bytes());
+            blobs.extend_from_slice(&((8 + xml.len()) as u32).to_be_bytes());
+            blobs.extend_from_slice(xml);
         }
 
+        let total_len = index_len + blobs.len();
+        sb.extend_from_slice(&CSMAGIC_EMBEDDED_SIGNATURE.to_be_bytes());
+        sb.extend_from_slice(&(total_len as u32).to_be_bytes());
+        sb.extend_from_slice(&count.to_be_bytes());
+        sb.extend_from_slice(&index);
+        sb.extend_from_slice(&blobs);
+        sb
+    }
+
+    /// Full synthetic builder: a `__TEXT,__text` section holding
+    /// `text_payload`, an `LC_LOAD_DYLIB` per entry in `dylibs`, an
+    /// `LC_RPATH` per entry in `rpaths`, and — if `code_signed` — an
+    /// `LC_CODE_SIGNATURE` pointing at a trailing SuperBlob carrying
+    /// `entitlements_xml` (if given). Returns the image bytes, the absolute
+    /// `__text` range, and the absolute file offset of the signature blob
+    /// (0 if `code_signed` is false — never a real offset since the header
+    /// always occupies the first bytes).
+    pub(crate) fn synth_macho_64_full(
+        text_payload: &[u8],
+        dylibs: &[&str],
+        rpaths: &[&str],
+        code_signed: bool,
+        entitlements_xml: Option<&[u8]>,
+    ) -> (Vec<u8>, Range<u64>, usize) {
         let header_size = 32usize;
-        let seg_cmd_size = 72usize; // segment_command_64
-        let sect_size = 80usize; // section_64
-        let cmdsize = seg_cmd_size + sect_size;
-        // Payload goes right after the load commands.
+        let seg_cmd_size = 72usize + 80usize; // segment_command_64 + one section_64
+
+        let dylib_cmds: Vec<Vec<u8>> = dylibs
+            .iter()
+            .map(|d| lc_str_command(LC_LOAD_DYLIB, d))
+            .collect();
+        let rpath_cmds: Vec<Vec<u8>> = rpaths.iter().map(|p| lc_str_command(LC_RPATH, p)).collect();
+        let codesig_cmd_size = if code_signed { 16usize } else { 0 };
+
+        let mut ncmds = 1u32; // __TEXT segment
+        ncmds += dylib_cmds.len() as u32;
+        ncmds += rpath_cmds.len() as u32;
+        ncmds += code_signed as u32;
+
+        let cmdsize: usize = seg_cmd_size
+            + dylib_cmds.iter().map(Vec::len).sum::<usize>()
+            + rpath_cmds.iter().map(Vec::len).sum::<usize>()
+            + codesig_cmd_size;
+
         let text_off = header_size + cmdsize;
 
         let mut v = Vec::new();
@@ -313,15 +550,15 @@ pub(crate) mod tests_support {
         v.extend_from_slice(&0x0100_0007u32.to_le_bytes()); // cputype x86_64
         v.extend_from_slice(&3u32.to_le_bytes()); // cpusubtype
         v.extend_from_slice(&2u32.to_le_bytes()); // filetype MH_EXECUTE
-        v.extend_from_slice(&1u32.to_le_bytes()); // ncmds
-        v.extend_from_slice(&(cmdsize as u32).to_le_bytes()); // sizeofcmds
+        v.extend_from_slice(&ncmds.to_le_bytes());
+        v.extend_from_slice(&(cmdsize as u32).to_le_bytes());
         v.extend_from_slice(&0u32.to_le_bytes()); // flags
         v.extend_from_slice(&0u32.to_le_bytes()); // reserved
 
         // --- LC_SEGMENT_64 for __TEXT ---
-        v.extend_from_slice(&LC_SEGMENT_64.to_le_bytes()); // cmd
-        v.extend_from_slice(&(cmdsize as u32).to_le_bytes()); // cmdsize
-        v.extend_from_slice(&seg_name(b"__TEXT")); // segname[16]
+        v.extend_from_slice(&LC_SEGMENT_64.to_le_bytes());
+        v.extend_from_slice(&(seg_cmd_size as u32).to_le_bytes());
+        v.extend_from_slice(&seg_name(b"__TEXT"));
         v.extend_from_slice(&0u64.to_le_bytes()); // vmaddr
         v.extend_from_slice(&0u64.to_le_bytes()); // vmsize
         v.extend_from_slice(&(text_off as u64).to_le_bytes()); // fileoff
@@ -332,8 +569,8 @@ pub(crate) mod tests_support {
         v.extend_from_slice(&0u32.to_le_bytes()); // flags
 
         // --- section_64 __text ---
-        v.extend_from_slice(&seg_name(b"__text")); // sectname[16]
-        v.extend_from_slice(&seg_name(b"__TEXT")); // segname[16]
+        v.extend_from_slice(&seg_name(b"__text"));
+        v.extend_from_slice(&seg_name(b"__TEXT"));
         v.extend_from_slice(&0u64.to_le_bytes()); // addr
         v.extend_from_slice(&(text_payload.len() as u64).to_le_bytes()); // size
         v.extend_from_slice(&(text_off as u32).to_le_bytes()); // offset
@@ -345,17 +582,46 @@ pub(crate) mod tests_support {
         v.extend_from_slice(&0u32.to_le_bytes()); // reserved2
         v.extend_from_slice(&0u32.to_le_bytes()); // reserved3
 
+        for c in &dylib_cmds {
+            v.extend_from_slice(c);
+        }
+        for c in &rpath_cmds {
+            v.extend_from_slice(c);
+        }
+
+        let sig_placeholder_at = v.len(); // where LC_CODE_SIGNATURE's cmd starts, if any
+        if code_signed {
+            // linkedit_data_command: dataoff/datasize filled in once known.
+            v.extend_from_slice(&LC_CODE_SIGNATURE.to_le_bytes());
+            v.extend_from_slice(&16u32.to_le_bytes());
+            v.extend_from_slice(&0u32.to_le_bytes()); // dataoff placeholder
+            v.extend_from_slice(&0u32.to_le_bytes()); // datasize placeholder
+        }
+
         assert_eq!(v.len(), text_off);
         v.extend_from_slice(text_payload);
 
+        let mut sig_off = 0usize;
+        if code_signed {
+            sig_off = v.len();
+            let blob = build_signature_blob(entitlements_xml);
+            let dataoff = sig_off as u32;
+            let datasize = blob.len() as u32;
+            v[sig_placeholder_at + 8..sig_placeholder_at + 12]
+                .copy_from_slice(&dataoff.to_le_bytes());
+            v[sig_placeholder_at + 12..sig_placeholder_at + 16]
+                .copy_from_slice(&datasize.to_le_bytes());
+            v.extend_from_slice(&blob);
+        }
+
         let range = text_off as u64..(text_off + text_payload.len()) as u64;
-        (v, range)
+        (v, range, sig_off)
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::tests_support::synth_macho_64;
+    use super::tests_support::{synth_macho_64, synth_macho_64_full};
     use super::*;
 
     #[test]
@@ -419,5 +685,93 @@ mod tests {
             v.resize(len, 0);
             let _ = parse(&v); // must not panic
         }
+    }
+
+    #[test]
+    fn collects_dylibs_and_rpaths_in_order() {
+        let (image, _, _) = synth_macho_64_full(
+            b"code",
+            &["/usr/lib/libSystem.B.dylib", "@rpath/libFoo.dylib"],
+            &["@executable_path/../Frameworks", "/tmp/evil"],
+            false,
+            None,
+        );
+        let parsed = parse(&image).unwrap();
+        assert_eq!(
+            parsed.dylibs,
+            vec![
+                "/usr/lib/libSystem.B.dylib".to_string(),
+                "@rpath/libFoo.dylib".to_string()
+            ]
+        );
+        assert_eq!(
+            parsed.rpaths,
+            vec![
+                "@executable_path/../Frameworks".to_string(),
+                "/tmp/evil".to_string()
+            ]
+        );
+        assert!(!parsed.has_code_signature);
+        assert_eq!(parsed.entitlements, None);
+    }
+
+    #[test]
+    fn detects_code_signature_without_entitlements() {
+        let (image, _, _) = synth_macho_64_full(b"code", &[], &[], true, None);
+        let parsed = parse(&image).unwrap();
+        assert!(parsed.has_code_signature);
+        assert_eq!(parsed.entitlements, None);
+    }
+
+    #[test]
+    fn extracts_entitlements_xml() {
+        let xml = br#"<?xml version="1.0"?><plist><dict>
+            <key>com.apple.security.cs.disable-library-validation</key><true/>
+        </dict></plist>"#;
+        let (image, _, _) = synth_macho_64_full(b"code", &[], &[], true, Some(xml));
+        let parsed = parse(&image).unwrap();
+        assert!(parsed.has_code_signature);
+        assert_eq!(parsed.entitlements.as_deref(), Some(&xml[..]));
+    }
+
+    #[test]
+    fn truncated_signature_region_yields_none_not_panic() {
+        let xml = b"<plist><dict/></plist>";
+        let (mut image, _, sig_off) = synth_macho_64_full(b"code", &[], &[], true, Some(xml));
+        // Chop the file off partway through the signature blob — a truncated
+        // 8 MiB capture is exactly this shape.
+        image.truncate(sig_off + 4);
+        let parsed = parse(&image).unwrap();
+        assert!(parsed.has_code_signature); // the load command itself is intact
+        assert_eq!(parsed.entitlements, None); // but the blob region is gone
+    }
+
+    #[test]
+    fn oversized_declared_datasize_does_not_panic_or_overread() {
+        let xml = b"<plist><dict/></plist>";
+        let (mut image, _, sig_off) = synth_macho_64_full(b"code", &[], &[], true, Some(xml));
+        // Corrupt LC_CODE_SIGNATURE's datasize to claim far more than the
+        // file actually holds.
+        let lc_off = image
+            .windows(4)
+            .position(|w| w == LC_CODE_SIGNATURE.to_le_bytes())
+            .expect("LC_CODE_SIGNATURE present");
+        image[lc_off + 12..lc_off + 16].copy_from_slice(&u32::MAX.to_le_bytes());
+        let parsed = parse(&image); // must not panic
+        if let Some(img) = parsed {
+            assert_eq!(img.entitlements, None);
+        }
+        let _ = sig_off;
+    }
+
+    #[test]
+    fn dylib_and_rpath_counts_are_capped() {
+        // MAX_RPATHS is 256 — build one more and confirm the parser doesn't
+        // choke or unbounded-allocate; it just stops collecting.
+        let many: Vec<String> = (0..300).map(|i| format!("/tmp/{i}")).collect();
+        let refs: Vec<&str> = many.iter().map(String::as_str).collect();
+        let (image, _, _) = synth_macho_64_full(b"code", &[], &refs, false, None);
+        let parsed = parse(&image).unwrap();
+        assert!(parsed.rpaths.len() <= MAX_RPATHS);
     }
 }
