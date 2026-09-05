@@ -47,6 +47,10 @@ pub struct MatchedSignal {
 pub enum SignalCategory {
     StaticSuspicion,
     ProvenanceConcern,
+    /// Reserved for observations from `navd`'s runtime event pipeline (§5.3,
+    /// Phase 2). Static rules must not emit this — a category is treated as an
+    /// independent evidence family under §5.1, so a static check wearing this
+    /// label would let one artifact corroborate itself (NAV-002).
     BehavioralConcern,
     TemporalCorrelation,
     TrustReduction,
