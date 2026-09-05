@@ -1,7 +1,9 @@
 //! Human and `--json` rendering for `scan` / `rules test` / `rules list`.
 //!
 //! `--json` mirrors the human structure — both render the same
-//! `nav_core::ScanResult` (§5.5). `scan` prints one terse line per file;
+//! `nav_core::ScanResult` (§5.5), plus a top-level `schema_version` marking
+//! the JSON as a versioned contract (§8).
+//! `scan` prints one terse line per file;
 //! `rules test` prints the worst file's full breakdown plus a roll-up.
 
 use std::path::Path;
@@ -11,8 +13,23 @@ use nav_core::{
     scan_target, EvidenceConfidence, Recommendation, ScanCompleteness, ScanResult, TargetKind,
     TargetScan,
 };
+use serde::Serialize;
 
 use crate::exit;
+
+/// Version of the `navctl --json` output shape. Bump on any breaking change
+/// to the emitted fields (§8) — scripts key off this to detect drift.
+const JSON_SCHEMA_VERSION: u32 = 1;
+
+/// Serializes `value` to a JSON object with `schema_version` merged in.
+/// `value` must serialize to a JSON object (all current callers do).
+fn with_schema_version<T: Serialize>(value: &T) -> serde_json::Value {
+    let mut v = serde_json::to_value(value).expect("navctl JSON output always serializes");
+    if let serde_json::Value::Object(map) = &mut v {
+        map.insert("schema_version".into(), JSON_SCHEMA_VERSION.into());
+    }
+    v
+}
 
 pub fn run_scan(path: &Path, recursive: bool, json: bool) -> ExitCode {
     let scan = match scan_target(path, recursive) {
@@ -31,7 +48,7 @@ pub fn run_scan(path: &Path, recursive: bool, json: bool) -> ExitCode {
     let mut worst = exit::CLEAN;
     for result in &scan.results {
         if json {
-            println!("{}", serde_json::to_string(result).unwrap());
+            println!("{}", with_schema_version(result));
         } else {
             print_scan_summary(result);
         }
@@ -58,7 +75,10 @@ pub fn run_rules_test(path: &Path, recursive: bool, json: bool) -> ExitCode {
     if scan.kind == TargetKind::File {
         let result = &scan.results[0];
         if json {
-            println!("{}", serde_json::to_string_pretty(result).unwrap());
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&with_schema_version(result)).unwrap()
+            );
         } else {
             print_rules_test(result);
         }
@@ -209,6 +229,7 @@ fn multi_json(scan: &TargetScan) -> serde_json::Value {
         _ => "directory",
     };
     serde_json::json!({
+        "schema_version": JSON_SCHEMA_VERSION,
         "target": scan.root,
         "kind": kind,
         "primary": scan.primary,
@@ -248,5 +269,46 @@ fn recommendation_str(r: Recommendation) -> &'static str {
         Recommendation::NotifyAndSuggestQuarantine => {
             "notify + suggest quarantine (no auto-action without opt-in)"
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+    use std::time::SystemTime;
+
+    fn sample_result() -> ScanResult {
+        ScanResult {
+            path: PathBuf::from("/tmp/sample"),
+            score: 0,
+            confidence: EvidenceConfidence::Low,
+            completeness: ScanCompleteness::Complete,
+            signals: Vec::new(),
+            recommendation: Recommendation::NoAction,
+            engine_version: "test".to_string(),
+            evaluated_at: SystemTime::UNIX_EPOCH,
+        }
+    }
+
+    #[test]
+    fn with_schema_version_adds_field_alongside_existing_ones() {
+        let value = with_schema_version(&sample_result());
+        assert_eq!(value["schema_version"], JSON_SCHEMA_VERSION);
+        // Original fields still present — schema_version is additive.
+        assert_eq!(value["score"], 0);
+    }
+
+    #[test]
+    fn multi_json_carries_schema_version() {
+        let scan = TargetScan {
+            root: PathBuf::from("/tmp"),
+            kind: TargetKind::Directory,
+            primary: None,
+            skipped: Vec::new(),
+            results: vec![sample_result()],
+        };
+        let value = multi_json(&scan);
+        assert_eq!(value["schema_version"], JSON_SCHEMA_VERSION);
     }
 }

@@ -69,7 +69,7 @@ This is an illustrative target. The engine today emits one signal *per rule* (e.
 
 A scan is `Complete` only when the whole object was actually examined. Reading that stops short of the whole file — the 8 MiB bounded content read (§3), or a container member whose extraction hit a §6.2 limit — yields at most `Partial`, never `Complete`, so relevant content placed past the read boundary is never mistaken for absent. This is a global fact folded in centrally (from the context's truncation flag), not something each rule has to re-check.
 
-`--json` output mirrors this structure (score, matched signals with id/weight/description, recommendation) rather than being a separate schema — worth writing this down explicitly once the scoring engine's internal signal representation is finalized, since §8 promises `--json` everywhere and this is the command most likely to get scripted against.
+`--json` output mirrors this structure (score, matched signals with id/weight/description, recommendation) rather than being a separate schema, plus a top-level `schema_version` (currently `1`, NAV-008) so scripts can detect a future breaking change before it surfaces as a parse error — since §8 promises `--json` everywhere and this is the command most likely to get scripted against.
 
 `Recommendation` is only action-safe when `Scan completeness` reads `Complete` — a `Partial`/`Indeterminate` result must not be acted on as if it were, so a caller reading a `ScanResult` gates on `ScanResult::is_actionable()` rather than `recommendation` alone (NAV-005).
 
@@ -183,7 +183,7 @@ navctl notify [enable|disable|status]  # opt-out control for navnotify delivery,
 navctl uninstall                      # full clean removal, see §11
 ```
 
-Design principles: `--json` everywhere for scriptability; config mirrored in `~/.config/navctl/config.toml` (user) and `/etc/navd/config.toml` (daemon) for reproducible/version-controllable setups.
+Design principles: `--json` everywhere for scriptability, versioned via a top-level `schema_version` field (currently `1`) so a future breaking change bumps it instead of silently reshaping what scripts parse; config mirrored in `~/.config/navctl/config.toml` (user) and `/etc/navd/config.toml` (daemon) for reproducible/version-controllable setups.
 
 **Exit codes distinguish completeness from verdict**, not just clean/malicious — a partial scan (e.g. a decompression-bomb limit hit, §6.2) must never return the same code as a complete clean scan, since those mean very different things to a script consuming the exit status:
 

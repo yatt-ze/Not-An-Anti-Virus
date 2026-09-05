@@ -74,7 +74,9 @@ navctl scan ./some-dir --recursive
 # that of the single worst file inside it.
 navctl rules test ./suspicious.app
 
-# The same breakdown as JSON — identical structure to the text output
+# The same breakdown as JSON — identical structure to the text output,
+# plus a top-level "schema_version" field (currently 1) marking it as a
+# versioned contract: scripts should check it before parsing further
 navctl rules test ./suspicious.app --json
 
 # Show the active ruleset
