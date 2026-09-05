@@ -11,6 +11,12 @@ on:
   push:
     branches: [main]
   pull_request:
+  # Drives fuzz-run only (see its `if`) — bounded fuzzing stays off the PR
+  # path so it doesn't slow every push. workflow_dispatch allows an ad hoc
+  # opt-in run.
+  schedule:
+    - cron: "17 5 * * *"
+  workflow_dispatch:
 
 # A newer push to the same branch/PR supersedes an in-flight run.
 concurrency:
@@ -23,6 +29,7 @@ env:
 jobs:
   fmt:
     name: rustfmt
+    if: github.event_name == 'push' || github.event_name == 'pull_request'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
@@ -33,6 +40,7 @@ jobs:
 
   test:
     name: clippy + test (${{ matrix.os }})
+    if: github.event_name == 'push' || github.event_name == 'pull_request'
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -53,6 +61,7 @@ jobs:
 
   audit:
     name: cargo audit
+    if: github.event_name == 'push' || github.event_name == 'pull_request'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
@@ -61,7 +70,8 @@ jobs:
           token: ${{ secrets.GITHUB_TOKEN }}
 
   fuzz-build:
-    name: fuzz targets build
+    name: fuzz targets build (compile-only)
+    if: github.event_name == 'push' || github.event_name == 'pull_request'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
@@ -74,9 +84,41 @@ jobs:
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-fuzz
-      # Compile-only: catches bitrot in the harnesses without spending CI time
-      # actually fuzzing. Sustained fuzzing runs belong elsewhere (design doc
-      # §11.9 / §12 Phase 0c). `--target` is pinned to the gnu triple: cargo-fuzz
-      # otherwise builds for musl, whose static libc is incompatible with ASan.
+      # Compile-only: catches bitrot in the harnesses on every PR without
+      # spending PR time actually fuzzing. Bounded fuzzing runs nightly
+      # instead, in fuzz-run below (NAV-014). `--target` is pinned to the gnu
+      # triple: cargo-fuzz otherwise builds for musl, whose static libc is
+      # incompatible with ASan.
       - run: cargo fuzz build --target x86_64-unknown-linux-gnu
         working-directory: crates/nav-core
+
+  fuzz-run:
+    name: bounded fuzz run (nightly)
+    # Off the PR path by design (NAV-014) — scheduled, or manually via
+    # workflow_dispatch. Priority order per the issue: xml/plist, xar, cpio,
+    # inflate, then macho.
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          targets: x86_64-unknown-linux-gnu
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: crates/nav-core/fuzz
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-fuzz
+      # 60s/target bounds wall-clock (~5min total) rather than depth; it
+      # catches regressions cargo-fuzz's corpus already knows about, not new
+      # ones. Sustained/corpus-growing fuzzing stays a deferred item (§12).
+      - name: bounded fuzz run
+        working-directory: crates/nav-core
+        run: |
+          set -euo pipefail
+          for target in parse_plist parse_xar parse_cpio inflate parse_macho; do
+            echo "::group::fuzz ${target} (60s)"
+            cargo fuzz run --target x86_64-unknown-linux-gnu "${target}" -- -max_total_time=60
+            echo "::endgroup::"
+          done
