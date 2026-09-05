@@ -32,5 +32,8 @@ pub use rules::{default_ruleset, embedded_content_ruleset, Rule, RuleOutcome};
 pub use scan::{
     scan_context, scan_embedded_bytes, scan_file, scan_file_with_rules, ENGINE_VERSION,
 };
-pub use target::{scan_target, TargetKind, TargetScan};
+pub use target::{
+    scan_target, scan_target_with_budget, BudgetLimit, BudgetOutcome, ScanBudget, TargetKind,
+    TargetScan,
+};
 pub use xar::{XarArchive, XarFile, XarHalt, XarLimits};

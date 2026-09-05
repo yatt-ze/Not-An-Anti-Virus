@@ -18,7 +18,7 @@ use std::time::{Duration, Instant};
 #[cfg(target_os = "macos")]
 use std::collections::BTreeMap;
 
-use nav_core::{scan_target, Recommendation, TargetScan};
+use nav_core::{scan_target, Recommendation, ScanCompleteness, TargetScan};
 
 fn fixtures_dir(sub: &str) -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -209,6 +209,135 @@ fn report_fixture_metrics() {
         total_runtime.as_secs_f64() * 1000.0
     );
     println!();
+}
+
+/// The quantitative Phase 0a acceptance gate (§11.1, NAV-015). Turns "low
+/// false-positive rate is the primary success metric" (§1, §12 go/no-go) from
+/// a stated priority into a measured, asserted number, and reports the rest of
+/// the corpus shape (detection coverage, verdict mix, completeness, runtime
+/// percentiles) alongside it. Two things are asserted, both corpus-size
+/// independent:
+///   * benign false-positive rate is exactly 0 — no known-good fixture alerts;
+///   * suspicious signal coverage is 100% — every deliberately-suspicious
+///     fixture produces at least one signal (a silent miss is a gate failure).
+///
+/// Runtime percentiles are reported, never asserted (environment-dependent,
+/// would flake CI). Peak memory stays honestly untracked — see the TODO on
+/// `report_fixture_metrics`; a misattributed number is worse than an absent one.
+#[test]
+fn false_positive_gate_and_corpus_metrics() {
+    let mut benign_total = 0usize;
+    let mut benign_alerts = 0usize;
+    let mut suspicious_total = 0usize;
+    let mut suspicious_with_signal = 0usize;
+    let mut high_risk = 0usize;
+    let mut notify = 0usize;
+    let mut incomplete = 0usize;
+    let mut runtimes: Vec<Duration> = Vec::new();
+
+    for sub in ["benign", "suspicious"] {
+        for path in list_fixtures(sub) {
+            let start = Instant::now();
+            let result = scan(&path);
+            runtimes.push(start.elapsed());
+
+            let alerted = result.recommendation() != Recommendation::NoAction;
+            let has_signal = result.results.iter().any(|r| !r.signals.is_empty());
+            // "Couldn't fully examine it" is tracked separately from the verdict
+            // (§11.8): the worst member's completeness, or budget coverage.
+            let complete = result.coverage_complete()
+                && result
+                    .worst()
+                    .is_none_or(|r| r.completeness == ScanCompleteness::Complete);
+            if !complete {
+                incomplete += 1;
+            }
+
+            match sub {
+                "benign" => {
+                    benign_total += 1;
+                    if alerted {
+                        benign_alerts += 1;
+                    }
+                }
+                _ => {
+                    suspicious_total += 1;
+                    if has_signal {
+                        suspicious_with_signal += 1;
+                    }
+                    match result.recommendation() {
+                        Recommendation::NotifyAndSuggestQuarantine => high_risk += 1,
+                        Recommendation::Notify => notify += 1,
+                        Recommendation::NoAction => {}
+                    }
+                }
+            }
+        }
+    }
+
+    let fp_rate = benign_alerts as f64 / benign_total.max(1) as f64;
+    let coverage = suspicious_with_signal as f64 / suspicious_total.max(1) as f64;
+    let (p50, p95) = runtime_percentiles(&mut runtimes);
+
+    println!();
+    println!("{:-<72}", "");
+    println!("Phase 0a false-positive acceptance gate (§11.1)");
+    println!("{:-<72}", "");
+    println!("benign fixtures:        {benign_total}");
+    println!("benign alerts:          {benign_alerts}");
+    println!(
+        "false-positive rate:    {:.1}%   (gate: 0%)",
+        fp_rate * 100.0
+    );
+    println!("suspicious fixtures:    {suspicious_total}");
+    println!(
+        "  with >=1 signal:      {suspicious_with_signal}  ({:.1}% coverage, gate: 100%)",
+        coverage * 100.0
+    );
+    println!("  high-risk (quarant.): {high_risk}");
+    println!("  notify:               {notify}");
+    println!(
+        "partial/indeterminate:  {incomplete} of {} fixtures",
+        benign_total + suspicious_total
+    );
+    println!(
+        "runtime per fixture:    p50={:.2}ms  p95={:.2}ms",
+        p50.as_secs_f64() * 1000.0,
+        p95.as_secs_f64() * 1000.0
+    );
+    println!("peak memory:            not tracked (see report_fixture_metrics TODO)");
+    println!("{:-<72}", "");
+    println!();
+
+    assert_eq!(
+        benign_alerts,
+        0,
+        "false-positive gate: {benign_alerts} of {benign_total} benign fixtures alerted \
+         (FP rate {:.1}%). Low false-positive rate is Phase 0a's primary success metric \
+         (§1/§12) — a benign sample crossing the alert threshold fails the gate.",
+        fp_rate * 100.0
+    );
+    assert_eq!(
+        suspicious_with_signal, suspicious_total,
+        "coverage gate: only {suspicious_with_signal} of {suspicious_total} suspicious fixtures \
+         produced a signal — a deliberately-suspicious sample was scored silently clean."
+    );
+}
+
+/// (p50, p95) of `runtimes`, sorted in place. Nearest-rank, clamped — reported
+/// only, so exactness past that doesn't matter.
+fn runtime_percentiles(runtimes: &mut [Duration]) -> (Duration, Duration) {
+    if runtimes.is_empty() {
+        return (Duration::ZERO, Duration::ZERO);
+    }
+    runtimes.sort_unstable();
+    let pick = |pct: f64| {
+        let idx = ((pct * runtimes.len() as f64).ceil() as usize)
+            .saturating_sub(1)
+            .min(runtimes.len() - 1);
+        runtimes[idx]
+    };
+    (pick(0.50), pick(0.95))
 }
 
 /// The deterministic, platform-stable fields snapshotted per fixture for the

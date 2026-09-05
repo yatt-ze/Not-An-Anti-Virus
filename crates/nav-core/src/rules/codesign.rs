@@ -212,7 +212,7 @@ impl Rule for RevokedSignatureRule {
             return Ok(None);
         }
 
-        if run_codesign_verify(&ctx.path)? {
+        if run_codesign_verify(ctx)? {
             Ok(Some(MatchedSignal {
                 id: "revoked-code-signature".to_string(),
                 weight: REVOKED_CERT_WEIGHT,
@@ -230,8 +230,15 @@ impl Rule for RevokedSignatureRule {
 /// (modified resource, broken seal, …) — those aren't this rule's claim to
 /// make. Best-effort: depends on `codesign`'s own cached/online revocation
 /// state, so `false` means "not reported," not "confirmed un-revoked."
-fn run_codesign_verify(path: &std::path::Path) -> Result<bool, RuleOutcome> {
-    let stderr = spawn_codesign_verify(path)?;
+///
+/// Bound to the scanned object's identity like the memoized `codesign -dv` /
+/// `spctl` checks (§11.7): a path swapped between the content read and this
+/// call drops the result to `NotApplicable` rather than reporting a different
+/// object's revocation state.
+fn run_codesign_verify(ctx: &ScanContext) -> Result<bool, RuleOutcome> {
+    let stderr = ctx
+        .run_object_bound(|| spawn_codesign_verify(&ctx.path).ok())
+        .ok_or(RuleOutcome::NotApplicable)?;
     Ok(indicates_revocation(&stderr))
 }
 
@@ -465,6 +472,7 @@ mod tests {
             content: Some(body.to_vec()),
             truncated: false,
             file_len: Some(body.len() as u64),
+            identity: None,
             source: ContentSource::File,
             codesign_dv_cache: std::sync::OnceLock::new(),
             spctl_cache: std::sync::OnceLock::new(),

@@ -29,8 +29,10 @@ plainly that they're unavailable rather than pretending to work.
 - **Code signing & notarization** — unsigned, ad-hoc signed, or
   signed-but-not-notarized code, weighed in context rather than as an
   automatic pass or fail.
-- **Mach-O structure** — unusual load commands, suspicious entitlements on
-  unsigned binaries, packed or obfuscated code sections.
+- **Mach-O structure** — dylib/rpath load paths into writable or transient
+  locations (`/tmp`, a hidden directory, under `/Users/`), suspicious
+  entitlements (e.g. disabled library validation) weighted higher on an
+  unsigned binary, and packed or obfuscated code sections.
 - **Obfuscation** — high-entropy regions where readable code or script text
   is expected (packed sections, base64 blobs), judged by *where* they
   appear rather than as one whole-file number.
@@ -74,7 +76,9 @@ navctl scan ./some-dir --recursive
 # that of the single worst file inside it.
 navctl rules test ./suspicious.app
 
-# The same breakdown as JSON — identical structure to the text output
+# The same breakdown as JSON — identical structure to the text output,
+# plus a top-level "schema_version" field (currently 1) marking it as a
+# versioned contract: scripts should check it before parsing further
 navctl rules test ./suspicious.app --json
 
 # Show the active ruleset

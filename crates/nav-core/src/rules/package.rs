@@ -170,6 +170,7 @@ mod tests {
             content: Some(body.to_vec()),
             truncated: false,
             file_len: Some(body.len() as u64),
+            identity: None,
             source: ContentSource::File,
             codesign_dv_cache: std::sync::OnceLock::new(),
             spctl_cache: std::sync::OnceLock::new(),

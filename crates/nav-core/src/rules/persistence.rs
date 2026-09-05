@@ -3,8 +3,12 @@
 //! **Purely static**: reads a launchd job plist's content and path, and makes
 //! no claim about which process installed it (that is §5.3 behavioral work).
 //! A well-formed ordinary LaunchAgent scores **nothing** — every point comes
-//! from a specific anomaly, and the rule contributes one category
-//! (`BehavioralConcern`), so alone it can't exceed a `Notify` verdict.
+//! from a specific anomaly. The signal is `StaticSuspicion`, not
+//! `BehavioralConcern`: this rule reads bytes, it does not observe a
+//! persistence *event*, so labelling it behavioral would let one static
+//! artifact (a plist that also trips `suspicious-strings`) masquerade as two
+//! independent evidence families under §5.1 (NAV-002). `BehavioralConcern` is
+//! reserved for `navd`'s runtime event pipeline (§5.3, Phase 2).
 
 use std::path::Path;
 
@@ -34,7 +38,7 @@ impl Rule for LaunchdPersistenceRule {
     }
 
     fn category(&self) -> SignalCategory {
-        SignalCategory::BehavioralConcern
+        SignalCategory::StaticSuspicion
     }
 
     fn evaluate(&self, ctx: &ScanContext) -> Result<Option<MatchedSignal>, RuleOutcome> {
@@ -304,6 +308,7 @@ mod tests {
             content: Some(body.to_vec()),
             truncated: false,
             file_len: Some(body.len() as u64),
+            identity: None,
             source: crate::context::ContentSource::File,
             codesign_dv_cache: std::sync::OnceLock::new(),
             spctl_cache: std::sync::OnceLock::new(),
@@ -346,7 +351,7 @@ mod tests {
         )
         .unwrap()
         .expect("should fire");
-        assert_eq!(sig.category, SignalCategory::BehavioralConcern);
+        assert_eq!(sig.category, SignalCategory::StaticSuspicion);
         assert!(sig.weight >= 15 && sig.weight <= MAX_WEIGHT);
     }
 
@@ -448,6 +453,7 @@ mod tests {
             content: Some(ORDINARY.to_vec()),
             truncated: true,
             file_len: Some(64 * 1024 * 1024),
+            identity: None,
             source: crate::context::ContentSource::File,
             codesign_dv_cache: std::sync::OnceLock::new(),
             spctl_cache: std::sync::OnceLock::new(),
@@ -495,6 +501,7 @@ mod tests {
             content: None,
             truncated: false,
             file_len: None,
+            identity: None,
             source: crate::context::ContentSource::File,
             codesign_dv_cache: std::sync::OnceLock::new(),
             spctl_cache: std::sync::OnceLock::new(),

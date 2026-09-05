@@ -47,6 +47,10 @@ pub struct MatchedSignal {
 pub enum SignalCategory {
     StaticSuspicion,
     ProvenanceConcern,
+    /// Reserved for observations from `navd`'s runtime event pipeline (§5.3,
+    /// Phase 2). Static rules must not emit this — a category is treated as an
+    /// independent evidence family under §5.1, so a static check wearing this
+    /// label would let one artifact corroborate itself (NAV-002).
     BehavioralConcern,
     TemporalCorrelation,
     TrustReduction,
@@ -82,6 +86,13 @@ impl ScanResult {
     pub fn is_significant(&self) -> bool {
         !matches!(self.recommendation, Recommendation::NoAction)
     }
+
+    /// Whether `recommendation` is backed by complete evidence (§5.5).
+    /// Callers that gate privileged action on a verdict must check this
+    /// instead of reading `recommendation` alone — NAV-005.
+    pub fn is_actionable(&self) -> bool {
+        matches!(self.completeness, ScanCompleteness::Complete)
+    }
 }
 
 mod system_time_secs {
@@ -99,5 +110,30 @@ mod system_time_secs {
     pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<SystemTime, D::Error> {
         let secs = u64::deserialize(d)?;
         Ok(UNIX_EPOCH + std::time::Duration::from_secs(secs))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn result_with(completeness: ScanCompleteness) -> ScanResult {
+        ScanResult {
+            path: PathBuf::from("/tmp/example"),
+            score: 78,
+            confidence: EvidenceConfidence::Medium,
+            completeness,
+            signals: Vec::new(),
+            recommendation: Recommendation::NotifyAndSuggestQuarantine,
+            engine_version: "test".to_string(),
+            evaluated_at: SystemTime::UNIX_EPOCH,
+        }
+    }
+
+    #[test]
+    fn only_complete_scans_are_actionable() {
+        assert!(result_with(ScanCompleteness::Complete).is_actionable());
+        assert!(!result_with(ScanCompleteness::Partial).is_actionable());
+        assert!(!result_with(ScanCompleteness::Indeterminate).is_actionable());
     }
 }
