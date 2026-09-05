@@ -13,10 +13,12 @@ pub const MAX_CONTENT_BYTES: usize = 8 * 1024 * 1024; // 8 MiB
 
 /// A best-effort stable identity for a file on disk, captured at load so an
 /// external check (codesign/spctl) can confirm it still names the same object
-/// it read — closing the TOCTOU window between the content read and a
-/// path-based tool call (§11.7). Not a security guarantee: `mtime` granularity
-/// and inode reuse mean a determined same-size, same-mtime swap into a reused
-/// inode can still evade it; it catches the ordinary replace-the-path race.
+/// it read (§11.7). It narrows, not closes, the TOCTOU window: the re-stat runs
+/// *after* the tool, so it catches the ordinary "swap the path and leave it
+/// swapped" race, but not a swap reverted before the re-stat, nor — given
+/// `mtime` granularity and inode reuse — a same-size, same-mtime swap into a
+/// reused inode. Not a security guarantee; fd-based scanning (§11.7) is the
+/// real close, deferred to Phase 0b+.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ObjectIdentity {
     pub dev: u64,
@@ -186,6 +188,17 @@ impl ScanContext {
             .clone()
     }
 
+    /// Run a path-based external check bound to the scanned object's identity,
+    /// the same guarantee [`Self::codesign_dv`]/[`Self::spctl_assessment`] give
+    /// through their caches — for a check that isn't memoized on the context
+    /// (e.g. `codesign --verify`). The result is dropped (`None`) if the file
+    /// changed identity since load, so a tool that inspected a swapped object
+    /// is treated as inconclusive, not trusted (§11.7). Embedded content and
+    /// files whose identity couldn't be captured pass through unchanged.
+    pub fn run_object_bound<T>(&self, spawn: impl FnOnce() -> Option<T>) -> Option<T> {
+        self.spawn_if_object_stable(spawn)
+    }
+
     /// Run a path-based external check, then drop its result if the file no
     /// longer matches the identity captured at load — the tool would have
     /// inspected a different object than the one this scan read, so its verdict
@@ -244,6 +257,12 @@ mod tests {
             None
         );
         assert_eq!(ctx2.spctl_assessment(|| Some("attacker".to_string())), None);
+        // The un-memoized guard (used by `codesign --verify`) drops its result
+        // the same way.
+        assert_eq!(
+            ctx2.run_object_bound(|| Some("attacker-verify".to_string())),
+            None
+        );
 
         let _ = std::fs::remove_file(&path);
     }
@@ -258,6 +277,10 @@ mod tests {
         assert_eq!(
             ctx.codesign_dv(|| Some((true, "ok".to_string()))),
             Some((true, "ok".to_string()))
+        );
+        assert_eq!(
+            ctx.run_object_bound(|| Some("ok".to_string())),
+            Some("ok".to_string())
         );
     }
 }
