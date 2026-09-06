@@ -26,18 +26,39 @@ the spike it depends on has been run and the user has said go (CLAUDE.md).
 
 Just enough to make the spikes runnable. Everything here is ad-hoc-signed.
 
-- **A1. Minimal `navd` skeleton** — a root LaunchDaemon that only runs the
+- **A1. Install / uninstall / residue-verify — built first, as one unit.** A
+  spike phase installs a root LaunchDaemon, root-owned files, and TCC state on
+  the real dev machine, so a *verified* teardown is a prerequisite for every
+  other spike, not a Phase 3 afterthought (it already exists in §11.10; this
+  pulls it forward). Three pieces, shipped together:
+  - `sudo navctl service install` (§11.10) — copy `navd` to a root-owned path
+    (`/Library/PrivilegedHelperTools/`), write the LaunchDaemon plist pointing
+    at the *copied* binary (never the Cellar path), create `/etc/navd` + state
+    dirs, bootstrap launchd. Idempotent, safe to re-run.
+  - `navctl service uninstall` — the inverse, and **tolerant of a partial or
+    failed install**: best-effort removal of each known artifact, never "fail
+    because the plist is already gone."
+  - a **residue check** the test harness can call to *assert* clean — no plist,
+    launchd unloaded, root paths removed, TCC probed and `tccutil reset`
+    attempted. "Clean" is verified, not claimed.
+  - **Caveat (honest):** fully hermetic for filesystem + launchd; **TCC/FDA
+    grants have no clean programmatic removal** (`tccutil reset
+    SystemPolicyAllFiles` is coarse and version-dependent; worst case a manual
+    System Settings removal). How cleanly TCC resets is itself a B1/B2 finding,
+    not something uninstall can guarantee up front.
+- **A2. Minimal `navd` skeleton** — a root LaunchDaemon that only runs the
   existing `nav-core` scan on a requested path. No `EventSource` yet.
-- **A2. `sudo navctl service install` / `uninstall` (§11.10)** — copy `navd` to
-  a root-owned path (`/Library/PrivilegedHelperTools/`), write the LaunchDaemon
-  plist pointing at the *copied* binary (never the Cellar path), create
-  `/etc/navd` + state dirs. This is the object under test for B5.
 - **A3. `navctl setup fda` + per-area FDA probe matrix + `navctl status`
   (§10)** — the user-invoked FDA helper and the per-area probes
   (`Downloads: verified`, `Documents: degraded`, …) B1 measures against.
 
 > The notarization pipeline (would-be A0) is **not** here — it needs a Developer
 > ID and moves to the Release-Readiness Gate.
+
+**Test protocol for every spike:** `install → test → uninstall → assert-clean`.
+Each run starts from a verified-clean baseline, so results (especially B1/B2's
+FDA state) aren't contaminated by a prior run and the dev machine isn't polluted.
+A spike that can't restore a clean baseline is a finding in its own right.
 
 ## Stage B — Go/no-go spikes
 
@@ -51,7 +72,7 @@ parallel.
 | **B2** | FDA scope & durability | Grant, then reinstall / bump version / renew cert / update CLI-only (§11.10). | **Deferred to the gate** — ad-hoc identity changes each build, so only the negative is observable now. Carry as "expected, unverified." |
 | **B3** | Interactive vs headless TCC | Compare `navctl rules test` (terminal) vs `navd` headless read of a protected path. | Behavior confirmed either way; on-demand scan may work without a `navd` grant. |
 | **B4** | `navnotify` delivery (§9.2) | Bare LaunchAgent vs `LSUIElement` app; post via UserNotifications; test Fast User Switching routing. | A form that posts correctly-attributed notifications, **or** CLI-only fallback with `navctl status` showing `notify delivery: degraded`. |
-| **B5** | Homebrew root-daemon attack (§11.10) | With A2 installed, attempt the Cellar-writable-binary → root swap; test Homebrew upgrade while `navd` runs. | Attack confirmed closed (plist runs only the root-owned copy); a regression test proving it. |
+| **B5** | Homebrew root-daemon attack (§11.10) | With A1 installed, attempt the Cellar-writable-binary → root swap; test Homebrew upgrade while `navd` runs. | Attack confirmed closed (plist runs only the root-owned copy); a regression test proving it. |
 | **B6** | FSEvents + DiskArbitration robustness | Drive FSEvents under high event volume; basic mount-watcher. | Degradation is *observable* (`Lossless / Dropped / Coalesced / ResyncRequired`, §11.8), never silent. |
 
 **Decision gate:** the §12 go/no-go — `navnotify` delivers (or CLI-only fallback
