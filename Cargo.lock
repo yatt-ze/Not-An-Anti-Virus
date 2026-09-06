@@ -167,6 +167,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "nav-service"
+version = "0.1.0"
+
+[[package]]
 name = "navctl"
 version = "0.1.0"
 dependencies = [
