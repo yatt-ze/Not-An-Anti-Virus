@@ -9,3 +9,6 @@ rust-version.workspace = true
 [lib]
 name = "nav_service"
 path = "src/lib.rs"
+
+[dependencies]
+anyhow = { workspace = true }

@@ -14,6 +14,10 @@
 
 use std::path::{Path, PathBuf};
 
+pub mod ops;
+
+pub use ops::{Call, FakeSystemOps, RealSystemOps, SystemOps};
+
 /// launchd job label and system-domain service name.
 pub const LABEL: &str = "com.nav.navd";
 /// Stable adhoc signing identity applied to the copied binary, so TCC has a
