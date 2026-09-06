@@ -15,8 +15,10 @@
 use std::path::{Path, PathBuf};
 
 pub mod ops;
+pub mod orchestrate;
 
 pub use ops::{Call, FakeSystemOps, RealSystemOps, SystemOps};
+pub use orchestrate::{install, residue, uninstall, ResidueReport, UninstallReport};
 
 /// launchd job label and system-domain service name.
 pub const LABEL: &str = "com.nav.navd";
