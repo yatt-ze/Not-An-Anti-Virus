@@ -192,6 +192,8 @@ navctl uninstall                      # full clean removal, see §11
 
 Design principles: `--json` everywhere for scriptability, versioned via a top-level `schema_version` field (currently `1`) so a future breaking change bumps it instead of silently reshaping what scripts parse; config mirrored in `~/.config/navctl/config.toml` (user) and `/etc/navd/config.toml` (daemon) for reproducible/version-controllable setups.
 
+**`ScanResult`'s presentation is canonical in `nav-core`, not duplicated per binary.** The `schema_version` envelope and the exit-code mapping below live in `nav_core::presentation` (Phase 0b A2) so every binary that renders a verdict — `navctl` today, `navd` for its Phase 0b A2 `scan-once` spike instrument (§12) — emits the identical contract. This is a deliberate, small widening of `nav-core`'s charter beyond scoring alone, recorded here rather than left as silent drift.
+
 **Exit codes distinguish completeness from verdict**, not just clean/malicious — a partial scan (e.g. a decompression-bomb limit hit, §6.2) must never return the same code as a complete clean scan, since those mean very different things to a script consuming the exit status:
 
 | Code | Meaning |
