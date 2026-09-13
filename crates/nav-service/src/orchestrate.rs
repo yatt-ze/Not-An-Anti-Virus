@@ -157,6 +157,11 @@ pub struct ResidueReport {
     pub fs_residue: Vec<PathBuf>,
     pub launchd_loaded: bool,
     pub launchd_disabled: bool,
+    /// A benign `=> enabled` record lingering in launchd's disabled DB.
+    /// Reported for visibility but not counted as unclean: there's no CLI to
+    /// unset it, and uninstall only ever creates it while clearing a real
+    /// disable override (§11.10/§11.8).
+    pub launchd_enabled_record: bool,
     /// `navd`-named entries in our parent dirs that the manifest doesn't list —
     /// a backstop against manifest drift.
     pub swept_extras: Vec<PathBuf>,
@@ -188,7 +193,9 @@ pub fn residue(layout: &Layout, ops: &dyn SystemOps) -> Result<ResidueReport> {
     }
 
     report.launchd_loaded = ops.is_loaded(LABEL)?;
-    report.launchd_disabled = ops.is_disabled(LABEL)?;
+    let record = ops.disable_record(LABEL)?;
+    report.launchd_disabled = record == Some(true);
+    report.launchd_enabled_record = record == Some(false);
 
     let managed: std::collections::HashSet<&PathBuf> =
         manifest.fs.iter().map(|a| &a.path).collect();
@@ -501,5 +508,23 @@ mod tests {
             "a real disable override must be cleared"
         );
         assert!(!residue(&layout, &ops).unwrap().launchd_disabled);
+    }
+
+    #[test]
+    fn uninstall_leaves_a_benign_enabled_record_that_stays_clean() {
+        let tp = TempPrefix::new();
+        let layout = tp.layout();
+        let ops = FakeSystemOps::preloaded();
+
+        uninstall(&layout, &ops);
+        let report = residue(&layout, &ops).unwrap();
+        assert!(
+            report.launchd_enabled_record,
+            "clearing a real override leaves a benign enabled record"
+        );
+        assert!(
+            report.is_clean(),
+            "a benign enabled record must not defeat clean"
+        );
     }
 }
