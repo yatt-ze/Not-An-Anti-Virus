@@ -1,15 +1,8 @@
 //! Integration coverage for `navd scan-once` (Phase 0b A2 spike instrument,
 //! §12/§9.1 — temporary, removed once B3 is answered). Drives the built
-//! `navd` binary as a subprocess, the same way the B3 spike invokes it.
-//!
-//! The no-arg-routes-to-the-daemon invariant (§12 A2 trap 1) is *not*
-//! covered here: spawning `navd` with no args and confirming a clean exit on
-//! SIGTERM was tried and found flaky under this environment's scheduling —
-//! the child was intermittently reaped by the default SIGTERM disposition
-//! before its handler installed, well past any plausible startup time,
-//! rather than reflecting a real bug. Per the plan's documented fallback,
-//! that invariant is instead pinned as a fast, deterministic unit test on
-//! the arg dispatcher itself in `src/main.rs` (`no_args_parses_to_no_subcommand`).
+//! `navd` binary as a subprocess, the same way the B3 spike invokes it. The
+//! no-arg-routes-to-daemon invariant is covered separately, as a unit test
+//! on the arg dispatcher in `src/main.rs`.
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};

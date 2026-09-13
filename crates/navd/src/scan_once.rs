@@ -11,7 +11,9 @@
 use std::path::Path;
 use std::process::ExitCode;
 
-use nav_core::{scan_result_json, scan_target, BudgetOutcome, ScanResult};
+use nav_core::{
+    scan_result_json, scan_target, BudgetOutcome, Recommendation, ScanCompleteness, ScanResult,
+};
 
 /// Scans `path` once and prints the verdict, human or `--json`, exiting with
 /// the shared §8 taxonomy. Never starts the daemon loop or its signal
@@ -48,16 +50,36 @@ pub fn run(path: &Path, recursive: bool, json: bool) -> ExitCode {
     nav_core::exit_code(nav_core::for_target(&scan))
 }
 
-/// Terse one-line-per-file human summary. The verdict content is secondary
-/// here — `completeness` is the load-bearing field B3 measures (§5.5,
-/// §10, §11.8): a TCC-blocked read must surface as `Indeterminate`, never
-/// as a clean scan.
+/// Terse one-line-per-file human summary (§5.5).
 fn print_summary(result: &ScanResult) {
     println!(
-        "{}  score={} completeness={:?} -> {:?}",
+        "{}  score={} completeness={} -> {}",
         result.path.display(),
         result.score,
-        result.completeness,
-        result.recommendation,
+        completeness_str(result.completeness),
+        recommendation_str(result.recommendation),
     );
+}
+
+// Local, deliberately not shared with nav-core or navctl: this whole module
+// is a throwaway spike instrument (see the module doc comment), and these
+// just mirror navctl/src/output.rs's spellings so an operator sees identical
+// tokens from either binary.
+
+fn completeness_str(c: ScanCompleteness) -> &'static str {
+    match c {
+        ScanCompleteness::Complete => "Complete",
+        ScanCompleteness::Partial => "Partial",
+        ScanCompleteness::Indeterminate => "Indeterminate",
+    }
+}
+
+fn recommendation_str(r: Recommendation) -> &'static str {
+    match r {
+        Recommendation::NoAction => "no action (clean)",
+        Recommendation::Notify => "notify",
+        Recommendation::NotifyAndSuggestQuarantine => {
+            "notify + suggest quarantine (no auto-action without opt-in)"
+        }
+    }
 }
