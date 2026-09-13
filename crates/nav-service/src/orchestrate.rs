@@ -191,7 +191,10 @@ pub fn residue(layout: &Layout, ops: &dyn SystemOps) -> Result<ResidueReport> {
 
     for artifact in &manifest.fs {
         let leftover = match artifact.kind {
-            FsKind::File | FsKind::Dir => artifact.path.exists(),
+            // `symlink_metadata` doesn't follow symlinks, so it also catches a
+            // dangling one — `exists()` would miss it, but `remove_file_if_present`
+            // (uninstall) removes it, so residue must see it too.
+            FsKind::File | FsKind::Dir => fs::symlink_metadata(&artifact.path).is_ok(),
             FsKind::SharedDir => artifact.path.is_dir() && is_empty_dir(&artifact.path)?,
         };
         if leftover {
@@ -213,13 +216,21 @@ pub fn residue(layout: &Layout, ops: &dyn SystemOps) -> Result<ResidueReport> {
         for entry in fs::read_dir(&dir).with_context(|| format!("sweeping {}", dir.display()))? {
             let path = entry?.path();
             let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
-            if name.contains("navd") && !managed.contains(&path) {
+            if is_our_namespace(name) && !managed.contains(&path) {
                 report.swept_extras.push(path);
             }
         }
     }
 
     Ok(report)
+}
+
+/// Whether `name` looks like one of ours: exactly `navd`, `navd.`-prefixed
+/// (e.g. `navd.out.log`), or `com.nav.navd`-prefixed (e.g. a launchd label
+/// plist) — narrow enough that an unrelated `com.other.mynavdhelper` isn't
+/// swept as a false positive.
+fn is_our_namespace(name: &str) -> bool {
+    name == "navd" || name.starts_with("navd.") || name.starts_with("com.nav.navd")
 }
 
 /// The parent dirs a name sweep inspects for stray `navd`-named artifacts.
@@ -487,6 +498,42 @@ mod tests {
 
         let report = residue(&layout, &ops).unwrap();
         assert!(report.swept_extras.contains(&stray));
+        assert!(!report.is_clean());
+    }
+
+    #[test]
+    fn residue_name_sweep_ignores_an_unrelated_foreign_file() {
+        let tp = TempPrefix::new();
+        let layout = tp.layout();
+        let ops = FakeSystemOps::new();
+        install(&layout, &ops, &fake_navd(&tp)).unwrap();
+        // A foreign file that merely contains "navd" as a substring, not ours —
+        // keeps the shared helper dir non-empty across uninstall (like the
+        // `uninstall_leaves_a_nonempty_shared_dir_alone` case).
+        let foreign = layout.helper_dir().join("com.other.mynavdhelper");
+        fs::write(&foreign, "not ours").unwrap();
+        uninstall(&layout, &ops);
+
+        let report = residue(&layout, &ops).unwrap();
+        assert!(
+            !report.swept_extras.contains(&foreign),
+            "must not sweep an unrelated file that merely contains \"navd\""
+        );
+        assert!(report.is_clean());
+    }
+
+    #[test]
+    fn residue_flags_a_dangling_symlink_at_a_managed_path() {
+        let tp = TempPrefix::new();
+        let layout = tp.layout();
+        let ops = FakeSystemOps::new();
+        install(&layout, &ops, &fake_navd(&tp)).unwrap();
+        // Simulate a teardown that left a broken symlink where the binary was.
+        fs::remove_file(layout.helper_binary()).unwrap();
+        std::os::unix::fs::symlink("/nonexistent/target", layout.helper_binary()).unwrap();
+
+        let report = residue(&layout, &ops).unwrap();
+        assert!(report.fs_residue.contains(&layout.helper_binary()));
         assert!(!report.is_clean());
     }
 
