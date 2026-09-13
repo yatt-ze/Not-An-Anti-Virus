@@ -30,8 +30,11 @@ pub fn install(layout: &Layout, ops: &dyn SystemOps, navd_src: &Path) -> Result<
         navd_src.display()
     );
 
-    // Tear out a still-loaded prior job before overwriting its binary — copying
-    // over a running executable can fail with ETXTBSY on a real install.
+    // Tear out a still-loaded prior job so the new plist bootstraps cleanly.
+    // `bootout` returns before the process actually exits, so it does *not*
+    // by itself avoid ETXTBSY on the copy below — the unlink right before
+    // `fs::copy` is what does that (a still-running process keeps its old
+    // inode open; the copy just creates a fresh one).
     if ops.is_loaded(LABEL)? {
         ops.bootout(LABEL)?;
     }
@@ -48,6 +51,10 @@ pub fn install(layout: &Layout, ops: &dyn SystemOps, navd_src: &Path) -> Result<
         ops.chown_root(&helper_dir)?;
     }
     let bin = layout.helper_binary();
+    // Unlink any existing binary first: a still-running prior daemon keeps its
+    // old inode open, so `fs::copy` creates a fresh one instead of truncating
+    // the one in use — this, not the `bootout` above, is what avoids ETXTBSY.
+    remove_file_if_present(&bin).with_context(|| format!("removing old {}", bin.display()))?;
     fs::copy(navd_src, &bin).with_context(|| format!("copying navd to {}", bin.display()))?;
     fs::set_permissions(&bin, fs::Permissions::from_mode(BIN_MODE))?;
     ops.chown_root(&bin)?;
@@ -353,6 +360,21 @@ mod tests {
         install(&layout, &ops, &src).unwrap(); // must not error
                                                // Second install saw a loaded job and tore it out before re-bootstrapping.
         assert!(ops.calls().contains(&Call::Bootout(LABEL.into())));
+    }
+
+    #[test]
+    fn install_unlinks_a_preexisting_binary_before_copying() {
+        let tp = TempPrefix::new();
+        let layout = tp.layout();
+        let bin = layout.helper_binary();
+        fs::create_dir_all(bin.parent().unwrap()).unwrap();
+        fs::write(&bin, b"stale binary").unwrap();
+        let ops = FakeSystemOps::new();
+        let src = fake_navd(&tp);
+
+        install(&layout, &ops, &src).unwrap();
+
+        assert_eq!(fs::read(&bin).unwrap(), fs::read(&src).unwrap());
     }
 
     #[test]
