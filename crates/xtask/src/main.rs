@@ -9,7 +9,8 @@ use anyhow::{bail, ensure, Context, Result};
 use clap::{Parser, Subcommand};
 
 use nav_service::{
-    install, residue, uninstall, FakeSystemOps, Layout, RealSystemOps, CODESIGN_ID, LABEL,
+    install, navd_beside_current_exe, residue, uninstall, FakeSystemOps, Layout, RealSystemOps,
+    CODESIGN_ID, LABEL,
 };
 
 #[derive(Parser)]
@@ -139,11 +140,7 @@ fn verify_real() -> Result<()> {
         "verify --real must run as root (try: sudo cargo xtask verify --real)"
     );
 
-    let exe = std::env::current_exe()?;
-    let navd = exe
-        .parent()
-        .context("xtask binary has no parent dir")?
-        .join("navd");
+    let navd = navd_beside_current_exe()?;
     if !navd.is_file() {
         bail!(
             "navd binary not found at {} — run `cargo build -p navd` first",

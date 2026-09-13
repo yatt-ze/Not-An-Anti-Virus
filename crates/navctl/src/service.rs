@@ -3,11 +3,11 @@
 //! one-manifest orchestration against the real system layout and need root;
 //! status is read-only but reports launchd state only when run as root.
 
-use std::path::PathBuf;
 use std::process::ExitCode;
 
-use anyhow::{Context, Result};
-use nav_service::{install, uninstall, Layout, RealSystemOps, SystemOps, LABEL};
+use nav_service::{
+    install, navd_beside_current_exe, uninstall, Layout, RealSystemOps, SystemOps, LABEL,
+};
 
 use crate::exit;
 
@@ -17,20 +17,12 @@ fn is_root() -> bool {
     unsafe { libc::geteuid() == 0 }
 }
 
-/// The `navd` binary shipped next to the running `navctl` — the source install
-/// copies to the root-owned helper path (§11.10: never the Cellar/target path).
-fn navd_source() -> Result<PathBuf> {
-    let exe = std::env::current_exe().context("resolving navctl's own path")?;
-    let dir = exe.parent().context("navctl has no parent directory")?;
-    Ok(dir.join("navd"))
-}
-
 pub fn run_install() -> ExitCode {
     if !is_root() {
         eprintln!("navctl: `service install` must run as root (try: sudo navctl service install)");
         return exit::code(exit::OPERATIONAL_ERROR);
     }
-    let navd_src = match navd_source() {
+    let navd_src = match navd_beside_current_exe() {
         Ok(p) => p,
         Err(e) => {
             eprintln!("navctl: {e:#}");

@@ -14,11 +14,23 @@
 
 use std::path::{Path, PathBuf};
 
+use anyhow::{Context, Result};
+
 pub mod ops;
 pub mod orchestrate;
 
 pub use ops::{Call, FakeSystemOps, RealSystemOps, SystemOps};
 pub use orchestrate::{install, residue, uninstall, ResidueReport, UninstallReport};
+
+/// Resolves the `navd` binary shipped alongside the running executable — the
+/// source `install` copies to the root-owned helper path (§11.10).
+pub fn navd_beside_current_exe() -> Result<PathBuf> {
+    let exe = std::env::current_exe().context("resolving the running executable's own path")?;
+    let dir = exe
+        .parent()
+        .context("running executable has no parent directory")?;
+    Ok(dir.join("navd"))
+}
 
 /// launchd job label and system-domain service name.
 pub const LABEL: &str = "com.nav.navd";
