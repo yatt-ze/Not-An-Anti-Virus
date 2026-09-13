@@ -12,7 +12,8 @@ use std::path::Path;
 use std::process::ExitCode;
 
 use nav_core::{
-    scan_result_json, scan_target, BudgetOutcome, Recommendation, ScanCompleteness, ScanResult,
+    scan_result_json, scan_target, BudgetOutcome, EvidenceConfidence, Recommendation,
+    ScanCompleteness, ScanResult,
 };
 
 /// Scans `path` once and prints the verdict, human or `--json`, exiting with
@@ -28,8 +29,10 @@ pub fn run(path: &Path, recursive: bool, json: bool) -> ExitCode {
     };
 
     if scan.results.is_empty() {
+        // Nothing readable, not a tool failure — matches `navctl rules
+        // test`'s empty-target code, the baseline B3 compares against.
         eprintln!("navd scan-once: no files found under {}", path.display());
-        return nav_core::exit_code(nav_core::OPERATIONAL_ERROR);
+        return nav_core::exit_code(nav_core::INDETERMINATE);
     }
 
     for result in &scan.results {
@@ -53,9 +56,10 @@ pub fn run(path: &Path, recursive: bool, json: bool) -> ExitCode {
 /// Terse one-line-per-file human summary (§5.5).
 fn print_summary(result: &ScanResult) {
     println!(
-        "{}  score={} completeness={} -> {}",
+        "{}  score={} confidence={} completeness={} -> {}",
         result.path.display(),
         result.score,
+        confidence_str(result.confidence),
         completeness_str(result.completeness),
         recommendation_str(result.recommendation),
     );
@@ -65,6 +69,14 @@ fn print_summary(result: &ScanResult) {
 // is a throwaway spike instrument (see the module doc comment), and these
 // just mirror navctl/src/output.rs's spellings so an operator sees identical
 // tokens from either binary.
+
+fn confidence_str(c: EvidenceConfidence) -> &'static str {
+    match c {
+        EvidenceConfidence::Low => "Low",
+        EvidenceConfidence::Medium => "Medium",
+        EvidenceConfidence::High => "High",
+    }
+}
 
 fn completeness_str(c: ScanCompleteness) -> &'static str {
     match c {

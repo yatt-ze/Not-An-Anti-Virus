@@ -116,6 +116,26 @@ fn nonexistent_path_is_an_operational_error_not_clean() {
     );
 }
 
+#[test]
+fn empty_directory_is_indeterminate_not_clean_or_operational_error() {
+    let dir = std::env::temp_dir().join(format!(
+        "navd-scan-once-emptydir-{}-{:?}",
+        std::process::id(),
+        Instant::now()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+
+    let out = run_scan_once(&dir, &[]);
+    let _ = std::fs::remove_dir(&dir);
+
+    assert_eq!(
+        out.status.code(),
+        Some(i32::from(nav_core::INDETERMINATE)),
+        "an empty (but readable) target has nothing to inspect — that's \
+         INDETERMINATE, distinct from both a clean scan and a tool failure"
+    );
+}
+
 #[cfg(unix)]
 #[test]
 fn unreadable_path_is_indeterminate_not_clean() {
