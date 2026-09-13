@@ -5,7 +5,9 @@
 //! `navd` links the same crate for the privileged cases.
 //!
 //! Knows nothing about event sources, the daemon, sockets, or notifications —
-//! it only turns a file path into a `ScanResult`.
+//! it turns a file path into a `ScanResult` and owns that result's canonical
+//! presentation: the versioned `--json` envelope and the §8 exit-code
+//! mapping, so `navctl` and `navd` render one contract instead of two.
 
 pub mod bundle;
 pub mod context;
@@ -14,6 +16,7 @@ pub mod inflate;
 pub mod macho;
 pub mod model;
 pub mod plist;
+pub mod presentation;
 pub mod rules;
 pub mod scan;
 pub mod target;
@@ -28,6 +31,10 @@ pub use model::{
     EvidenceConfidence, MatchedSignal, Recommendation, ScanCompleteness, ScanResult, SignalCategory,
 };
 pub use plist::PlistValue;
+pub use presentation::{
+    exit_code, for_result, for_target, scan_result_json, with_schema_version, CLEAN, HIGH_RISK,
+    INDETERMINATE, OPERATIONAL_ERROR, SCAN_JSON_SCHEMA_VERSION, SUSPICIOUS,
+};
 pub use rules::{default_ruleset, embedded_content_ruleset, Rule, RuleOutcome};
 pub use scan::{
     scan_context, scan_embedded_bytes, scan_file, scan_file_with_rules, ENGINE_VERSION,

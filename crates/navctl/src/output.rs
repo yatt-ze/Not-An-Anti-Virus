@@ -2,7 +2,8 @@
 //!
 //! `--json` mirrors the human structure — both render the same
 //! `nav_core::ScanResult` (§5.5), plus a top-level `schema_version` marking
-//! the JSON as a versioned contract (§8).
+//! the JSON as a versioned contract (§8), via the shared envelope in
+//! `nav_core::presentation`.
 //! `scan` prints one terse line per file;
 //! `rules test` prints the worst file's full breakdown plus a roll-up.
 
@@ -10,26 +11,11 @@ use std::path::Path;
 use std::process::ExitCode;
 
 use nav_core::{
-    scan_target, BudgetLimit, BudgetOutcome, EvidenceConfidence, Recommendation, ScanCompleteness,
-    ScanResult, TargetKind, TargetScan,
+    scan_target, with_schema_version, BudgetLimit, BudgetOutcome, EvidenceConfidence,
+    Recommendation, ScanCompleteness, ScanResult, TargetKind, TargetScan, SCAN_JSON_SCHEMA_VERSION,
 };
-use serde::Serialize;
 
 use crate::exit;
-
-/// Version of the `navctl --json` output shape. Bump on any breaking change
-/// to the emitted fields (§8) — scripts key off this to detect drift.
-const JSON_SCHEMA_VERSION: u32 = 1;
-
-/// Serializes `value` to a JSON object with `schema_version` merged in.
-/// `value` must serialize to a JSON object (all current callers do).
-fn with_schema_version<T: Serialize>(value: &T) -> serde_json::Value {
-    let mut v = serde_json::to_value(value).expect("navctl JSON output always serializes");
-    if let serde_json::Value::Object(map) = &mut v {
-        map.insert("schema_version".into(), JSON_SCHEMA_VERSION.into());
-    }
-    v
-}
 
 pub fn run_scan(path: &Path, recursive: bool, json: bool) -> ExitCode {
     let scan = match scan_target(path, recursive) {
@@ -235,7 +221,7 @@ fn multi_json(scan: &TargetScan) -> serde_json::Value {
         _ => "directory",
     };
     serde_json::json!({
-        "schema_version": JSON_SCHEMA_VERSION,
+        "schema_version": SCAN_JSON_SCHEMA_VERSION,
         "target": scan.root,
         "kind": kind,
         "primary": scan.primary,
@@ -332,7 +318,7 @@ mod tests {
     #[test]
     fn with_schema_version_adds_field_alongside_existing_ones() {
         let value = with_schema_version(&sample_result());
-        assert_eq!(value["schema_version"], JSON_SCHEMA_VERSION);
+        assert_eq!(value["schema_version"], SCAN_JSON_SCHEMA_VERSION);
         // Original fields still present — schema_version is additive.
         assert_eq!(value["score"], 0);
     }
@@ -348,7 +334,7 @@ mod tests {
             budget: nav_core::BudgetOutcome::Within,
         };
         let value = multi_json(&scan);
-        assert_eq!(value["schema_version"], JSON_SCHEMA_VERSION);
+        assert_eq!(value["schema_version"], SCAN_JSON_SCHEMA_VERSION);
     }
 
     /// A budget-exhausted target is never a clean exit, even when every file it
