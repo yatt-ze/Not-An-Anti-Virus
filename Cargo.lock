@@ -179,7 +179,9 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
+ "libc",
  "nav-core",
+ "nav-service",
  "serde",
  "serde_json",
 ]

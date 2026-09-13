@@ -7,6 +7,7 @@
 
 mod exit;
 mod output;
+mod service;
 
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -29,6 +30,11 @@ enum Command {
     },
     /// Grant Full Disk Access to navd. Explicitly user-invoked only — never run automatically.
     SetupFda,
+    /// Install, remove, or inspect navd's system service (§11.10). Install/uninstall need root.
+    Service {
+        #[command(subcommand)]
+        command: ServiceCommand,
+    },
     /// Scan a file or directory and print a verdict.
     Scan {
         path: PathBuf,
@@ -76,6 +82,16 @@ enum Command {
     Notify { action: Option<String> },
     /// Fully remove NAV. Requires navd (Phase 3).
     Uninstall,
+}
+
+#[derive(Subcommand)]
+enum ServiceCommand {
+    /// Install navd as a root LaunchDaemon and bootstrap it. Requires root.
+    Install,
+    /// Remove navd and all its artifacts (best-effort, tolerant of a partial install). Requires root.
+    Uninstall,
+    /// Report install state: which artifacts are present and the launchd job status.
+    Status,
 }
 
 #[derive(Subcommand)]
@@ -157,6 +173,12 @@ fn main() -> ExitCode {
             RulesCommand::List => output::run_rules_list(),
             RulesCommand::Reload => not_yet_implemented("rules reload", "Phase 3"),
             RulesCommand::Rollback => not_yet_implemented("rules rollback", "Phase 3"),
+        },
+
+        Command::Service { command } => match command {
+            ServiceCommand::Install => service::run_install(),
+            ServiceCommand::Uninstall => service::run_uninstall(),
+            ServiceCommand::Status => service::run_status(),
         },
 
         Command::Status { .. } => not_yet_implemented("status", "Phase 0b"),
