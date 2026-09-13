@@ -66,6 +66,7 @@ Quarantine manager, allow/denylist, config file support, ruleset hot-reload + ro
 - **Domain-reputation approach** — locked, see §5.6. Local-first by default (`LocalHeuristicProvider`, using precisely-named local-prevalence signals rather than overclaiming registration-age data), with an opt-in `CloudFeedProvider` extension point reserved for a future release.
 - **Naming/positioning** — resolved: project is **NAV**, "Not an Anti-Virus."
 - **Notification delivery** — locked, see §9.2. `navnotify`, a background-only per-user LaunchAgent, no openable window, opt-out respected end-to-end.
+- **Software versioning** — SemVer on one unified workspace version (`[workspace.package] version`, inherited by every crate), so all binaries release as one product. Pre-1.0 while the socket protocol, CLI surface, and config format are unsettled: the minor tracks the phased roadmap (§12) — `0.1.x` Phase 0a, `0.2.x` Phase 0b, `0.3.x` Phase 1, and so on — with the patch as a released-version counter that advances per tagged release within a phase. `1.0.0` is reserved for committed stability of the protocol/CLI/config, at or after the Release-Readiness Gate (§13), not merely "it works." Releases are annotated git tags `vX.Y.Z`; the signing identity (`com.nav.navd`) and launchd label stay constant across version bumps, independent of the version (§11.10). Distinct from the design-doc revision in `docs/design.md`'s `**Status:**`, which is a separate document-changelog counter, not the software version.
 
 ---
 
