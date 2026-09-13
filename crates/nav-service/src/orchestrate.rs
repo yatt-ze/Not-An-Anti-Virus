@@ -36,9 +36,17 @@ pub fn install(layout: &Layout, ops: &dyn SystemOps, navd_src: &Path) -> Result<
         ops.bootout(LABEL)?;
     }
 
-    // Root-owned copy of the daemon (never the Cellar path, §11.10).
-    fs::create_dir_all(layout.helper_dir())
-        .with_context(|| format!("creating {}", layout.helper_dir().display()))?;
+    // Root-owned copy of the daemon (never the Cellar path, §11.10). The helper
+    // dir is Apple-shared: create it only if absent and set explicit root:wheel
+    // 0755 perms only when we created it — never re-permission a dir another
+    // installer already owns, and don't leave the perms to root's umask.
+    let helper_dir = layout.helper_dir();
+    if !helper_dir.exists() {
+        fs::create_dir_all(&helper_dir)
+            .with_context(|| format!("creating {}", helper_dir.display()))?;
+        fs::set_permissions(&helper_dir, fs::Permissions::from_mode(DIR_MODE))?;
+        ops.chown_root(&helper_dir)?;
+    }
     let bin = layout.helper_binary();
     fs::copy(navd_src, &bin).with_context(|| format!("copying navd to {}", bin.display()))?;
     fs::set_permissions(&bin, fs::Permissions::from_mode(BIN_MODE))?;
@@ -285,6 +293,31 @@ mod tests {
         }));
         assert!(calls.contains(&Call::ChownRoot(layout.helper_binary())));
         assert!(calls.contains(&Call::Bootstrap(layout.plist_path())));
+    }
+
+    #[test]
+    fn install_sets_root_owned_perms_on_a_helper_dir_it_creates() {
+        let tp = TempPrefix::new();
+        let layout = tp.layout();
+        let ops = FakeSystemOps::new();
+        install(&layout, &ops, &fake_navd(&tp)).unwrap();
+        assert!(
+            ops.calls().contains(&Call::ChownRoot(layout.helper_dir())),
+            "a helper dir we create must be chowned root:wheel, not left to umask"
+        );
+    }
+
+    #[test]
+    fn install_does_not_repermission_a_preexisting_shared_helper_dir() {
+        let tp = TempPrefix::new();
+        let layout = tp.layout();
+        fs::create_dir_all(layout.helper_dir()).unwrap();
+        let ops = FakeSystemOps::new();
+        install(&layout, &ops, &fake_navd(&tp)).unwrap();
+        assert!(
+            !ops.calls().contains(&Call::ChownRoot(layout.helper_dir())),
+            "must not chown a shared helper dir another installer already owns"
+        );
     }
 
     #[test]
