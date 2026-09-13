@@ -190,8 +190,10 @@ dependencies = [
 name = "navd"
 version = "0.2.0"
 dependencies = [
+ "clap",
  "libc",
  "nav-core",
+ "serde_json",
 ]
 
 [[package]]

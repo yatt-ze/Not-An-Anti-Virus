@@ -1,56 +1,85 @@
 //! `navd` — NAV's privileged daemon.
 //!
-//! Phase 0b A1 scope: a minimal stay-alive skeleton, so the LaunchDaemon that
-//! `navctl service install` bootstraps has a real target to keep running
-//! (§11.10). It links `nav-core` but runs no event sources, socket, or
-//! scanning pipeline yet — those are A2 onward (§12); building them here would
-//! be ahead of phase.
-//!
-//! Lifecycle: log a startup line, block until SIGTERM/SIGINT (launchd
-//! `bootout` sends SIGTERM), then log a shutdown line and exit 0 so a teardown
-//! reads as a clean stop rather than a crash.
+//! Two strictly separate process lifecycles behind one binary (§12 Phase
+//! 0b A2): bare `navd` (no args) is the persistent A1 stay-alive daemon the
+//! LaunchDaemon plist invokes (see [`daemon`]) — it never scans. `navd
+//! scan-once <path>` is a separate short-lived invocation that runs one
+//! `nav-core` scan and exits (see [`scan_once`]) — it never starts the
+//! daemon loop. The subcommand is optional so the plist's zero-arg
+//! invocation keeps routing to the daemon instead of erroring on a missing
+//! subcommand.
 
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::thread;
-use std::time::Duration;
+mod daemon;
+mod scan_once;
 
-/// Poll interval of the stay-alive loop — the worst-case latency between a
-/// termination signal and a clean exit. launchd allows far longer before it
-/// escalates `bootout` to SIGKILL, so a second is comfortably within budget.
-const POLL_INTERVAL: Duration = Duration::from_secs(1);
+use std::path::PathBuf;
+use std::process::ExitCode;
 
-/// Set by the signal handler, polled by the run loop to exit cleanly.
-static SHUTDOWN: AtomicBool = AtomicBool::new(false);
+use clap::{Parser, Subcommand};
 
-/// Async-signal-safe: an atomic store is the only thing it does.
-extern "C" fn on_terminate(_signum: libc::c_int) {
-    SHUTDOWN.store(true, Ordering::SeqCst);
+#[derive(Parser)]
+#[command(name = "navd", version, about = "NAV's privileged daemon")]
+struct Cli {
+    #[command(subcommand)]
+    command: Option<Command>,
 }
 
-fn install_signal_handlers() {
-    let handler = on_terminate as extern "C" fn(libc::c_int) as libc::sighandler_t;
-    // SAFETY: the handler only performs an atomic store, which is
-    // async-signal-safe; installing it has no other precondition.
-    unsafe {
-        libc::signal(libc::SIGTERM, handler);
-        libc::signal(libc::SIGINT, handler);
+#[derive(Subcommand, Debug)]
+enum Command {
+    /// One-shot self-scan spike instrument for the Phase 0b B3 TCC-behavior
+    /// check (§12). Temporary — not stable CLI surface (§9.1); removed once
+    /// B3 is answered.
+    ScanOnce {
+        path: PathBuf,
+        #[arg(long)]
+        json: bool,
+        #[arg(long)]
+        recursive: bool,
+    },
+}
+
+fn main() -> ExitCode {
+    match Cli::parse().command {
+        None => {
+            daemon::run();
+            ExitCode::SUCCESS
+        }
+        Some(Command::ScanOnce {
+            path,
+            json,
+            recursive,
+        }) => scan_once::run(&path, recursive, json),
     }
 }
 
-fn main() {
-    install_signal_handlers();
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-    // stdout/stderr are the plist's log paths (§11.10) — this is how the
-    // `--real` verify run confirms the daemon actually came up under launchd.
-    println!(
-        "navd starting (pid {}, engine {}): stay-alive skeleton, no event sources yet (§12).",
-        std::process::id(),
-        nav_core::ENGINE_VERSION
-    );
-
-    while !SHUTDOWN.load(Ordering::SeqCst) {
-        thread::sleep(POLL_INTERVAL);
+    /// The installed LaunchDaemon plist invokes bare `navd` with zero
+    /// arguments (§12 A2 trap 1) — that must parse to no subcommand, routing
+    /// to the daemon, never a clap usage error over a required subcommand.
+    #[test]
+    fn no_args_parses_to_no_subcommand() {
+        let cli = Cli::try_parse_from(["navd"]).expect("bare `navd` must parse");
+        assert!(cli.command.is_none());
     }
 
-    println!("navd shutting down on signal.");
+    #[test]
+    fn scan_once_parses_its_path_and_flags() {
+        let cli = Cli::try_parse_from(["navd", "scan-once", "/tmp/x", "--json", "--recursive"])
+            .expect("scan-once with a path parses");
+        match cli.command {
+            Some(Command::ScanOnce {
+                path,
+                json,
+                recursive,
+            }) => {
+                assert_eq!(path, PathBuf::from("/tmp/x"));
+                assert!(json);
+                assert!(recursive);
+            }
+            other => panic!("expected ScanOnce, got {other:?}"),
+        }
+    }
 }
