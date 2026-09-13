@@ -6,6 +6,7 @@ members = [
     "crates/navctl",
     "crates/navd",
     "crates/navnotify",
+    "crates/xtask",
 ]
 
 [workspace.package]
