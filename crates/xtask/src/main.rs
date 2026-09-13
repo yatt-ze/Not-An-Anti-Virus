@@ -92,13 +92,16 @@ fn run_verify_fake(tempdir: &std::path::Path) -> Result<()> {
             path: layout.helper_binary(),
             identifier: CODESIGN_ID.into(),
         },
-        nav_service::Call::Enable(LABEL.into()),
     ] {
         ensure!(
             calls.contains(&expected),
             "missing expected call: {expected:?}"
         );
     }
+    ensure!(
+        !calls.contains(&nav_service::Call::Enable(LABEL.into())),
+        "a clean install must not write an enable override (zero residue, §11.10)"
+    );
     println!("install: OK");
 
     // Re-install must be idempotent and tear out the now-loaded job first.

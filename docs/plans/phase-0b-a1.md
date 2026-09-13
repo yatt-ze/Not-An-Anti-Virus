@@ -25,7 +25,7 @@ exactly it, **uninstall** removes exactly it (whole list, tolerant of already-go
 | `/etc/navd/` (+`config.toml`) | rm -r | |
 | `/private/var/db/navd/` (+logs/state) | rm -r | |
 | launchd registration | `bootout system/com.nav.navd` | modern API, not load/unload |
-| launchd disable override | `enable` **before** bootout | sticky; survives bootout otherwise |
+| launchd disable override | `enable` **before** bootout, but only when one is actually set | sticky; survives bootout otherwise. An *unconditional* `enable` itself leaves a persistent enabled record (residue), so it is gated on `is_disabled` (found on the `--real` run) |
 | TCC/FDA grant | scoped `tccutil reset SystemPolicyAllFiles com.nav.navd` | best-effort; **honest residual**, reported not claimed clean |
 
 Residue check also **name-sweeps** the parent dirs for `navd`/`com.nav.navd` as a

@@ -70,8 +70,12 @@ pub fn install(layout: &Layout, ops: &dyn SystemOps, navd_src: &Path) -> Result<
     fs::set_permissions(&plist, fs::Permissions::from_mode(PLIST_MODE))?;
     ops.chown_root(&plist)?;
 
-    // Clear any sticky disable override before loading (§11.10), then bootstrap.
-    ops.enable(LABEL)?;
+    // Clear a sticky disable override before loading — but only when one is
+    // actually set: an unconditional `enable` writes a persistent enabled
+    // record into launchd's disabled DB, itself residue (§11.10).
+    if ops.is_disabled(LABEL)? {
+        ops.enable(LABEL)?;
+    }
     ops.bootstrap(&plist)?;
     Ok(())
 }
@@ -99,9 +103,21 @@ impl UninstallReport {
 pub fn uninstall(layout: &Layout, ops: &dyn SystemOps) -> UninstallReport {
     let mut report = UninstallReport::default();
 
-    // Clear a sticky disable override *before* bootout (it survives bootout).
-    if let Err(e) = ops.enable(LABEL) {
-        report.errors.push(format!("enable {LABEL}: {e:#}"));
+    // Clear a sticky disable override *before* bootout (it survives bootout),
+    // but only if one is set — an unconditional `enable` would leave a
+    // persistent enabled record, defeating zero residue (§11.10). On a failed
+    // check, clear defensively so a stuck override can't block a re-install.
+    let disabled = match ops.is_disabled(LABEL) {
+        Ok(d) => d,
+        Err(e) => {
+            report.errors.push(format!("is_disabled {LABEL}: {e:#}"));
+            true
+        }
+    };
+    if disabled {
+        if let Err(e) = ops.enable(LABEL) {
+            report.errors.push(format!("enable {LABEL}: {e:#}"));
+        }
     }
     if let Err(e) = ops.bootout(LABEL) {
         report.errors.push(format!("bootout {LABEL}: {e:#}"));
@@ -333,6 +349,36 @@ mod tests {
     }
 
     #[test]
+    fn install_skips_enable_when_not_disabled() {
+        let tp = TempPrefix::new();
+        let layout = tp.layout();
+        let ops = FakeSystemOps::new();
+        install(&layout, &ops, &fake_navd(&tp)).unwrap();
+
+        let calls = ops.calls();
+        assert!(
+            !calls.contains(&Call::Enable(LABEL.into())),
+            "a clean install must not write an enabled record"
+        );
+        assert!(calls.contains(&Call::Bootstrap(layout.plist_path())));
+    }
+
+    #[test]
+    fn install_clears_a_disable_override() {
+        let tp = TempPrefix::new();
+        let layout = tp.layout();
+        let ops = FakeSystemOps::preloaded();
+        install(&layout, &ops, &fake_navd(&tp)).unwrap();
+
+        let calls = ops.calls();
+        assert!(
+            calls.contains(&Call::Enable(LABEL.into())),
+            "a real disable override must be cleared"
+        );
+        assert!(calls.contains(&Call::Bootstrap(layout.plist_path())));
+    }
+
+    #[test]
     fn uninstall_then_residue_is_clean() {
         let tp = TempPrefix::new();
         let layout = tp.layout();
@@ -425,5 +471,35 @@ mod tests {
         let report = residue(&layout, &ops).unwrap();
         assert!(report.launchd_disabled);
         assert!(!report.is_clean());
+    }
+
+    #[test]
+    fn uninstall_skips_enable_when_not_disabled() {
+        let tp = TempPrefix::new();
+        let layout = tp.layout();
+        let ops = FakeSystemOps::new();
+        install(&layout, &ops, &fake_navd(&tp)).unwrap();
+
+        let report = uninstall(&layout, &ops);
+        assert!(report.is_ok(), "uninstall errors: {:?}", report.errors);
+        assert!(
+            !ops.calls().contains(&Call::Enable(LABEL.into())),
+            "uninstall must not write an enabled record when none was disabled"
+        );
+        assert!(residue(&layout, &ops).unwrap().is_clean());
+    }
+
+    #[test]
+    fn uninstall_clears_a_real_disable_override() {
+        let tp = TempPrefix::new();
+        let layout = tp.layout();
+        let ops = FakeSystemOps::preloaded();
+
+        uninstall(&layout, &ops);
+        assert!(
+            ops.calls().contains(&Call::Enable(LABEL.into())),
+            "a real disable override must be cleared"
+        );
+        assert!(!residue(&layout, &ops).unwrap().launchd_disabled);
     }
 }
