@@ -53,8 +53,19 @@ pub fn run_uninstall() -> ExitCode {
         println!("removed {}", path.display());
     }
     // The FDA/TCC grant reset is best-effort and can't be asserted clean — say
-    // so rather than implying a guarantee (§11.8).
-    println!("Full Disk Access grant reset (best-effort); verify in System Settings if needed.");
+    // so rather than implying a guarantee (§11.8). But if the reset itself
+    // never ran (surfaced as a "tccutil reset " error below), don't claim it did.
+    if report
+        .errors
+        .iter()
+        .any(|e| e.starts_with("tccutil reset "))
+    {
+        println!("Full Disk Access grant reset could not be run; check System Settings.");
+    } else {
+        println!(
+            "Full Disk Access grant reset (best-effort); verify in System Settings if needed."
+        );
+    }
 
     if report.is_ok() {
         println!("navd uninstalled.");
