@@ -170,6 +170,9 @@ Every verdict retains the ruleset version, engine version, and score-at-evaluati
 ```
 navctl status [--resource-usage]      # reports notify delivery: ok/degraded/disabled AND per-area protected-path coverage: verified/degraded/unknown
 navctl setup fda                      # explicitly user-invoked; opens System Settings + reveals navd binary in Finder. Never run automatically.
+navctl service install                # install navd as a root LaunchDaemon and bootstrap it (needs root); see §11.10
+navctl service uninstall              # remove navd and its artifacts (needs root), best-effort/zero-residue; see §11.10
+navctl service status                 # report install state: which artifacts are present + the launchd job status
 navctl scan <path> [--recursive] [--json] [--quick|--full]
 navctl rules test <path> [--recursive] [--json]   # full signal breakdown (file / dir / .app bundle, §5.8), dry-run, no action taken
 navctl rules list
@@ -184,6 +187,8 @@ navctl logs [--since 1h] [--grep ...]
 navctl notify [enable|disable|status]  # opt-out control for navnotify delivery, see §9.2
 navctl uninstall                      # full clean removal, see §11
 ```
+
+`service uninstall` is the daemon-lifecycle teardown of exactly what `service install` created (§11.10), driven off the single install manifest; the top-level `navctl uninstall` is the Phase 3 umbrella full-product removal (§11) that subsumes it once quarantine/config/allowlist state also exists.
 
 Design principles: `--json` everywhere for scriptability, versioned via a top-level `schema_version` field (currently `1`) so a future breaking change bumps it instead of silently reshaping what scripts parse; config mirrored in `~/.config/navctl/config.toml` (user) and `/etc/navd/config.toml` (daemon) for reproducible/version-controllable setups.
 

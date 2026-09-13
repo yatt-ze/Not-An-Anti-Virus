@@ -1,0 +1,14 @@
+[package]
+name = "nav-service"
+description = "NAV privileged-install layer: the LaunchDaemon layout, artifact manifest, and plist rendering shared by `navctl service` and the xtask verify runner (§11.10)."
+version.workspace = true
+edition.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[lib]
+name = "nav_service"
+path = "src/lib.rs"
+
+[dependencies]
+anyhow = { workspace = true }

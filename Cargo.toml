@@ -2,9 +2,11 @@
 resolver = "2"
 members = [
     "crates/nav-core",
+    "crates/nav-service",
     "crates/navctl",
     "crates/navd",
     "crates/navnotify",
+    "crates/xtask",
 ]
 
 [workspace.package]
@@ -15,8 +17,10 @@ rust-version = "1.75"
 
 [workspace.dependencies]
 nav-core = { path = "crates/nav-core" }
+nav-service = { path = "crates/nav-service" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 clap = { version = "4", features = ["derive"] }
 anyhow = "1"
 thiserror = "2"
+libc = "0.2"

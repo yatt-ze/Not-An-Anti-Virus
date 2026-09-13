@@ -1,0 +1,18 @@
+[package]
+name = "xtask"
+description = "Dev runner: drives nav-service install/uninstall/residue through one code path in --fake (CI) or --real (sudo dev-box) mode (§11.10)."
+publish = false
+version.workspace = true
+edition.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "xtask"
+path = "src/main.rs"
+
+[dependencies]
+nav-service = { workspace = true }
+anyhow = { workspace = true }
+clap = { workspace = true }
+libc = { workspace = true }

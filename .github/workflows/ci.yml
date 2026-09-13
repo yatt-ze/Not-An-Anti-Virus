@@ -3,8 +3,9 @@
 #   cargo clippy --workspace --all-targets -- -D warnings
 #   cargo test --workspace
 # plus a build of the nightly-only fuzz targets (crates/nav-core/fuzz is a
-# separate workspace by design, so it is not covered by --workspace), and a
-# supply-chain advisory-DB check (§11, NAV-017).
+# separate workspace by design, so it is not covered by --workspace), a
+# supply-chain advisory-DB check (§11, NAV-017), and cargo xtask verify
+# --fake (install/uninstall/residue orchestration, §11.10) on both runners.
 name: CI
 
 on:
@@ -58,6 +59,8 @@ jobs:
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - name: test
         run: cargo test --workspace --locked
+      - name: verify install/uninstall (fake prefix)
+        run: cargo run --locked -p xtask -- verify --fake
 
   audit:
     name: cargo audit
