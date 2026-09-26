@@ -5,6 +5,7 @@
 //! diverge on what a target means — `scan` renders it tersely, `rules test` in
 //! full, both from the same [`TargetScan`].
 
+use std::collections::BTreeSet;
 use std::io;
 use std::path::{Path, PathBuf};
 
@@ -93,6 +94,12 @@ pub struct TargetScan {
     /// Bundle members traversed but not scored (see
     /// [`bundle::is_inert_bundle_resource`]).
     pub skipped: Vec<PathBuf>,
+    /// Directories under the target that `collect_files` couldn't read
+    /// (permission denied, race), sorted and deduped (§11.1). Traversal
+    /// continues past each one rather than aborting (§11.8); non-empty means
+    /// the target's coverage is partial (§11.12). Always empty for a
+    /// single-file target.
+    pub unreadable: Vec<PathBuf>,
     /// Whether the scan fit inside its budget, or was cut short (and how).
     pub budget: BudgetOutcome,
 }
@@ -124,11 +131,12 @@ impl TargetScan {
     }
 
     /// Whether the whole target was covered. `false` when a [`ScanBudget`]
-    /// ceiling cut the traversal short, so the target result is partial even
-    /// if every scored file was individually `Complete` — "couldn't finish"
-    /// is not "clean" (§11.8).
+    /// ceiling cut the traversal short, or a subdirectory couldn't be read,
+    /// so the target result is partial even if every scored file was
+    /// individually `Complete` — "couldn't finish" is not "clean"
+    /// (§11.8/§11.12).
     pub fn coverage_complete(&self) -> bool {
-        self.budget == BudgetOutcome::Within
+        self.budget == BudgetOutcome::Within && self.unreadable.is_empty()
     }
 }
 
@@ -179,13 +187,14 @@ pub fn scan_target_with_budget(
             results: vec![scan_file(path)],
             primary: None,
             skipped: Vec::new(),
+            unreadable: Vec::new(),
             budget: BudgetOutcome::Within,
         });
     }
 
     if let Some(layout) = BundleLayout::detect(path) {
         // A bundle is always traversed in full; `recursive` doesn't apply.
-        let (all, collect_limit) = collect_files(path, true, budget)?;
+        let (all, collect_limit, unreadable) = collect_files(path, true, budget)?;
         let (to_scan, skipped): (Vec<PathBuf>, Vec<PathBuf>) = all
             .into_iter()
             .partition(|p| !bundle::is_inert_bundle_resource(p));
@@ -196,11 +205,12 @@ pub fn scan_target_with_budget(
             results,
             primary: layout.main_executable,
             skipped,
+            unreadable,
             budget: outcome(collect_limit, byte_limit),
         });
     }
 
-    let (files, collect_limit) = collect_files(path, recursive, budget)?;
+    let (files, collect_limit, unreadable) = collect_files(path, recursive, budget)?;
     let (results, byte_limit) = scan_within_bytes(&files, budget);
     Ok(TargetScan {
         root: path.to_path_buf(),
@@ -208,6 +218,7 @@ pub fn scan_target_with_budget(
         results,
         primary: None,
         skipped: Vec::new(),
+        unreadable,
         budget: outcome(collect_limit, byte_limit),
     })
 }
@@ -249,13 +260,21 @@ fn scan_within_bytes(
 /// Directory symlinks are not followed (traversal cycles, scan escape).
 /// Stops early if the budget's file-count or depth ceiling is reached,
 /// returning which limit was hit so the target can be marked partial.
+///
+/// `root` itself failing to read (`depth == 0`) is an operational error and
+/// propagates via `?` — there's nothing to traverse or report partial
+/// coverage over. A deeper directory that can't be read (or a `DirEntry`/
+/// `file_type()` that errors while listing one) is recorded in the returned
+/// set instead, and the walk continues; a failing entry is just skipped
+/// (§11.8).
 fn collect_files(
     root: &Path,
     recursive: bool,
     budget: &ScanBudget,
-) -> io::Result<(Vec<PathBuf>, Option<BudgetLimit>)> {
+) -> io::Result<(Vec<PathBuf>, Option<BudgetLimit>, Vec<PathBuf>)> {
     let mut out = Vec::new();
     let mut limit_hit = None;
+    let mut unreadable: BTreeSet<PathBuf> = BTreeSet::new();
     // Every directory entry examined, across the whole walk — bounds breadth
     // (and, since each queued directory was itself one such entry, the stack)
     // so an all-empty-directory tree can't run unbounded past `max_files`.
@@ -264,15 +283,38 @@ fn collect_files(
     let mut stack = vec![(root.to_path_buf(), 0usize)];
 
     'walk: while let Some((dir, depth)) = stack.pop() {
-        for entry in std::fs::read_dir(&dir)? {
+        let read_dir = match std::fs::read_dir(&dir) {
+            Ok(rd) => rd,
+            Err(e) => {
+                if depth == 0 {
+                    return Err(e);
+                }
+                unreadable.insert(dir);
+                continue;
+            }
+        };
+
+        for entry in read_dir {
             entries_seen += 1;
             if entries_seen > budget.max_entries {
                 limit_hit = Some(BudgetLimit::Entries);
                 break 'walk;
             }
-            let entry = entry?;
+            let entry = match entry {
+                Ok(e) => e,
+                Err(_) => {
+                    unreadable.insert(dir.clone());
+                    continue;
+                }
+            };
             // `DirEntry::file_type` does not traverse a symlink.
-            let file_type = entry.file_type()?;
+            let file_type = match entry.file_type() {
+                Ok(ft) => ft,
+                Err(_) => {
+                    unreadable.insert(dir.clone());
+                    continue;
+                }
+            };
             let path = entry.path();
 
             if file_type.is_dir() {
@@ -295,7 +337,7 @@ fn collect_files(
     }
 
     out.sort();
-    Ok((out, limit_hit))
+    Ok((out, limit_hit, unreadable.into_iter().collect()))
 }
 
 #[cfg(test)]
@@ -524,5 +566,42 @@ mod tests {
             // "real/x.txt" once, not also via "link/x.txt".
             assert_eq!(scan.results.len(), 1);
         }
+    }
+
+    /// A `chmod 000` subdirectory is recorded, not fatal: the rest of the
+    /// target still scans and the target is reported partial (§11.8/§11.12).
+    #[cfg(unix)]
+    #[test]
+    fn unreadable_subdirectory_is_recorded_and_traversal_continues() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = TempDir::new("unreadable");
+        fs::write(dir.path().join("readable.txt"), b"ok").unwrap();
+        let locked = dir.path().join("locked");
+        fs::create_dir(&locked).unwrap();
+        fs::write(locked.join("inside.txt"), b"hidden").unwrap();
+
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o000)).unwrap();
+
+        // Some environments (root, certain CI containers) ignore directory
+        // permission bits — skip rather than assert a bogus failure.
+        if fs::read_dir(&locked).is_ok() {
+            fs::set_permissions(&locked, fs::Permissions::from_mode(0o755)).unwrap();
+            return;
+        }
+
+        let scan = scan_target(dir.path(), true);
+
+        // Always restore permissions before the TempDir drops, regardless of
+        // the outcome above, so cleanup can recurse into `locked`.
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let scan = scan.unwrap();
+        assert!(scan
+            .results
+            .iter()
+            .any(|r| r.path.ends_with("readable.txt")));
+        assert_eq!(scan.unreadable, vec![locked]);
+        assert!(!scan.coverage_complete());
     }
 }

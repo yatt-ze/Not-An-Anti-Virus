@@ -48,6 +48,9 @@ pub fn run_scan(path: &Path, recursive: bool, json: bool) -> ExitCode {
             path.display()
         );
     }
+    if let Some(note) = unreadable_note(&scan) {
+        eprintln!("{note}");
+    }
     exit::code(exit::for_target(&scan))
 }
 
@@ -166,6 +169,9 @@ fn print_rules_test_multi(scan: &TargetScan) {
     if let Some(note) = budget_note(scan) {
         println!("{note}");
     }
+    if let Some(note) = unreadable_coverage_note(scan) {
+        println!("{note}");
+    }
     println!();
     println!(
         "Worst finding — {}",
@@ -228,6 +234,7 @@ fn multi_json(scan: &TargetScan) -> serde_json::Value {
         "skipped_resources": scan.skipped,
         "coverage_complete": scan.coverage_complete(),
         "budget_limit": budget_limit_str(scan),
+        "unreadable": scan.unreadable,
         "recommendation": scan.recommendation(),
         "results": scan.results,
     })
@@ -244,6 +251,48 @@ fn budget_note(scan: &TargetScan) -> Option<String> {
             budget_limit_label(limit)
         )),
     }
+}
+
+/// A stderr warning naming directories that couldn't be read during
+/// traversal, or `None` when there were none. Traversal continues past each
+/// one (§11.8); their presence is what makes the target's coverage partial
+/// (§11.12).
+fn unreadable_note(scan: &TargetScan) -> Option<String> {
+    if scan.unreadable.is_empty() {
+        return None;
+    }
+    let paths = scan
+        .unreadable
+        .iter()
+        .map(|p| p.display().to_string())
+        .collect::<Vec<_>>()
+        .join(", ");
+    Some(format!(
+        "navctl: partial coverage — {} director(ies) could not be read under {}: {}",
+        scan.unreadable.len(),
+        scan.root.display(),
+        paths
+    ))
+}
+
+/// Human-output counterpart to [`unreadable_note`], formatted like
+/// [`budget_note`] for `rules test`'s multi-file breakdown.
+fn unreadable_coverage_note(scan: &TargetScan) -> Option<String> {
+    if scan.unreadable.is_empty() {
+        return None;
+    }
+    let paths = scan
+        .unreadable
+        .iter()
+        .map(|p| display_relative(&scan.root, p))
+        .collect::<Vec<_>>()
+        .join(", ");
+    Some(format!(
+        "  [PARTIAL COVERAGE: {} director(ies) could not be read under {}: {}]",
+        scan.unreadable.len(),
+        scan.root.display(),
+        paths
+    ))
 }
 
 /// Machine-readable budget-limit tag for `--json`, or `None` if within budget.
@@ -330,6 +379,7 @@ mod tests {
             kind: TargetKind::Directory,
             primary: None,
             skipped: Vec::new(),
+            unreadable: Vec::new(),
             results: vec![sample_result()],
             budget: nav_core::BudgetOutcome::Within,
         };
@@ -347,6 +397,7 @@ mod tests {
             kind: TargetKind::Directory,
             primary: None,
             skipped: Vec::new(),
+            unreadable: Vec::new(),
             results: vec![sample_result()], // complete + NoAction
             budget,
         };

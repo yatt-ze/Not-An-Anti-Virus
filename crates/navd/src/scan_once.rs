@@ -49,6 +49,20 @@ pub fn run(path: &Path, recursive: bool, json: bool) -> ExitCode {
             path.display()
         );
     }
+    if !scan.unreadable.is_empty() {
+        let paths = scan
+            .unreadable
+            .iter()
+            .map(|p| p.display().to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
+        eprintln!(
+            "navd scan-once: partial coverage — {} director(ies) could not be read under {}: {}",
+            scan.unreadable.len(),
+            path.display(),
+            paths
+        );
+    }
 
     nav_core::exit_code(nav_core::for_target(&scan))
 }
