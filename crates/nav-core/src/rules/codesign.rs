@@ -243,9 +243,14 @@ fn run_codesign_verify(ctx: &ScanContext) -> Result<bool, RuleOutcome> {
 }
 
 fn indicates_revocation(stderr: &str) -> bool {
-    // Covers both the literal CSSMERR_TP_CERT_REVOKED constant `codesign`
-    // reports and any future rewording that still says "revoked".
-    stderr.to_lowercase().contains("revoked")
+    // Match only the literal error constant as the trailing diagnostic on a
+    // line — `codesign` prefixes every line with the scanned path (and, with
+    // `--deep`, nested code paths), so a substring match on "revoked" fires
+    // on any path containing that word (#30).
+    stderr.lines().any(|line| {
+        let line = line.trim_end();
+        line == "CSSMERR_TP_CERT_REVOKED" || line.ends_with(": CSSMERR_TP_CERT_REVOKED")
+    })
 }
 
 #[cfg(target_os = "macos")]
@@ -579,6 +584,26 @@ mod tests {
     fn indicates_revocation_is_false_for_an_unrelated_verify_failure() {
         assert!(!indicates_revocation(
             "test-binary: a sealed resource is missing or invalid\n"
+        ));
+    }
+
+    /// Regression for #30: `codesign` prefixes every line with the scanned
+    /// path, so a path containing "revoked" must not itself trigger a match.
+    #[test]
+    fn indicates_revocation_is_false_for_a_path_containing_the_word() {
+        assert!(!indicates_revocation(
+            "/Users/x/unrevoked-tools/tool: valid on disk\n\
+             /Users/x/unrevoked-tools/tool: satisfies its Designated Requirement\n"
+        ));
+    }
+
+    /// A `--deep` nested path can also contain the word without the binary
+    /// actually being revoked.
+    #[test]
+    fn indicates_revocation_is_false_for_a_deep_nested_path_containing_the_word() {
+        assert!(!indicates_revocation(
+            "/Applications/App.app/Contents/Frameworks/Revoked.framework: \
+             a sealed resource is missing or invalid\n"
         ));
     }
 
