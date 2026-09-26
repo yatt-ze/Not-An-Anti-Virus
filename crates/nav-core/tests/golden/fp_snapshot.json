@@ -250,6 +250,15 @@
     ],
     "completeness": "complete"
   },
+  "suspicious/macho_duplicate_code_signature": {
+    "score": 10,
+    "recommendation": "no-action",
+    "rule_ids": [
+      "suspicious-strings",
+      "unsigned-binary"
+    ],
+    "completeness": "partial"
+  },
   "suspicious/macho_fat_malformed_slice": {
     "score": 10,
     "recommendation": "no-action",

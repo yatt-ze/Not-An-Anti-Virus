@@ -380,6 +380,13 @@ fn parse_thin(data: &[u8], base: usize, is_64: bool, be: bool, is_fat: bool) -> 
                 }
             }
         } else if cmd == LC_CODE_SIGNATURE {
+            if has_code_signature {
+                // A second LC_CODE_SIGNATURE has no legitimate meaning and no
+                // documented kernel precedence — rather than guess which one
+                // wins (and risk a bogus second command silently erasing the
+                // real signature's facts, #37), the whole slice is malformed.
+                return None;
+            }
             has_code_signature = true;
             // linkedit_data_command: cmd(4), cmdsize(4), dataoff(4), datasize(4).
             if let (Some(dataoff), Some(datasize)) =
@@ -1040,13 +1047,102 @@ pub(crate) mod tests_support {
         let range = text_off as u64..(text_off + text_payload.len()) as u64;
         (v, range, sig_off)
     }
+
+    /// A thin 64-bit Mach-O with **two** `LC_CODE_SIGNATURE` load commands:
+    /// the first pointing at a real SuperBlob (`entitlements_xml`/`cd_flags`
+    /// as given), the second pointing at zero-length data — the malformed
+    /// shape `parse_thin` must reject outright rather than let the second,
+    /// bogus command silently overwrite the first's facts (#37).
+    pub(crate) fn synth_macho_64_duplicate_code_signature(
+        text_payload: &[u8],
+        entitlements_xml: Option<&[u8]>,
+        cd_flags: Option<u32>,
+    ) -> Vec<u8> {
+        let header_size = 32usize;
+        let seg_cmd_size = 72usize + 80usize; // segment_command_64 + one section_64
+        let codesig_cmd_size = 16usize;
+        let ncmds = 3u32; // __TEXT segment + two LC_CODE_SIGNATURE
+        let cmdsize = seg_cmd_size + codesig_cmd_size * 2;
+        let text_off = header_size + cmdsize;
+
+        let mut v = Vec::new();
+        // --- mach_header_64 (little-endian) ---
+        v.extend_from_slice(&[0xCF, 0xFA, 0xED, 0xFE]); // magic -> BE 0xCFFAEDFE
+        v.extend_from_slice(&0x0100_0007u32.to_le_bytes()); // cputype x86_64
+        v.extend_from_slice(&3u32.to_le_bytes()); // cpusubtype
+        v.extend_from_slice(&2u32.to_le_bytes()); // filetype MH_EXECUTE
+        v.extend_from_slice(&ncmds.to_le_bytes());
+        v.extend_from_slice(&(cmdsize as u32).to_le_bytes());
+        v.extend_from_slice(&0u32.to_le_bytes()); // flags
+        v.extend_from_slice(&0u32.to_le_bytes()); // reserved
+
+        // --- LC_SEGMENT_64 for __TEXT ---
+        v.extend_from_slice(&LC_SEGMENT_64.to_le_bytes());
+        v.extend_from_slice(&(seg_cmd_size as u32).to_le_bytes());
+        v.extend_from_slice(&seg_name(b"__TEXT"));
+        v.extend_from_slice(&0u64.to_le_bytes()); // vmaddr
+        v.extend_from_slice(&0u64.to_le_bytes()); // vmsize
+        v.extend_from_slice(&(text_off as u64).to_le_bytes()); // fileoff
+        v.extend_from_slice(&(text_payload.len() as u64).to_le_bytes()); // filesize
+        v.extend_from_slice(&5u32.to_le_bytes()); // maxprot
+        v.extend_from_slice(&5u32.to_le_bytes()); // initprot
+        v.extend_from_slice(&1u32.to_le_bytes()); // nsects
+        v.extend_from_slice(&0u32.to_le_bytes()); // flags
+
+        // --- section_64 __text ---
+        v.extend_from_slice(&seg_name(b"__text"));
+        v.extend_from_slice(&seg_name(b"__TEXT"));
+        v.extend_from_slice(&0u64.to_le_bytes()); // addr
+        v.extend_from_slice(&(text_payload.len() as u64).to_le_bytes()); // size
+        v.extend_from_slice(&(text_off as u32).to_le_bytes()); // offset
+        v.extend_from_slice(&0u32.to_le_bytes()); // align
+        v.extend_from_slice(&0u32.to_le_bytes()); // reloff
+        v.extend_from_slice(&0u32.to_le_bytes()); // nreloc
+        v.extend_from_slice(&0u32.to_le_bytes()); // flags
+        v.extend_from_slice(&0u32.to_le_bytes()); // reserved1
+        v.extend_from_slice(&0u32.to_le_bytes()); // reserved2
+        v.extend_from_slice(&0u32.to_le_bytes()); // reserved3
+
+        // First LC_CODE_SIGNATURE: dataoff/datasize filled in once the trailing
+        // SuperBlob's offset is known.
+        let first_sig_cmd_at = v.len();
+        v.extend_from_slice(&LC_CODE_SIGNATURE.to_le_bytes());
+        v.extend_from_slice(&(codesig_cmd_size as u32).to_le_bytes());
+        v.extend_from_slice(&0u32.to_le_bytes()); // dataoff placeholder
+        v.extend_from_slice(&0u32.to_le_bytes()); // datasize placeholder
+
+        // Second LC_CODE_SIGNATURE: the duplicate. `parse_thin` must bail on
+        // seeing this command before ever reading its fields, so they're left
+        // as zero.
+        v.extend_from_slice(&LC_CODE_SIGNATURE.to_le_bytes());
+        v.extend_from_slice(&(codesig_cmd_size as u32).to_le_bytes());
+        v.extend_from_slice(&0u32.to_le_bytes()); // dataoff
+        v.extend_from_slice(&0u32.to_le_bytes()); // datasize
+
+        assert_eq!(v.len(), text_off);
+        v.extend_from_slice(text_payload);
+
+        let sig_off = v.len();
+        let cds: Vec<(u32, u32)> = cd_flags
+            .map(|flags| vec![(CSSLOT_CODEDIRECTORY, flags)])
+            .unwrap_or_default();
+        let blob = build_signature_blob(entitlements_xml, &cds);
+        v[first_sig_cmd_at + 8..first_sig_cmd_at + 12]
+            .copy_from_slice(&(sig_off as u32).to_le_bytes());
+        v[first_sig_cmd_at + 12..first_sig_cmd_at + 16]
+            .copy_from_slice(&(blob.len() as u32).to_le_bytes());
+        v.extend_from_slice(&blob);
+
+        v
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::tests_support::{
         synth_fat, synth_fat_with_bogus_arches, synth_fat_with_duplicate_offsets, synth_macho_64,
-        synth_macho_64_full, synth_macho_64_full_with_cd_flags, synth_macho_64_full_with_cds,
+        synth_macho_64_duplicate_code_signature, synth_macho_64_full,
+        synth_macho_64_full_with_cd_flags, synth_macho_64_full_with_cds,
     };
     use super::*;
 
@@ -1313,6 +1409,38 @@ mod tests {
     fn no_code_directory_blob_is_none_not_zero() {
         let (image, _, _) = synth_macho_64_full(b"code", &[], &[], true, None);
         assert_eq!(parse(&image).unwrap().code_directory_flags, None);
+    }
+
+    /// A second `LC_CODE_SIGNATURE` has no legal meaning — rather than guess
+    /// which one the kernel would honor, the whole slice is malformed and a
+    /// thin file yields no image at all (#37).
+    #[test]
+    fn duplicate_code_signature_command_makes_the_thin_slice_malformed() {
+        let entitlements = br#"<?xml version="1.0"?><plist><dict>
+            <key>com.apple.security.cs.disable-library-validation</key><true/>
+        </dict></plist>"#;
+        let image =
+            synth_macho_64_duplicate_code_signature(b"code", Some(entitlements), Some(CS_ADHOC));
+        assert!(
+            parse(&image).is_none(),
+            "a duplicate LC_CODE_SIGNATURE must not silently keep or erase the first \
+             signature's facts"
+        );
+    }
+
+    /// As above, but as one slice of a fat binary: the malformed slice must
+    /// count as skipped rather than disappear silently or take down the
+    /// sibling slice (#37).
+    #[test]
+    fn duplicate_code_signature_in_one_fat_slice_is_skipped() {
+        let (clean, _, _) =
+            synth_macho_64_full(b"clean", &["/usr/lib/libSystem.B.dylib"], &[], false, None);
+        let bad = synth_macho_64_duplicate_code_signature(b"bad", None, Some(CS_ADHOC));
+        let fat = synth_fat(&[&clean, &bad]);
+
+        let (images, skipped) = parse_all_slices(&fat, false);
+        assert_eq!(images.len(), 1);
+        assert_eq!(skipped, 1);
     }
 
     /// XNU accepts a CodeDirectory in any of 5 alternate slots

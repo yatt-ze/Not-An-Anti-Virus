@@ -711,8 +711,8 @@ mod tests {
 #[cfg(test)]
 mod fixture_gen {
     use crate::macho::tests_support::{
-        synth_fat, synth_fat_with_bogus_arches_aligned, synth_macho_64_full,
-        synth_macho_64_full_with_cd_flags,
+        synth_fat, synth_fat_with_bogus_arches_aligned, synth_macho_64_duplicate_code_signature,
+        synth_macho_64_full, synth_macho_64_full_with_cd_flags,
     };
     use crate::macho::CS_ADHOC;
     use std::path::Path;
@@ -864,5 +864,29 @@ mod fixture_gen {
         );
         let many_arches = synth_fat_with_bogus_arches_aligned(&many_arches_slice, 24, 16);
         std::fs::write(root.join("suspicious/macho_fat_many_arches"), many_arches).unwrap();
+
+        // Suspicious: thin, two LC_CODE_SIGNATURE commands — the first
+        // carrying a real ad-hoc signature with disable-library-validation,
+        // the second pointing at zero-length data. `parse_thin` must reject
+        // this as malformed rather than let the second command silently
+        // erase the first's facts (#37); an `osascript` string keeps
+        // suspicious-strings firing on Ubuntu CI, where this rule reads back
+        // as NotApplicable (no walkable image) and the completeness gate is
+        // what pins this fixture's `partial` golden entry.
+        let duplicate_cs_entitlements = br#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+    <key>com.apple.security.cs.disable-library-validation</key><true/>
+</dict></plist>"#;
+        let duplicate_cs = synth_macho_64_duplicate_code_signature(
+            b"\x55\x48\x89\xe5\x90 shells out via osascript for testing",
+            Some(duplicate_cs_entitlements),
+            Some(CS_ADHOC),
+        );
+        std::fs::write(
+            root.join("suspicious/macho_duplicate_code_signature"),
+            duplicate_cs,
+        )
+        .unwrap();
     }
 }
