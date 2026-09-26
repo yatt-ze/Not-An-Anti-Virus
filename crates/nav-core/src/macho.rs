@@ -106,15 +106,29 @@ pub fn parse(data: &[u8]) -> Option<MachOImage> {
 /// fat-table order. Empty for non-Mach-O input, a truncated stub, or a fat
 /// container with no walkable slice (incl. a Java `.class`). Structure rules
 /// iterate this so a fat binary is judged on all its slices, not just the
-/// first (§5.2).
+/// first (§5.2). A thin wrapper over [`parse_all_slices`] for callers that
+/// don't need the skipped-arch count.
 pub fn parse_all(data: &[u8]) -> Vec<MachOImage> {
+    parse_all_slices(data).0
+}
+
+/// As [`parse_all`], plus the number of *declared* fat-table arches that
+/// couldn't be walked (bad table entry, an offset past the bytes held, a
+/// non-Mach-O slice magic, or a `parse_thin` failure) — nonzero here means a
+/// slice's contents genuinely couldn't be judged, not that there was nothing
+/// to judge. Always `0` for thin input or non-Mach-O input, since neither
+/// declares a slice count to compare against.
+pub fn parse_all_slices(data: &[u8]) -> (Vec<MachOImage>, usize) {
     match be_u32(data, 0) {
         Some(FAT_MAGIC) | Some(FAT_MAGIC_64) => parse_fat_all(data),
         Some(magic) => match thin_kind(magic) {
-            Some((is_64, be)) => parse_thin(data, 0, is_64, be, false).into_iter().collect(),
-            None => Vec::new(),
+            Some((is_64, be)) => (
+                parse_thin(data, 0, is_64, be, false).into_iter().collect(),
+                0,
+            ),
+            None => (Vec::new(), 0),
         },
-        None => Vec::new(),
+        None => (Vec::new(), 0),
     }
 }
 
@@ -165,19 +179,24 @@ fn plausible_fat_header(data: &[u8]) -> Option<(bool, u32)> {
 }
 
 /// Walk every arch of a fat/universal binary, collecting the slices this
-/// parser can read (in fat-table order). Empty for an implausible fat header
-/// (incl. a Java `.class`, see [`plausible_fat_header`]).
-fn parse_fat_all(data: &[u8]) -> Vec<MachOImage> {
+/// parser can read (in fat-table order) plus how many declared arches
+/// couldn't be. `(empty, 0)` for an implausible fat header (incl. a Java
+/// `.class`, see [`plausible_fat_header`]) — there's no declared arch count
+/// to trust in that case, so it's "not a fat binary," not "every arch
+/// skipped."
+fn parse_fat_all(data: &[u8]) -> (Vec<MachOImage>, usize) {
     let mut out = Vec::new();
+    let mut skipped = 0usize;
     let Some((is_64, nfat)) = plausible_fat_header(data) else {
-        return out;
+        return (out, skipped);
     };
     for i in 0..nfat as usize {
-        if let Some(img) = fat_member(data, is_64, i) {
-            out.push(img);
+        match fat_member(data, is_64, i) {
+            Some(img) => out.push(img),
+            None => skipped += 1,
         }
     }
-    out
+    (out, skipped)
 }
 
 /// Parse fat arch `i`'s slice, or `None` if its table entry or object offset
@@ -1024,5 +1043,52 @@ mod tests {
         let (image, _, _) = synth_macho_64_full(b"code", &[], &refs, false, None);
         let parsed = parse(&image).unwrap();
         assert!(parsed.rpaths.len() <= MAX_RPATHS);
+    }
+
+    #[test]
+    fn parse_all_slices_counts_unwalkable_arches() {
+        let (good, _, _) = synth_macho_64_full(b"good", &[], &[], false, None);
+        let garbage: &[u8] = &[0xDE, 0xAD, 0xBE, 0xEF, 0, 0, 0, 0];
+        let fat = synth_fat(&[&good, garbage]);
+        let (images, skipped) = parse_all_slices(&fat);
+        assert_eq!(images.len(), 1);
+        assert_eq!(skipped, 1);
+    }
+
+    #[test]
+    fn thin_and_two_clean_slices_report_zero_skipped() {
+        let (thin, _) = synth_macho_64(b"code");
+        assert_eq!(parse_all_slices(&thin), (parse_all(&thin), 0));
+
+        let (a, _, _) = synth_macho_64_full(b"aaaa", &[], &[], false, None);
+        let (b, _, _) = synth_macho_64_full(b"bbbb", &[], &[], false, None);
+        let fat = synth_fat(&[&a, &b]);
+        let (images, skipped) = parse_all_slices(&fat);
+        assert_eq!(images.len(), 2);
+        assert_eq!(skipped, 0);
+    }
+
+    #[test]
+    fn an_implausible_fat_header_reports_zero_skipped_not_all_skipped() {
+        // Java-.class-shaped header: not a fat binary at all, so this reads
+        // as "nothing declared," not "every arch skipped."
+        let mut v = vec![0xCA, 0xFE, 0xBA, 0xBE];
+        v.extend_from_slice(&0x0000_0034u32.to_be_bytes());
+        v.extend_from_slice(&[0u8; 64]);
+        assert_eq!(parse_all_slices(&v), (Vec::new(), 0));
+    }
+
+    #[test]
+    fn a_fat_table_entry_pointing_past_eof_is_skipped_and_counted() {
+        let (good, _, _) = synth_macho_64_full(b"good", &[], &[], false, None);
+        let mut fat = synth_fat(&[&good, &good]);
+        let total_len = fat.len() as u32;
+        // Corrupt the second fat_arch's offset field (bytes 36..40: the
+        // second 20-byte fat_arch entry starts at 28, offset is its 3rd u32)
+        // to point past EOF.
+        fat[36..40].copy_from_slice(&(total_len + 1000).to_be_bytes());
+        let (images, skipped) = parse_all_slices(&fat);
+        assert_eq!(images.len(), 1);
+        assert_eq!(skipped, 1);
     }
 }

@@ -69,7 +69,7 @@ impl Rule for MachOStructureRule {
         // Recognized Mach-O magic that the parser couldn't walk within its
         // bounds (truncated header, malformed load commands, or a fat container
         // with no walkable slice) — "couldn't check," not "clean" (§10/§11.8).
-        let images = macho::parse_all(content);
+        let (images, skipped_slices) = macho::parse_all_slices(content);
         if images.is_empty() {
             return Err(RuleOutcome::NotApplicable);
         }
@@ -77,7 +77,9 @@ impl Rule for MachOStructureRule {
         // Judge a fat binary on all its slices: a malicious arm64 slice must
         // not disappear behind a clean x86_64 one (§5.2). Load-path anomalies
         // are unioned across slices; each slice's entitlements are scored on
-        // its own signed/unsigned status.
+        // its own signed/unsigned status. `skipped_slices > 0` means at least
+        // one *declared* arch couldn't be walked at all — a deliberately
+        // malformed slice must not hide behind the rest coming back clean.
         let mut bad_paths: Vec<&str> = Vec::new();
         let mut findings: Vec<(i32, String)> = Vec::new();
         let mut entitlements_gap = false;
@@ -117,7 +119,7 @@ impl Rule for MachOStructureRule {
         }
 
         if findings.is_empty() {
-            return if entitlements_gap {
+            return if entitlements_gap || skipped_slices > 0 {
                 Err(RuleOutcome::NotApplicable)
             } else {
                 Ok(None)
@@ -524,6 +526,48 @@ mod tests {
             Err(RuleOutcome::NotApplicable)
         ));
     }
+
+    #[test]
+    fn two_clean_fat_slices_score_nothing() {
+        let (a, _, _) =
+            synth_macho_64_full(b"aaaa", &["/usr/lib/libSystem.B.dylib"], &[], false, None);
+        let (b, _, _) =
+            synth_macho_64_full(b"bbbb", &["/usr/lib/libSystem.B.dylib"], &[], false, None);
+        let fat = synth_fat(&[&a, &b]);
+        assert!(matches!(
+            MachOStructureRule.evaluate(&ctx_for(fat)),
+            Ok(None)
+        ));
+    }
+
+    #[test]
+    fn an_unwalkable_slice_alongside_a_clean_one_is_not_applicable() {
+        // A malformed-on-purpose slice (bad magic) must not hide behind a
+        // clean slice reading as scored-fine (§38).
+        let (clean, _, _) =
+            synth_macho_64_full(b"clean", &["/usr/lib/libSystem.B.dylib"], &[], false, None);
+        let garbage: &[u8] = &[0xDE, 0xAD, 0xBE, 0xEF, 0, 0, 0, 0];
+        let fat = synth_fat(&[&clean, garbage]);
+        assert!(matches!(
+            MachOStructureRule.evaluate(&ctx_for(fat)),
+            Err(RuleOutcome::NotApplicable)
+        ));
+    }
+
+    #[test]
+    fn an_unwalkable_slice_does_not_hide_a_real_finding_in_the_good_slice() {
+        // Same shape as above, but the walkable slice has its own anomaly —
+        // that finding must still stand even though a sibling slice was
+        // unwalkable.
+        let (clean, _, _) = synth_macho_64_full(b"clean", &[], &["/tmp/evil-rpath"], false, None);
+        let garbage: &[u8] = &[0xDE, 0xAD, 0xBE, 0xEF, 0, 0, 0, 0];
+        let fat = synth_fat(&[&clean, garbage]);
+        let sig = MachOStructureRule
+            .evaluate(&ctx_for(fat))
+            .unwrap()
+            .expect("the good slice's finding must still surface");
+        assert!(sig.description.contains("writable/transient"));
+    }
 }
 
 /// Regenerates the fp-harness fixtures this rule's coverage depends on.
@@ -533,7 +577,9 @@ mod tests {
 /// deliberate change; review the resulting `git diff` before committing.
 #[cfg(test)]
 mod fixture_gen {
-    use crate::macho::tests_support::{synth_macho_64_full, synth_macho_64_full_with_cd_flags};
+    use crate::macho::tests_support::{
+        synth_fat, synth_macho_64_full, synth_macho_64_full_with_cd_flags,
+    };
     use std::path::Path;
 
     #[test]
@@ -621,5 +667,22 @@ mod fixture_gen {
             adhoc,
         )
         .unwrap();
+
+        // Suspicious: a fat binary with one clean slice and one malformed
+        // (bad-magic) slice — the malformed slice must degrade the scan to
+        // NotApplicable/Partial rather than let the clean slice look fine on
+        // its own (§38). The clean slice carries an `osascript` string so the
+        // cross-platform suspicious-strings rule still fires on Ubuntu, where
+        // the codesign-backed rules don't run.
+        let (clean_slice, _, _) = synth_macho_64_full(
+            b"\x55\x48\x89\xe5\x90 shells out via osascript for testing",
+            &["/usr/lib/libSystem.B.dylib"],
+            &[],
+            false,
+            None,
+        );
+        let malformed_slice: &[u8] = &[0xDE, 0xAD, 0xBE, 0xEF, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+        let fat = synth_fat(&[&clean_slice, malformed_slice]);
+        std::fs::write(root.join("suspicious/macho_fat_malformed_slice"), fat).unwrap();
     }
 }

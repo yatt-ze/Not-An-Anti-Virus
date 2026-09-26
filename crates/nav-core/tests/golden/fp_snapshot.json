@@ -208,6 +208,14 @@
       "unsigned-binary"
     ]
   },
+  "suspicious/macho_fat_malformed_slice": {
+    "score": 10,
+    "recommendation": "no-action",
+    "rule_ids": [
+      "suspicious-strings",
+      "unsigned-binary"
+    ]
+  },
   "suspicious/macho_tmp_rpath_disable_lib_validation": {
     "score": 29,
     "recommendation": "notify",
