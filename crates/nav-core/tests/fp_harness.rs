@@ -8,7 +8,8 @@
 //!
 //! Guards against: a rule change pushing a benign sample over the alert
 //! threshold, making scoring nondeterministic, or (via the golden snapshot)
-//! silently changing a fixture's score, recommendation, or fired rule ids.
+//! silently changing a fixture's score, recommendation, fired rule ids, or
+//! scan completeness.
 
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -349,14 +350,16 @@ fn runtime_percentiles(runtimes: &mut [Duration]) -> (Duration, Duration) {
 /// For a directory/`.app` target this is the target-level verdict — the
 /// worst scanned member's score/recommendation, via
 /// `TargetScan::recommendation`/`worst` — plus the sorted union of rule ids
-/// fired across every scanned member. For a single-file target this
-/// collapses to that one file's own score/recommendation/signals.
+/// fired across every scanned member and the worst completeness anywhere in
+/// the scan (see [`overall_completeness`]). For a single-file target this
+/// collapses to that one file's own score/recommendation/signals/completeness.
 #[cfg(target_os = "macos")]
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 struct FixtureSnapshot {
     score: i32,
     recommendation: Recommendation,
     rule_ids: Vec<String>,
+    completeness: ScanCompleteness,
 }
 
 #[cfg(target_os = "macos")]
@@ -366,8 +369,38 @@ impl FixtureSnapshot {
             score: scan.worst().map(|r| r.score).unwrap_or(0),
             recommendation: scan.recommendation(),
             rule_ids: fired_rule_ids(scan),
+            completeness: overall_completeness(scan),
         }
     }
+}
+
+/// The worst completeness a fixture's scan actually achieved: the worst
+/// per-file `ScanResult::completeness` across `scan.results` (Indeterminate >
+/// Partial > Complete), degraded to at least `Partial` when
+/// `!scan.coverage_complete()` (a budget ceiling or unreadable subdirectory
+/// cut the target scan short even if every scored file was individually
+/// `Complete`, §11.8/§11.12). `Complete` when nothing was scanned and
+/// coverage was otherwise whole.
+#[cfg(target_os = "macos")]
+fn overall_completeness(scan: &TargetScan) -> ScanCompleteness {
+    fn rank(c: ScanCompleteness) -> u8 {
+        match c {
+            ScanCompleteness::Complete => 0,
+            ScanCompleteness::Partial => 1,
+            ScanCompleteness::Indeterminate => 2,
+        }
+    }
+
+    let mut worst = scan
+        .results
+        .iter()
+        .map(|r| r.completeness)
+        .max_by_key(|c| rank(*c))
+        .unwrap_or(ScanCompleteness::Complete);
+    if !scan.coverage_complete() && rank(worst) < rank(ScanCompleteness::Partial) {
+        worst = ScanCompleteness::Partial;
+    }
+    worst
 }
 
 #[cfg(target_os = "macos")]
@@ -433,13 +466,15 @@ fn golden_snapshot_matches_known_fixtures() {
         match expected.get(key) {
             Some(expected_snap) if expected_snap == actual_snap => {}
             Some(expected_snap) => diffs.push(format!(
-                "{key}:\n  expected: score={} recommendation={:?} rule_ids={:?}\n  actual:   score={} recommendation={:?} rule_ids={:?}",
+                "{key}:\n  expected: score={} recommendation={:?} rule_ids={:?} completeness={:?}\n  actual:   score={} recommendation={:?} rule_ids={:?} completeness={:?}",
                 expected_snap.score,
                 expected_snap.recommendation,
                 expected_snap.rule_ids,
+                expected_snap.completeness,
                 actual_snap.score,
                 actual_snap.recommendation,
                 actual_snap.rule_ids,
+                actual_snap.completeness,
             )),
             None => diffs.push(format!("{key}: new fixture, missing from golden file")),
         }
