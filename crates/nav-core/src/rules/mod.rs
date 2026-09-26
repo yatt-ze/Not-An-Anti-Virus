@@ -34,6 +34,19 @@ pub enum RuleOutcome {
     NotApplicable,
 }
 
+/// Per-user/system temp and shared-writable locations a legitimate program
+/// almost never runs or loads from. Shared so the persistence and
+/// Mach-O-loader rules can't drift apart on what counts as transient (§39).
+pub(super) const TRANSIENT_PREFIXES: &[&str] = &[
+    "/tmp/",
+    "/private/tmp/",
+    "/var/tmp/",
+    "/private/var/tmp/",
+    "/var/folders/",
+    "/private/var/folders/",
+    "/Users/Shared/",
+];
+
 pub trait Rule: Send + Sync {
     /// Stable id, used in output and by the false-positive harness.
     fn id(&self) -> &'static str;

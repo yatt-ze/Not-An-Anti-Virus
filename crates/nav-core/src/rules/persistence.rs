@@ -177,16 +177,7 @@ impl<'a> LaunchdJob<'a> {
     /// program almost never does — a temp/cache tree or a hidden directory.
     fn program_in_unusual_location(&self) -> Option<&str> {
         let exe = self.executable()?;
-        const TRANSIENT_PREFIXES: &[&str] = &[
-            "/tmp/",
-            "/private/tmp/",
-            "/var/tmp/",
-            "/private/var/tmp/",
-            "/var/folders/",
-            "/private/var/folders/",
-            "/Users/Shared/",
-        ];
-        let in_transient = TRANSIENT_PREFIXES.iter().any(|p| exe.starts_with(p));
+        let in_transient = super::TRANSIENT_PREFIXES.iter().any(|p| exe.starts_with(p));
         let hidden = hidden_component(exe)
             .is_some_and(|(name, under_home)| !(under_home && TOOL_ROOTS.contains(&name)));
         (in_transient || hidden).then_some(exe)
