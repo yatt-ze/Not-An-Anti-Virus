@@ -169,23 +169,33 @@ impl HighEntropyRule {
 
     /// Scan for a base64-encoded high-entropy payload: find maximal runs of
     /// the base64 alphabet, walk each run as a sequence of wrapped-base64
-    /// *blocks* and single-line boundaries (§ module docs — a block is a
-    /// candidate on its own, so an unrelated short line — blank, a wordlist
-    /// entry, a heredoc terminator — can't fuse an adjacent real payload into
-    /// a run it fails to qualify as, nor smuggle itself in as part of one),
-    /// skip candidates that are ordinary data-URI or PEM carriers, decode the
-    /// rest, and score the first decoded candidate whose entropy clears the
-    /// threshold. Every candidate is examined — content is already capped at
-    /// 8 MiB (§3) and each candidate's decode is bounded by its own length,
-    /// so there's no separate work cap for a payload to hide behind many
-    /// decoys.
+    /// *blocks* and single-line boundaries (a block is a candidate on its
+    /// own, so an unrelated short line — blank, a wordlist entry, a heredoc
+    /// terminator — can't fuse an adjacent real payload into a run it fails
+    /// to qualify as, nor smuggle itself in as part of one), decide once per
+    /// run — from the first candidate segment long enough to matter, module
+    /// docs above — whether it's an ordinary data-URI or PEM carrier whose
+    /// decoded bytes actually match what it claims, and if so skip every
+    /// candidate in the run; otherwise score the first one whose entropy
+    /// clears the threshold. Every candidate is examined — content is
+    /// already capped at 8 MiB (§3) and each candidate's decode is bounded
+    /// by its own length, so there's no separate work cap for a payload to
+    /// hide behind many decoys.
     fn eval_base64_payload(&self, content: &[u8]) -> Option<MatchedSignal> {
         let mut pos = 0;
         while let Some((run_start, run_end, resume)) = next_base64_run(content, pos) {
+            let carrier = Carrier::detect(content, run_start);
+            let mut carrier_confirmed = None;
             let mut seg_start = run_start;
             while seg_start < run_end {
                 let (seg_end, next_start) = next_base64_segment(content, seg_start, run_end);
-                if let Some(signal) = self.try_base64_candidate(content, seg_start, seg_end) {
+                if let Some(signal) = self.try_base64_candidate(
+                    content,
+                    seg_start,
+                    seg_end,
+                    &carrier,
+                    &mut carrier_confirmed,
+                ) {
                     return Some(signal);
                 }
                 seg_start = next_start;
@@ -195,12 +205,19 @@ impl HighEntropyRule {
         None
     }
 
-    /// Evaluate one candidate byte range as a possible base64 payload.
+    /// Evaluate one candidate byte range as a possible base64 payload. The
+    /// first candidate in a run long enough to decode also settles
+    /// `carrier_confirmed` for the rest of the run: a short leading segment
+    /// (a stray header word, a blank line) decodes to noise, not the
+    /// payload's true start, so it's skipped for this decision — but once
+    /// settled, the same verdict applies to every candidate in the run.
     fn try_base64_candidate(
         &self,
         content: &[u8],
         start: usize,
         end: usize,
+        carrier: &Carrier,
+        carrier_confirmed: &mut Option<bool>,
     ) -> Option<MatchedSignal> {
         let run = &content[start..end];
         let alphabet_len = run
@@ -211,16 +228,14 @@ impl HighEntropyRule {
             return None;
         }
 
-        // Ordinary carrier for high-entropy bytes, not an obfuscation attempt.
-        if preceded_by_data_uri(content, start) {
-            return None;
-        }
-        // Same: a certificate/key bundle, not a payload.
-        if preceded_by_pem_begin(content, start) {
-            return None;
-        }
-
         let decoded = base64::decode_bounded(run, run.len(), base64::OnInvalid::Stop);
+        let confirmed = *carrier_confirmed.get_or_insert_with(|| {
+            !matches!(carrier, Carrier::None)
+                && carrier.matches(&decoded[..decoded.len().min(CARRIER_MAGIC_PREFIX_BYTES)])
+        });
+        if confirmed {
+            return None;
+        }
         if decoded.len() < MIN_DECODED_BYTES {
             return None;
         }
@@ -374,28 +389,181 @@ fn next_base64_run(content: &[u8], from: usize) -> Option<(usize, usize, usize)>
     }
 }
 
-/// Whether the run starting at `start` is a data-URI payload — the bytes
-/// immediately before it end `;base64,`.
-fn preceded_by_data_uri(content: &[u8], start: usize) -> bool {
-    let lookback = &content[start.saturating_sub(128)..start];
-    lookback.ends_with(b";base64,")
+/// How many preceding lines [`find_pem_carrier`] will look back through
+/// (header lines and a blank separator) to find a `-----BEGIN ` line.
+const PEM_LOOKBACK_LINES: usize = 8;
+
+/// Bytes to search backward from a `;base64,` suffix for a `data:` prefix —
+/// mime types are short, so this is generous.
+const MAX_MIME_LOOKBACK: usize = 64;
+
+/// What a base64 run is claimed to carry, read once from the text before it
+/// (§5.2): a run immediately preceded by `;base64,` (a data URI) or, within
+/// [`PEM_LOOKBACK_LINES`], a `-----BEGIN ` line (PEM armor). Whether it's
+/// actually skipped is a separate, later decision ([`HighEntropyRule::try_base64_candidate`]):
+/// the claim only holds once a candidate's *decoded* bytes match it
+/// ([`Carrier::matches`]) — a spoofed prefix in front of an unrelated
+/// payload matches nothing and skips nothing.
+enum Carrier {
+    None,
+    /// The mime type's expected magic bytes, or `None` for an unrecognized
+    /// mime (never matches — scored normally).
+    DataUri(Option<&'static [u8]>),
+    Pem(PemArmor),
 }
 
-/// Whether the run starting at `start` is PEM armor — ignoring trailing
-/// whitespace, the preceding line starts `-----BEGIN `.
-fn preceded_by_pem_begin(content: &[u8], start: usize) -> bool {
-    let lookback = &content[start.saturating_sub(256)..start];
-    let mut end = lookback.len();
-    while end > 0 && lookback[end - 1].is_ascii_whitespace() {
-        end -= 1;
+/// A `-----BEGIN `-armored carrier's shape, as read from its label and
+/// header lines.
+struct PemArmor {
+    /// The label contains `PGP` — an OpenPGP packet, not DER.
+    is_pgp: bool,
+    /// A `Proc-Type: 4,ENCRYPTED` header — a legacy OpenSSL encrypted key.
+    /// Its body is ciphertext with no magic to check.
+    is_legacy_encrypted: bool,
+}
+
+impl Carrier {
+    fn detect(content: &[u8], run_start: usize) -> Carrier {
+        if let Some(pem) = find_pem_carrier(content, run_start) {
+            return Carrier::Pem(pem);
+        }
+        if let Some(mime) = find_data_uri_mime(content, run_start) {
+            return Carrier::DataUri(data_uri_magic(mime));
+        }
+        Carrier::None
     }
-    let trimmed = &lookback[..end];
-    let line_start = trimmed
-        .iter()
-        .rposition(|&b| b == b'\n')
-        .map(|p| p + 1)
-        .unwrap_or(0);
-    trimmed[line_start..].starts_with(b"-----BEGIN ")
+
+    /// Whether `decoded` (the run's own decoded start) matches what this
+    /// carrier claims to hold.
+    fn matches(&self, decoded: &[u8]) -> bool {
+        match self {
+            Carrier::None => false,
+            Carrier::DataUri(magic) => magic.is_some_and(|m| decoded.starts_with(m)),
+            Carrier::Pem(pem) => pem.matches(decoded),
+        }
+    }
+}
+
+/// Bytes of decoded prefix needed to check any carrier's magic (the longest
+/// is 4 bytes) — enough regardless of which candidate settles the check.
+const CARRIER_MAGIC_PREFIX_BYTES: usize = 8;
+
+impl PemArmor {
+    fn matches(&self, decoded: &[u8]) -> bool {
+        if self.is_legacy_encrypted {
+            return true; // ciphertext — no magic to check
+        }
+        let Some(&first) = decoded.first() else {
+            return false;
+        };
+        if first == 0x30 {
+            return true; // DER SEQUENCE
+        }
+        self.is_pgp && first & 0x80 != 0 // OpenPGP packet tag
+    }
+}
+
+/// Find a PEM carrier for the run starting at `run_start`: walk backward
+/// through the text lines ending at `run_start` (a base64 run can start
+/// mid-line — a header value's last word, or a line's own trailing `\n`, is
+/// itself a run byte — so this reconstructs lines from raw text, independent
+/// of run boundaries). Up to [`PEM_LOOKBACK_LINES`] lines are tolerated, each
+/// blank or a `Key: value` header (`Version:`, `Proc-Type:`, ... — real PEM/
+/// PGP shape, not part of the base64 body), until a `-----BEGIN ` line is
+/// found; running out of budget or hitting a line that's neither means no
+/// carrier.
+fn find_pem_carrier(content: &[u8], run_start: usize) -> Option<PemArmor> {
+    let mut end = run_start;
+    let mut is_legacy_encrypted = false;
+
+    for _ in 0..PEM_LOOKBACK_LINES {
+        if end == 0 {
+            return None;
+        }
+        let start = content[..end]
+            .iter()
+            .rposition(|&b| b == b'\n')
+            .map(|p| p + 1)
+            .unwrap_or(0);
+        let line_end = if end > start && content[end - 1] == b'\r' {
+            end - 1
+        } else {
+            end
+        };
+        let line = &content[start..line_end];
+
+        if line.starts_with(b"-----BEGIN ") {
+            return Some(PemArmor {
+                is_pgp: contains_bytes(line, b"PGP"),
+                is_legacy_encrypted,
+            });
+        }
+        if is_blank_line(line) {
+            end = start.saturating_sub(1);
+            continue;
+        }
+        if is_header_line(line) {
+            if line.starts_with(b"Proc-Type:") && contains_bytes(line, b"ENCRYPTED") {
+                is_legacy_encrypted = true;
+            }
+            end = start.saturating_sub(1);
+            continue;
+        }
+        return None;
+    }
+    None
+}
+
+fn is_blank_line(line: &[u8]) -> bool {
+    line.iter().all(|b| b.is_ascii_whitespace())
+}
+
+/// Whether `line` looks like a `Key: value` header — a run of alphanumeric/
+/// `-` characters, followed by `:`.
+fn is_header_line(line: &[u8]) -> bool {
+    match line.iter().position(|&b| b == b':') {
+        Some(0) => false,
+        Some(i) => line[..i]
+            .iter()
+            .all(|&b| b.is_ascii_alphanumeric() || b == b'-'),
+        None => false,
+    }
+}
+
+fn contains_bytes(haystack: &[u8], needle: &[u8]) -> bool {
+    haystack.windows(needle.len()).any(|w| w == needle)
+}
+
+/// Find the mime type of a data URI whose base64 body starts at `run_start`:
+/// the bytes immediately before it must end `;base64,`, with a `data:`
+/// prefix within [`MAX_MIME_LOOKBACK`] bytes before that.
+fn find_data_uri_mime(content: &[u8], run_start: usize) -> Option<&[u8]> {
+    let before = &content[..run_start];
+    if !before.ends_with(b";base64,") {
+        return None;
+    }
+    let mime_end = before.len() - b";base64,".len();
+    let search_start = mime_end.saturating_sub(MAX_MIME_LOOKBACK);
+    let window = &content[search_start..mime_end];
+    let data_pos = window.windows(5).rposition(|w| w == b"data:")?;
+    Some(&content[search_start + data_pos + 5..mime_end])
+}
+
+/// Expected magic bytes for a known mime type carried as a data URI, or
+/// `None` for one this rule doesn't recognize.
+fn data_uri_magic(mime: &[u8]) -> Option<&'static [u8]> {
+    match mime {
+        b"image/png" => Some(b"\x89PNG"),
+        b"image/jpeg" => Some(b"\xFF\xD8\xFF"),
+        b"image/gif" => Some(b"GIF8"),
+        b"image/webp" => Some(b"RIFF"),
+        b"font/woff" | b"application/font-woff" => Some(b"wOFF"),
+        b"font/woff2" => Some(b"wOF2"),
+        b"application/pdf" => Some(b"%PDF"),
+        b"application/zip" => Some(b"PK\x03\x04"),
+        b"application/gzip" | b"application/x-gzip" => Some(b"\x1f\x8b"),
+        _ => None,
+    }
 }
 
 /// Whether `content`/`path` looks like a script or text file (which could
@@ -459,6 +627,14 @@ fn shannon_entropy(data: &[u8]) -> f64 {
 mod tests {
     use super::*;
     use std::path::PathBuf;
+
+    /// `total_len` high-entropy bytes, starting with `magic` — for building
+    /// a payload that a content-validated carrier check should recognize.
+    fn magic_prefixed_blob(magic: &[u8], total_len: usize) -> Vec<u8> {
+        let mut out = magic.to_vec();
+        out.extend(high_entropy_blob(total_len - magic.len()));
+        out
+    }
 
     fn high_entropy_blob(len: usize) -> Vec<u8> {
         // Deterministic pseudo-random fill, no external RNG dependency.
@@ -617,7 +793,8 @@ mod tests {
 
     #[test]
     fn base64_payload_in_a_data_uri_is_not_scored() {
-        let payload = high_entropy_blob(1536);
+        // Decoded bytes carry the real PNG signature — a genuine carrier.
+        let payload = magic_prefixed_blob(b"\x89PNG\r\n\x1a\n", 1536);
         let encoded = base64_encode(&payload);
         let content = format!("export const icon = \"data:image/png;base64,{encoded}\";\n");
         let ctx = make_ctx("icon.js", content.into_bytes());
@@ -625,14 +802,85 @@ mod tests {
     }
 
     #[test]
+    fn png_data_uri_wrapped_across_multiple_segments_is_not_scored() {
+        // Two different wrap widths mid-stream force the run to split into
+        // more than one segment; the carrier decision is made once for the
+        // whole run, so both segments stay skipped.
+        let payload = magic_prefixed_blob(b"\x89PNG\r\n\x1a\n", 4096);
+        let encoded = base64_encode(&payload);
+        let mid = (encoded.len() / 2 / 4) * 4; // keep the split on a 4-char boundary
+        let (first_half, second_half) = encoded.split_at(mid);
+        let wrapped = format!("{}\n{}", wrap(first_half, 76), wrap(second_half, 50));
+        let content = format!("export const icon = \"data:image/png;base64,{wrapped}\";\n");
+        let ctx = make_ctx("icon.js", content.into_bytes());
+        assert!(HighEntropyRule::default().evaluate(&ctx).unwrap().is_none());
+    }
+
+    #[test]
+    fn spoofed_data_uri_prefix_is_scored() {
+        // Claims image/png but the decoded bytes are a gzip stream — the
+        // carrier claim doesn't match, so it's scored like any other payload.
+        let payload = magic_prefixed_blob(b"\x1f\x8b", 2048);
+        let encoded = wrap(&base64_encode(&payload), 76);
+        let content =
+            format!("P=\";base64,{encoded}\"\necho \"${{P#*,}}\" | base64 -d | gunzip | sh\n");
+        let ctx = make_ctx("dropper.sh", content.into_bytes());
+        assert!(HighEntropyRule::default().evaluate(&ctx).unwrap().is_some());
+    }
+
+    #[test]
     fn base64_payload_in_pem_armor_is_not_scored() {
-        let payload = high_entropy_blob(1536);
+        // Decoded bytes carry a DER SEQUENCE header — a genuine carrier.
+        let payload = magic_prefixed_blob(&[0x30, 0x82, 0x00, 0x00], 1536);
         let encoded = wrap(&base64_encode(&payload), 64);
         let content = format!(
             "#!/bin/sh\ncat > ca.pem <<'EOF'\n-----BEGIN CERTIFICATE-----\n\
              {encoded}\n-----END CERTIFICATE-----\nEOF\n"
         );
         let ctx = make_ctx("pem_bundle.sh", content.into_bytes());
+        assert!(HighEntropyRule::default().evaluate(&ctx).unwrap().is_none());
+    }
+
+    #[test]
+    fn spoofed_pem_begin_is_scored() {
+        // A `-----BEGIN FOO-----` label in front of a gzip payload: found as
+        // a candidate PEM carrier, but the decoded bytes match neither DER
+        // nor PGP, so it's scored normally.
+        let payload = magic_prefixed_blob(b"\x1f\x8b", 2048);
+        let encoded = wrap(&base64_encode(&payload), 64);
+        let content = format!(
+            "#!/bin/sh\ncat > payload.bin <<'EOF'\n-----BEGIN FOO-----\n\
+             {encoded}\n-----END FOO-----\nEOF\n"
+        );
+        let ctx = make_ctx("spoofed.sh", content.into_bytes());
+        assert!(HighEntropyRule::default().evaluate(&ctx).unwrap().is_some());
+    }
+
+    #[test]
+    fn pgp_public_key_block_is_not_scored() {
+        // Decoded first byte 0x99: an OpenPGP old-format packet tag (high
+        // bit set) — headers and a blank line separate BEGIN from the body.
+        let payload = magic_prefixed_blob(&[0x99], 1536);
+        let encoded = wrap(&base64_encode(&payload), 64);
+        let content = format!(
+            "-----BEGIN PGP PUBLIC KEY BLOCK-----\nVersion: GnuPG v1\n\
+             Comment: exported\n\n{encoded}\n-----END PGP PUBLIC KEY BLOCK-----\n"
+        );
+        let ctx = make_ctx("key.asc", content.into_bytes());
+        assert!(HighEntropyRule::default().evaluate(&ctx).unwrap().is_none());
+    }
+
+    #[test]
+    fn legacy_encrypted_pem_is_not_scored() {
+        // `Proc-Type: 4,ENCRYPTED` marks ciphertext with no magic to expect.
+        let payload = high_entropy_blob(1536);
+        let encoded = wrap(&base64_encode(&payload), 64);
+        let content = format!(
+            "-----BEGIN RSA PRIVATE KEY-----\nProc-Type: 4,ENCRYPTED\n\
+             DEK-Info: AES-128-CBC,0123456789ABCDEF0123456789ABCDEF\n\n\
+             {encoded}\n-----END RSA PRIVATE KEY-----\n"
+        );
+        let ctx = make_ctx("key.pem", content.into_bytes());
         assert!(HighEntropyRule::default().evaluate(&ctx).unwrap().is_none());
     }
 

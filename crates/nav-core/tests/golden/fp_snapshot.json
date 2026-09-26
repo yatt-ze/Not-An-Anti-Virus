@@ -213,6 +213,14 @@
       "suspicious-strings"
     ]
   },
+  "suspicious/dropper_spoofed_data_uri.sh": {
+    "score": 18,
+    "recommendation": "notify",
+    "rule_ids": [
+      "high-entropy-content",
+      "suspicious-strings"
+    ]
+  },
   "suspicious/installer_applescript_preinstall.pkg": {
     "score": 15,
     "recommendation": "notify",
