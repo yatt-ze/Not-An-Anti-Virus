@@ -10,6 +10,7 @@
 //! SuperBlob it can bound, and returns `None`/empty for anything it can't
 //! recognize or bound.
 
+use std::collections::HashMap;
 use std::ops::Range;
 
 // Magic read big-endian from the first four bytes. A little-endian file (every
@@ -121,7 +122,27 @@ pub struct MachOImage {
 /// instead — judging a universal binary on one slice lets a malicious slice
 /// hide behind a benign one (§5.2).
 pub fn parse(data: &[u8]) -> Option<MachOImage> {
-    parse_all(data).into_iter().next()
+    match be_u32(data, 0) {
+        Some(FAT_MAGIC) | Some(FAT_MAGIC_64) => parse_first_fat_slice(data),
+        Some(magic) => {
+            let (is_64, be) = thin_kind(magic)?;
+            parse_thin(data, 0, is_64, be, false)
+        }
+        None => None,
+    }
+}
+
+/// The first walkable slice of a fat/universal binary's arch table, or
+/// `None` if none is — stops as soon as one is found, so a hostile table
+/// with many arches (up to `MAX_FAT_ARCHES`) costs one `parse_thin` call
+/// here, not one per declared arch.
+fn parse_first_fat_slice(data: &[u8]) -> Option<MachOImage> {
+    let (is_64, nfat) = plausible_fat_header(data, false)?;
+    let stride: usize = if is_64 { 32 } else { 20 };
+    (0..nfat as usize).find_map(|i| {
+        let obj_off = fat_arch_offset(data, is_64, stride, i)?;
+        parse_fat_slice_at(data, obj_off)
+    })
 }
 
 /// Parse **every** Mach-O image in `data`: a single thin image, or all
@@ -242,10 +263,36 @@ fn parse_fat_all(data: &[u8], truncated: bool) -> (Vec<MachOImage>, usize) {
     let Some((is_64, nfat)) = plausible_fat_header(data, truncated) else {
         return (out, skipped);
     };
+    let stride: usize = if is_64 { 32 } else { 20 };
+
+    // Distinct slice offsets walked so far: a hostile table can point
+    // MAX_FAT_ARCHES (1024) entries at one offset, and each `MachOImage`
+    // owns up to MAX_ENTITLEMENTS_BYTES — walking (and pushing) the same
+    // slice once per referring entry would be unbounded work for one file.
+    // Entries sharing an offset are one slice, not N: only the first is
+    // walked and pushed; later ones reuse that outcome, so a duplicate of a
+    // *walkable* slice is never counted in `skipped` (it's not unwalked —
+    // it just wasn't re-walked), while a duplicate of an offset that failed
+    // to walk still counts, once per declared arch, like any other failure.
+    let mut seen: HashMap<u64, bool> = HashMap::new(); // offset -> walked ok?
     for i in 0..nfat as usize {
-        match fat_member(data, is_64, i) {
-            Some(img) => out.push(img),
-            None => skipped += 1,
+        let Some(obj_off) = fat_arch_offset(data, is_64, stride, i) else {
+            skipped += 1; // this entry's own bytes lie outside what we hold
+            continue;
+        };
+        match seen.get(&obj_off) {
+            Some(true) => {}
+            Some(false) => skipped += 1,
+            None => match parse_fat_slice_at(data, obj_off) {
+                Some(img) => {
+                    seen.insert(obj_off, true);
+                    out.push(img);
+                }
+                None => {
+                    seen.insert(obj_off, false);
+                    skipped += 1;
+                }
+            },
         }
     }
     (out, skipped)
@@ -264,12 +311,11 @@ fn fat_arch_offset(data: &[u8], is_64: bool, stride: usize, i: usize) -> Option<
     }
 }
 
-/// Parse fat arch `i`'s slice, or `None` if its table entry or object offset
-/// can't be read within bounds (a bad entry skips just that arch).
-fn fat_member(data: &[u8], is_64: bool, i: usize) -> Option<MachOImage> {
-    let stride: usize = if is_64 { 32 } else { 20 };
-    let obj_off = fat_arch_offset(data, is_64, stride, i)?;
-
+/// Parse the fat/universal slice at absolute offset `obj_off` within `data`,
+/// or `None` if the offset lies outside the bytes held or doesn't begin with
+/// a thin Mach-O magic. Keyed only by offset (not by which arch-table entry
+/// pointed here) so callers can dedupe entries that share one offset.
+fn parse_fat_slice_at(data: &[u8], obj_off: u64) -> Option<MachOImage> {
     // Slice must start within the bytes we hold (and not overflow usize).
     let base = match usize::try_from(obj_off) {
         Ok(b) if b < data.len() => b,
@@ -658,6 +704,29 @@ pub(crate) mod tests_support {
         v
     }
 
+    /// A fat/universal binary with `count` arch-table entries that all point
+    /// at the same single embedded slice — the shape a hostile fat table
+    /// uses to make an offset-naive walker re-parse (and re-allocate) one
+    /// slice once per referring entry.
+    pub(crate) fn synth_fat_with_duplicate_offsets(member: &[u8], count: usize) -> Vec<u8> {
+        let header_len = 8 + 20 * count;
+        let offset = (header_len + 15) & !15;
+
+        let mut v = Vec::new();
+        v.extend_from_slice(&FAT_MAGIC.to_be_bytes());
+        v.extend_from_slice(&(count as u32).to_be_bytes());
+        for i in 0..count {
+            v.extend_from_slice(&0x0100_0007u32.to_be_bytes()); // cputype
+            v.extend_from_slice(&(i as u32).to_be_bytes()); // cpusubtype (distinct)
+            v.extend_from_slice(&(offset as u32).to_be_bytes()); // offset — same for every entry
+            v.extend_from_slice(&(member.len() as u32).to_be_bytes()); // size
+            v.extend_from_slice(&0u32.to_be_bytes()); // align
+        }
+        v.resize(offset, 0);
+        v.extend_from_slice(member);
+        v
+    }
+
     /// A fat/universal binary with `bogus_count` arch entries pointing at
     /// distinct, 16 KiB-aligned zeroed regions (no thin Mach-O magic) plus one
     /// real slice (`real_member`) last in the table — the shape a real fat
@@ -977,8 +1046,8 @@ pub(crate) mod tests_support {
 #[cfg(test)]
 mod tests {
     use super::tests_support::{
-        synth_fat, synth_fat_with_bogus_arches, synth_macho_64, synth_macho_64_full,
-        synth_macho_64_full_with_cd_flags, synth_macho_64_full_with_cds,
+        synth_fat, synth_fat_with_bogus_arches, synth_fat_with_duplicate_offsets, synth_macho_64,
+        synth_macho_64_full, synth_macho_64_full_with_cd_flags, synth_macho_64_full_with_cds,
     };
     use super::*;
 
@@ -999,6 +1068,29 @@ mod tests {
             parse(&fat).unwrap().dylibs,
             vec!["/usr/lib/a.dylib".to_string()]
         );
+    }
+
+    #[test]
+    fn parse_returns_only_the_first_walkable_fat_slice() {
+        let (a, _, _) = synth_macho_64_full(b"aaaa", &["/usr/lib/a.dylib"], &[], false, None);
+        let (b, _, _) = synth_macho_64_full(b"bbbb", &["/tmp/b.dylib"], &[], false, None);
+        let fat = synth_fat(&[&a, &b]);
+        assert_eq!(
+            parse(&fat).unwrap().dylibs,
+            vec!["/usr/lib/a.dylib".to_string()]
+        );
+    }
+
+    #[test]
+    fn many_fat_arches_sharing_one_offset_parse_once_and_are_not_skipped() {
+        // A hostile fat table can point MAX_FAT_ARCHES entries at the same
+        // slice — that's one slice, not one per entry, and a duplicate of a
+        // walkable slice must not count toward `skipped`.
+        let (member, _, _) = synth_macho_64_full(b"shared slice", &[], &[], false, None);
+        let fat = synth_fat_with_duplicate_offsets(&member, 1024);
+        let (images, skipped) = parse_all_slices(&fat, false);
+        assert_eq!(images.len(), 1);
+        assert_eq!(skipped, 0);
     }
 
     #[test]
