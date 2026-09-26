@@ -94,11 +94,10 @@ pub struct TargetScan {
     /// Bundle members traversed but not scored (see
     /// [`bundle::is_inert_bundle_resource`]).
     pub skipped: Vec<PathBuf>,
-    /// Directories under the target that `collect_files` couldn't read
-    /// (permission denied, race), sorted and deduped (§11.1). Traversal
-    /// continues past each one rather than aborting (§11.8); non-empty means
-    /// the target's coverage is partial (§11.12). Always empty for a
-    /// single-file target.
+    /// Directories whose listing failed in whole or in part (permission
+    /// denied, race), sorted and deduped (§11.1). Traversal continues past
+    /// each one rather than aborting (§11.8); non-empty means the target's
+    /// coverage is partial (§11.12). Always empty for a single-file target.
     pub unreadable: Vec<PathBuf>,
     /// Whether the scan fit inside its budget, or was cut short (and how).
     pub budget: BudgetOutcome,

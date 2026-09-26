@@ -13,7 +13,7 @@ use std::process::ExitCode;
 
 use nav_core::{
     scan_result_json, scan_target, BudgetOutcome, EvidenceConfidence, Recommendation,
-    ScanCompleteness, ScanResult,
+    ScanCompleteness, ScanResult, TargetScan,
 };
 
 /// Scans `path` once and prints the verdict, human or `--json`, exiting with
@@ -31,6 +31,9 @@ pub fn run(path: &Path, recursive: bool, json: bool) -> ExitCode {
     if scan.results.is_empty() {
         // Nothing readable, not a tool failure — matches `navctl rules
         // test`'s empty-target code, the baseline B3 compares against.
+        if let Some(note) = unreadable_note(&scan) {
+            eprintln!("{note}");
+        }
         eprintln!("navd scan-once: no files found under {}", path.display());
         return nav_core::exit_code(nav_core::INDETERMINATE);
     }
@@ -49,22 +52,32 @@ pub fn run(path: &Path, recursive: bool, json: bool) -> ExitCode {
             path.display()
         );
     }
-    if !scan.unreadable.is_empty() {
-        let paths = scan
-            .unreadable
-            .iter()
-            .map(|p| p.display().to_string())
-            .collect::<Vec<_>>()
-            .join(", ");
-        eprintln!(
-            "navd scan-once: partial coverage — {} director(ies) could not be read under {}: {}",
-            scan.unreadable.len(),
-            path.display(),
-            paths
-        );
+    if let Some(note) = unreadable_note(&scan) {
+        eprintln!("{note}");
     }
 
     nav_core::exit_code(nav_core::for_target(&scan))
+}
+
+/// A stderr warning naming directories that couldn't be read during
+/// traversal, or `None` when there were none — shared by the empty-target
+/// and normal-exit paths above (§11.12/#32).
+fn unreadable_note(scan: &TargetScan) -> Option<String> {
+    if scan.unreadable.is_empty() {
+        return None;
+    }
+    let paths = scan
+        .unreadable
+        .iter()
+        .map(|p| p.display().to_string())
+        .collect::<Vec<_>>()
+        .join(", ");
+    Some(format!(
+        "navd scan-once: partial coverage — {} director(ies) could not be read under {}: {}",
+        scan.unreadable.len(),
+        scan.root.display(),
+        paths
+    ))
 }
 
 /// Terse one-line-per-file human summary (§5.5).
