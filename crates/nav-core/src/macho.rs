@@ -37,6 +37,12 @@ const LC_CODE_SIGNATURE: u32 = 0x1d;
 // always big-endian, independent of the Mach-O's own endianness.
 const CSMAGIC_EMBEDDED_SIGNATURE: u32 = 0xfade_0cc0;
 const CSMAGIC_EMBEDDED_ENTITLEMENTS: u32 = 0xfade_7171;
+const CSMAGIC_CODEDIRECTORY: u32 = 0xfade_0c02;
+
+// CS_BlobIndex slot types (cs_blobs.h) identifying a blob's role within the
+// SuperBlob.
+const CSSLOT_CODEDIRECTORY: u32 = 0;
+const CSSLOT_ENTITLEMENTS: u32 = 5;
 
 // Loop ceilings — far above any real Mach-O, but bound work on hostile input.
 const MAX_FAT_ARCHES: u32 = 64;
@@ -75,6 +81,12 @@ pub struct MachOImage {
     /// no signature, no entitlements blob in the SuperBlob, and a signature
     /// region lying past the bytes this parser holds (a truncated capture).
     pub entitlements: Option<Vec<u8>>,
+    /// The `flags` field of the slot-0 CodeDirectory in the embedded code
+    /// signature's SuperBlob (`CS_ADHOC` etc., `<Security/CSCommon.h>`).
+    /// `None` if there's no signature, no CodeDirectory found, or the
+    /// signature region lies past the bytes this parser holds — never read as
+    /// "not ad-hoc".
+    pub code_directory_flags: Option<u32>,
 }
 
 /// Parse `data` as a single Mach-O image: the thin image, or the **first**
@@ -193,6 +205,7 @@ fn parse_thin(data: &[u8], base: usize, is_64: bool, be: bool, is_fat: bool) -> 
     let mut rpaths = Vec::new();
     let mut has_code_signature = false;
     let mut entitlements = None;
+    let mut code_directory_flags = None;
 
     let mut off = cmds_start;
     for _ in 0..ncmds {
@@ -230,7 +243,9 @@ fn parse_thin(data: &[u8], base: usize, is_64: bool, be: bool, is_fat: bool) -> 
             if let (Some(dataoff), Some(datasize)) =
                 (r.u32(off.checked_add(8)?), r.u32(off.checked_add(12)?))
             {
-                entitlements = extract_entitlements(data, base, dataoff, datasize);
+                let facts = extract_signature_facts(data, base, dataoff, datasize);
+                entitlements = facts.entitlements;
+                code_directory_flags = facts.code_directory_flags;
             }
         }
 
@@ -245,6 +260,7 @@ fn parse_thin(data: &[u8], base: usize, is_64: bool, be: bool, is_fat: bool) -> 
         rpaths,
         has_code_signature,
         entitlements,
+        code_directory_flags,
     })
 }
 
@@ -278,14 +294,37 @@ fn read_lc_str(r: &Reader, cmd_off: usize, cmd_end: usize, max_len: usize) -> Op
     Some(String::from_utf8_lossy(&bytes[..len]).into_owned())
 }
 
-/// Recover the entitlements plist embedded in a Mach-O's code-signature
-/// SuperBlob. `dataoff`/`datasize` are the `LC_CODE_SIGNATURE` fields (Mach-O
-/// endianness); the SuperBlob itself is always big-endian. `base` is where
-/// this image begins in `data`. `None` if there's no entitlements blob, the
-/// SuperBlob is malformed, or the signature region lies past the bytes held
-/// (a truncated capture) — the caller must not read `None` as "no
-/// entitlements".
-fn extract_entitlements(data: &[u8], base: usize, dataoff: u32, datasize: u32) -> Option<Vec<u8>> {
+/// Facts recovered from a Mach-O's embedded code-signature SuperBlob in one
+/// bounded walk — see [`extract_signature_facts`].
+#[derive(Default)]
+struct SignatureFacts {
+    entitlements: Option<Vec<u8>>,
+    code_directory_flags: Option<u32>,
+}
+
+/// Recover the entitlements plist and the slot-0 CodeDirectory's `flags` from
+/// a Mach-O's embedded code-signature SuperBlob, in one bounded walk of its
+/// blob index. `dataoff`/`datasize` are the `LC_CODE_SIGNATURE` fields
+/// (Mach-O endianness); the SuperBlob itself is always big-endian. `base` is
+/// where this image begins in `data`. Either field of the result is `None` if
+/// its blob is absent or the SuperBlob is malformed; both are `None` if the
+/// signature region lies past the bytes held (a truncated capture) — the
+/// caller must not read either `None` as a determined fact.
+fn extract_signature_facts(
+    data: &[u8],
+    base: usize,
+    dataoff: u32,
+    datasize: u32,
+) -> SignatureFacts {
+    extract_signature_facts_checked(data, base, dataoff, datasize).unwrap_or_default()
+}
+
+fn extract_signature_facts_checked(
+    data: &[u8],
+    base: usize,
+    dataoff: u32,
+    datasize: u32,
+) -> Option<SignatureFacts> {
     let sig_off = base.checked_add(dataoff as usize)?;
     let sig_end = sig_off.checked_add(datasize as usize)?;
     if sig_end > data.len() {
@@ -299,37 +338,59 @@ fn extract_entitlements(data: &[u8], base: usize, dataoff: u32, datasize: u32) -
         return None;
     }
 
+    let mut facts = SignatureFacts::default();
+
     for i in 0..count as usize {
         // CS_BlobIndex: type(4), offset(4) — offset relative to `sig_off`.
         let entry_off = sig_off.checked_add(12)?.checked_add(i.checked_mul(8)?)?;
         if entry_off.checked_add(8)? > sig_end {
             break;
         }
+        let slot_type = be_u32(data, entry_off)?;
         let rel_off = be_u32(data, entry_off.checked_add(4)?)?;
         let blob_off = sig_off.checked_add(rel_off as usize)?;
         if blob_off.checked_add(8)? > sig_end {
             continue;
         }
-        if be_u32(data, blob_off)? != CSMAGIC_EMBEDDED_ENTITLEMENTS {
-            continue;
+        let magic = be_u32(data, blob_off)?;
+
+        if slot_type == CSSLOT_ENTITLEMENTS
+            && magic == CSMAGIC_EMBEDDED_ENTITLEMENTS
+            && facts.entitlements.is_none()
+        {
+            facts.entitlements = extract_blob_payload(data, blob_off, sig_end);
+        } else if slot_type == CSSLOT_CODEDIRECTORY
+            && magic == CSMAGIC_CODEDIRECTORY
+            && facts.code_directory_flags.is_none()
+        {
+            // CodeDirectory: magic(4)@0, length(4)@4, version(4)@8, flags(4)@12.
+            if blob_off.checked_add(16)? <= sig_end {
+                facts.code_directory_flags = be_u32(data, blob_off.checked_add(12)?);
+            }
         }
-        // Blob: magic(4), length(4, total incl. header), payload.
-        let blob_len = be_u32(data, blob_off.checked_add(4)?)? as usize;
-        if blob_len < 8 {
-            continue;
-        }
-        let payload_len = (blob_len - 8).min(MAX_ENTITLEMENTS_BYTES);
-        let payload_start = blob_off.checked_add(8)?;
-        let payload_end = payload_start
-            .checked_add(payload_len)?
-            .min(sig_end)
-            .min(data.len());
-        if payload_end <= payload_start {
-            continue;
-        }
-        return Some(data[payload_start..payload_end].to_vec());
     }
-    None
+    Some(facts)
+}
+
+/// Read a `CS_GenericBlob`'s payload (magic(4), length(4, total incl.
+/// header), payload) at `blob_off`, capped at `MAX_ENTITLEMENTS_BYTES` and
+/// never past `sig_end`/the bytes held. `None` if the declared length is
+/// implausible or the payload is empty.
+fn extract_blob_payload(data: &[u8], blob_off: usize, sig_end: usize) -> Option<Vec<u8>> {
+    let blob_len = be_u32(data, blob_off.checked_add(4)?)? as usize;
+    if blob_len < 8 {
+        return None;
+    }
+    let payload_len = (blob_len - 8).min(MAX_ENTITLEMENTS_BYTES);
+    let payload_start = blob_off.checked_add(8)?;
+    let payload_end = payload_start
+        .checked_add(payload_len)?
+        .min(sig_end)
+        .min(data.len());
+    if payload_end <= payload_start {
+        return None;
+    }
+    Some(data[payload_start..payload_end].to_vec())
 }
 
 /// If the segment command at `off` is `__TEXT`, return the absolute file range
@@ -452,8 +513,9 @@ impl<'a> Reader<'a> {
 #[cfg(test)]
 pub(crate) mod tests_support {
     use super::{
-        CSMAGIC_EMBEDDED_ENTITLEMENTS, CSMAGIC_EMBEDDED_SIGNATURE, FAT_MAGIC, LC_CODE_SIGNATURE,
-        LC_LOAD_DYLIB, LC_RPATH, LC_SEGMENT_64,
+        CSMAGIC_CODEDIRECTORY, CSMAGIC_EMBEDDED_ENTITLEMENTS, CSMAGIC_EMBEDDED_SIGNATURE,
+        CSSLOT_CODEDIRECTORY, CSSLOT_ENTITLEMENTS, FAT_MAGIC, LC_CODE_SIGNATURE, LC_LOAD_DYLIB,
+        LC_RPATH, LC_SEGMENT_64,
     };
     use std::ops::Range;
 
@@ -530,30 +592,48 @@ pub(crate) mod tests_support {
         v
     }
 
-    /// A code-signature SuperBlob holding zero or one entitlements blobs, and
-    /// the `LC_CODE_SIGNATURE` command pointing at it (`dataoff` filled in by
-    /// the caller once the file offset is known).
-    fn build_signature_blob(entitlements_xml: Option<&[u8]>) -> Vec<u8> {
-        let mut sb = Vec::new();
-        let count: u32 = entitlements_xml.is_some().into();
-        let index_len = 12usize + 8 * count as usize;
-
-        let mut blobs = Vec::new();
-        let mut index = Vec::new();
+    /// A code-signature SuperBlob holding, in slot order, an optional slot-0
+    /// CodeDirectory (`cd_flags`, if given) and an optional entitlements blob
+    /// (`entitlements_xml`, if given), plus the `LC_CODE_SIGNATURE` command
+    /// pointing at it (`dataoff` filled in by the caller once the file offset
+    /// is known). `cd_flags: None` omits the CodeDirectory blob entirely, so
+    /// existing callers that only pass entitlements produce identical bytes
+    /// to before this blob was added.
+    fn build_signature_blob(entitlements_xml: Option<&[u8]>, cd_flags: Option<u32>) -> Vec<u8> {
+        let mut entries: Vec<(u32, Vec<u8>)> = Vec::new();
+        if let Some(flags) = cd_flags {
+            // Minimal CodeDirectory: magic(4), length(4), version(4), flags(4).
+            let mut cd = Vec::new();
+            cd.extend_from_slice(&CSMAGIC_CODEDIRECTORY.to_be_bytes());
+            cd.extend_from_slice(&16u32.to_be_bytes());
+            cd.extend_from_slice(&0x0002_0400u32.to_be_bytes()); // version
+            cd.extend_from_slice(&flags.to_be_bytes());
+            entries.push((CSSLOT_CODEDIRECTORY, cd));
+        }
         if let Some(xml) = entitlements_xml {
-            let blob_off = index_len as u32;
-            index.extend_from_slice(&5u32.to_be_bytes()); // CSSLOT_ENTITLEMENTS
-            index.extend_from_slice(&blob_off.to_be_bytes());
+            let mut blob = Vec::new();
+            blob.extend_from_slice(&CSMAGIC_EMBEDDED_ENTITLEMENTS.to_be_bytes());
+            blob.extend_from_slice(&((8 + xml.len()) as u32).to_be_bytes());
+            blob.extend_from_slice(xml);
+            entries.push((CSSLOT_ENTITLEMENTS, blob));
+        }
 
-            blobs.extend_from_slice(&CSMAGIC_EMBEDDED_ENTITLEMENTS.to_be_bytes());
-            blobs.extend_from_slice(&((8 + xml.len()) as u32).to_be_bytes());
-            blobs.extend_from_slice(xml);
+        let index_len = 12usize + 8 * entries.len();
+        let mut index = Vec::new();
+        let mut blobs = Vec::new();
+        let mut cursor = index_len as u32;
+        for (slot_type, blob) in &entries {
+            index.extend_from_slice(&slot_type.to_be_bytes());
+            index.extend_from_slice(&cursor.to_be_bytes());
+            blobs.extend_from_slice(blob);
+            cursor += blob.len() as u32;
         }
 
         let total_len = index_len + blobs.len();
+        let mut sb = Vec::new();
         sb.extend_from_slice(&CSMAGIC_EMBEDDED_SIGNATURE.to_be_bytes());
         sb.extend_from_slice(&(total_len as u32).to_be_bytes());
-        sb.extend_from_slice(&count.to_be_bytes());
+        sb.extend_from_slice(&(entries.len() as u32).to_be_bytes());
         sb.extend_from_slice(&index);
         sb.extend_from_slice(&blobs);
         sb
@@ -573,6 +653,28 @@ pub(crate) mod tests_support {
         rpaths: &[&str],
         code_signed: bool,
         entitlements_xml: Option<&[u8]>,
+    ) -> (Vec<u8>, Range<u64>, usize) {
+        synth_macho_64_full_with_cd_flags(
+            text_payload,
+            dylibs,
+            rpaths,
+            code_signed,
+            entitlements_xml,
+            None,
+        )
+    }
+
+    /// As [`synth_macho_64_full`], with an optional slot-0 CodeDirectory
+    /// carrying `cd_flags` (e.g. `CS_ADHOC`) added to the signature SuperBlob.
+    /// `cd_flags: None` produces byte-identical output to
+    /// `synth_macho_64_full`.
+    pub(crate) fn synth_macho_64_full_with_cd_flags(
+        text_payload: &[u8],
+        dylibs: &[&str],
+        rpaths: &[&str],
+        code_signed: bool,
+        entitlements_xml: Option<&[u8]>,
+        cd_flags: Option<u32>,
     ) -> (Vec<u8>, Range<u64>, usize) {
         let header_size = 32usize;
         let seg_cmd_size = 72usize + 80usize; // segment_command_64 + one section_64
@@ -656,7 +758,7 @@ pub(crate) mod tests_support {
         let mut sig_off = 0usize;
         if code_signed {
             sig_off = v.len();
-            let blob = build_signature_blob(entitlements_xml);
+            let blob = build_signature_blob(entitlements_xml, cd_flags);
             let dataoff = sig_off as u32;
             let datasize = blob.len() as u32;
             v[sig_placeholder_at + 8..sig_placeholder_at + 12]
@@ -673,7 +775,9 @@ pub(crate) mod tests_support {
 
 #[cfg(test)]
 mod tests {
-    use super::tests_support::{synth_fat, synth_macho_64, synth_macho_64_full};
+    use super::tests_support::{
+        synth_fat, synth_macho_64, synth_macho_64_full, synth_macho_64_full_with_cd_flags,
+    };
     use super::*;
 
     #[test]
@@ -833,6 +937,39 @@ mod tests {
             assert_eq!(img.entitlements, None);
         }
         let _ = sig_off;
+    }
+
+    #[test]
+    fn code_directory_flags_are_read_back() {
+        let (adhoc, _, _) =
+            synth_macho_64_full_with_cd_flags(b"code", &[], &[], true, None, Some(0x2));
+        assert_eq!(parse(&adhoc).unwrap().code_directory_flags, Some(0x2));
+
+        let (identity, _, _) =
+            synth_macho_64_full_with_cd_flags(b"code", &[], &[], true, None, Some(0x10000));
+        assert_eq!(
+            parse(&identity).unwrap().code_directory_flags,
+            Some(0x10000)
+        );
+    }
+
+    #[test]
+    fn no_code_directory_blob_is_none_not_zero() {
+        let (image, _, _) = synth_macho_64_full(b"code", &[], &[], true, None);
+        assert_eq!(parse(&image).unwrap().code_directory_flags, None);
+    }
+
+    #[test]
+    fn code_directory_pointing_out_of_bounds_yields_none_not_panic() {
+        let (mut image, _, sig_off) =
+            synth_macho_64_full_with_cd_flags(b"code", &[], &[], true, None, Some(0x2));
+        // Chop the file off inside the CodeDirectory blob, same shape as a
+        // truncated capture — must not panic and must not fabricate flags.
+        image.truncate(sig_off + 8);
+        let parsed = parse(&image); // must not panic
+        if let Some(img) = parsed {
+            assert_eq!(img.code_directory_flags, None);
+        }
     }
 
     #[test]

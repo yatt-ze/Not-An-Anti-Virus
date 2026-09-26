@@ -1,12 +1,14 @@
 //! Mach-O structural/entitlement anomaly detection (§5.2, NAV-007).
 //!
 //! Purely structural: reads what `macho::parse` already recovered (load
-//! paths, code-signature presence, embedded entitlements) and scores two
-//! narrow anomalies — a dylib/rpath load path into a writable/transient
-//! location, and a handful of specific "exempt me from platform protections"
-//! entitlements. Each is corroboration-only (§5.1): summed weight is capped
-//! well under the high-severity threshold, so this rule alone can never push
-//! a verdict past `Notify`.
+//! paths, code-signature presence, embedded entitlements, CodeDirectory
+//! flags) and scores two narrow anomalies — a dylib/rpath load path into a
+//! writable/transient location, and a handful of specific "exempt me from
+//! platform protections" entitlements, weighted higher when the binary is
+//! only ad-hoc signed rather than under a real identity. Each is
+//! corroboration-only (§5.1): summed weight is capped well under the
+//! high-severity threshold, so this rule alone can never push a verdict past
+//! `Notify`.
 
 use super::{Rule, RuleOutcome};
 use crate::context::ScanContext;
@@ -18,12 +20,17 @@ use crate::plist::{self, PlistValue};
 /// location. Flat, not per-path — the anomaly is "loads from somewhere an
 /// attacker can write," not "N such paths is N times worse."
 const TRANSIENT_LOCATION_WEIGHT: i32 = 15;
-/// Per-entitlement weight when the binary carries a real code signature.
+/// Per-entitlement weight for a real (non-ad-hoc) signing identity, and the
+/// safe default when the CodeDirectory's flags couldn't be determined.
 const ENTITLEMENT_WEIGHT_SIGNED: i32 = 10;
-/// Per-entitlement weight when there's no code signature at all — an
-/// unsigned/ad-hoc binary asking for these exemptions is more notable than a
-/// signed one (README's "suspicious entitlements on unsigned binaries").
-const ENTITLEMENT_WEIGHT_UNSIGNED: i32 = 18;
+/// Per-entitlement weight when the CodeDirectory's flags carry `CS_ADHOC` — an
+/// ad-hoc-signed binary asking for these exemptions is more notable than one
+/// under a real identity (README's "suspicious entitlements on unsigned
+/// binaries").
+const ENTITLEMENT_WEIGHT_ADHOC: i32 = 18;
+/// `CS_ADHOC` in a CodeDirectory's `flags` field: ad-hoc signed, no real
+/// identity (`<Security/CSCommon.h>`).
+const CS_ADHOC: u32 = 0x2;
 /// Ceiling on this rule's single signal — comfortably in `Notify` range,
 /// never near the §5.1 high-severity threshold on its own.
 const MAX_WEIGHT: i32 = 30;
@@ -166,15 +173,27 @@ fn entitlements_finding(
         return Ok(None);
     }
 
-    let weight_each = if image.has_code_signature {
-        ENTITLEMENT_WEIGHT_SIGNED
+    // Ad-hoc vs. a real signing identity, not signed vs. unsigned: entitlements
+    // only ever come from inside a code signature, so `has_code_signature` is
+    // always true here. Unknown flags (no CodeDirectory recovered) fall back
+    // to the lower, real-identity weight rather than assuming the worse case.
+    let is_adhoc = image
+        .code_directory_flags
+        .is_some_and(|flags| flags & CS_ADHOC != 0);
+    let weight_each = if is_adhoc {
+        ENTITLEMENT_WEIGHT_ADHOC
     } else {
-        ENTITLEMENT_WEIGHT_UNSIGNED
+        ENTITLEMENT_WEIGHT_SIGNED
     };
-    Ok(Some((
-        weight_each * bad.len() as i32,
-        format!("requests suspicious entitlement(s): {}", bad.join(", ")),
-    )))
+    let description = if is_adhoc {
+        format!(
+            "requests suspicious entitlement(s) on an ad-hoc-signed binary: {}",
+            bad.join(", ")
+        )
+    } else {
+        format!("requests suspicious entitlement(s): {}", bad.join(", "))
+    };
+    Ok(Some((weight_each * bad.len() as i32, description)))
 }
 
 /// Which of [`SUSPICIOUS_ENTITLEMENTS`] are set `true` in `plist`.
@@ -223,7 +242,9 @@ fn is_writable_or_transient(path: &str) -> bool {
 mod tests {
     use super::*;
     use crate::context::{ContentSource, ScanContext};
-    use crate::macho::tests_support::{synth_fat, synth_macho_64_full};
+    use crate::macho::tests_support::{
+        synth_fat, synth_macho_64_full, synth_macho_64_full_with_cd_flags,
+    };
     use std::path::PathBuf;
 
     fn ctx_for(content: Vec<u8>) -> ScanContext {
@@ -335,6 +356,53 @@ mod tests {
             .unwrap()
             .expect("should fire");
         assert!(sig.description.contains("disable-library-validation"));
+    }
+
+    #[test]
+    fn adhoc_signed_disable_lib_validation_weighs_more_than_identity_signed() {
+        let xml = br#"<?xml version="1.0"?><plist version="1.0"><dict>
+            <key>com.apple.security.cs.disable-library-validation</key><true/>
+        </dict></plist>"#;
+
+        let (adhoc, _, _) = synth_macho_64_full_with_cd_flags(
+            b"code",
+            &[],
+            &[],
+            true,
+            Some(xml),
+            Some(0x2), // CS_ADHOC
+        );
+        let adhoc_sig = MachOStructureRule
+            .evaluate(&ctx_for(adhoc))
+            .unwrap()
+            .expect("should fire");
+        assert_eq!(adhoc_sig.weight, ENTITLEMENT_WEIGHT_ADHOC);
+        assert!(adhoc_sig.description.contains("ad-hoc"));
+
+        let (identity, _, _) = synth_macho_64_full_with_cd_flags(
+            b"code",
+            &[],
+            &[],
+            true,
+            Some(xml),
+            Some(0x10000), // no CS_ADHOC bit — a real identity, e.g. runtime-enabled
+        );
+        let identity_sig = MachOStructureRule
+            .evaluate(&ctx_for(identity))
+            .unwrap()
+            .expect("should fire");
+        assert_eq!(identity_sig.weight, ENTITLEMENT_WEIGHT_SIGNED);
+        assert!(!identity_sig.description.contains("ad-hoc"));
+
+        let (unknown, _, _) = synth_macho_64_full(b"code", &[], &[], true, Some(xml));
+        let unknown_sig = MachOStructureRule
+            .evaluate(&ctx_for(unknown))
+            .unwrap()
+            .expect("should fire");
+        assert_eq!(
+            unknown_sig.weight, ENTITLEMENT_WEIGHT_SIGNED,
+            "an unrecoverable CodeDirectory must not assume the worse case"
+        );
     }
 
     #[test]
@@ -465,7 +533,7 @@ mod tests {
 /// deliberate change; review the resulting `git diff` before committing.
 #[cfg(test)]
 mod fixture_gen {
-    use crate::macho::tests_support::synth_macho_64_full;
+    use crate::macho::tests_support::{synth_macho_64_full, synth_macho_64_full_with_cd_flags};
     use std::path::Path;
 
     #[test]
@@ -531,5 +599,27 @@ mod fixture_gen {
             None,
         );
         std::fs::write(root.join("suspicious/macho_tmpdir_dylib"), tmpdir_dylib).unwrap();
+
+        // Suspicious: ad-hoc signed (CS_ADHOC) with disable-library-validation
+        // — the higher of the two entitlement weights (§37). Benign system
+        // dylibs only, so the entitlement is the sole anomaly.
+        let adhoc_entitlements = br#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+    <key>com.apple.security.cs.disable-library-validation</key><true/>
+</dict></plist>"#;
+        let (adhoc, _, _) = synth_macho_64_full_with_cd_flags(
+            b"\x55\x48\x89\xe5\x90adhoc machine code padding to look real",
+            &["/usr/lib/libSystem.B.dylib"],
+            &[],
+            true,
+            Some(adhoc_entitlements),
+            Some(0x2), // CS_ADHOC
+        );
+        std::fs::write(
+            root.join("suspicious/macho_adhoc_disable_lib_validation"),
+            adhoc,
+        )
+        .unwrap();
     }
 }

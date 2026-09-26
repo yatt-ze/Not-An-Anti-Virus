@@ -195,6 +195,14 @@
       "unsigned-installer-package"
     ]
   },
+  "suspicious/macho_adhoc_disable_lib_validation": {
+    "score": 22,
+    "recommendation": "notify",
+    "rule_ids": [
+      "macho-loader-anomaly",
+      "unsigned-binary"
+    ]
+  },
   "suspicious/macho_tmp_rpath_disable_lib_validation": {
     "score": 29,
     "recommendation": "notify",
