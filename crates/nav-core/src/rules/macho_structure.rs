@@ -19,6 +19,7 @@ use crate::context::ScanContext;
 use crate::macho::{self, MachOImage, CS_ADHOC};
 use crate::model::{MatchedSignal, SignalCategory};
 use crate::plist::{self, PlistValue};
+use std::collections::HashMap;
 
 /// Weight for at least one dylib/rpath load path in a writable/transient
 /// location. Flat, not per-path — the anomaly is "loads from somewhere an
@@ -111,12 +112,17 @@ impl Rule for MachOStructureRule {
 
         // Judge a fat binary on all its slices: a malicious arm64 slice must
         // not disappear behind a clean x86_64 one (§5.2). Load-path anomalies
-        // are unioned across slices; each slice's entitlements are scored on
-        // its own signed/unsigned status. `skipped_slices > 0` means at least
-        // one *declared* arch couldn't be walked at all — a deliberately
-        // malformed slice must not hide behind the rest coming back clean.
+        // and suspicious entitlement keys are each unioned across slices —
+        // one signal per distinct bad path / entitlement key, not one per
+        // slice that requests it — so a universal binary carrying the same
+        // anomaly in every slice doesn't inflate the score or repeat the
+        // text (§5.2). A key requested by more than one slice is weighted by
+        // the worst (most ad-hoc) of those slices. `skipped_slices > 0` means
+        // at least one *declared* arch couldn't be walked at all — a
+        // deliberately malformed slice must not hide behind the rest coming
+        // back clean.
         let mut bad_paths: Vec<&str> = Vec::new();
-        let mut findings: Vec<(i32, String)> = Vec::new();
+        let mut entitlement_weights: HashMap<&'static str, i32> = HashMap::new();
         let mut entitlements_gap = false;
 
         for image in &images {
@@ -131,7 +137,14 @@ impl Rule for MachOStructureRule {
                 }
             }
             match entitlements_finding(image, ctx.truncated) {
-                Ok(Some(f)) => findings.push(f),
+                Ok(Some(contributing)) => {
+                    for (key, weight) in contributing {
+                        entitlement_weights
+                            .entry(key)
+                            .and_modify(|w| *w = (*w).max(weight))
+                            .or_insert(weight);
+                    }
+                }
                 Ok(None) => {}
                 // Couldn't determine this slice's entitlements (truncated
                 // signature region, malformed blob). Only fatal if nothing
@@ -140,17 +153,37 @@ impl Rule for MachOStructureRule {
             }
         }
 
+        let mut findings: Vec<(i32, String)> = Vec::new();
         if !bad_paths.is_empty() {
-            findings.insert(
-                0,
-                (
-                    TRANSIENT_LOCATION_WEIGHT,
-                    format!(
-                        "loads from a writable/transient location: {}",
-                        bad_paths.join(", ")
-                    ),
+            findings.push((
+                TRANSIENT_LOCATION_WEIGHT,
+                format!(
+                    "loads from a writable/transient location: {}",
+                    bad_paths.join(", ")
                 ),
-            );
+            ));
+        }
+        if !entitlement_weights.is_empty() {
+            // List in SUSPICIOUS_ENTITLEMENTS's fixed order for a deterministic
+            // description regardless of slice/HashMap iteration order.
+            let keys: Vec<&'static str> = SUSPICIOUS_ENTITLEMENTS
+                .iter()
+                .map(|ent| ent.key)
+                .filter(|key| entitlement_weights.contains_key(key))
+                .collect();
+            let weight: i32 = entitlement_weights.values().sum();
+            let any_adhoc = entitlement_weights
+                .values()
+                .any(|&w| w == ENTITLEMENT_WEIGHT_ADHOC);
+            let description = if any_adhoc {
+                format!(
+                    "requests suspicious entitlement(s) on an ad-hoc-signed binary: {}",
+                    keys.join(", ")
+                )
+            } else {
+                format!("requests suspicious entitlement(s): {}", keys.join(", "))
+            };
+            findings.push((weight, description));
         }
 
         if findings.is_empty() {
@@ -181,19 +214,22 @@ impl Rule for MachOStructureRule {
     }
 }
 
-/// Score the binary's entitlements, if any were recovered. `Ok(None)` covers
-/// "no code signature at all" (entitlements live inside one, so there's
-/// nothing to examine), "signed and we held the whole file but found no
-/// entitlements blob" (a determined fact), and "signed, entitlements
-/// present, none of them suspicious." `Err(NotApplicable)` only when the read
-/// was `truncated` and signed with no entitlements recovered — the signature
-/// (near EOF) is exactly what an 8 MiB capture loses first, so that
-/// combination can't be told apart from "truncated past a real entitlements
-/// blob" (§10/§11.8) and must not be read as a clean bill of health.
+/// Score this slice's entitlements, if any were recovered — the suspicious
+/// keys it requests, each with its own ad-hoc/identity weight; the caller
+/// unions these across a fat binary's slices rather than scoring each slice
+/// separately (§5.2). `Ok(None)` covers "no code signature at all"
+/// (entitlements live inside one, so there's nothing to examine), "signed
+/// and we held the whole file but found no entitlements blob" (a determined
+/// fact), and "signed, entitlements present, none of them suspicious."
+/// `Err(NotApplicable)` only when the read was `truncated` and signed with no
+/// entitlements recovered — the signature (near EOF) is exactly what an 8
+/// MiB capture loses first, so that combination can't be told apart from
+/// "truncated past a real entitlements blob" (§10/§11.8) and must not be
+/// read as a clean bill of health.
 fn entitlements_finding(
     image: &MachOImage,
     truncated: bool,
-) -> Result<Option<(i32, String)>, RuleOutcome> {
+) -> Result<Option<Vec<(&'static str, i32)>>, RuleOutcome> {
     let Some(xml) = &image.entitlements else {
         return if image.has_code_signature && truncated {
             Err(RuleOutcome::NotApplicable)
@@ -217,47 +253,34 @@ fn entitlements_finding(
         .map(|flags| flags & CS_ADHOC != 0 || !image.has_cms_signature);
     let is_adhoc = is_adhoc_known.unwrap_or(false); // unknown falls back to the real-identity weight
 
-    let mut contributing: Vec<&'static str> = Vec::new();
-    let mut weight = 0i32;
+    let mut contributing: Vec<(&'static str, i32)> = Vec::new();
     for ent in SUSPICIOUS_ENTITLEMENTS {
         if parsed.get(ent.key).and_then(PlistValue::as_bool) != Some(true) {
             continue;
         }
         match ent.policy {
             EntitlementPolicy::WeightedByIdentity => {
-                contributing.push(ent.key);
-                weight += if is_adhoc {
+                let weight = if is_adhoc {
                     ENTITLEMENT_WEIGHT_ADHOC
                 } else {
                     ENTITLEMENT_WEIGHT_SIGNED
                 };
+                contributing.push((ent.key, weight));
             }
             // Ad-hoc or unknown flags: not identity-confirmed, so this
             // entitlement contributes nothing and isn't listed.
             EntitlementPolicy::IdentityOnly if is_adhoc_known == Some(false) => {
-                contributing.push(ent.key);
-                weight += ENTITLEMENT_WEIGHT_SIGNED;
+                contributing.push((ent.key, ENTITLEMENT_WEIGHT_SIGNED));
             }
             EntitlementPolicy::IdentityOnly => {}
         }
     }
 
     if contributing.is_empty() {
-        return Ok(None);
-    }
-
-    let description = if is_adhoc {
-        format!(
-            "requests suspicious entitlement(s) on an ad-hoc-signed binary: {}",
-            contributing.join(", ")
-        )
+        Ok(None)
     } else {
-        format!(
-            "requests suspicious entitlement(s): {}",
-            contributing.join(", ")
-        )
-    };
-    Ok(Some((weight, description)))
+        Ok(Some(contributing))
+    }
 }
 
 /// True if `path` is a load path worth flagging: an absolute path into a
@@ -685,6 +708,59 @@ mod tests {
             .expect("the malicious second slice must still fire");
         assert!(sig.description.contains("writable/transient"));
         assert!(sig.description.contains("/tmp/evil-rpath"));
+    }
+
+    #[test]
+    fn same_entitlement_in_two_ad_hoc_slices_is_unioned_not_repeated() {
+        let xml = br#"<?xml version="1.0"?><plist version="1.0"><dict>
+            <key>com.apple.security.cs.disable-library-validation</key><true/>
+        </dict></plist>"#;
+        let (a, _, _) =
+            synth_macho_64_full_with_cd_flags(b"aaaa", &[], &[], true, Some(xml), Some(CS_ADHOC));
+        let (b, _, _) =
+            synth_macho_64_full_with_cd_flags(b"bbbb", &[], &[], true, Some(xml), Some(CS_ADHOC));
+        let fat = synth_fat(&[&a, &b]);
+
+        let sig = MachOStructureRule
+            .evaluate(&ctx_for(fat))
+            .unwrap()
+            .expect("should fire");
+        assert_eq!(sig.weight, ENTITLEMENT_WEIGHT_ADHOC);
+        assert_eq!(
+            sig.description
+                .matches("disable-library-validation")
+                .count(),
+            1,
+            "the key must be listed once, not once per slice"
+        );
+    }
+
+    #[test]
+    fn same_entitlement_ad_hoc_in_one_slice_and_identity_in_another_takes_the_worse_weight() {
+        let xml = br#"<?xml version="1.0"?><plist version="1.0"><dict>
+            <key>com.apple.security.cs.disable-library-validation</key><true/>
+        </dict></plist>"#;
+        let (adhoc, _, _) =
+            synth_macho_64_full_with_cd_flags(b"aaaa", &[], &[], true, Some(xml), Some(CS_ADHOC));
+        let (identity, _, _) = synth_macho_64_full_with_cds_and_cms(
+            b"bbbb",
+            &[],
+            &[],
+            true,
+            Some(xml),
+            &[(0, 0)], // slot 0, flags=0
+            Some(4),   // non-empty CMS blob — a confirmed real identity
+        );
+        let fat = synth_fat(&[&adhoc, &identity]);
+
+        let sig = MachOStructureRule
+            .evaluate(&ctx_for(fat))
+            .unwrap()
+            .expect("should fire");
+        assert_eq!(
+            sig.weight, ENTITLEMENT_WEIGHT_ADHOC,
+            "a key requested by both an ad-hoc and an identity slice takes the worse weight"
+        );
     }
 
     #[test]
