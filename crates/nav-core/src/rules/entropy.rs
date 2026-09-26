@@ -53,11 +53,17 @@ const MIN_BASE64_RUN: usize = 1024;
 /// from, mirroring [`MIN_SAMPLE_BYTES`]'s role for the whole-content case.
 const MIN_DECODED_BYTES: usize = 768;
 
-/// A multi-line run's non-final lines must all be at least this wide to be
-/// treated as one wrapped-base64 candidate — real wrapping uses 64 or
-/// 76-column lines. Below it, a uniform width is more likely coincidental
-/// (e.g. a dictionary's short one-word-per-line entries).
-const MIN_WRAPPED_LINE_LEN: usize = 40;
+/// Consecutive lines sharing this width or more merge into one block if the
+/// width is exact and uniform across all of them (e.g. `base64 -b 32`).
+/// Below it, a shared width is more likely coincidental (e.g. a dictionary's
+/// short one-word-per-line entries).
+const MIN_WRAPPED_LINE_LEN: usize = 16;
+
+/// Consecutive lines merge into one block if every one of them is at least
+/// this wide, even at uneven widths (e.g. wrapping that varies by a column
+/// or two) — real wrapping uses 64 or 76-column lines; a wordlist's entries
+/// don't reliably reach this width at all, uniform or not.
+const MIN_FREEFORM_LINE_LEN: usize = 48;
 
 /// Corroboration-only (§5.1): a script embedding a compressed/encoded
 /// payload as base64 is common in benign software (installers, bundlers),
@@ -239,37 +245,49 @@ impl HighEntropyRule {
 
 /// Find the next base64 candidate segment starting at `seg_start` within
 /// `content[..run_end]`, returning its (exclusive) end and where to resume
-/// scanning for the next one. A segment is either: a single line shorter
-/// than [`MIN_WRAPPED_LINE_LEN`] (too narrow to be real wrapping — a blank
-/// line, a wordlist entry, a short terminator word — judged only on its own
-/// bytes); or a maximal *block* of consecutive lines that all share one
-/// width >= [`MIN_WRAPPED_LINE_LEN`], optionally followed by one shorter
-/// trailing line (real base64 wrapping's final, partial line). Splitting
-/// into blocks this way means a block is unaffected by what lies just before
-/// or after it in the run — a blank separator line or a heredoc terminator
-/// word can't blind detection of a genuinely wrapped payload next to it, nor
-/// can it borrow the payload's length to pass as one itself.
+/// scanning for the next one. A segment is either: a single line under both
+/// [`MIN_WRAPPED_LINE_LEN`] and [`MIN_FREEFORM_LINE_LEN`] (too narrow to be
+/// real wrapping — a blank line, a wordlist entry, a short terminator word —
+/// judged only on its own bytes); or a maximal *block* of consecutive lines
+/// that either all share one exact width >= `MIN_WRAPPED_LINE_LEN` (uniform
+/// wrapping, e.g. `base64 -b 32`) or are all individually >=
+/// `MIN_FREEFORM_LINE_LEN` regardless of exact width (uneven wrapping),
+/// optionally followed by one trailing line no wider than the block's last
+/// line (real base64 wrapping's final, partial line). Splitting into blocks
+/// this way means a block is unaffected by what lies just before or after it
+/// in the run — a blank separator line or a heredoc terminator word can't
+/// blind detection of a genuinely wrapped payload next to it, nor can it
+/// borrow the payload's length to pass as one itself.
 fn next_base64_segment(content: &[u8], seg_start: usize, run_end: usize) -> (usize, usize) {
     let (first_end, first_next) = next_base64_line(content, seg_start, run_end);
-    let width = first_end - seg_start;
-    if width < MIN_WRAPPED_LINE_LEN {
+    let first_width = first_end - seg_start;
+    let mut uniform_ok = first_width >= MIN_WRAPPED_LINE_LEN;
+    let mut freeform_ok = first_width >= MIN_FREEFORM_LINE_LEN;
+    if !uniform_ok && !freeform_ok {
         return (first_end, first_next);
     }
 
     let mut block_end = first_end;
     let mut next = first_next;
+    let mut last_width = first_width;
     while next < run_end {
         let (line_end, line_next) = next_base64_line(content, next, run_end);
-        if line_end - next != width {
+        let width = line_end - next;
+        let still_uniform = uniform_ok && width == first_width;
+        let still_freeform = freeform_ok && width >= MIN_FREEFORM_LINE_LEN;
+        if !still_uniform && !still_freeform {
             break;
         }
+        uniform_ok = still_uniform;
+        freeform_ok = still_freeform;
         block_end = line_end;
         next = line_next;
+        last_width = width;
     }
     // One optional shorter (or equal) trailing line: the wrap remainder.
     if next < run_end {
         let (line_end, line_next) = next_base64_line(content, next, run_end);
-        if line_end - next <= width {
+        if line_end - next <= last_width {
             block_end = line_end;
             next = line_next;
         }
@@ -666,6 +684,49 @@ mod tests {
     }
 
     #[test]
+    fn wrapped_32_col_base64_is_one_segment() {
+        // `base64 -b 32`: narrower than the old 40-char threshold, but still
+        // real uniform wrapping.
+        let payload = high_entropy_blob(2048);
+        let wrapped = wrap(&base64_encode(&payload), 32);
+        let (seg_end, next) = next_base64_segment(wrapped.as_bytes(), 0, wrapped.len());
+        assert_eq!(
+            seg_end,
+            wrapped.len(),
+            "a narrow but uniform wrap width still forms one block"
+        );
+        assert_eq!(next, wrapped.len());
+    }
+
+    #[test]
+    fn alternating_width_wrap_is_one_segment() {
+        // Uneven wrapping (e.g. a client that varies line length by a
+        // column): no two consecutive lines need share an exact width, only
+        // each be wide enough on its own.
+        let payload = high_entropy_blob(2048);
+        let encoded = base64_encode(&payload);
+        let mut wrapped = String::new();
+        let mut rest = encoded.as_str();
+        let mut toggle = 60;
+        while !rest.is_empty() {
+            let take = toggle.min(rest.len());
+            wrapped.push_str(&rest[..take]);
+            rest = &rest[take..];
+            if !rest.is_empty() {
+                wrapped.push('\n');
+            }
+            toggle = if toggle == 60 { 61 } else { 60 };
+        }
+        let (seg_end, next) = next_base64_segment(wrapped.as_bytes(), 0, wrapped.len());
+        assert_eq!(
+            seg_end,
+            wrapped.len(),
+            "alternating 60/61-column lines still form one block"
+        );
+        assert_eq!(next, wrapped.len());
+    }
+
+    #[test]
     fn wordlist_first_word_is_its_own_segment() {
         // Mimics a one-word-per-line dictionary/password list: every
         // character is in the base64 alphabet, but each line is far under a
@@ -713,6 +774,9 @@ mod tests {
 
     #[test]
     fn wordlist_like_block_does_not_form_a_base64_candidate() {
+        // Lengths vary, mostly under MIN_WRAPPED_LINE_LEN (16) with a couple
+        // reaching up to ~20 — enough to probe the lowered threshold without
+        // any two adjacent entries coincidentally sharing a width >= 16.
         let words = [
             "password",
             "letmein",
@@ -720,6 +784,8 @@ mod tests {
             "qwerty123",
             "dragon",
             "monkey12",
+            "abcdefghijklmnop",
+            "abcdefghijklmnopqrst",
         ];
         let mut block = String::new();
         for i in 0..300 {
@@ -734,6 +800,43 @@ mod tests {
         assert!(
             HighEntropyRule::default().evaluate(&ctx).unwrap().is_none(),
             "a joined wordlist run must not be treated as one base64 candidate"
+        );
+    }
+
+    #[test]
+    fn equal_length_short_wordlist_lines_do_not_form_a_base64_candidate() {
+        // A dictionary sorted by length produces long runs of consecutive
+        // *equal*-length lines — exactly the uniform-width shape the block
+        // rule looks for — but at 8-12 chars, well under MIN_WRAPPED_LINE_LEN
+        // (16), so it must not qualify just because the width matches.
+        let words_8 = [
+            "password", "dragon12", "letmein1", "baseball", "sunshine", "qwerty12",
+        ];
+        let words_12 = [
+            "correcthorse",
+            "trustno12345",
+            "monkeybarsxx",
+            "footballerxx",
+        ];
+        assert!(words_8.iter().all(|w| w.len() == 8));
+        assert!(words_12.iter().all(|w| w.len() == 12));
+        let mut block = String::new();
+        for i in 0..100 {
+            block.push_str(words_8[i % words_8.len()]);
+            block.push('\n');
+        }
+        for i in 0..100 {
+            block.push_str(words_12[i % words_12.len()]);
+            block.push('\n');
+        }
+        assert!(
+            block.len() > MIN_BASE64_RUN,
+            "block must exceed the run threshold to be meaningful"
+        );
+        let ctx = make_ctx("wordlist_sorted.txt", block.into_bytes());
+        assert!(
+            HighEntropyRule::default().evaluate(&ctx).unwrap().is_none(),
+            "consecutive equal-length short lines must not be treated as one base64 candidate"
         );
     }
 
