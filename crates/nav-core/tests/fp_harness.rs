@@ -383,22 +383,14 @@ impl FixtureSnapshot {
 /// coverage was otherwise whole.
 #[cfg(target_os = "macos")]
 fn overall_completeness(scan: &TargetScan) -> ScanCompleteness {
-    fn rank(c: ScanCompleteness) -> u8 {
-        match c {
-            ScanCompleteness::Complete => 0,
-            ScanCompleteness::Partial => 1,
-            ScanCompleteness::Indeterminate => 2,
-        }
-    }
-
     let mut worst = scan
         .results
         .iter()
         .map(|r| r.completeness)
-        .max_by_key(|c| rank(*c))
+        .max()
         .unwrap_or(ScanCompleteness::Complete);
-    if !scan.coverage_complete() && rank(worst) < rank(ScanCompleteness::Partial) {
-        worst = ScanCompleteness::Partial;
+    if !scan.coverage_complete() {
+        worst = worst.max(ScanCompleteness::Partial);
     }
     worst
 }

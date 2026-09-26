@@ -20,7 +20,10 @@ pub enum EvidenceConfidence {
 /// Whether the scan actually finished examining what it set out to examine.
 /// A `Partial`/`Indeterminate` scan must never be presented the same way as
 /// a `Complete` clean scan — see design doc §6.2 and §8 (exit codes).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+/// Declaration order is significant: derived `Ord` ranks `Complete` <
+/// `Partial` < `Indeterminate`, matching increasing severity, so `.max()`
+/// picks the worst of two.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ScanCompleteness {
     Complete,
