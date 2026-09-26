@@ -9,6 +9,7 @@
 //! presentation: the versioned `--json` envelope and the §8 exit-code
 //! mapping, so `navctl` and `navd` render one contract instead of two.
 
+pub(crate) mod base64;
 pub mod bundle;
 pub mod context;
 pub mod cpio;

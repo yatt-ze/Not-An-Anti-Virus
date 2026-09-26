@@ -31,6 +31,7 @@
 use std::path::Path;
 
 use super::{Rule, RuleOutcome};
+use crate::base64;
 use crate::context::ScanContext;
 use crate::macho;
 use crate::model::{MatchedSignal, SignalCategory};
@@ -231,7 +232,7 @@ impl HighEntropyRule {
         let run = &content[start..end];
         let alphabet_len = run
             .iter()
-            .filter(|&&b| base64_char_value(b).is_some())
+            .filter(|&&b| base64::char_value(b).is_some())
             .count();
         if alphabet_len < MIN_BASE64_RUN {
             return Base64Step::Continue;
@@ -250,7 +251,7 @@ impl HighEntropyRule {
             return Base64Step::Continue;
         }
 
-        let decoded = decode_base64_bounded(run, *remaining_budget);
+        let decoded = base64::decode_bounded(run, *remaining_budget, base64::OnInvalid::Stop);
         *remaining_budget = remaining_budget.saturating_sub(decoded.len());
         if decoded.len() < MIN_DECODED_BYTES {
             return Base64Step::Continue;
@@ -349,77 +350,7 @@ fn next_base64_line(content: &[u8], start: usize, run_end: usize) -> (usize, usi
 /// Whether `b` can appear inside a base64 run: alphabet, padding, or a line
 /// break (line-wrapped base64 is common and carries no information).
 fn is_base64_run_byte(b: u8) -> bool {
-    base64_char_value(b).is_some() || b == b'=' || b == b'\r' || b == b'\n'
-}
-
-/// Standard base64 alphabet (RFC 4648 §4) value of `b`, or `None` if `b`
-/// isn't in it.
-fn base64_char_value(b: u8) -> Option<u8> {
-    match b {
-        b'A'..=b'Z' => Some(b - b'A'),
-        b'a'..=b'z' => Some(b - b'a' + 26),
-        b'0'..=b'9' => Some(b - b'0' + 52),
-        b'+' => Some(62),
-        b'/' => Some(63),
-        _ => None,
-    }
-}
-
-/// Decode a base64 run (alphabet chars, optional trailing `=` padding, `\r`
-/// and `\n` ignored), stopping once `max_output` decoded bytes have been
-/// produced or the run ends. An invalid character (shouldn't occur — the
-/// caller only calls this on bytes [`is_base64_run_byte`] accepted) or a
-/// truncated final group ends decoding without panicking; a dangling
-/// single leftover character is simply dropped, matching most decoders'
-/// handling of malformed input.
-fn decode_base64_bounded(run: &[u8], max_output: usize) -> Vec<u8> {
-    let mut out = Vec::new();
-    let mut group = [0u8; 4];
-    let mut group_len = 0usize;
-    let mut padding_started = false;
-
-    for &b in run {
-        if b == b'\r' || b == b'\n' {
-            continue;
-        }
-        if b == b'=' {
-            padding_started = true;
-            continue;
-        }
-        if padding_started {
-            // Padding, once started, should only be followed by more `=` or
-            // the run's end; anything else is malformed — stop cleanly.
-            break;
-        }
-        let Some(v) = base64_char_value(b) else {
-            break;
-        };
-        group[group_len] = v;
-        group_len += 1;
-        if group_len == 4 {
-            out.push((group[0] << 2) | (group[1] >> 4));
-            out.push((group[1] << 4) | (group[2] >> 2));
-            out.push((group[2] << 6) | group[3]);
-            group_len = 0;
-            if out.len() >= max_output {
-                out.truncate(max_output);
-                return out;
-            }
-        }
-    }
-    // Trailing partial group: 2 chars decode to 1 byte, 3 chars to 2 bytes
-    // (standard base64 padding shapes); 1 leftover char has no valid
-    // decoding and is dropped rather than panicking.
-    match group_len {
-        2 => out.push((group[0] << 2) | (group[1] >> 4)),
-        3 => {
-            out.push((group[0] << 2) | (group[1] >> 4));
-            out.push((group[1] << 4) | (group[2] >> 2));
-        }
-        _ => {}
-    }
-    out.truncate(max_output);
-    out
+    base64::char_value(b).is_some() || b == b'=' || b == b'\r' || b == b'\n'
 }
 
 /// Whether the run starting at `start` is a data-URI payload — the bytes
@@ -602,7 +533,7 @@ mod tests {
     }
 
     /// Minimal standard base64 encoder (RFC 4648 §4), test-only — mirrors
-    /// [`decode_base64_bounded`] so the round trip pins both directions.
+    /// [`base64::decode_bounded`] so the round trip pins both directions.
     fn base64_encode(data: &[u8]) -> String {
         const ALPHABET: &[u8; 64] =
             b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
@@ -639,43 +570,8 @@ mod tests {
         out
     }
 
-    // --- decoder ---
-
-    #[test]
-    fn decode_rfc4648_vectors() {
-        assert_eq!(decode_base64_bounded(b"", usize::MAX), b"");
-        assert_eq!(decode_base64_bounded(b"Zg==", usize::MAX), b"f");
-        assert_eq!(decode_base64_bounded(b"Zm9vYmFy", usize::MAX), b"foobar");
-    }
-
-    #[test]
-    fn decode_line_wrapped_input_matches_unwrapped() {
-        let data = high_entropy_blob(300);
-        let encoded = base64_encode(&data);
-        let wrapped = wrap(&encoded, 76).replace('\n', "\r\n");
-        assert_eq!(decode_base64_bounded(wrapped.as_bytes(), usize::MAX), data);
-    }
-
-    #[test]
-    fn decode_stops_at_invalid_char() {
-        // "Zm9v" -> "foo"; '!' is not in the alphabet and ends decoding.
-        assert_eq!(decode_base64_bounded(b"Zm9v!YmFy", usize::MAX), b"foo");
-    }
-
-    #[test]
-    fn decode_odd_length_and_stray_padding_do_not_panic() {
-        assert_eq!(decode_base64_bounded(b"A", usize::MAX), b"");
-        assert_eq!(decode_base64_bounded(b"A=B", usize::MAX), b"");
-        assert_eq!(decode_base64_bounded(b"====", usize::MAX), b"");
-    }
-
-    #[test]
-    fn decode_respects_output_cap() {
-        let data = high_entropy_blob(3000);
-        let encoded = base64_encode(&data);
-        let decoded = decode_base64_bounded(encoded.as_bytes(), 100);
-        assert_eq!(decoded.len(), 100);
-    }
+    // Decoder-level tests (RFC vectors, invalid/padding handling, output cap)
+    // live in `crate::base64`'s own test module now that it owns the decoder.
 
     // --- rule ---
 
