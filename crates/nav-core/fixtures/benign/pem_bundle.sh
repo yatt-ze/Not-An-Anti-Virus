@@ -1,0 +1,34 @@
+#!/bin/sh
+# Synthetic benign fixture: writes out a CA bundle via heredoc. PEM-armored
+# base64 is high-entropy (it's a DER certificate) but a legitimate carrier,
+# which is exactly the case the entropy rule's PEM-armor skip exists for
+# (issue #36).
+cat > /tmp/ca-bundle.pem <<'EOF'
+-----BEGIN CERTIFICATE-----
+paPEmIhNHSmnEfj4oBXGaZKdyZS/Pgwh1lFo+YR7+qxHWawHrJpiDu7SKQ31FL4Z
+XcClAM3vBAgOyl/suHmYhxe5/GUTc9NjJIKCXMQJCj3MLVzDF3lAeg7vLXA23Wa6
+rRjyCKUHghVgRys+CFd5G/+3qqWqWUm16uGsY6vh1R5Bd06/eBQTwjb5mK4owPUj
+dn8XXRyuq8O+bg1F2APnVvorWGJ8u/ExKcRMPrqTTEDUEVi2vnNMVS1vY2sTheiO
+8a3orGX52RCc0vecJsOnDuRZu0ZiSXgC/aygLr7lNq3cDkIWzm0HZ2F76rf2Zrch
+UnpvumQZ6OATP8ErFGTT6eSwc+iqVotwAY9P+WAWZflouuxUeZmh5cRxUHPfPOze
+nuepMSNGgX8rl2RUQa0ltpAziASJMjZNeqtoq50hxZ0f27Hm/niSyZIkbtaFhFN3
+X9emFwLHdxKiNtS+xAy9my5XyjSTzUmY51riId0Ll7fPTXgQhe2QF9aapPupVz1C
+UMVxvzSBT5uByAsGqkLiiQTYHnekNhEw17SHTqGiRvOfMu5/YHNk8eQ042DxPbrQ
+pOXT3CaH8rhNSXHJqdCFi+4IHCp4bOAIeYYhAiWHBuc7i2etyq8Q8y8oC2YsC8qv
+TUL8zF/g3k11WpRv4eaIxqvAwU6muLW+kjeDVwhz/RbW0tbxtMIodK4jE/vQe971
+QUTb8WKVzESBsFLAoXRMkm8QCGPanx0VS8NZW9mOqxfdnMv+MHkljkOKZqZHvrcn
+7c9FjyOlHVRkXHyfp0Mj72HvTBL2yUwZKfyLI0UaG6DuREiUC/YOy/YjHfuBIkVz
+DxxAaV1jrKfVKUrIGp8xoP5VCoqJwRtNilRbM4UFscmGfGKRQUqlL1sdK2U+WLUX
+TVFZn6J0exf4FquxBY10Td1JZfgCjrnEV1oXRynAzGlB1Y0G5ywmBFvYiLpPHi1g
+DtQOYdPNh7HXr3U3M4yrS1fB/7SdMpxXxob3bzR1Zh3jdKhh2ATfKCk1g8P/u2Mq
+V1WL2DnqHbkSVacvKDepgJU/7xC6Aa/UeQFS/qIVKaNNtczMVJcOw+WlmYkNaito
+x5pSIeda/kj6FD7AnR+fWfFw113WlY5His4Va6N4VJVSAz4PVBYEJLemp/VJqiBe
+AJIK2K1nnXXqZzGgnynZUwRbFLCJ4rD3rZNupEkR5lHk/oPuijA5ty4O8IQf6tkW
+uZndDQWa8UC0gPqti2/IicqoKiFfGoxn7Ep4DUM5mKlvoinGzLQC43o/8UwLWQEw
+CORZQOHQBXTnvbvG5z4gK6+l8+iGyFun90H3MsDPd45LoSgJ/eVTxRWIju7FREua
+1Fpbe3H8Na3enZbsdrr6rrY8M44wBxXTt3YW4Hx9wv+e5pzZ4EU++F9RsyKMZNp8
+7kamwpNnVFh9ETOkXpyCBIH7c2FUv5nki3kTELqHv0QvyPIYHujwKD6I94gKIEYb
+Tos5iKyPcJf5ym2AZ0zMLBOgzRUju4sAGM5J0E6hEaX0hfVDs+Hs+aZUNivsfGJL
+g7BwBHtbJFtALp6+IaPHwIHyECTHWH4WhxHkVDCnR7TX4S6Z1NtqSSsPnc27drSq
+-----END CERTIFICATE-----
+EOF

@@ -85,6 +85,11 @@
     "recommendation": "no-action",
     "rule_ids": []
   },
+  "benign/inline_image_data_uri.js": {
+    "score": 0,
+    "recommendation": "no-action",
+    "rule_ids": []
+  },
   "benign/installer_nested.pkg": {
     "score": 6,
     "recommendation": "no-action",
@@ -119,6 +124,11 @@
     "rule_ids": [
       "unsigned-binary"
     ]
+  },
+  "benign/pem_bundle.sh": {
+    "score": 0,
+    "recommendation": "no-action",
+    "rule_ids": []
   },
   "benign/pipe_to_checksum.sh": {
     "score": 0,
@@ -162,6 +172,14 @@
     "score": 13,
     "recommendation": "no-action",
     "rule_ids": [
+      "suspicious-strings"
+    ]
+  },
+  "suspicious/dropper_base64_packed.sh": {
+    "score": 18,
+    "recommendation": "notify",
+    "rule_ids": [
+      "high-entropy-content",
       "suspicious-strings"
     ]
   },
