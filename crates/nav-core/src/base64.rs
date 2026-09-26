@@ -134,7 +134,10 @@ mod tests {
         // group (still under 4 symbols) is emitted. Skip mode (plist's
         // tolerant reader) treats the stray '=' as noise and keeps
         // collecting symbols, completing the group.
-        assert_eq!(decode_stop(b"AB==CD", usize::MAX), decode_stop(b"AB", usize::MAX));
+        assert_eq!(
+            decode_stop(b"AB==CD", usize::MAX),
+            decode_stop(b"AB", usize::MAX)
+        );
         assert_eq!(
             decode_skip(b"AB==CD", usize::MAX),
             decode_skip(b"ABCD", usize::MAX)

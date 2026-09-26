@@ -53,18 +53,6 @@ const MIN_BASE64_RUN: usize = 1024;
 /// from, mirroring [`MIN_SAMPLE_BYTES`]'s role for the whole-content case.
 const MIN_DECODED_BYTES: usize = 768;
 
-/// Total decoded bytes this rule will produce across all candidate runs in
-/// one file. Content is already bounded to 8 MiB (§3), so this is generous
-/// enough that hitting it without an earlier finding is not expected in
-/// practice; it exists to bound worst-case decode work, not to trim normal
-/// scanning.
-const MAX_BASE64_DECODED_BYTES: usize = 1024 * 1024;
-
-/// Stop considering further base64 runs after this many have cleared
-/// [`MIN_BASE64_RUN`] — bounds worst-case work on a file built from many
-/// qualifying runs.
-const MAX_BASE64_CANDIDATES: usize = 64;
-
 /// A multi-line run's non-final lines must all be at least this wide to be
 /// treated as one wrapped-base64 candidate — real wrapping uses 64 or
 /// 76-column lines. Below it, a uniform width is more likely coincidental
@@ -181,86 +169,60 @@ impl HighEntropyRule {
     /// a run it fails to qualify as, nor smuggle itself in as part of one),
     /// skip candidates that are ordinary data-URI or PEM carriers, decode the
     /// rest, and score the first decoded candidate whose entropy clears the
-    /// threshold. Bounded by [`MAX_BASE64_CANDIDATES`] qualifying candidates
-    /// and [`MAX_BASE64_DECODED_BYTES`] total decoded bytes.
+    /// threshold. Every candidate is examined — content is already capped at
+    /// 8 MiB (§3) and each candidate's decode is bounded by its own length,
+    /// so there's no separate work cap for a payload to hide behind many
+    /// decoys.
     fn eval_base64_payload(&self, content: &[u8]) -> Option<MatchedSignal> {
-        let mut remaining_budget = MAX_BASE64_DECODED_BYTES;
-        let mut candidates = 0usize;
-        let len = content.len();
-        let mut i = 0;
-        while i < len {
-            if !is_base64_run_byte(content[i]) {
-                i += 1;
-                continue;
-            }
-            let run_start = i;
-            while i < len && is_base64_run_byte(content[i]) {
-                i += 1;
-            }
-            let run_end = i;
-
+        let mut pos = 0;
+        while let Some((run_start, run_end, resume)) = next_base64_run(content, pos) {
             let mut seg_start = run_start;
             while seg_start < run_end {
                 let (seg_end, next_start) = next_base64_segment(content, seg_start, run_end);
-                match self.try_base64_candidate(
-                    content,
-                    seg_start,
-                    seg_end,
-                    &mut remaining_budget,
-                    &mut candidates,
-                ) {
-                    Base64Step::Match(signal) => return Some(signal),
-                    Base64Step::Stop => return None,
-                    Base64Step::Continue => {}
+                if let Some(signal) = self.try_base64_candidate(content, seg_start, seg_end) {
+                    return Some(signal);
                 }
                 seg_start = next_start;
             }
+            pos = resume;
         }
         None
     }
 
-    /// Evaluate one candidate byte range as a possible base64 payload,
-    /// consuming from `remaining_budget`/`candidates` as it goes.
+    /// Evaluate one candidate byte range as a possible base64 payload.
     fn try_base64_candidate(
         &self,
         content: &[u8],
         start: usize,
         end: usize,
-        remaining_budget: &mut usize,
-        candidates: &mut usize,
-    ) -> Base64Step {
+    ) -> Option<MatchedSignal> {
         let run = &content[start..end];
         let alphabet_len = run
             .iter()
             .filter(|&&b| base64::char_value(b).is_some())
             .count();
         if alphabet_len < MIN_BASE64_RUN {
-            return Base64Step::Continue;
+            return None;
         }
-        if *candidates >= MAX_BASE64_CANDIDATES || *remaining_budget == 0 {
-            return Base64Step::Stop;
-        }
-        *candidates += 1;
 
         // Ordinary carrier for high-entropy bytes, not an obfuscation attempt.
         if preceded_by_data_uri(content, start) {
-            return Base64Step::Continue;
+            return None;
         }
         // Same: a certificate/key bundle, not a payload.
         if preceded_by_pem_begin(content, start) {
-            return Base64Step::Continue;
+            return None;
         }
 
-        let decoded = base64::decode_bounded(run, *remaining_budget, base64::OnInvalid::Stop);
-        *remaining_budget = remaining_budget.saturating_sub(decoded.len());
+        let decoded = base64::decode_bounded(run, run.len(), base64::OnInvalid::Stop);
         if decoded.len() < MIN_DECODED_BYTES {
-            return Base64Step::Continue;
+            return None;
         }
         let entropy = shannon_entropy(&decoded);
         if entropy < self.threshold {
-            return Base64Step::Continue;
+            return None;
         }
-        Base64Step::Match(MatchedSignal {
+        Some(MatchedSignal {
             id: self.id().to_string(),
             weight: BASE64_PAYLOAD_WEIGHT,
             description: format!(
@@ -273,16 +235,6 @@ impl HighEntropyRule {
             category: self.category(),
         })
     }
-}
-
-/// Outcome of evaluating one base64 candidate range.
-enum Base64Step {
-    /// No match; keep scanning.
-    Continue,
-    /// The candidate/budget cap was hit; stop scanning entirely.
-    Stop,
-    /// A qualifying payload was found.
-    Match(MatchedSignal),
 }
 
 /// Find the next base64 candidate segment starting at `seg_start` within
@@ -351,6 +303,57 @@ fn next_base64_line(content: &[u8], start: usize, run_end: usize) -> (usize, usi
 /// break (line-wrapped base64 is common and carries no information).
 fn is_base64_run_byte(b: u8) -> bool {
     base64::char_value(b).is_some() || b == b'=' || b == b'\r' || b == b'\n'
+}
+
+/// Whether `b` continues a run's payload — alphabet or a line break, but not
+/// `=`: padding only belongs to a run when it's genuinely trailing (see
+/// [`next_base64_run`]).
+fn is_base64_payload_byte(b: u8) -> bool {
+    base64::char_value(b).is_some() || b == b'\r' || b == b'\n'
+}
+
+/// Find the next maximal base64 run at or after `from`: alphabet/line-break
+/// bytes, plus a trailing `=` padding block — but only when that padding
+/// isn't itself followed by more alphabet bytes. Without this, an unquoted
+/// shell assignment (`P=H4sI...`) fuses the variable name and `=` into one
+/// run, so the decoder reads `=` as the start of padding and stops at the
+/// `H` that follows, silently decoding to nothing. Here that `=` ends the
+/// run instead, and scanning resumes right after it, starting a fresh run at
+/// the payload. Returns `(run_start, run_end, resume_from)`.
+fn next_base64_run(content: &[u8], from: usize) -> Option<(usize, usize, usize)> {
+    let len = content.len();
+    let mut i = from;
+    while i < len && !is_base64_run_byte(content[i]) {
+        i += 1;
+    }
+    if i >= len {
+        return None;
+    }
+    let run_start = i;
+    loop {
+        while i < len && is_base64_payload_byte(content[i]) {
+            i += 1;
+        }
+        if i < len && content[i] == b'=' {
+            let eq_start = i;
+            while i < len && content[i] == b'=' {
+                i += 1;
+            }
+            let mut lookahead = i;
+            while lookahead < len && (content[lookahead] == b'\r' || content[lookahead] == b'\n') {
+                lookahead += 1;
+            }
+            if lookahead < len && base64::char_value(content[lookahead]).is_some() {
+                // Padding followed by more payload: not trailing padding —
+                // exclude it, and let the next run start fresh right after it.
+                return Some((run_start, eq_start, i));
+            }
+            // Genuine trailing padding: keep it in the run and keep looking
+            // for more payload bytes (there normally are none).
+            continue;
+        }
+        return Some((run_start, i, i));
+    }
 }
 
 /// Whether the run starting at `start` is a data-URI payload — the bytes
@@ -731,6 +734,82 @@ mod tests {
         assert!(
             HighEntropyRule::default().evaluate(&ctx).unwrap().is_none(),
             "a joined wordlist run must not be treated as one base64 candidate"
+        );
+    }
+
+    // --- work caps and the `=`-splitting fix (§5.1 review round on #36) ---
+
+    #[test]
+    fn unquoted_assignment_is_not_swallowed_by_its_own_equals_sign() {
+        // "P=<payload>" with no quotes: the `=` sits directly against the
+        // payload, with nothing to separate them into different runs except
+        // the run-finding fix itself.
+        let payload = high_entropy_blob(2048);
+        let encoded = base64_encode(&payload);
+        let content = format!("#!/bin/sh\nP={encoded}\necho $P | base64 -d | gunzip | sh\n");
+        let ctx = make_ctx("dropper.sh", content.into_bytes());
+        let signal = HighEntropyRule::default().evaluate(&ctx).unwrap();
+        assert!(
+            signal.is_some(),
+            "an unquoted P=<payload> assignment must still be detected"
+        );
+    }
+
+    #[test]
+    fn base64_payload_survives_many_low_entropy_decoys() {
+        // Regression: MAX_BASE64_CANDIDATES used to stop scanning after 64
+        // qualifying candidates, so enough low-entropy decoys ahead of the
+        // real payload would hide it entirely.
+        let decoy_text = "the quick brown fox jumps over the lazy dog. ".repeat(40);
+        let decoy_encoded = base64_encode(decoy_text.as_bytes());
+        assert!(
+            decoy_encoded.len() >= MIN_BASE64_RUN,
+            "each decoy must itself qualify as a candidate"
+        );
+        let mut content = String::from("#!/bin/sh\n");
+        for i in 0..70 {
+            content.push_str(&format!("D{i}=\"{decoy_encoded}\"\n"));
+        }
+        let payload = high_entropy_blob(2048);
+        let encoded_payload = wrap(&base64_encode(&payload), 76);
+        content.push_str(&format!(
+            "P=\"{encoded_payload}\"\necho \"$P\" | base64 -d | gunzip | sh\n"
+        ));
+        let ctx = make_ctx("many_decoys.sh", content.into_bytes());
+        let signal = HighEntropyRule::default().evaluate(&ctx).unwrap();
+        assert!(
+            signal.is_some(),
+            "a real payload after 70 low-entropy decoys must still be found"
+        );
+    }
+
+    #[test]
+    fn base64_payload_survives_many_data_uri_decoys() {
+        // Same regression, via the other capped resource: 70 skipped
+        // data-URI candidates ahead of the real payload used to exhaust
+        // MAX_BASE64_CANDIDATES before it was ever reached.
+        let icon = high_entropy_blob(900);
+        let icon_encoded = base64_encode(&icon);
+        assert!(
+            icon_encoded.len() >= MIN_BASE64_RUN,
+            "each decoy must itself qualify as a candidate"
+        );
+        let mut content = String::from("#!/bin/sh\n");
+        for i in 0..70 {
+            content.push_str(&format!(
+                "ICON{i}=\"data:image/png;base64,{icon_encoded}\"\n"
+            ));
+        }
+        let payload = high_entropy_blob(2048);
+        let encoded_payload = wrap(&base64_encode(&payload), 76);
+        content.push_str(&format!(
+            "P=\"{encoded_payload}\"\necho \"$P\" | base64 -d | gunzip | sh\n"
+        ));
+        let ctx = make_ctx("many_icons.sh", content.into_bytes());
+        let signal = HighEntropyRule::default().evaluate(&ctx).unwrap();
+        assert!(
+            signal.is_some(),
+            "a real payload after 70 skipped data-URI decoys must still be found"
         );
     }
 }
