@@ -634,12 +634,23 @@ pub(crate) mod tests_support {
     /// binary the kernel will still run can take (§46: verified with 24 bogus
     /// entries alongside one real arm64 slice).
     pub(crate) fn synth_fat_with_bogus_arches(real_member: &[u8], bogus_count: usize) -> Vec<u8> {
-        const PAGE: usize = 16 * 1024;
+        synth_fat_with_bogus_arches_aligned(real_member, bogus_count, 16 * 1024)
+    }
+
+    /// As [`synth_fat_with_bogus_arches`], but with the bogus regions aligned
+    /// to `page` bytes instead of a fixed 16 KiB. A fixture that only needs
+    /// to be *parsed* (never mapped/executed) can pack them far tighter than
+    /// the kernel-runnable shape `synth_fat_with_bogus_arches` reproduces.
+    pub(crate) fn synth_fat_with_bogus_arches_aligned(
+        real_member: &[u8],
+        bogus_count: usize,
+        page: usize,
+    ) -> Vec<u8> {
         const BOGUS_SIZE: usize = 16;
 
         let total = bogus_count + 1;
         let header_len = 8 + 20 * total;
-        let align_up = |x: usize| x.div_ceil(PAGE) * PAGE;
+        let align_up = |x: usize| x.div_ceil(page) * page;
 
         let mut offsets = Vec::with_capacity(total);
         let mut cursor = header_len;

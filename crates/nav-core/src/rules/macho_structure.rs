@@ -595,7 +595,7 @@ mod tests {
 #[cfg(test)]
 mod fixture_gen {
     use crate::macho::tests_support::{
-        synth_fat, synth_fat_with_bogus_arches, synth_macho_64_full,
+        synth_fat, synth_fat_with_bogus_arches_aligned, synth_macho_64_full,
         synth_macho_64_full_with_cd_flags,
     };
     use std::path::Path;
@@ -709,7 +709,10 @@ mod fixture_gen {
         // slice. The 24 unwalkable declared arches must degrade the scan to
         // Partial rather than let the clean slice score fine. The slice
         // carries an `osascript` string so suspicious-strings still fires on
-        // Ubuntu CI, where the codesign-backed rules don't run.
+        // Ubuntu CI, where the codesign-backed rules don't run. This fixture
+        // is only ever parsed, never executed, so the bogus regions are
+        // packed tight (16-byte alignment) instead of the real 16 KiB the
+        // kernel requires — keeps the checked-in file a few KiB instead of ~400KB.
         let (many_arches_slice, _, _) = synth_macho_64_full(
             b"\x55\x48\x89\xe5\x90 shells out via osascript for testing",
             &["/usr/lib/libSystem.B.dylib"],
@@ -717,7 +720,7 @@ mod fixture_gen {
             false,
             None,
         );
-        let many_arches = synth_fat_with_bogus_arches(&many_arches_slice, 24);
+        let many_arches = synth_fat_with_bogus_arches_aligned(&many_arches_slice, 24, 16);
         std::fs::write(root.join("suspicious/macho_fat_many_arches"), many_arches).unwrap();
     }
 }
