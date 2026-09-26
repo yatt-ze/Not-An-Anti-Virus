@@ -26,18 +26,25 @@ pub(crate) enum OnInvalid {
     Stop,
 }
 
-/// Decode up to `max_output` bytes of base64 from `input`. `\r`/`\n` are
-/// always skipped (line-wrapped base64 is common); `=` starts padding.
-/// `on_invalid` governs both a byte outside the alphabet/padding and an
-/// alphabet byte following padding (malformed input). Never panics: a
-/// truncated final group of 2 or 3 symbols decodes to 1 or 2 bytes, 1
-/// leftover symbol is dropped, matching most decoders' handling of
-/// malformed input.
-pub(crate) fn decode_bounded(input: &[u8], max_output: usize, on_invalid: OnInvalid) -> Vec<u8> {
+/// Decode up to `max_output` bytes of base64 from `input`, also returning
+/// the count of alphabet characters consumed (`=`/`\r`/`\n` not counted) —
+/// so a caller judging whether a candidate is long enough doesn't need its
+/// own separate counting pass over the same bytes. `\r`/`\n` are always
+/// skipped (line-wrapped base64 is common); `=` starts padding. `on_invalid`
+/// governs both a byte outside the alphabet/padding and an alphabet byte
+/// following padding (malformed input). Never panics: a truncated final
+/// group of 2 or 3 symbols decodes to 1 or 2 bytes, 1 leftover symbol is
+/// dropped, matching most decoders' handling of malformed input.
+pub(crate) fn decode_bounded(
+    input: &[u8],
+    max_output: usize,
+    on_invalid: OnInvalid,
+) -> (Vec<u8>, usize) {
     let mut out = Vec::new();
     let mut group = [0u8; 4];
     let mut group_len = 0usize;
     let mut padding_started = false;
+    let mut alphabet_count = 0usize;
     let stop_on_invalid = matches!(on_invalid, OnInvalid::Stop);
 
     for &b in input {
@@ -57,6 +64,7 @@ pub(crate) fn decode_bounded(input: &[u8], max_output: usize, on_invalid: OnInva
             }
             continue;
         };
+        alphabet_count += 1;
         group[group_len] = v;
         group_len += 1;
         if group_len == 4 {
@@ -66,7 +74,7 @@ pub(crate) fn decode_bounded(input: &[u8], max_output: usize, on_invalid: OnInva
             group_len = 0;
             if out.len() >= max_output {
                 out.truncate(max_output);
-                return out;
+                return (out, alphabet_count);
             }
         }
     }
@@ -79,7 +87,7 @@ pub(crate) fn decode_bounded(input: &[u8], max_output: usize, on_invalid: OnInva
         _ => {}
     }
     out.truncate(max_output);
-    out
+    (out, alphabet_count)
 }
 
 #[cfg(test)]
@@ -87,11 +95,18 @@ mod tests {
     use super::*;
 
     fn decode_stop(input: &[u8], max_output: usize) -> Vec<u8> {
-        decode_bounded(input, max_output, OnInvalid::Stop)
+        decode_bounded(input, max_output, OnInvalid::Stop).0
     }
 
     fn decode_skip(input: &[u8], max_output: usize) -> Vec<u8> {
-        decode_bounded(input, max_output, OnInvalid::Skip)
+        decode_bounded(input, max_output, OnInvalid::Skip).0
+    }
+
+    #[test]
+    fn decode_bounded_returns_alphabet_count() {
+        let (decoded, count) = decode_bounded(b"Zm9v\r\n!YmFy==", usize::MAX, OnInvalid::Skip);
+        assert_eq!(decoded, b"foobar");
+        assert_eq!(count, 8, "\\r\\n, '!', and '=' padding don't count");
     }
 
     #[test]

@@ -1,32 +1,12 @@
 //! High-entropy content detection — a weak generic signal on its own (§5.1).
 //!
-//! Structure-aware, not whole-file:
-//! - **Mach-O**: scores the `__TEXT` code section (§5.2) — packed/obfuscated
-//!   code is well above the ceiling, normal machine code well below.
-//! - **script/text**: scores the whole content first (raw binary spliced
-//!   into a script, weight 15), then looks for a base64-encoded high-entropy
-//!   payload (§5.2, weight 8 — corroboration-only, see
-//!   [`BASE64_PAYLOAD_WEIGHT`]). Base64's 64-symbol alphabet caps
-//!   whole-content entropy at 6.0 bits/byte, so an encoded payload can never
-//!   trip the whole-content check — only *decoding* a qualifying run
-//!   recovers its real entropy. A data-URI (`;base64,`) or PEM-armored
-//!   (`-----BEGIN ...-----`) run is skipped, since both are ordinary
-//!   carriers for high-entropy bytes. A multi-line run is split into
-//!   candidate *blocks* — maximal stretches of consecutive same-width lines
-//!   (a possible shorter final line allowed, real base64 wrapping's
-//!   remainder) — rather than judged as a single all-or-nothing candidate,
-//!   so a wordlist/dictionary's one-token-per-line text can't fuse into a
-//!   fake giant run just because every character sits in the base64
-//!   alphabet, and, the other direction, a blank separator line or a short
-//!   heredoc terminator word sitting right next to a genuinely wrapped
-//!   payload can't blind detection of it either — each block stands on its
-//!   own. Base64 of plain text (e.g. an encoded shell script) decodes
-//!   to *low* entropy and is deliberately not this rule's signal — that
-//!   encode-then-hand-to-an-interpreter shape is a string-marker concern
-//!   (issue #35).
-//! - **any other opaque binary** (archive, image, encrypted data): high
-//!   entropy is expected, so it is *not* scored — whole-file scoring was a
-//!   real false-positive source (a plain `.tar.gz` alerted) (§1).
+//! Structure-aware, not whole-file (§5.2):
+//! - **Mach-O**: scores the `__TEXT` code section.
+//! - **script/text**: scores the whole content first (weight 15), then a
+//!   base64-encoded payload's *decoded* bytes (weight 8, corroboration-only
+//!   — see [`BASE64_PAYLOAD_WEIGHT`]). Base64 of plain text decodes to low
+//!   entropy and is deliberately not this rule's signal (issue #35).
+//! - **any other opaque binary**: not scored — expected to be high-entropy.
 
 use std::path::Path;
 
@@ -155,8 +135,8 @@ impl HighEntropyRule {
                     id: self.id().to_string(),
                     weight: 15,
                     description: format!(
-                        "high-entropy content embedded in a script/text file \
-                         (entropy: {:.1} bits/byte over {} bytes) — possible obfuscated/base64 payload",
+                        "binary data embedded in a script/text file \
+                         (entropy: {:.1} bits/byte over {} bytes)",
                         entropy,
                         content.len()
                     ),
@@ -167,20 +147,11 @@ impl HighEntropyRule {
         self.eval_base64_payload(content)
     }
 
-    /// Scan for a base64-encoded high-entropy payload: find maximal runs of
-    /// the base64 alphabet, walk each run as a sequence of wrapped-base64
-    /// *blocks* and single-line boundaries (a block is a candidate on its
-    /// own, so an unrelated short line — blank, a wordlist entry, a heredoc
-    /// terminator — can't fuse an adjacent real payload into a run it fails
-    /// to qualify as, nor smuggle itself in as part of one), decide once per
-    /// run — from the first candidate segment long enough to matter, module
-    /// docs above — whether it's an ordinary data-URI or PEM carrier whose
-    /// decoded bytes actually match what it claims, and if so skip every
-    /// candidate in the run; otherwise score the first one whose entropy
-    /// clears the threshold. Every candidate is examined — content is
-    /// already capped at 8 MiB (§3) and each candidate's decode is bounded
-    /// by its own length, so there's no separate work cap for a payload to
-    /// hide behind many decoys.
+    /// Scan for a base64-encoded high-entropy payload: find maximal runs,
+    /// split each into candidate blocks/lines, skip a run confirmed as an
+    /// ordinary carrier, and score the first remaining candidate whose
+    /// entropy clears the threshold. Every candidate is examined — no work
+    /// cap (§5.2).
     fn eval_base64_payload(&self, content: &[u8]) -> Option<MatchedSignal> {
         let mut pos = 0;
         while let Some((run_start, run_end, resume)) = next_base64_run(content, pos) {
@@ -205,12 +176,9 @@ impl HighEntropyRule {
         None
     }
 
-    /// Evaluate one candidate byte range as a possible base64 payload. The
-    /// first candidate in a run long enough to decode also settles
-    /// `carrier_confirmed` for the rest of the run: a short leading segment
-    /// (a stray header word, a blank line) decodes to noise, not the
-    /// payload's true start, so it's skipped for this decision — but once
-    /// settled, the same verdict applies to every candidate in the run.
+    /// Evaluate one candidate byte range as a possible base64 payload.
+    /// `carrier_confirmed` is settled by the first candidate long enough to
+    /// decode meaningfully, then applied to the rest of the run (§5.2).
     fn try_base64_candidate(
         &self,
         content: &[u8],
@@ -220,15 +188,12 @@ impl HighEntropyRule {
         carrier_confirmed: &mut Option<bool>,
     ) -> Option<MatchedSignal> {
         let run = &content[start..end];
-        let alphabet_len = run
-            .iter()
-            .filter(|&&b| base64::char_value(b).is_some())
-            .count();
+        let (decoded, alphabet_len) =
+            base64::decode_bounded(run, run.len(), base64::OnInvalid::Stop);
         if alphabet_len < MIN_BASE64_RUN {
             return None;
         }
 
-        let decoded = base64::decode_bounded(run, run.len(), base64::OnInvalid::Stop);
         let confirmed = *carrier_confirmed.get_or_insert_with(|| {
             !matches!(carrier, Carrier::None)
                 && carrier.matches(&decoded[..decoded.len().min(CARRIER_MAGIC_PREFIX_BYTES)])
@@ -259,20 +224,11 @@ impl HighEntropyRule {
 }
 
 /// Find the next base64 candidate segment starting at `seg_start` within
-/// `content[..run_end]`, returning its (exclusive) end and where to resume
-/// scanning for the next one. A segment is either: a single line under both
-/// [`MIN_WRAPPED_LINE_LEN`] and [`MIN_FREEFORM_LINE_LEN`] (too narrow to be
-/// real wrapping — a blank line, a wordlist entry, a short terminator word —
-/// judged only on its own bytes); or a maximal *block* of consecutive lines
-/// that either all share one exact width >= `MIN_WRAPPED_LINE_LEN` (uniform
-/// wrapping, e.g. `base64 -b 32`) or are all individually >=
-/// `MIN_FREEFORM_LINE_LEN` regardless of exact width (uneven wrapping),
-/// optionally followed by one trailing line no wider than the block's last
-/// line (real base64 wrapping's final, partial line). Splitting into blocks
-/// this way means a block is unaffected by what lies just before or after it
-/// in the run — a blank separator line or a heredoc terminator word can't
-/// blind detection of a genuinely wrapped payload next to it, nor can it
-/// borrow the payload's length to pass as one itself.
+/// `content[..run_end]`: its (exclusive) end, and where to resume scanning.
+/// A segment is a single line under both [`MIN_WRAPPED_LINE_LEN`] and
+/// [`MIN_FREEFORM_LINE_LEN`], or a maximal block of consecutive lines
+/// matching one of those two width rules, optionally with one shorter
+/// trailing line (§5.2).
 fn next_base64_segment(content: &[u8], seg_start: usize, run_end: usize) -> (usize, usize) {
     let (first_end, first_next) = next_base64_line(content, seg_start, run_end);
     let first_width = first_end - seg_start;
@@ -347,12 +303,9 @@ fn is_base64_payload_byte(b: u8) -> bool {
 
 /// Find the next maximal base64 run at or after `from`: alphabet/line-break
 /// bytes, plus a trailing `=` padding block — but only when that padding
-/// isn't itself followed by more alphabet bytes. Without this, an unquoted
-/// shell assignment (`P=H4sI...`) fuses the variable name and `=` into one
-/// run, so the decoder reads `=` as the start of padding and stops at the
-/// `H` that follows, silently decoding to nothing. Here that `=` ends the
-/// run instead, and scanning resumes right after it, starting a fresh run at
-/// the payload. Returns `(run_start, run_end, resume_from)`.
+/// isn't itself followed by more alphabet bytes (§5.2: an unquoted `P=<b64>`
+/// assignment must not fuse the `=` into the payload as false padding).
+/// Returns `(run_start, run_end, resume_from)`.
 fn next_base64_run(content: &[u8], from: usize) -> Option<(usize, usize, usize)> {
     let len = content.len();
     let mut i = from;
@@ -397,13 +350,10 @@ const PEM_LOOKBACK_LINES: usize = 8;
 /// mime types are short, so this is generous.
 const MAX_MIME_LOOKBACK: usize = 64;
 
-/// What a base64 run is claimed to carry, read once from the text before it
-/// (§5.2): a run immediately preceded by `;base64,` (a data URI) or, within
-/// [`PEM_LOOKBACK_LINES`], a `-----BEGIN ` line (PEM armor). Whether it's
-/// actually skipped is a separate, later decision ([`HighEntropyRule::try_base64_candidate`]):
-/// the claim only holds once a candidate's *decoded* bytes match it
-/// ([`Carrier::matches`]) — a spoofed prefix in front of an unrelated
-/// payload matches nothing and skips nothing.
+/// What a base64 run is claimed to carry, read once from the text before it:
+/// `;base64,` (a data URI) or a nearby `-----BEGIN ` line (PEM armor). Only
+/// a claim confirmed by the candidate's *decoded* bytes ([`Carrier::matches`])
+/// is actually skipped (§5.2) — a spoofed prefix matches nothing.
 enum Carrier {
     None,
     /// The mime type's expected magic bytes, or `None` for an unrecognized
@@ -464,14 +414,10 @@ impl PemArmor {
 }
 
 /// Find a PEM carrier for the run starting at `run_start`: walk backward
-/// through the text lines ending at `run_start` (a base64 run can start
-/// mid-line — a header value's last word, or a line's own trailing `\n`, is
-/// itself a run byte — so this reconstructs lines from raw text, independent
-/// of run boundaries). Up to [`PEM_LOOKBACK_LINES`] lines are tolerated, each
-/// blank or a `Key: value` header (`Version:`, `Proc-Type:`, ... — real PEM/
-/// PGP shape, not part of the base64 body), until a `-----BEGIN ` line is
-/// found; running out of budget or hitting a line that's neither means no
-/// carrier.
+/// through the text lines ending there (independent of run boundaries — a
+/// run can start mid-line, since a header value's last word is itself a run
+/// byte). Up to [`PEM_LOOKBACK_LINES`] blank/`Key: value`-header lines are
+/// tolerated before a `-----BEGIN ` line; anything else means no carrier.
 fn find_pem_carrier(content: &[u8], run_start: usize) -> Option<PemArmor> {
     let mut end = run_start;
     let mut is_legacy_encrypted = false;

@@ -563,7 +563,7 @@ mod xml_reader {
     /// Tolerant: any byte outside the alphabet (padding included) is skipped
     /// rather than ending the decode, unlike `entropy`'s run decoder.
     fn decode_base64_bounded(s: &str) -> Vec<u8> {
-        base64::decode_bounded(s.as_bytes(), MAX_DATA_BYTES, base64::OnInvalid::Skip)
+        base64::decode_bounded(s.as_bytes(), MAX_DATA_BYTES, base64::OnInvalid::Skip).0
     }
 }
 
