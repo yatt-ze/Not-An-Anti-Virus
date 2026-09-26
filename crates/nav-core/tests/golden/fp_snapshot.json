@@ -131,6 +131,14 @@
     ],
     "completeness": "complete"
   },
+  "benign/macho_adhoc_debug_get_task_allow": {
+    "score": 4,
+    "recommendation": "no-action",
+    "rule_ids": [
+      "unsigned-binary"
+    ],
+    "completeness": "complete"
+  },
   "benign/macho_like_but_incomplete": {
     "score": 4,
     "recommendation": "no-action",

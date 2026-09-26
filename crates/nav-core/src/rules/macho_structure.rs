@@ -4,8 +4,12 @@
 //! paths, code-signature presence, embedded entitlements, CodeDirectory
 //! flags) and scores two narrow anomalies — a dylib/rpath load path into a
 //! writable/transient location, and a handful of specific "exempt me from
-//! platform protections" entitlements, weighted higher when the binary is
-//! only ad-hoc signed rather than under a real identity. Each is
+//! platform protections" entitlements, most weighted higher when the binary
+//! is only ad-hoc signed rather than under a real identity
+//! (`EntitlementPolicy::WeightedByIdentity`); `get-task-allow` is the
+//! exception — Xcode Debug builds are always ad-hoc and always request it, so
+//! it only scores on a confirmed identity-signed binary
+//! (`EntitlementPolicy::IdentityOnly`, #37). Each anomaly is
 //! corroboration-only (§5.1): summed weight is capped well under the
 //! high-severity threshold, so this rule alone can never push a verdict past
 //! `Notify`.
@@ -32,13 +36,47 @@ const ENTITLEMENT_WEIGHT_ADHOC: i32 = 18;
 /// never near the §5.1 high-severity threshold on its own.
 const MAX_WEIGHT: i32 = 30;
 
-/// Entitlement keys that exempt a binary from a platform protection —
-/// meaningful on their own regardless of what else the binary does.
-const SUSPICIOUS_ENTITLEMENTS: &[&str] = &[
-    "com.apple.security.cs.disable-library-validation",
-    "com.apple.security.cs.allow-dyld-environment-variables",
-    "com.apple.security.cs.disable-executable-page-protection",
-    "com.apple.security.get-task-allow",
+/// When a suspicious entitlement contributes to the score.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum EntitlementPolicy {
+    /// Always contributes, weighted by ad-hoc-vs-identity like the rest of
+    /// this rule (`ENTITLEMENT_WEIGHT_ADHOC`/`ENTITLEMENT_WEIGHT_SIGNED`).
+    WeightedByIdentity,
+    /// Only contributes on a confirmed identity-signed binary (`CS_ADHOC`
+    /// known absent) — see `get-task-allow`'s entry below.
+    IdentityOnly,
+}
+
+/// An entitlement key that exempts a binary from a platform protection,
+/// meaningful on its own regardless of what else the binary does, together
+/// with when it's scored.
+struct SuspiciousEntitlement {
+    key: &'static str,
+    policy: EntitlementPolicy,
+}
+
+/// `com.apple.security.get-task-allow` only scores on an identity-signed
+/// binary: Xcode adds it to *every* Debug build, and Xcode Debug builds are
+/// always ad-hoc signed ("Sign to Run Locally") — so on an ad-hoc binary it's
+/// the ordinary dev-build state, not an anomaly. Notarization rejects it on
+/// a real identity, so there it's still meaningful (#37).
+const SUSPICIOUS_ENTITLEMENTS: &[SuspiciousEntitlement] = &[
+    SuspiciousEntitlement {
+        key: "com.apple.security.cs.disable-library-validation",
+        policy: EntitlementPolicy::WeightedByIdentity,
+    },
+    SuspiciousEntitlement {
+        key: "com.apple.security.cs.allow-dyld-environment-variables",
+        policy: EntitlementPolicy::WeightedByIdentity,
+    },
+    SuspiciousEntitlement {
+        key: "com.apple.security.cs.disable-executable-page-protection",
+        policy: EntitlementPolicy::WeightedByIdentity,
+    },
+    SuspiciousEntitlement {
+        key: "com.apple.security.get-task-allow",
+        policy: EntitlementPolicy::IdentityOnly,
+    },
 ];
 
 pub struct MachOStructureRule;
@@ -167,41 +205,55 @@ fn entitlements_finding(
         return Err(RuleOutcome::NotApplicable); // malformed entitlements blob
     };
 
-    let bad = suspicious_entitlements(&parsed);
-    if bad.is_empty() {
+    // Ad-hoc vs. a real signing identity, not signed vs. unsigned: entitlements
+    // only ever come from inside a code signature, so `has_code_signature` is
+    // always true here. `None` means the CodeDirectory couldn't be recovered.
+    let is_adhoc_known = image
+        .code_directory_flags
+        .map(|flags| flags & CS_ADHOC != 0);
+    let is_adhoc = is_adhoc_known.unwrap_or(false); // unknown falls back to the real-identity weight
+
+    let mut contributing: Vec<&'static str> = Vec::new();
+    let mut weight = 0i32;
+    for ent in SUSPICIOUS_ENTITLEMENTS {
+        if parsed.get(ent.key).and_then(PlistValue::as_bool) != Some(true) {
+            continue;
+        }
+        match ent.policy {
+            EntitlementPolicy::WeightedByIdentity => {
+                contributing.push(ent.key);
+                weight += if is_adhoc {
+                    ENTITLEMENT_WEIGHT_ADHOC
+                } else {
+                    ENTITLEMENT_WEIGHT_SIGNED
+                };
+            }
+            // Ad-hoc or unknown flags: not identity-confirmed, so this
+            // entitlement contributes nothing and isn't listed.
+            EntitlementPolicy::IdentityOnly if is_adhoc_known == Some(false) => {
+                contributing.push(ent.key);
+                weight += ENTITLEMENT_WEIGHT_SIGNED;
+            }
+            EntitlementPolicy::IdentityOnly => {}
+        }
+    }
+
+    if contributing.is_empty() {
         return Ok(None);
     }
 
-    // Ad-hoc vs. a real signing identity, not signed vs. unsigned: entitlements
-    // only ever come from inside a code signature, so `has_code_signature` is
-    // always true here. Unknown flags (no CodeDirectory recovered) fall back
-    // to the lower, real-identity weight rather than assuming the worse case.
-    let is_adhoc = image
-        .code_directory_flags
-        .is_some_and(|flags| flags & CS_ADHOC != 0);
-    let weight_each = if is_adhoc {
-        ENTITLEMENT_WEIGHT_ADHOC
-    } else {
-        ENTITLEMENT_WEIGHT_SIGNED
-    };
     let description = if is_adhoc {
         format!(
             "requests suspicious entitlement(s) on an ad-hoc-signed binary: {}",
-            bad.join(", ")
+            contributing.join(", ")
         )
     } else {
-        format!("requests suspicious entitlement(s): {}", bad.join(", "))
+        format!(
+            "requests suspicious entitlement(s): {}",
+            contributing.join(", ")
+        )
     };
-    Ok(Some((weight_each * bad.len() as i32, description)))
-}
-
-/// Which of [`SUSPICIOUS_ENTITLEMENTS`] are set `true` in `plist`.
-fn suspicious_entitlements(plist: &PlistValue) -> Vec<&'static str> {
-    SUSPICIOUS_ENTITLEMENTS
-        .iter()
-        .copied()
-        .filter(|key| plist.get(key).and_then(PlistValue::as_bool) == Some(true))
-        .collect()
+    Ok(Some((weight, description)))
 }
 
 /// True if `path` is a load path worth flagging: an absolute path into a
@@ -397,6 +449,79 @@ mod tests {
             unknown_sig.weight, ENTITLEMENT_WEIGHT_SIGNED,
             "an unrecoverable CodeDirectory must not assume the worse case"
         );
+    }
+
+    #[test]
+    fn get_task_allow_on_an_adhoc_binary_scores_nothing() {
+        // Xcode adds get-task-allow to every Debug build, and Debug builds
+        // are always ad-hoc signed ("Sign to Run Locally") — the ordinary
+        // dev-build state, not an anomaly (#37).
+        let xml = br#"<?xml version="1.0"?><plist version="1.0"><dict>
+            <key>com.apple.security.get-task-allow</key><true/>
+        </dict></plist>"#;
+        let (image, _, _) =
+            synth_macho_64_full_with_cd_flags(b"code", &[], &[], true, Some(xml), Some(CS_ADHOC));
+        assert!(matches!(
+            MachOStructureRule.evaluate(&ctx_for(image)),
+            Ok(None)
+        ));
+    }
+
+    #[test]
+    fn get_task_allow_on_an_identity_signed_binary_is_flagged() {
+        // Notarization rejects get-task-allow on a real identity, so there
+        // it's still meaningful.
+        let xml = br#"<?xml version="1.0"?><plist version="1.0"><dict>
+            <key>com.apple.security.get-task-allow</key><true/>
+        </dict></plist>"#;
+        let (image, _, _) = synth_macho_64_full_with_cd_flags(
+            b"code",
+            &[],
+            &[],
+            true,
+            Some(xml),
+            Some(0x10000), // no CS_ADHOC bit — a real identity
+        );
+        let sig = MachOStructureRule
+            .evaluate(&ctx_for(image))
+            .unwrap()
+            .expect("should fire");
+        assert_eq!(sig.weight, ENTITLEMENT_WEIGHT_SIGNED);
+        assert!(sig.description.contains("get-task-allow"));
+    }
+
+    #[test]
+    fn get_task_allow_alongside_an_adhoc_weighted_entitlement_is_excluded_from_the_finding() {
+        let xml = br#"<?xml version="1.0"?><plist version="1.0"><dict>
+            <key>com.apple.security.cs.disable-library-validation</key><true/>
+            <key>com.apple.security.get-task-allow</key><true/>
+        </dict></plist>"#;
+        let (image, _, _) =
+            synth_macho_64_full_with_cd_flags(b"code", &[], &[], true, Some(xml), Some(CS_ADHOC));
+        let sig = MachOStructureRule
+            .evaluate(&ctx_for(image))
+            .unwrap()
+            .expect("should fire");
+        assert_eq!(
+            sig.weight, ENTITLEMENT_WEIGHT_ADHOC,
+            "only the ad-hoc-weighted entitlement should contribute"
+        );
+        assert!(sig.description.contains("disable-library-validation"));
+        assert!(!sig.description.contains("get-task-allow"));
+    }
+
+    #[test]
+    fn get_task_allow_with_unknown_flags_scores_nothing() {
+        // No CodeDirectory recovered at all: not confirmed identity-signed,
+        // so get-task-allow must not assume the worse case either.
+        let xml = br#"<?xml version="1.0"?><plist version="1.0"><dict>
+            <key>com.apple.security.get-task-allow</key><true/>
+        </dict></plist>"#;
+        let (image, _, _) = synth_macho_64_full(b"code", &[], &[], true, Some(xml));
+        assert!(matches!(
+            MachOStructureRule.evaluate(&ctx_for(image)),
+            Ok(None)
+        ));
     }
 
     #[test]
@@ -621,6 +746,31 @@ mod fixture_gen {
             Some(benign_entitlements),
         );
         std::fs::write(root.join("benign/macho_normal_loader"), benign).unwrap();
+
+        // Benign: an ad-hoc "Sign to Run Locally" Xcode Debug build shape —
+        // CS_ADHOC CodeDirectory flags, app-sandbox + get-task-allow
+        // entitlements (Xcode adds get-task-allow to every Debug build),
+        // benign system dylibs only. get-task-allow must not score on an
+        // ad-hoc binary (#37) — Xcode Debug builds are always ad-hoc-signed.
+        let adhoc_debug_entitlements = br#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+    <key>com.apple.security.app-sandbox</key><true/>
+    <key>com.apple.security.get-task-allow</key><true/>
+</dict></plist>"#;
+        let (adhoc_debug, _, _) = synth_macho_64_full_with_cd_flags(
+            b"\x55\x48\x89\xe5\x90adhoc debug build machine code padding to look real",
+            &["/usr/lib/libSystem.B.dylib"],
+            &[],
+            true,
+            Some(adhoc_debug_entitlements),
+            Some(CS_ADHOC),
+        );
+        std::fs::write(
+            root.join("benign/macho_adhoc_debug_get_task_allow"),
+            adhoc_debug,
+        )
+        .unwrap();
 
         // Suspicious: an rpath into /tmp plus a disable-library-validation
         // entitlement — both anomalies this rule looks for.
