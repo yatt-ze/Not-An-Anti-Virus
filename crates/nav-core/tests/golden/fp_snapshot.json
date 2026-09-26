@@ -9,6 +9,11 @@
     "recommendation": "no-action",
     "rule_ids": []
   },
+  "benign/Hello.class": {
+    "score": 0,
+    "recommendation": "no-action",
+    "rule_ids": []
+  },
   "benign/NamedDiff.app": {
     "score": 0,
     "recommendation": "no-action",

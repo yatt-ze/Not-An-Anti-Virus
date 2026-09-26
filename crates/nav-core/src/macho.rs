@@ -45,7 +45,6 @@ const CSSLOT_CODEDIRECTORY: u32 = 0;
 const CSSLOT_ENTITLEMENTS: u32 = 5;
 
 // Loop ceilings — far above any real Mach-O, but bound work on hostile input.
-const MAX_FAT_ARCHES: u32 = 64;
 const MAX_NCMDS: u32 = 4096;
 const MAX_NSECTS: u32 = 4096;
 const MAX_DYLIBS: usize = 4096;
@@ -110,8 +109,7 @@ pub fn parse(data: &[u8]) -> Option<MachOImage> {
 /// first (§5.2).
 pub fn parse_all(data: &[u8]) -> Vec<MachOImage> {
     match be_u32(data, 0) {
-        Some(FAT_MAGIC) => parse_fat_all(data, false),
-        Some(FAT_MAGIC_64) => parse_fat_all(data, true),
+        Some(FAT_MAGIC) | Some(FAT_MAGIC_64) => parse_fat_all(data),
         Some(magic) => match thin_kind(magic) {
             Some((is_64, be)) => parse_thin(data, 0, is_64, be, false).into_iter().collect(),
             None => Vec::new(),
@@ -125,7 +123,7 @@ pub fn parse_all(data: &[u8]) -> Vec<MachOImage> {
 /// at all", including images `parse` declines to walk.
 pub fn is_macho_magic(data: &[u8]) -> bool {
     match be_u32(data, 0) {
-        Some(FAT_MAGIC) | Some(FAT_MAGIC_64) => true,
+        Some(FAT_MAGIC) | Some(FAT_MAGIC_64) => plausible_fat_header(data).is_some(),
         Some(magic) => thin_kind(magic).is_some(),
         None => false,
     }
@@ -143,15 +141,36 @@ fn thin_kind(magic: u32) -> Option<(bool, bool)> {
     }
 }
 
-/// Walk every arch of a fat/universal binary, collecting the slices this
-/// parser can read (in fat-table order). A zero/implausible `nfat_arch` also
-/// rejects a Java `.class` (its version number sits where `nfat_arch` would).
-fn parse_fat_all(data: &[u8], is_64: bool) -> Vec<MachOImage> {
-    let mut out = Vec::new();
+/// Real universal binaries carry a handful of architecture slices; a Java
+/// `.class` file shares `FAT_MAGIC` with its minor/major version sitting
+/// where `nfat_arch` would be, and major versions are 45 and up (JDK 1.1
+/// onward) — so a plausible fat header caps `nfat_arch` well below that.
+const MAX_PLAUSIBLE_FAT_ARCHES: u32 = 19;
+
+/// Recognize a plausible fat/universal Mach-O header: `FAT_MAGIC`/
+/// `FAT_MAGIC_64` with a small, nonzero `nfat_arch` — rejecting a Java
+/// `.class` file, which shares `FAT_MAGIC` but not this shape. Returns
+/// `(is_64, nfat_arch)`.
+fn plausible_fat_header(data: &[u8]) -> Option<(bool, u32)> {
+    let is_64 = match be_u32(data, 0)? {
+        FAT_MAGIC => false,
+        FAT_MAGIC_64 => true,
+        _ => return None,
+    };
     // fat_header (always big-endian): magic(4), nfat_arch(4).
-    let nfat = match be_u32(data, 4) {
-        Some(n) if n != 0 && n <= MAX_FAT_ARCHES => n,
-        _ => return out,
+    match be_u32(data, 4) {
+        Some(n) if n != 0 && n <= MAX_PLAUSIBLE_FAT_ARCHES => Some((is_64, n)),
+        _ => None,
+    }
+}
+
+/// Walk every arch of a fat/universal binary, collecting the slices this
+/// parser can read (in fat-table order). Empty for an implausible fat header
+/// (incl. a Java `.class`, see [`plausible_fat_header`]).
+fn parse_fat_all(data: &[u8]) -> Vec<MachOImage> {
+    let mut out = Vec::new();
+    let Some((is_64, nfat)) = plausible_fat_header(data) else {
+        return out;
     };
     for i in 0..nfat as usize {
         if let Some(img) = fat_member(data, is_64, i) {
@@ -849,6 +868,30 @@ mod tests {
         v.extend_from_slice(&0x0000_0034u32.to_be_bytes()); // minor=0, major=52
         v.extend_from_slice(&[0u8; 64]);
         assert!(parse(&v).is_none());
+    }
+
+    #[test]
+    fn java_class_headers_are_not_macho() {
+        // CAFEBABE + (minor=0, major=52) and (minor=0, major=65) — real Java
+        // major versions (JDK 1.1 onward is 45+) land well past
+        // MAX_PLAUSIBLE_FAT_ARCHES, unlike any real universal binary's arch
+        // count.
+        for major in [0x34u32, 0x41] {
+            let mut v = vec![0xCA, 0xFE, 0xBA, 0xBE];
+            v.extend_from_slice(&major.to_be_bytes());
+            v.extend_from_slice(&[0u8; 64]);
+            assert!(!is_macho_magic(&v), "major {major:#x}");
+            assert!(parse_all(&v).is_empty(), "major {major:#x}");
+        }
+    }
+
+    #[test]
+    fn a_real_fat_header_with_a_handful_of_arches_is_still_macho() {
+        let (a, _, _) = synth_macho_64_full(b"aaaa", &[], &[], false, None);
+        let (b, _, _) = synth_macho_64_full(b"bbbb", &[], &[], false, None);
+        let fat = synth_fat(&[&a, &b]);
+        assert!(is_macho_magic(&fat));
+        assert_eq!(parse_all(&fat).len(), 2);
     }
 
     #[test]
