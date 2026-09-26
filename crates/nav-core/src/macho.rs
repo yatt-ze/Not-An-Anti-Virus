@@ -43,6 +43,12 @@ const CSMAGIC_CODEDIRECTORY: u32 = 0xfade_0c02;
 // SuperBlob.
 const CSSLOT_CODEDIRECTORY: u32 = 0;
 const CSSLOT_ENTITLEMENTS: u32 = 5;
+// XNU also accepts a CodeDirectory in any of 5 "alternate" slots (cs_blobs.h:
+// CSSLOT_ALTERNATE_CODEDIRECTORIES..+MAX_CODE_DIRECTORIES), used for a
+// signature carrying more than one digest algorithm's CodeDirectory. A
+// binary's *only* CodeDirectory can legally sit here, not just in slot 0.
+const CSSLOT_ALTERNATE_CODEDIRECTORIES: u32 = 0x1000;
+const MAX_ALTERNATE_CODEDIRECTORIES: u32 = 5;
 
 /// `CS_ADHOC`, from `<Security/CSCommon.h>`'s `CodeDirectory` flag bits:
 /// ad-hoc signed, no real identity. Shared by the `codesign`-backed rules
@@ -95,11 +101,13 @@ pub struct MachOImage {
     /// no signature, no entitlements blob in the SuperBlob, and a signature
     /// region lying past the bytes this parser holds (a truncated capture).
     pub entitlements: Option<Vec<u8>>,
-    /// The `flags` field of the slot-0 CodeDirectory in the embedded code
-    /// signature's SuperBlob (`CS_ADHOC` etc., `<Security/CSCommon.h>`).
-    /// `None` if there's no signature, no CodeDirectory found, or the
-    /// signature region lies past the bytes this parser holds — never read as
-    /// "not ad-hoc".
+    /// Bitwise OR of `flags` (`CS_ADHOC` etc., `<Security/CSCommon.h>`) across
+    /// every CodeDirectory found in the embedded code signature's
+    /// SuperBlob — slot 0 and the 5 alternate CodeDirectory slots XNU also
+    /// accepts (`0x1000`..`0x1005`, cs_blobs.h), since an attacker can put
+    /// its only ad-hoc CodeDirectory in an alternate slot. `None` if there's
+    /// no signature, no CodeDirectory found, or the signature region lies
+    /// past the bytes this parser holds — never read as "not ad-hoc".
     pub code_directory_flags: Option<u32>,
 }
 
@@ -391,14 +399,14 @@ struct SignatureFacts {
     code_directory_flags: Option<u32>,
 }
 
-/// Recover the entitlements plist and the slot-0 CodeDirectory's `flags` from
-/// a Mach-O's embedded code-signature SuperBlob, in one bounded walk of its
-/// blob index. `dataoff`/`datasize` are the `LC_CODE_SIGNATURE` fields
-/// (Mach-O endianness); the SuperBlob itself is always big-endian. `base` is
-/// where this image begins in `data`. Either field of the result is `None` if
-/// its blob is absent or the SuperBlob is malformed; both are `None` if the
-/// signature region lies past the bytes held (a truncated capture) — the
-/// caller must not read either `None` as a determined fact.
+/// Recover the entitlements plist and the OR of every CodeDirectory's
+/// `flags` from a Mach-O's embedded code-signature SuperBlob, in one bounded
+/// walk of its blob index. `dataoff`/`datasize` are the `LC_CODE_SIGNATURE`
+/// fields (Mach-O endianness); the SuperBlob itself is always big-endian.
+/// `base` is where this image begins in `data`. Either field of the result is
+/// `None` if its blob is absent or the SuperBlob is malformed; both are
+/// `None` if the signature region lies past the bytes held (a truncated
+/// capture) — the caller must not read either `None` as a determined fact.
 fn extract_signature_facts(
     data: &[u8],
     base: usize,
@@ -406,6 +414,16 @@ fn extract_signature_facts(
     datasize: u32,
 ) -> SignatureFacts {
     extract_signature_facts_checked(data, base, dataoff, datasize).unwrap_or_default()
+}
+
+/// True for the primary CodeDirectory slot (0) or any of the 5 alternate
+/// CodeDirectory slots XNU also accepts (`CSSLOT_ALTERNATE_CODEDIRECTORIES`
+/// through `+MAX_ALTERNATE_CODEDIRECTORIES-1`, cs_blobs.h).
+fn is_codedirectory_slot(slot_type: u32) -> bool {
+    slot_type == CSSLOT_CODEDIRECTORY
+        || (CSSLOT_ALTERNATE_CODEDIRECTORIES
+            ..CSSLOT_ALTERNATE_CODEDIRECTORIES + MAX_ALTERNATE_CODEDIRECTORIES)
+            .contains(&slot_type)
 }
 
 fn extract_signature_facts_checked(
@@ -448,13 +466,15 @@ fn extract_signature_facts_checked(
             && facts.entitlements.is_none()
         {
             facts.entitlements = extract_blob_payload(data, blob_off, sig_end);
-        } else if slot_type == CSSLOT_CODEDIRECTORY
-            && magic == CSMAGIC_CODEDIRECTORY
-            && facts.code_directory_flags.is_none()
-        {
+        } else if is_codedirectory_slot(slot_type) && magic == CSMAGIC_CODEDIRECTORY {
             // CodeDirectory: magic(4)@0, length(4)@4, version(4)@8, flags(4)@12.
+            // OR every CD's flags together: any one of them carrying CS_ADHOC
+            // means the binary is ad-hoc, wherever XNU found that CD (§37).
             if blob_off.checked_add(16)? <= sig_end {
-                facts.code_directory_flags = be_u32(data, blob_off.checked_add(12)?);
+                if let Some(flags) = be_u32(data, blob_off.checked_add(12)?) {
+                    facts.code_directory_flags =
+                        Some(facts.code_directory_flags.unwrap_or(0) | flags);
+                }
             }
         }
     }
@@ -747,23 +767,23 @@ pub(crate) mod tests_support {
         v
     }
 
-    /// A code-signature SuperBlob holding, in slot order, an optional slot-0
-    /// CodeDirectory (`cd_flags`, if given) and an optional entitlements blob
-    /// (`entitlements_xml`, if given), plus the `LC_CODE_SIGNATURE` command
-    /// pointing at it (`dataoff` filled in by the caller once the file offset
-    /// is known). `cd_flags: None` omits the CodeDirectory blob entirely, so
-    /// existing callers that only pass entitlements produce identical bytes
-    /// to before this blob was added.
-    fn build_signature_blob(entitlements_xml: Option<&[u8]>, cd_flags: Option<u32>) -> Vec<u8> {
+    /// A code-signature SuperBlob holding, in slot order, one CodeDirectory
+    /// blob per `(slot_type, flags)` pair in `cds` and an optional
+    /// entitlements blob (`entitlements_xml`, if given), plus the
+    /// `LC_CODE_SIGNATURE` command pointing at it (`dataoff` filled in by the
+    /// caller once the file offset is known). `cds: &[]` omits the
+    /// CodeDirectory blob(s) entirely, so existing callers that only pass
+    /// entitlements produce identical bytes to before this blob was added.
+    fn build_signature_blob(entitlements_xml: Option<&[u8]>, cds: &[(u32, u32)]) -> Vec<u8> {
         let mut entries: Vec<(u32, Vec<u8>)> = Vec::new();
-        if let Some(flags) = cd_flags {
+        for &(slot_type, flags) in cds {
             // Minimal CodeDirectory: magic(4), length(4), version(4), flags(4).
             let mut cd = Vec::new();
             cd.extend_from_slice(&CSMAGIC_CODEDIRECTORY.to_be_bytes());
             cd.extend_from_slice(&16u32.to_be_bytes());
             cd.extend_from_slice(&0x0002_0400u32.to_be_bytes()); // version
             cd.extend_from_slice(&flags.to_be_bytes());
-            entries.push((CSSLOT_CODEDIRECTORY, cd));
+            entries.push((slot_type, cd));
         }
         if let Some(xml) = entitlements_xml {
             let mut blob = Vec::new();
@@ -830,6 +850,32 @@ pub(crate) mod tests_support {
         code_signed: bool,
         entitlements_xml: Option<&[u8]>,
         cd_flags: Option<u32>,
+    ) -> (Vec<u8>, Range<u64>, usize) {
+        let cds: Vec<(u32, u32)> = cd_flags
+            .map(|flags| vec![(CSSLOT_CODEDIRECTORY, flags)])
+            .unwrap_or_default();
+        synth_macho_64_full_with_cds(
+            text_payload,
+            dylibs,
+            rpaths,
+            code_signed,
+            entitlements_xml,
+            &cds,
+        )
+    }
+
+    /// As [`synth_macho_64_full`], with one CodeDirectory blob per
+    /// `(slot_type, flags)` pair in `cds` added to the signature SuperBlob —
+    /// e.g. `&[(CSSLOT_ALTERNATE_CODEDIRECTORIES, CS_ADHOC)]` puts the only
+    /// CodeDirectory in an alternate slot instead of slot 0. `cds: &[]`
+    /// produces byte-identical output to `synth_macho_64_full`.
+    pub(crate) fn synth_macho_64_full_with_cds(
+        text_payload: &[u8],
+        dylibs: &[&str],
+        rpaths: &[&str],
+        code_signed: bool,
+        entitlements_xml: Option<&[u8]>,
+        cds: &[(u32, u32)],
     ) -> (Vec<u8>, Range<u64>, usize) {
         let header_size = 32usize;
         let seg_cmd_size = 72usize + 80usize; // segment_command_64 + one section_64
@@ -913,7 +959,7 @@ pub(crate) mod tests_support {
         let mut sig_off = 0usize;
         if code_signed {
             sig_off = v.len();
-            let blob = build_signature_blob(entitlements_xml, cd_flags);
+            let blob = build_signature_blob(entitlements_xml, cds);
             let dataoff = sig_off as u32;
             let datasize = blob.len() as u32;
             v[sig_placeholder_at + 8..sig_placeholder_at + 12]
@@ -932,7 +978,7 @@ pub(crate) mod tests_support {
 mod tests {
     use super::tests_support::{
         synth_fat, synth_fat_with_bogus_arches, synth_macho_64, synth_macho_64_full,
-        synth_macho_64_full_with_cd_flags,
+        synth_macho_64_full_with_cd_flags, synth_macho_64_full_with_cds,
     };
     use super::*;
 
@@ -1178,17 +1224,64 @@ mod tests {
         assert_eq!(parse(&image).unwrap().code_directory_flags, None);
     }
 
+    /// XNU accepts a CodeDirectory in any of 5 alternate slots
+    /// (`CSSLOT_ALTERNATE_CODEDIRECTORIES`..+4), not just slot 0 — an
+    /// attacker can put its only, ad-hoc CD there (§37).
     #[test]
-    fn code_directory_pointing_out_of_bounds_yields_none_not_panic() {
-        let (mut image, _, sig_off) =
+    fn ad_hoc_flag_from_alternate_codedirectory_slot_only() {
+        let (image, _, _) = synth_macho_64_full_with_cds(
+            b"code",
+            &[],
+            &[],
+            true,
+            None,
+            &[(CSSLOT_ALTERNATE_CODEDIRECTORIES, CS_ADHOC)],
+        );
+        let flags = parse(&image).unwrap().code_directory_flags.unwrap();
+        assert_ne!(flags & CS_ADHOC, 0);
+    }
+
+    /// A CodeDirectory in slot 0 saying "real identity" must not shadow an
+    /// ad-hoc one sitting in an alternate slot — the OR must catch it (§37).
+    #[test]
+    fn ad_hoc_flag_from_slot_0_plus_alternate_is_ored_in() {
+        let (image, _, _) = synth_macho_64_full_with_cds(
+            b"code",
+            &[],
+            &[],
+            true,
+            None,
+            &[
+                (CSSLOT_CODEDIRECTORY, 0x10000), // slot 0: identity, no CS_ADHOC
+                (CSSLOT_ALTERNATE_CODEDIRECTORIES, CS_ADHOC), // alternate: ad-hoc
+            ],
+        );
+        let flags = parse(&image).unwrap().code_directory_flags.unwrap();
+        assert_ne!(
+            flags & CS_ADHOC,
+            0,
+            "any CD being ad-hoc must OR in as ad-hoc"
+        );
+    }
+
+    /// A signature region fully held, but whose CodeDirectory blob is cut
+    /// short by `datasize` (`blob_off + 16 > sig_end`) — distinct from a
+    /// truncated *capture*: the parse of the header/load-commands must still
+    /// succeed, and the unreadable CD must not fabricate flags.
+    #[test]
+    fn code_directory_cut_short_by_datasize_yields_none_not_panic() {
+        let (mut image, _, _) =
             synth_macho_64_full_with_cd_flags(b"code", &[], &[], true, None, Some(CS_ADHOC));
-        // Chop the file off inside the CodeDirectory blob, same shape as a
-        // truncated capture — must not panic and must not fabricate flags.
-        image.truncate(sig_off + 8);
-        let parsed = parse(&image); // must not panic
-        if let Some(img) = parsed {
-            assert_eq!(img.code_directory_flags, None);
-        }
+        let lc_off = image
+            .windows(4)
+            .position(|w| w == LC_CODE_SIGNATURE.to_le_bytes())
+            .expect("LC_CODE_SIGNATURE present");
+        // index (12 + 8*1 entry = 20 bytes) + 12 bytes into the 16-byte CD
+        // blob: sig_end lands inside the CD, short of the flags field.
+        let new_datasize = 20u32 + 12;
+        image[lc_off + 12..lc_off + 16].copy_from_slice(&new_datasize.to_le_bytes());
+        let parsed = parse(&image).expect("full header/load-commands still parse");
+        assert_eq!(parsed.code_directory_flags, None);
     }
 
     #[test]
