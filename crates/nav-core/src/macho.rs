@@ -138,9 +138,8 @@ pub fn parse(data: &[u8]) -> Option<MachOImage> {
 /// here, not one per declared arch.
 fn parse_first_fat_slice(data: &[u8]) -> Option<MachOImage> {
     let (is_64, nfat) = plausible_fat_header(data, false)?;
-    let stride: usize = if is_64 { 32 } else { 20 };
     (0..nfat as usize).find_map(|i| {
-        let obj_off = fat_arch_offset(data, is_64, stride, i)?;
+        let obj_off = fat_arch_offset(data, is_64, i)?;
         parse_fat_slice_at(data, obj_off)
     })
 }
@@ -233,9 +232,8 @@ fn plausible_fat_header(data: &[u8], truncated: bool) -> Option<(bool, u32)> {
 /// point at a Mach-O magic, so a non-truncated read of one finds nothing
 /// here.
 fn fat_references_real_slice(data: &[u8], is_64: bool, nfat: u32, truncated: bool) -> bool {
-    let stride: usize = if is_64 { 32 } else { 20 };
     for i in 0..nfat as usize {
-        let Some(obj_off) = fat_arch_offset(data, is_64, stride, i) else {
+        let Some(obj_off) = fat_arch_offset(data, is_64, i) else {
             continue; // entry's own bytes lie outside what we hold
         };
         match usize::try_from(obj_off) {
@@ -263,7 +261,6 @@ fn parse_fat_all(data: &[u8], truncated: bool) -> (Vec<MachOImage>, usize) {
     let Some((is_64, nfat)) = plausible_fat_header(data, truncated) else {
         return (out, skipped);
     };
-    let stride: usize = if is_64 { 32 } else { 20 };
 
     // Distinct slice offsets walked so far: a hostile table can point
     // MAX_FAT_ARCHES (1024) entries at one offset, and each `MachOImage`
@@ -276,7 +273,7 @@ fn parse_fat_all(data: &[u8], truncated: bool) -> (Vec<MachOImage>, usize) {
     // to walk still counts, once per declared arch, like any other failure.
     let mut seen: HashMap<u64, bool> = HashMap::new(); // offset -> walked ok?
     for i in 0..nfat as usize {
-        let Some(obj_off) = fat_arch_offset(data, is_64, stride, i) else {
+        let Some(obj_off) = fat_arch_offset(data, is_64, i) else {
             skipped += 1; // this entry's own bytes lie outside what we hold
             continue;
         };
@@ -300,9 +297,11 @@ fn parse_fat_all(data: &[u8], truncated: bool) -> (Vec<MachOImage>, usize) {
 
 /// Read fat arch `i`'s declared object-file offset (the `fat_arch`/
 /// `fat_arch_64` `offset` field), or `None` if that entry's own bytes lie
-/// outside `data`.
-fn fat_arch_offset(data: &[u8], is_64: bool, stride: usize, i: usize) -> Option<u64> {
+/// outside `data`. `is_64` selects the table's entry stride (`fat_arch_64`
+/// is wider than `fat_arch`) as well as the offset field's own width.
+fn fat_arch_offset(data: &[u8], is_64: bool, i: usize) -> Option<u64> {
     // fat_arch: cputype(4), cpusubtype(4), offset, size, align[, reserved].
+    let stride: usize = if is_64 { 32 } else { 20 };
     let arch_off = 8usize.checked_add(i.checked_mul(stride)?)?;
     if is_64 {
         be_u64(data, arch_off.checked_add(8)?)
