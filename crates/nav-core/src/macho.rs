@@ -538,7 +538,7 @@ fn extract_signature_facts_checked(
         } else if is_codedirectory_slot(slot_type) && magic == CSMAGIC_CODEDIRECTORY {
             // CodeDirectory: magic(4)@0, length(4)@4, version(4)@8, flags(4)@12.
             // OR every CD's flags together: any one of them carrying CS_ADHOC
-            // means the binary is ad-hoc, wherever XNU found that CD (§37).
+            // means the binary is ad-hoc, wherever XNU found that CD (#37).
             if blob_off.checked_add(16)? <= sig_end {
                 if let Some(flags) = be_u32(data, blob_off.checked_add(12)?) {
                     facts.code_directory_flags =
@@ -763,7 +763,7 @@ pub(crate) mod tests_support {
     /// A fat/universal binary with `bogus_count` arch entries pointing at
     /// distinct, 16 KiB-aligned zeroed regions (no thin Mach-O magic) plus one
     /// real slice (`real_member`) last in the table — the shape a real fat
-    /// binary the kernel will still run can take (§46: verified with 24 bogus
+    /// binary the kernel will still run can take (#46: verified with 24 bogus
     /// entries alongside one real arm64 slice).
     pub(crate) fn synth_fat_with_bogus_arches(real_member: &[u8], bogus_count: usize) -> Vec<u8> {
         synth_fat_with_bogus_arches_aligned(real_member, bogus_count, 16 * 1024)
@@ -1334,7 +1334,7 @@ mod tests {
     fn truncated_java_like_header_with_offset_past_eof_is_lenient() {
         // Same CAFEBABE + major=52 shape, but the first arch entry's offset
         // field is set past the end of the (short) buffer. A non-truncated
-        // read of this shape can only mean "not a fat binary" (§46); a
+        // read of this shape can only mean "not a fat binary" (#46); a
         // truncated one can't rule out a real slice lying past what was
         // captured, so it must not be read as "not a Mach-O" (§10/§11.8).
         let mut v = vec![0xCA, 0xFE, 0xBA, 0xBE];
@@ -1361,7 +1361,7 @@ mod tests {
 
     #[test]
     fn many_bogus_arches_alongside_one_real_slice_is_still_macho() {
-        // §46: the kernel runs a fat binary with far more arch entries than
+        // #46: the kernel runs a fat binary with far more arch entries than
         // any real toolchain emits, as long as one slice is real — an
         // arch-count cap alone must not be the discriminator.
         let (real, _, _) = synth_macho_64_full(b"real slice", &[], &[], false, None);
@@ -1531,7 +1531,7 @@ mod tests {
 
     /// XNU accepts a CodeDirectory in any of 5 alternate slots
     /// (`CSSLOT_ALTERNATE_CODEDIRECTORIES`..+4), not just slot 0 — an
-    /// attacker can put its only, ad-hoc CD there (§37).
+    /// attacker can put its only, ad-hoc CD there (#37).
     #[test]
     fn ad_hoc_flag_from_alternate_codedirectory_slot_only() {
         let (image, _, _) = synth_macho_64_full_with_cds(
@@ -1547,7 +1547,7 @@ mod tests {
     }
 
     /// A CodeDirectory in slot 0 saying "real identity" must not shadow an
-    /// ad-hoc one sitting in an alternate slot — the OR must catch it (§37).
+    /// ad-hoc one sitting in an alternate slot — the OR must catch it (#37).
     #[test]
     fn ad_hoc_flag_from_slot_0_plus_alternate_is_ored_in() {
         let (image, _, _) = synth_macho_64_full_with_cds(

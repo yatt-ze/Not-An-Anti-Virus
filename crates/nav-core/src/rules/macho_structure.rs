@@ -788,7 +788,7 @@ mod tests {
     #[test]
     fn an_unwalkable_slice_alongside_a_clean_one_is_not_applicable() {
         // A malformed-on-purpose slice (bad magic) must not hide behind a
-        // clean slice reading as scored-fine (§38).
+        // clean slice reading as scored-fine (#38).
         let (clean, _, _) =
             synth_macho_64_full(b"clean", &["/usr/lib/libSystem.B.dylib"], &[], false, None);
         let garbage: &[u8] = &[0xDE, 0xAD, 0xBE, 0xEF, 0, 0, 0, 0];
@@ -816,7 +816,7 @@ mod tests {
 
     #[test]
     fn many_bogus_arches_alongside_one_clean_slice_is_not_applicable() {
-        // §46: a fat binary shaped like the verified regression — 24 bogus
+        // #46: a fat binary shaped like the verified regression — 24 bogus
         // arch entries plus one real, clean slice. It must count as Mach-O
         // (evasion would be scoring it as if it weren't), and the 24
         // unwalkable declared arches must degrade the result to
@@ -922,7 +922,7 @@ mod fixture_gen {
         .unwrap();
 
         // Suspicious: an LC_LOAD_DYLIB into per-user $TMPDIR
-        // (/private/var/folders/…), unsigned — the §39 gap this rule now covers.
+        // (/private/var/folders/…), unsigned — the #39 gap this rule now covers.
         let (tmpdir_dylib, _, _) = synth_macho_64_full(
             b"\x55\x48\x89\xe5\x90tmpdir dylib machine code padding to look real",
             &[
@@ -936,7 +936,7 @@ mod fixture_gen {
         std::fs::write(root.join("suspicious/macho_tmpdir_dylib"), tmpdir_dylib).unwrap();
 
         // Suspicious: ad-hoc signed (CS_ADHOC) with disable-library-validation
-        // — the higher of the two entitlement weights (§37). Benign system
+        // — the higher of the two entitlement weights (#37). Benign system
         // dylibs only, so the entitlement is the sole anomaly.
         let adhoc_entitlements = br#"<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -960,7 +960,7 @@ mod fixture_gen {
         // Suspicious: a fat binary with one clean slice and one malformed
         // (bad-magic) slice — the malformed slice must degrade the scan to
         // NotApplicable/Partial rather than let the clean slice look fine on
-        // its own (§38). The clean slice carries an `osascript` string so the
+        // its own (#38). The clean slice carries an `osascript` string so the
         // cross-platform suspicious-strings rule still fires on Ubuntu, where
         // the codesign-backed rules don't run.
         let (clean_slice, _, _) = synth_macho_64_full(
@@ -974,7 +974,7 @@ mod fixture_gen {
         let fat = synth_fat(&[&clean_slice, malformed_slice]);
         std::fs::write(root.join("suspicious/macho_fat_malformed_slice"), fat).unwrap();
 
-        // Suspicious: a fat binary shaped like the §46 regression — 24 bogus
+        // Suspicious: a fat binary shaped like the #46 regression — 24 bogus
         // arch entries (the kernel runs binaries like this; an arch-count cap
         // alone must not be the discriminator) alongside one real, clean
         // slice. The 24 unwalkable declared arches must degrade the scan to

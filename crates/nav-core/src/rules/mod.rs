@@ -36,7 +36,7 @@ pub enum RuleOutcome {
 
 /// Per-user/system temp and shared-writable locations a legitimate program
 /// almost never runs or loads from. Shared so the persistence and
-/// Mach-O-loader rules can't drift apart on what counts as transient (§39).
+/// Mach-O-loader rules can't drift apart on what counts as transient (#39).
 /// Private is enough: `persistence`/`macho_structure` are child modules of
 /// `rules`, so they can already see a private item of their parent.
 const TRANSIENT_PREFIXES: &[&str] = &[
