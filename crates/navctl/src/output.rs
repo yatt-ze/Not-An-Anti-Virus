@@ -27,8 +27,11 @@ pub fn run_scan(path: &Path, recursive: bool, json: bool) -> ExitCode {
     };
 
     if scan.results.is_empty() {
+        if let Some(note) = unreadable_note(&scan) {
+            eprintln!("{note}");
+        }
         eprintln!("navctl: no files found under {}", path.display());
-        return exit::code(exit::OPERATIONAL_ERROR);
+        return exit::code(empty_scan_exit_code(&scan));
     }
 
     for result in &scan.results {
@@ -47,6 +50,9 @@ pub fn run_scan(path: &Path, recursive: bool, json: bool) -> ExitCode {
             budget_limit_label(limit),
             path.display()
         );
+    }
+    if let Some(note) = unreadable_note(&scan) {
+        eprintln!("{note}");
     }
     exit::code(exit::for_target(&scan))
 }
@@ -81,6 +87,22 @@ pub fn run_rules_test(path: &Path, recursive: bool, json: bool) -> ExitCode {
 
     if scan.results.is_empty() {
         // Nothing readable — "couldn't check", not "clean" (§10, §11.8).
+        if let Some(note) = unreadable_note(&scan) {
+            eprintln!("{note}");
+            // Unreadable subdirectories are structured data (§11.12), so a
+            // `--json` caller gets the multi-target envelope — empty
+            // `results`, `coverage_complete: false`, the `unreadable` array —
+            // rather than only a stderr note. `print_rules_test_multi` isn't
+            // usable here: it expects a non-empty `results` to pick a worst
+            // file from.
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&multi_json(&scan)).unwrap()
+                );
+                return exit::code(exit::INDETERMINATE);
+            }
+        }
         eprintln!("navctl: no files to scan under {}", path.display());
         return exit::code(exit::INDETERMINATE);
     }
@@ -166,6 +188,9 @@ fn print_rules_test_multi(scan: &TargetScan) {
     if let Some(note) = budget_note(scan) {
         println!("{note}");
     }
+    if let Some(note) = unreadable_coverage_note(scan) {
+        println!("{note}");
+    }
     println!();
     println!(
         "Worst finding — {}",
@@ -228,6 +253,7 @@ fn multi_json(scan: &TargetScan) -> serde_json::Value {
         "skipped_resources": scan.skipped,
         "coverage_complete": scan.coverage_complete(),
         "budget_limit": budget_limit_str(scan),
+        "unreadable": scan.unreadable,
         "recommendation": scan.recommendation(),
         "results": scan.results,
     })
@@ -244,6 +270,60 @@ fn budget_note(scan: &TargetScan) -> Option<String> {
             budget_limit_label(limit)
         )),
     }
+}
+
+/// Exit code for a `scan` target that scored no files: `INDETERMINATE` when
+/// unreadable directories explain the emptiness — "couldn't check," not a
+/// tool failure (§10/§11.8) — `OPERATIONAL_ERROR` otherwise (issue #29,
+/// unchanged).
+fn empty_scan_exit_code(scan: &TargetScan) -> u8 {
+    if scan.unreadable.is_empty() {
+        exit::OPERATIONAL_ERROR
+    } else {
+        exit::INDETERMINATE
+    }
+}
+
+/// A stderr warning naming directories that couldn't be read during
+/// traversal, or `None` when there were none. Traversal continues past each
+/// one (§11.8); their presence is what makes the target's coverage partial
+/// (§11.12).
+fn unreadable_note(scan: &TargetScan) -> Option<String> {
+    if scan.unreadable.is_empty() {
+        return None;
+    }
+    let paths = scan
+        .unreadable
+        .iter()
+        .map(|p| p.display().to_string())
+        .collect::<Vec<_>>()
+        .join(", ");
+    Some(format!(
+        "navctl: partial coverage — {} director(ies) could not be read under {}: {}",
+        scan.unreadable.len(),
+        scan.root.display(),
+        paths
+    ))
+}
+
+/// Human-output counterpart to [`unreadable_note`], formatted like
+/// [`budget_note`] for `rules test`'s multi-file breakdown.
+fn unreadable_coverage_note(scan: &TargetScan) -> Option<String> {
+    if scan.unreadable.is_empty() {
+        return None;
+    }
+    let paths = scan
+        .unreadable
+        .iter()
+        .map(|p| display_relative(&scan.root, p))
+        .collect::<Vec<_>>()
+        .join(", ");
+    Some(format!(
+        "  [PARTIAL COVERAGE: {} director(ies) could not be read under {}: {}]",
+        scan.unreadable.len(),
+        scan.root.display(),
+        paths
+    ))
 }
 
 /// Machine-readable budget-limit tag for `--json`, or `None` if within budget.
@@ -330,6 +410,7 @@ mod tests {
             kind: TargetKind::Directory,
             primary: None,
             skipped: Vec::new(),
+            unreadable: Vec::new(),
             results: vec![sample_result()],
             budget: nav_core::BudgetOutcome::Within,
         };
@@ -347,6 +428,7 @@ mod tests {
             kind: TargetKind::Directory,
             primary: None,
             skipped: Vec::new(),
+            unreadable: Vec::new(),
             results: vec![sample_result()], // complete + NoAction
             budget,
         };
@@ -360,5 +442,47 @@ mod tests {
             exit::INDETERMINATE,
             "a target cut short by the budget is indeterminate, not clean"
         );
+    }
+
+    fn empty_scan(unreadable: Vec<PathBuf>) -> TargetScan {
+        TargetScan {
+            root: PathBuf::from("/tmp"),
+            kind: TargetKind::Directory,
+            primary: None,
+            skipped: Vec::new(),
+            unreadable,
+            results: Vec::new(),
+            budget: nav_core::BudgetOutcome::Within,
+        }
+    }
+
+    /// #32 follow-up: a target whose only content is unreadable subdirectories
+    /// (the Phase 0b B3 TCC case) is "couldn't check," not a tool failure —
+    /// distinct from a target that is genuinely empty (issue #29, unchanged).
+    #[test]
+    fn empty_scan_exit_code_is_indeterminate_only_when_unreadable_explains_it() {
+        assert_eq!(
+            empty_scan_exit_code(&empty_scan(Vec::new())),
+            exit::OPERATIONAL_ERROR,
+            "a genuinely empty, fully-readable target is still issue #29's exit 4"
+        );
+        assert_eq!(
+            empty_scan_exit_code(&empty_scan(vec![PathBuf::from("/tmp/locked")])),
+            exit::INDETERMINATE,
+            "unreadable subdirectories explain the emptiness — couldn't check, not a failure"
+        );
+    }
+
+    /// `multi_json` must stay safe on an empty-results scan — it backs the
+    /// `rules test --json` branch for a target whose only content is
+    /// unreadable subdirectories, which never reaches `print_rules_test_multi`
+    /// (whose `worst().expect(..)` would panic on empty `results`).
+    #[test]
+    fn multi_json_on_empty_results_reports_incomplete_coverage() {
+        let scan = empty_scan(vec![PathBuf::from("/tmp/locked")]);
+        let value = multi_json(&scan);
+        assert_eq!(value["results"], serde_json::json!([]));
+        assert_eq!(value["coverage_complete"], false);
+        assert_eq!(value["unreadable"], serde_json::json!(["/tmp/locked"]));
     }
 }

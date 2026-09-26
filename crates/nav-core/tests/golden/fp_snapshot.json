@@ -120,6 +120,11 @@
       "unsigned-binary"
     ]
   },
+  "benign/pipe_to_checksum.sh": {
+    "score": 0,
+    "recommendation": "no-action",
+    "rule_ids": []
+  },
   "benign/readme.txt": {
     "score": 0,
     "recommendation": "no-action",
@@ -129,6 +134,14 @@
     "score": 0,
     "recommendation": "no-action",
     "rule_ids": []
+  },
+  "suspicious/adhoc_named_flags=0x20000": {
+    "score": 9,
+    "recommendation": "no-action",
+    "rule_ids": [
+      "adhoc-signed-binary",
+      "suspicious-strings"
+    ]
   },
   "suspicious/com.apple.softwareupdate.plist": {
     "score": 36,

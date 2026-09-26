@@ -117,6 +117,7 @@ mod tests {
             kind: TargetKind::Directory,
             primary: None,
             skipped: Vec::new(),
+            unreadable: Vec::new(),
             results: vec![sample_result()], // complete + NoAction
             budget,
         };
@@ -130,5 +131,23 @@ mod tests {
             INDETERMINATE,
             "a target cut short by the budget is indeterminate, not clean"
         );
+    }
+
+    /// An unreadable subdirectory makes a target partial the same way a
+    /// budget ceiling does, even when every scored file was clean
+    /// (§11.8/§11.12).
+    #[test]
+    fn unreadable_subdirectory_makes_the_target_exit_indeterminate() {
+        let scan = TargetScan {
+            root: PathBuf::from("/tmp"),
+            kind: TargetKind::Directory,
+            primary: None,
+            skipped: Vec::new(),
+            unreadable: vec![PathBuf::from("/tmp/locked")],
+            results: vec![sample_result()], // complete + NoAction
+            budget: BudgetOutcome::Within,
+        };
+        assert!(!scan.coverage_complete());
+        assert_eq!(for_target(&scan), INDETERMINATE);
     }
 }

@@ -181,3 +181,57 @@ fn unreadable_path_is_indeterminate_not_clean() {
         "an unreadable file is a couldn't-check, not a clean read (§11.8)"
     );
 }
+
+/// #32 follow-up: a target whose only content is an unreadable subdirectory
+/// (the Phase 0b B3 TCC case) scores no files, but that's "couldn't check,"
+/// not the same as a genuinely empty, fully-readable target — it must still
+/// name the unreadable directory, not just report "no files found".
+#[cfg(unix)]
+#[test]
+fn only_unreadable_subdirs_is_indeterminate_and_names_the_directory() {
+    use std::os::unix::fs::PermissionsExt;
+
+    if unsafe { libc::geteuid() } == 0 {
+        eprintln!("skipping only_unreadable_subdirs_is_indeterminate_and_names_the_directory: running as root");
+        return;
+    }
+
+    let dir = std::env::temp_dir().join(format!(
+        "navd-scan-once-onlylocked-{}-{:?}",
+        std::process::id(),
+        Instant::now()
+    ));
+    let locked = dir.join("locked");
+    std::fs::create_dir_all(&locked).unwrap();
+    std::fs::write(locked.join("inside.txt"), b"hidden").unwrap();
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+    // Some environments (root, certain CI containers) ignore directory
+    // permission bits — skip rather than assert a bogus failure.
+    if std::fs::read_dir(&locked).is_ok() {
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        eprintln!(
+            "skipping only_unreadable_subdirs_is_indeterminate_and_names_the_directory: \
+             directory permissions not enforced in this environment"
+        );
+        return;
+    }
+
+    let out = run_scan_once(&dir, &["--recursive"]);
+
+    // Always restore permissions before removal, regardless of the outcome.
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+
+    assert_eq!(
+        out.status.code(),
+        Some(i32::from(nav_core::INDETERMINATE)),
+        "only-unreadable-content is a couldn't-check, not clean or an operational error"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains(&locked.display().to_string()),
+        "stderr should name the unreadable directory: {stderr}"
+    );
+}
