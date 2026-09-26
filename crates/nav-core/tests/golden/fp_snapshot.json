@@ -203,6 +203,14 @@
       "unsigned-binary"
     ]
   },
+  "suspicious/macho_tmpdir_dylib": {
+    "score": 19,
+    "recommendation": "notify",
+    "rule_ids": [
+      "macho-loader-anomaly",
+      "unsigned-binary"
+    ]
+  },
   "suspicious/packed_payload.sh": {
     "score": 31,
     "recommendation": "notify",

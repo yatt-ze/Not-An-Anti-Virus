@@ -207,14 +207,11 @@ fn is_writable_or_transient(path: &str) -> bool {
         return false;
     }
 
-    const TRANSIENT_PREFIXES: &[&str] = &[
-        "/tmp/",
-        "/private/tmp/",
-        "/var/tmp/",
-        "/private/var/tmp/",
-        "/Users/Shared/",
-    ];
-    if TRANSIENT_PREFIXES.iter().any(|p| path.starts_with(p)) || path.starts_with("/Users/") {
+    if super::TRANSIENT_PREFIXES
+        .iter()
+        .any(|p| path.starts_with(p))
+        || path.starts_with("/Users/")
+    {
         return true;
     }
 
@@ -413,6 +410,12 @@ mod tests {
         assert!(is_writable_or_transient("/Users/Shared/evil"));
         assert!(is_writable_or_transient("/Users/alice/evil"));
         assert!(is_writable_or_transient("/opt/app/.hidden/lib"));
+        assert!(is_writable_or_transient(
+            "/private/var/folders/xy/abc/T/libevil.dylib"
+        ));
+        assert!(is_writable_or_transient(
+            "/var/folders/xy/abc/T/libevil.dylib"
+        ));
 
         assert!(!is_writable_or_transient("@executable_path/../Frameworks"));
         assert!(!is_writable_or_transient("@loader_path/lib.dylib"));
@@ -514,5 +517,19 @@ mod fixture_gen {
             suspicious,
         )
         .unwrap();
+
+        // Suspicious: an LC_LOAD_DYLIB into per-user $TMPDIR
+        // (/private/var/folders/…), unsigned — the §39 gap this rule now covers.
+        let (tmpdir_dylib, _, _) = synth_macho_64_full(
+            b"\x55\x48\x89\xe5\x90tmpdir dylib machine code padding to look real",
+            &[
+                "/private/var/folders/zz/zyxvpxvq6csfxvn_n0000000000000/T/libupdate.dylib",
+                "/usr/lib/libSystem.B.dylib",
+            ],
+            &[],
+            false,
+            None,
+        );
+        std::fs::write(root.join("suspicious/macho_tmpdir_dylib"), tmpdir_dylib).unwrap();
     }
 }
