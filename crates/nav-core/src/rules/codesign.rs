@@ -7,6 +7,7 @@
 
 use super::{Rule, RuleOutcome};
 use crate::context::ScanContext;
+use crate::macho::{CS_ADHOC, CS_LINKER_SIGNED};
 use crate::model::{MatchedSignal, SignalCategory};
 
 /// What `codesign -dv` says about a code object's signature. Doesn't yet say
@@ -24,11 +25,6 @@ enum DvStatus {
     /// A real (non-ad-hoc) identity — Developer ID, Apple, or otherwise.
     Signed,
 }
-
-/// `CS_ADHOC`, from `<Security/CSCommon.h>`'s `CodeDirectory` flag bits.
-const CS_ADHOC: u32 = 0x2;
-/// `CS_LINKER_SIGNED`, from `<Security/CSCommon.h>`'s `CodeDirectory` flag bits.
-const CS_LINKER_SIGNED: u32 = 0x20000;
 
 /// False if `path`'s string form contains a newline or carriage return. Both
 /// `codesign` and `spctl` echo the scanned path back into the stderr we parse

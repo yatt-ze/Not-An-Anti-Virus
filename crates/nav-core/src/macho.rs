@@ -44,6 +44,16 @@ const CSMAGIC_CODEDIRECTORY: u32 = 0xfade_0c02;
 const CSSLOT_CODEDIRECTORY: u32 = 0;
 const CSSLOT_ENTITLEMENTS: u32 = 5;
 
+/// `CS_ADHOC`, from `<Security/CSCommon.h>`'s `CodeDirectory` flag bits:
+/// ad-hoc signed, no real identity. Shared by the `codesign`-backed rules
+/// (parsed from `codesign -dv` text) and `macho-loader-anomaly` (read
+/// straight from a CodeDirectory's `flags` field here).
+pub(crate) const CS_ADHOC: u32 = 0x2;
+/// `CS_LINKER_SIGNED`, from `<Security/CSCommon.h>`'s `CodeDirectory` flag
+/// bits: the automatic ad-hoc signature the linker stamps on at build time,
+/// as distinct from a hand-applied one.
+pub(crate) const CS_LINKER_SIGNED: u32 = 0x20000;
+
 // Loop ceilings — far above any real Mach-O, but bound work on hostile input.
 const MAX_NCMDS: u32 = 4096;
 const MAX_NSECTS: u32 = 4096;
@@ -1151,8 +1161,8 @@ mod tests {
     #[test]
     fn code_directory_flags_are_read_back() {
         let (adhoc, _, _) =
-            synth_macho_64_full_with_cd_flags(b"code", &[], &[], true, None, Some(0x2));
-        assert_eq!(parse(&adhoc).unwrap().code_directory_flags, Some(0x2));
+            synth_macho_64_full_with_cd_flags(b"code", &[], &[], true, None, Some(CS_ADHOC));
+        assert_eq!(parse(&adhoc).unwrap().code_directory_flags, Some(CS_ADHOC));
 
         let (identity, _, _) =
             synth_macho_64_full_with_cd_flags(b"code", &[], &[], true, None, Some(0x10000));
@@ -1171,7 +1181,7 @@ mod tests {
     #[test]
     fn code_directory_pointing_out_of_bounds_yields_none_not_panic() {
         let (mut image, _, sig_off) =
-            synth_macho_64_full_with_cd_flags(b"code", &[], &[], true, None, Some(0x2));
+            synth_macho_64_full_with_cd_flags(b"code", &[], &[], true, None, Some(CS_ADHOC));
         // Chop the file off inside the CodeDirectory blob, same shape as a
         // truncated capture — must not panic and must not fabricate flags.
         image.truncate(sig_off + 8);

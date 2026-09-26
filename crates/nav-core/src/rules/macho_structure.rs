@@ -12,7 +12,7 @@
 
 use super::{Rule, RuleOutcome};
 use crate::context::ScanContext;
-use crate::macho::{self, MachOImage};
+use crate::macho::{self, MachOImage, CS_ADHOC};
 use crate::model::{MatchedSignal, SignalCategory};
 use crate::plist::{self, PlistValue};
 
@@ -28,9 +28,6 @@ const ENTITLEMENT_WEIGHT_SIGNED: i32 = 10;
 /// under a real identity (README's "suspicious entitlements on unsigned
 /// binaries").
 const ENTITLEMENT_WEIGHT_ADHOC: i32 = 18;
-/// `CS_ADHOC` in a CodeDirectory's `flags` field: ad-hoc signed, no real
-/// identity (`<Security/CSCommon.h>`).
-const CS_ADHOC: u32 = 0x2;
 /// Ceiling on this rule's single signal — comfortably in `Notify` range,
 /// never near the §5.1 high-severity threshold on its own.
 const MAX_WEIGHT: i32 = 30;
@@ -367,14 +364,8 @@ mod tests {
             <key>com.apple.security.cs.disable-library-validation</key><true/>
         </dict></plist>"#;
 
-        let (adhoc, _, _) = synth_macho_64_full_with_cd_flags(
-            b"code",
-            &[],
-            &[],
-            true,
-            Some(xml),
-            Some(0x2), // CS_ADHOC
-        );
+        let (adhoc, _, _) =
+            synth_macho_64_full_with_cd_flags(b"code", &[], &[], true, Some(xml), Some(CS_ADHOC));
         let adhoc_sig = MachOStructureRule
             .evaluate(&ctx_for(adhoc))
             .unwrap()
@@ -598,6 +589,7 @@ mod fixture_gen {
         synth_fat, synth_fat_with_bogus_arches_aligned, synth_macho_64_full,
         synth_macho_64_full_with_cd_flags,
     };
+    use crate::macho::CS_ADHOC;
     use std::path::Path;
 
     #[test]
@@ -678,7 +670,7 @@ mod fixture_gen {
             &[],
             true,
             Some(adhoc_entitlements),
-            Some(0x2), // CS_ADHOC
+            Some(CS_ADHOC),
         );
         std::fs::write(
             root.join("suspicious/macho_adhoc_disable_lib_validation"),
