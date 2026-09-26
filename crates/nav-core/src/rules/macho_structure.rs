@@ -63,13 +63,13 @@ impl Rule for MachOStructureRule {
 
     fn evaluate(&self, ctx: &ScanContext) -> Result<Option<MatchedSignal>, RuleOutcome> {
         let content = ctx.content.as_ref().ok_or(RuleOutcome::NotApplicable)?;
-        if !macho::is_macho_magic(content) {
+        if !macho::is_macho_magic(content, ctx.truncated) {
             return Ok(None);
         }
         // Recognized Mach-O magic that the parser couldn't walk within its
         // bounds (truncated header, malformed load commands, or a fat container
         // with no walkable slice) — "couldn't check," not "clean" (§10/§11.8).
-        let (images, skipped_slices) = macho::parse_all_slices(content);
+        let (images, skipped_slices) = macho::parse_all_slices(content, ctx.truncated);
         if images.is_empty() {
             return Err(RuleOutcome::NotApplicable);
         }
@@ -245,7 +245,8 @@ mod tests {
     use super::*;
     use crate::context::{ContentSource, ScanContext};
     use crate::macho::tests_support::{
-        synth_fat, synth_macho_64_full, synth_macho_64_full_with_cd_flags,
+        synth_fat, synth_fat_with_bogus_arches, synth_macho_64_full,
+        synth_macho_64_full_with_cd_flags,
     };
     use std::path::PathBuf;
 
@@ -568,6 +569,22 @@ mod tests {
             .expect("the good slice's finding must still surface");
         assert!(sig.description.contains("writable/transient"));
     }
+
+    #[test]
+    fn many_bogus_arches_alongside_one_clean_slice_is_not_applicable() {
+        // §46: a fat binary shaped like the verified regression — 24 bogus
+        // arch entries plus one real, clean slice. It must count as Mach-O
+        // (evasion would be scoring it as if it weren't), and the 24
+        // unwalkable declared arches must degrade the result to
+        // NotApplicable rather than let the clean slice read as fine.
+        let (real, _, _) =
+            synth_macho_64_full(b"clean", &["/usr/lib/libSystem.B.dylib"], &[], false, None);
+        let fat = synth_fat_with_bogus_arches(&real, 24);
+        assert!(matches!(
+            MachOStructureRule.evaluate(&ctx_for(fat)),
+            Err(RuleOutcome::NotApplicable)
+        ));
+    }
 }
 
 /// Regenerates the fp-harness fixtures this rule's coverage depends on.
@@ -578,7 +595,8 @@ mod tests {
 #[cfg(test)]
 mod fixture_gen {
     use crate::macho::tests_support::{
-        synth_fat, synth_macho_64_full, synth_macho_64_full_with_cd_flags,
+        synth_fat, synth_fat_with_bogus_arches, synth_macho_64_full,
+        synth_macho_64_full_with_cd_flags,
     };
     use std::path::Path;
 
@@ -684,5 +702,22 @@ mod fixture_gen {
         let malformed_slice: &[u8] = &[0xDE, 0xAD, 0xBE, 0xEF, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
         let fat = synth_fat(&[&clean_slice, malformed_slice]);
         std::fs::write(root.join("suspicious/macho_fat_malformed_slice"), fat).unwrap();
+
+        // Suspicious: a fat binary shaped like the §46 regression — 24 bogus
+        // arch entries (the kernel runs binaries like this; an arch-count cap
+        // alone must not be the discriminator) alongside one real, clean
+        // slice. The 24 unwalkable declared arches must degrade the scan to
+        // Partial rather than let the clean slice score fine. The slice
+        // carries an `osascript` string so suspicious-strings still fires on
+        // Ubuntu CI, where the codesign-backed rules don't run.
+        let (many_arches_slice, _, _) = synth_macho_64_full(
+            b"\x55\x48\x89\xe5\x90 shells out via osascript for testing",
+            &["/usr/lib/libSystem.B.dylib"],
+            &[],
+            false,
+            None,
+        );
+        let many_arches = synth_fat_with_bogus_arches(&many_arches_slice, 24);
+        std::fs::write(root.join("suspicious/macho_fat_many_arches"), many_arches).unwrap();
     }
 }

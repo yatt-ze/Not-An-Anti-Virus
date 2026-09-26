@@ -52,6 +52,11 @@ const MAX_RPATHS: usize = 256;
 const MAX_LC_STR_BYTES: usize = 4096;
 const MAX_CS_BLOBS: u32 = 256;
 const MAX_ENTITLEMENTS_BYTES: usize = 256 * 1024;
+// Bounds work on hostile input; far above what the kernel accepts (a real fat
+// binary the kernel will run has been seen with dozens of bogus arch entries
+// alongside the real slice, #46) — don't lower it to exclude other formats,
+// an arch-count cap can hide a runnable binary.
+const MAX_FAT_ARCHES: u32 = 1024;
 
 /// A recognized Mach-O image: `__TEXT,__text`'s file range plus the loader
 /// facts (`dylibs`/`rpaths`/`has_code_signature`/`entitlements`) the
@@ -107,9 +112,10 @@ pub fn parse(data: &[u8]) -> Option<MachOImage> {
 /// container with no walkable slice (incl. a Java `.class`). Structure rules
 /// iterate this so a fat binary is judged on all its slices, not just the
 /// first (§5.2). A thin wrapper over [`parse_all_slices`] for callers that
-/// don't need the skipped-arch count.
+/// don't need the skipped-arch count or a truncation-aware fat/non-fat call;
+/// treats `data` as a complete read.
 pub fn parse_all(data: &[u8]) -> Vec<MachOImage> {
-    parse_all_slices(data).0
+    parse_all_slices(data, false).0
 }
 
 /// As [`parse_all`], plus the number of *declared* fat-table arches that
@@ -117,10 +123,12 @@ pub fn parse_all(data: &[u8]) -> Vec<MachOImage> {
 /// non-Mach-O slice magic, or a `parse_thin` failure) — nonzero here means a
 /// slice's contents genuinely couldn't be judged, not that there was nothing
 /// to judge. Always `0` for thin input or non-Mach-O input, since neither
-/// declares a slice count to compare against.
-pub fn parse_all_slices(data: &[u8]) -> (Vec<MachOImage>, usize) {
+/// declares a slice count to compare against. `truncated` must match what
+/// [`is_macho_magic`] was told for the same bytes — see there for why it
+/// matters for a fat header.
+pub fn parse_all_slices(data: &[u8], truncated: bool) -> (Vec<MachOImage>, usize) {
     match be_u32(data, 0) {
-        Some(FAT_MAGIC) | Some(FAT_MAGIC_64) => parse_fat_all(data),
+        Some(FAT_MAGIC) | Some(FAT_MAGIC_64) => parse_fat_all(data, truncated),
         Some(magic) => match thin_kind(magic) {
             Some((is_64, be)) => (
                 parse_thin(data, 0, is_64, be, false).into_iter().collect(),
@@ -135,9 +143,15 @@ pub fn parse_all_slices(data: &[u8]) -> (Vec<MachOImage>, usize) {
 /// Whether `data` begins with any Mach-O magic (thin, either word size/endian,
 /// or fat). Cheaper and broader than [`parse`] — answers "is this a code object
 /// at all", including images `parse` declines to walk.
-pub fn is_macho_magic(data: &[u8]) -> bool {
+///
+/// `truncated` is whether `data` is a partial read of a larger file (§10/
+/// §11.8): for a fat header, a declared arch whose offset lands past `data`
+/// is only counted as a real slice when the read was truncated — otherwise a
+/// short, complete read (e.g. a whole Java `.class` file) correctly finds no
+/// evidence rather than being read as "couldn't check, assume Mach-O."
+pub fn is_macho_magic(data: &[u8], truncated: bool) -> bool {
     match be_u32(data, 0) {
-        Some(FAT_MAGIC) | Some(FAT_MAGIC_64) => plausible_fat_header(data).is_some(),
+        Some(FAT_MAGIC) | Some(FAT_MAGIC_64) => plausible_fat_header(data, truncated).is_some(),
         Some(magic) => thin_kind(magic).is_some(),
         None => false,
     }
@@ -155,27 +169,47 @@ fn thin_kind(magic: u32) -> Option<(bool, bool)> {
     }
 }
 
-/// Real universal binaries carry a handful of architecture slices; a Java
-/// `.class` file shares `FAT_MAGIC` with its minor/major version sitting
-/// where `nfat_arch` would be, and major versions are 45 and up (JDK 1.1
-/// onward) — so a plausible fat header caps `nfat_arch` well below that.
-const MAX_PLAUSIBLE_FAT_ARCHES: u32 = 19;
-
 /// Recognize a plausible fat/universal Mach-O header: `FAT_MAGIC`/
-/// `FAT_MAGIC_64` with a small, nonzero `nfat_arch` — rejecting a Java
-/// `.class` file, which shares `FAT_MAGIC` but not this shape. Returns
-/// `(is_64, nfat_arch)`.
-fn plausible_fat_header(data: &[u8]) -> Option<(bool, u32)> {
+/// `FAT_MAGIC_64` with `0 < nfat_arch <= MAX_FAT_ARCHES`, and at least one
+/// declared arch that's real evidence of a Mach-O slice rather than a Java
+/// `.class` file's constant pool sharing `FAT_MAGIC` — see
+/// [`fat_references_real_slice`]. Returns `(is_64, nfat_arch)`.
+fn plausible_fat_header(data: &[u8], truncated: bool) -> Option<(bool, u32)> {
     let is_64 = match be_u32(data, 0)? {
         FAT_MAGIC => false,
         FAT_MAGIC_64 => true,
         _ => return None,
     };
     // fat_header (always big-endian): magic(4), nfat_arch(4).
-    match be_u32(data, 4) {
-        Some(n) if n != 0 && n <= MAX_PLAUSIBLE_FAT_ARCHES => Some((is_64, n)),
-        _ => None,
+    let nfat = be_u32(data, 4).filter(|&n| n != 0 && n <= MAX_FAT_ARCHES)?;
+    fat_references_real_slice(data, is_64, nfat, truncated).then_some((is_64, nfat))
+}
+
+/// True if the fat table's `nfat` declared arches contain real evidence of a
+/// Mach-O slice: an entry whose offset field we can read points at a thin
+/// Mach-O magic within `data`, or — only when `truncated` — points past the
+/// bytes held (the slice may lie beyond what this capture holds; "couldn't
+/// check" must not become "not a Mach-O", §11.8). A Java `.class` file has
+/// constant-pool bytes sitting where the arch table would be, which won't
+/// point at a Mach-O magic, so a non-truncated read of one finds nothing
+/// here.
+fn fat_references_real_slice(data: &[u8], is_64: bool, nfat: u32, truncated: bool) -> bool {
+    let stride: usize = if is_64 { 32 } else { 20 };
+    for i in 0..nfat as usize {
+        let Some(obj_off) = fat_arch_offset(data, is_64, stride, i) else {
+            continue; // entry's own bytes lie outside what we hold
+        };
+        match usize::try_from(obj_off) {
+            Ok(off) if off < data.len() => {
+                if be_u32(data, off).and_then(thin_kind).is_some() {
+                    return true;
+                }
+            }
+            _ if truncated => return true,
+            _ => {}
+        }
     }
+    false
 }
 
 /// Walk every arch of a fat/universal binary, collecting the slices this
@@ -184,10 +218,10 @@ fn plausible_fat_header(data: &[u8]) -> Option<(bool, u32)> {
 /// `.class`, see [`plausible_fat_header`]) — there's no declared arch count
 /// to trust in that case, so it's "not a fat binary," not "every arch
 /// skipped."
-fn parse_fat_all(data: &[u8]) -> (Vec<MachOImage>, usize) {
+fn parse_fat_all(data: &[u8], truncated: bool) -> (Vec<MachOImage>, usize) {
     let mut out = Vec::new();
     let mut skipped = 0usize;
-    let Some((is_64, nfat)) = plausible_fat_header(data) else {
+    let Some((is_64, nfat)) = plausible_fat_header(data, truncated) else {
         return (out, skipped);
     };
     for i in 0..nfat as usize {
@@ -199,17 +233,24 @@ fn parse_fat_all(data: &[u8]) -> (Vec<MachOImage>, usize) {
     (out, skipped)
 }
 
+/// Read fat arch `i`'s declared object-file offset (the `fat_arch`/
+/// `fat_arch_64` `offset` field), or `None` if that entry's own bytes lie
+/// outside `data`.
+fn fat_arch_offset(data: &[u8], is_64: bool, stride: usize, i: usize) -> Option<u64> {
+    // fat_arch: cputype(4), cpusubtype(4), offset, size, align[, reserved].
+    let arch_off = 8usize.checked_add(i.checked_mul(stride)?)?;
+    if is_64 {
+        be_u64(data, arch_off.checked_add(8)?)
+    } else {
+        be_u32(data, arch_off.checked_add(8)?).map(u64::from)
+    }
+}
+
 /// Parse fat arch `i`'s slice, or `None` if its table entry or object offset
 /// can't be read within bounds (a bad entry skips just that arch).
 fn fat_member(data: &[u8], is_64: bool, i: usize) -> Option<MachOImage> {
-    // fat_arch: cputype(4), cpusubtype(4), offset, size, align[, reserved].
-    let arch_stride: usize = if is_64 { 32 } else { 20 };
-    let arch_off = 8usize.checked_add(i.checked_mul(arch_stride)?)?;
-    let obj_off = if is_64 {
-        be_u64(data, arch_off.checked_add(8)?)?
-    } else {
-        be_u32(data, arch_off.checked_add(8)?)? as u64
-    };
+    let stride: usize = if is_64 { 32 } else { 20 };
+    let obj_off = fat_arch_offset(data, is_64, stride, i)?;
 
     // Slice must start within the bytes we hold (and not overflow usize).
     let base = match usize::try_from(obj_off) {
@@ -587,6 +628,61 @@ pub(crate) mod tests_support {
         v
     }
 
+    /// A fat/universal binary with `bogus_count` arch entries pointing at
+    /// distinct, 16 KiB-aligned zeroed regions (no thin Mach-O magic) plus one
+    /// real slice (`real_member`) last in the table — the shape a real fat
+    /// binary the kernel will still run can take (§46: verified with 24 bogus
+    /// entries alongside one real arm64 slice).
+    pub(crate) fn synth_fat_with_bogus_arches(real_member: &[u8], bogus_count: usize) -> Vec<u8> {
+        const PAGE: usize = 16 * 1024;
+        const BOGUS_SIZE: usize = 16;
+
+        let total = bogus_count + 1;
+        let header_len = 8 + 20 * total;
+        let align_up = |x: usize| x.div_ceil(PAGE) * PAGE;
+
+        let mut offsets = Vec::with_capacity(total);
+        let mut cursor = header_len;
+        for _ in 0..bogus_count {
+            let aligned = align_up(cursor);
+            offsets.push(aligned);
+            cursor = aligned + BOGUS_SIZE;
+        }
+        let real_off = align_up(cursor);
+        offsets.push(real_off);
+
+        let mut v = Vec::new();
+        v.extend_from_slice(&FAT_MAGIC.to_be_bytes());
+        v.extend_from_slice(&(total as u32).to_be_bytes());
+        for (i, &off) in offsets.iter().enumerate() {
+            let is_real = i == bogus_count;
+            let cputype = if is_real {
+                0x0100_0007u32
+            } else {
+                0x7f00_0000u32 + i as u32
+            };
+            let size = if is_real {
+                real_member.len()
+            } else {
+                BOGUS_SIZE
+            };
+            v.extend_from_slice(&cputype.to_be_bytes());
+            v.extend_from_slice(&(i as u32).to_be_bytes()); // cpusubtype (distinct)
+            v.extend_from_slice(&(off as u32).to_be_bytes());
+            v.extend_from_slice(&(size as u32).to_be_bytes());
+            v.extend_from_slice(&0u32.to_be_bytes()); // align
+        }
+        for (i, &off) in offsets.iter().enumerate() {
+            v.resize(off, 0);
+            if i == bogus_count {
+                v.extend_from_slice(real_member);
+            } else {
+                v.resize(off + BOGUS_SIZE, 0);
+            }
+        }
+        v
+    }
+
     fn seg_name(name: &[u8]) -> [u8; 16] {
         let mut b = [0u8; 16];
         b[..name.len()].copy_from_slice(name);
@@ -814,7 +910,8 @@ pub(crate) mod tests_support {
 #[cfg(test)]
 mod tests {
     use super::tests_support::{
-        synth_fat, synth_macho_64, synth_macho_64_full, synth_macho_64_full_with_cd_flags,
+        synth_fat, synth_fat_with_bogus_arches, synth_macho_64, synth_macho_64_full,
+        synth_macho_64_full_with_cd_flags,
     };
     use super::*;
 
@@ -867,16 +964,20 @@ mod tests {
     #[test]
     fn magic_detection_matches_what_parse_accepts() {
         let (image, _) = synth_macho_64(b"code");
-        assert!(is_macho_magic(&image));
-        // Fat magic counts even though this stub has no usable arch table.
-        assert!(is_macho_magic(&[0xCA, 0xFE, 0xBA, 0xBE, 0, 0, 0, 1]));
+        assert!(is_macho_magic(&image, false));
+        // Fat magic alone, with no arch table entry pointing at a real slice,
+        // is not enough (that's exactly what let a Java `.class` file through).
+        assert!(!is_macho_magic(
+            &[0xCA, 0xFE, 0xBA, 0xBE, 0, 0, 0, 1],
+            false
+        ));
         // Everything that is plainly not a code object.
-        assert!(!is_macho_magic(b"#!/bin/sh\n"));
-        assert!(!is_macho_magic(b"xar!"));
-        assert!(!is_macho_magic(b"just some text"));
-        assert!(!is_macho_magic(b"\x1f\x8b\x08\x00"));
-        assert!(!is_macho_magic(b""));
-        assert!(!is_macho_magic(b"\xCF\xFA"));
+        assert!(!is_macho_magic(b"#!/bin/sh\n", false));
+        assert!(!is_macho_magic(b"xar!", false));
+        assert!(!is_macho_magic(b"just some text", false));
+        assert!(!is_macho_magic(b"\x1f\x8b\x08\x00", false));
+        assert!(!is_macho_magic(b"", false));
+        assert!(!is_macho_magic(b"\xCF\xFA", false));
     }
 
     #[test]
@@ -892,16 +993,38 @@ mod tests {
     #[test]
     fn java_class_headers_are_not_macho() {
         // CAFEBABE + (minor=0, major=52) and (minor=0, major=65) — real Java
-        // major versions (JDK 1.1 onward is 45+) land well past
-        // MAX_PLAUSIBLE_FAT_ARCHES, unlike any real universal binary's arch
-        // count.
+        // major versions (JDK 1.1 onward is 45+). The bytes following the
+        // magic are all zero, so every arch-table entry this reads either
+        // points at offset 0 (the CAFEBABE bytes themselves, not a thin
+        // Mach-O magic) or falls outside the 64-byte constant-pool stand-in —
+        // never real evidence of a slice.
         for major in [0x34u32, 0x41] {
             let mut v = vec![0xCA, 0xFE, 0xBA, 0xBE];
             v.extend_from_slice(&major.to_be_bytes());
             v.extend_from_slice(&[0u8; 64]);
-            assert!(!is_macho_magic(&v), "major {major:#x}");
+            assert!(!is_macho_magic(&v, false), "major {major:#x}");
             assert!(parse_all(&v).is_empty(), "major {major:#x}");
         }
+    }
+
+    #[test]
+    fn truncated_java_like_header_with_offset_past_eof_is_lenient() {
+        // Same CAFEBABE + major=52 shape, but the first arch entry's offset
+        // field is set past the end of the (short) buffer. A non-truncated
+        // read of this shape can only mean "not a fat binary" (§46); a
+        // truncated one can't rule out a real slice lying past what was
+        // captured, so it must not be read as "not a Mach-O" (§10/§11.8).
+        let mut v = vec![0xCA, 0xFE, 0xBA, 0xBE];
+        v.extend_from_slice(&0x0000_0034u32.to_be_bytes()); // minor=0, major=52
+        v.extend_from_slice(&[0u8; 64]);
+        // First fat_arch's offset field: bytes 16..20 (arch_off=8, +8).
+        let past_eof = v.len() as u32 + 1000;
+        v[16..20].copy_from_slice(&past_eof.to_be_bytes());
+        assert!(
+            !is_macho_magic(&v, false),
+            "complete read finds no evidence"
+        );
+        assert!(is_macho_magic(&v, true), "truncated read stays lenient");
     }
 
     #[test]
@@ -909,8 +1032,21 @@ mod tests {
         let (a, _, _) = synth_macho_64_full(b"aaaa", &[], &[], false, None);
         let (b, _, _) = synth_macho_64_full(b"bbbb", &[], &[], false, None);
         let fat = synth_fat(&[&a, &b]);
-        assert!(is_macho_magic(&fat));
+        assert!(is_macho_magic(&fat, false));
         assert_eq!(parse_all(&fat).len(), 2);
+    }
+
+    #[test]
+    fn many_bogus_arches_alongside_one_real_slice_is_still_macho() {
+        // §46: the kernel runs a fat binary with far more arch entries than
+        // any real toolchain emits, as long as one slice is real — an
+        // arch-count cap alone must not be the discriminator.
+        let (real, _, _) = synth_macho_64_full(b"real slice", &[], &[], false, None);
+        let fat = synth_fat_with_bogus_arches(&real, 24);
+        assert!(is_macho_magic(&fat, false));
+        let (images, skipped) = parse_all_slices(&fat, false);
+        assert_eq!(images.len(), 1);
+        assert_eq!(skipped, 24);
     }
 
     #[test]
@@ -1050,7 +1186,7 @@ mod tests {
         let (good, _, _) = synth_macho_64_full(b"good", &[], &[], false, None);
         let garbage: &[u8] = &[0xDE, 0xAD, 0xBE, 0xEF, 0, 0, 0, 0];
         let fat = synth_fat(&[&good, garbage]);
-        let (images, skipped) = parse_all_slices(&fat);
+        let (images, skipped) = parse_all_slices(&fat, false);
         assert_eq!(images.len(), 1);
         assert_eq!(skipped, 1);
     }
@@ -1058,12 +1194,12 @@ mod tests {
     #[test]
     fn thin_and_two_clean_slices_report_zero_skipped() {
         let (thin, _) = synth_macho_64(b"code");
-        assert_eq!(parse_all_slices(&thin), (parse_all(&thin), 0));
+        assert_eq!(parse_all_slices(&thin, false), (parse_all(&thin), 0));
 
         let (a, _, _) = synth_macho_64_full(b"aaaa", &[], &[], false, None);
         let (b, _, _) = synth_macho_64_full(b"bbbb", &[], &[], false, None);
         let fat = synth_fat(&[&a, &b]);
-        let (images, skipped) = parse_all_slices(&fat);
+        let (images, skipped) = parse_all_slices(&fat, false);
         assert_eq!(images.len(), 2);
         assert_eq!(skipped, 0);
     }
@@ -1075,7 +1211,7 @@ mod tests {
         let mut v = vec![0xCA, 0xFE, 0xBA, 0xBE];
         v.extend_from_slice(&0x0000_0034u32.to_be_bytes());
         v.extend_from_slice(&[0u8; 64]);
-        assert_eq!(parse_all_slices(&v), (Vec::new(), 0));
+        assert_eq!(parse_all_slices(&v, false), (Vec::new(), 0));
     }
 
     #[test]
@@ -1087,7 +1223,7 @@ mod tests {
         // second 20-byte fat_arch entry starts at 28, offset is its 3rd u32)
         // to point past EOF.
         fat[36..40].copy_from_slice(&(total_len + 1000).to_be_bytes());
-        let (images, skipped) = parse_all_slices(&fat);
+        let (images, skipped) = parse_all_slices(&fat, false);
         assert_eq!(images.len(), 1);
         assert_eq!(skipped, 1);
     }
