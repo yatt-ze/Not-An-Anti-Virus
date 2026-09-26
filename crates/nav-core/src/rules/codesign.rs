@@ -302,6 +302,14 @@ fn indicates_revocation(stderr: &str) -> bool {
     // on any path containing that word (#30).
     stderr.lines().any(|line| {
         let line = line.trim_end();
+        // `--deep --strict -v` also emits `--prepared:<path>`/`--validated:
+        // <path>` progress lines as it walks nested code; a component named
+        // to end in the error constant (colons are legal on APFS) would
+        // otherwise forge a match on a validly signed bundle (#30 follow-up).
+        let trimmed_start = line.trim_start();
+        if trimmed_start.starts_with("--prepared:") || trimmed_start.starts_with("--validated:") {
+            return false;
+        }
         line == "CSSMERR_TP_CERT_REVOKED" || line.ends_with(": CSSMERR_TP_CERT_REVOKED")
     })
 }
@@ -667,6 +675,21 @@ mod tests {
         assert!(!indicates_revocation(
             "/Applications/App.app/Contents/Frameworks/Revoked.framework: \
              a sealed resource is missing or invalid\n"
+        ));
+    }
+
+    /// Regression for #30's follow-up: `--deep --strict -v` emits
+    /// `--prepared:`/`--validated:` progress lines for each nested code path
+    /// it walks. Colons are legal on APFS, so a component literally named
+    /// `helper: CSSMERR_TP_CERT_REVOKED` makes such a line end with the exact
+    /// error constant on a validly signed bundle — those lines must be
+    /// ignored, not just path-prefix lines in general.
+    #[test]
+    fn indicates_revocation_is_false_for_deep_progress_lines_ending_in_the_constant() {
+        assert!(!indicates_revocation(
+            "--prepared:/A.app/Contents/MacOS/helper: CSSMERR_TP_CERT_REVOKED\n\
+             --validated:/A.app/Contents/MacOS/helper: CSSMERR_TP_CERT_REVOKED\n\
+             /A.app: valid on disk\n"
         ));
     }
 
