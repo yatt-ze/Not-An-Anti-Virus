@@ -25,6 +25,8 @@ enum DvStatus {
     Signed,
 }
 
+/// `CS_ADHOC`, from `<Security/CSCommon.h>`'s `CodeDirectory` flag bits.
+const CS_ADHOC: u32 = 0x2;
 /// `CS_LINKER_SIGNED`, from `<Security/CSCommon.h>`'s `CodeDirectory` flag bits.
 const CS_LINKER_SIGNED: u32 = 0x20000;
 
@@ -38,43 +40,69 @@ fn path_is_line_safe(path: &std::path::Path) -> bool {
     !s.contains('\n') && !s.contains('\r')
 }
 
-/// True if the `CodeDirectory` line of `codesign -dv` output carries the
-/// linker-applied ad-hoc signature, as opposed to a hand-applied one. Prefers
-/// parsing that line's numeric `flags=0x<hex>` token and testing
-/// `CS_LINKER_SIGNED`; falls back to a textual `"linker-signed"` match on the
-/// same line when the flags token is missing or malformed. No `CodeDirectory`
-/// line at all means `false`.
-fn is_linker_signed(stderr: &str) -> bool {
-    let Some(line) = stderr
+/// Finds the sole line in `codesign -dv --verbose=4` output that starts with
+/// `CodeDirectory `. Real output for a code object carries exactly one; a
+/// signer-chosen field that embeds a newline (e.g. `codesign -i`'s identifier)
+/// can echo a second line shaped like it, so anything but exactly one is
+/// forged, not parsed — `None` (§11.9/#31).
+fn single_code_directory_line(stderr: &str) -> Option<&str> {
+    let mut lines = stderr
         .lines()
-        .find(|line| line.trim_start().starts_with("CodeDirectory "))
-    else {
-        return false;
-    };
+        .filter(|line| line.trim_start().starts_with("CodeDirectory "));
+    let only = lines.next()?;
+    lines.next().is_none().then_some(only)
+}
 
-    line.split("flags=0x")
+/// Parses the numeric `flags=0x<hex>` token off a `CodeDirectory` line.
+fn code_directory_flags(code_directory_line: &str) -> Option<u32> {
+    code_directory_line
+        .split("flags=0x")
         .nth(1)
         .and_then(|rest| rest.split(|c: char| !c.is_ascii_hexdigit()).next())
         .and_then(|hex| u32::from_str_radix(hex, 16).ok())
+}
+
+/// True if `code_directory_line` (the sole `CodeDirectory` line, see
+/// [`single_code_directory_line`]) carries the linker-applied ad-hoc
+/// signature, as opposed to a hand-applied one. Prefers parsing its numeric
+/// `flags=0x<hex>` token and testing `CS_LINKER_SIGNED`; falls back to a
+/// textual `"linker-signed"` match on the line when the token is missing or
+/// malformed.
+fn is_linker_signed(code_directory_line: &str) -> bool {
+    code_directory_flags(code_directory_line)
         .map(|flags| flags & CS_LINKER_SIGNED != 0)
-        .unwrap_or_else(|| line.contains("linker-signed"))
+        .unwrap_or_else(|| code_directory_line.contains("linker-signed"))
 }
 
 /// Parses `codesign -dv --verbose=4` output. `codesign -dv` writes its report
 /// to stderr, not stdout, regardless of exit status. Line-anchored (§11.9/#31)
 /// since `codesign` echoes the scanned path (e.g. `Executable=<path>`) into
 /// the same stream, and a crafted filename must not be able to forge a match.
+///
+/// A signer-chosen field can go further and inject a whole extra
+/// `CodeDirectory `-prefixed line (a multi-line `-i` identifier); requiring
+/// exactly one such line before trusting its flags closes that gap (#31).
 fn classify_dv(success: bool, stderr: &str) -> Result<DvStatus, RuleOutcome> {
     if success {
-        let is_adhoc = stderr.lines().any(|line| line.trim() == "Signature=adhoc");
-        return Ok(if is_adhoc {
-            if is_linker_signed(stderr) {
-                DvStatus::AdHocLinkerSigned
-            } else {
-                DvStatus::AdHocManual
+        let cd_line = single_code_directory_line(stderr).ok_or(RuleOutcome::NotApplicable)?;
+        return Ok(match code_directory_flags(cd_line) {
+            // Numeric flags parsed: ad-hoc/linker-signed come straight from
+            // the bits — the `Signature=adhoc` line is not consulted.
+            Some(flags) if flags & CS_ADHOC == 0 => DvStatus::Signed,
+            Some(flags) if flags & CS_LINKER_SIGNED != 0 => DvStatus::AdHocLinkerSigned,
+            Some(_) => DvStatus::AdHocManual,
+            // Flags token missing or malformed: fall back to the textual
+            // markers, as before #31's hardening.
+            None => {
+                let is_adhoc = stderr.lines().any(|line| line.trim() == "Signature=adhoc");
+                if !is_adhoc {
+                    DvStatus::Signed
+                } else if is_linker_signed(cd_line) {
+                    DvStatus::AdHocLinkerSigned
+                } else {
+                    DvStatus::AdHocManual
+                }
             }
-        } else {
-            DvStatus::Signed
         });
     }
     // `codesign -dv` exits non-zero for unsigned binaries *and* for genuine
@@ -566,6 +594,7 @@ mod tests {
     #[test]
     fn classify_dv_real_identity() {
         let stderr = "Executable=/tmp/x\n\
+             CodeDirectory v=20400 size=... flags=0x10000(runtime) hashes=...\n\
              Authority=Developer ID Application: Example Corp (TEAMID1234)\n\
              Authority=Developer ID Certification Authority\n\
              Authority=Apple Root CA\n";
@@ -700,8 +729,7 @@ mod tests {
     #[test]
     fn is_linker_signed_matches_the_named_form() {
         assert!(is_linker_signed(
-            "Executable=/tmp/x\n\
-             CodeDirectory v=20400 size=... flags=0x20002(adhoc,linker-signed) hashes=877+0\n"
+            "CodeDirectory v=20400 size=... flags=0x20002(adhoc,linker-signed) hashes=877+0"
         ));
     }
 
@@ -727,35 +755,81 @@ mod tests {
     #[test]
     fn is_linker_signed_is_false_without_the_bit_or_the_text() {
         assert!(!is_linker_signed(
-            "Executable=/tmp/x\n\
-             CodeDirectory v=20400 size=... flags=0x2(adhoc) hashes=877+0\n"
+            "CodeDirectory v=20400 size=... flags=0x2(adhoc) hashes=877+0"
         ));
         assert!(!is_linker_signed(
-            "Executable=/tmp/x\n\
-             CodeDirectory v=20400 size=... flags=0x2 hashes=877+0\n"
+            "CodeDirectory v=20400 size=... flags=0x2 hashes=877+0"
         ));
     }
 
     #[test]
     fn is_linker_signed_falls_back_to_text_when_flags_token_is_malformed() {
         assert!(is_linker_signed(
-            "Executable=/tmp/x\n\
-             CodeDirectory v=20400 size=... flags=0xZZ(adhoc,linker-signed)\n"
+            "CodeDirectory v=20400 size=... flags=0xZZ(adhoc,linker-signed)"
         ));
     }
 
     #[test]
     fn is_linker_signed_is_false_when_flags_token_is_absent() {
-        assert!(!is_linker_signed("Signature=adhoc\n"));
+        assert!(!is_linker_signed("CodeDirectory v=20400 size=1 hashes=0+0"));
+    }
+
+    /// Regression for #31: a signer-chosen field that embeds a newline (e.g.
+    /// `codesign -i`'s identifier) can echo a second line shaped like the real
+    /// `CodeDirectory` line — the point of the exactly-one check, not just its
+    /// presence.
+    #[test]
+    fn single_code_directory_line_is_none_when_there_are_two() {
+        let stderr = "Executable=/path/bin\n\
+             Identifier=x\n\
+             CodeDirectory v=20400 size=1 flags=0x20002(adhoc,linker-signed) hashes=1+1\n\
+             Format=Mach-O thin (arm64)\n\
+             CodeDirectory v=20400 size=293 flags=0x2(adhoc) hashes=2+2 location=embedded\n\
+             Signature=adhoc\n";
+        assert_eq!(single_code_directory_line(stderr), None);
     }
 
     /// No `CodeDirectory` line at all (e.g. a truncated/odd `codesign`
-    /// output) must not fall back to scanning the whole blob for the text.
+    /// output, or forged text that never actually starts a line with the
+    /// literal prefix) must not fall back to scanning the whole blob for it.
     #[test]
-    fn is_linker_signed_is_false_without_a_codedirectory_line() {
-        assert!(!is_linker_signed(
-            "Executable=/tmp/flags=0x20002(adhoc,linker-signed)\nSignature=adhoc\n"
-        ));
+    fn single_code_directory_line_is_none_without_a_codedirectory_line() {
+        assert_eq!(
+            single_code_directory_line(
+                "Executable=/tmp/flags=0x20002(adhoc,linker-signed)\nSignature=adhoc\n"
+            ),
+            None
+        );
+    }
+
+    /// The exact identifier-injection repro from #31's follow-up review: a
+    /// crafted `-i` value forges a second `CodeDirectory `-prefixed line
+    /// ahead of the real one, so the count is 2, not 1 — `classify_dv` must
+    /// refuse to guess which one is real rather than trusting the first.
+    #[test]
+    fn classify_dv_is_not_applicable_when_a_codedirectory_line_is_forged() {
+        let stderr = "Executable=/path/bin\n\
+             Identifier=x\n\
+             CodeDirectory v=20400 size=1 flags=0x20002(adhoc,linker-signed) hashes=1+1\n\
+             Format=Mach-O thin (arm64)\n\
+             CodeDirectory v=20400 size=293 flags=0x2(adhoc) hashes=2+2 location=embedded\n\
+             Signature=adhoc\n";
+        assert_eq!(classify_dv(true, stderr), Err(RuleOutcome::NotApplicable));
+    }
+
+    /// An injected bare `Signature=adhoc` line must not override a real,
+    /// single `CodeDirectory` line's flags — once those parse, the
+    /// `Signature=` line is never consulted (#31).
+    #[test]
+    fn classify_dv_ignores_an_injected_signature_adhoc_line_when_flags_parse() {
+        let stderr = "Executable=/tmp/x\n\
+             Identifier=x\n\
+             Signature=adhoc\n\
+             CodeDirectory v=20400 size=... flags=0x10000(runtime) hashes=...\n\
+             Authority=Developer ID Application: Example Corp (TEAMID1234)\n\
+             Authority=Developer ID Certification Authority\n\
+             Authority=Apple Root CA\n";
+        assert_eq!(classify_dv(true, stderr), Ok(DvStatus::Signed));
     }
 
     #[test]
@@ -801,6 +875,7 @@ mod tests {
     #[test]
     fn classify_dv_ignores_signature_adhoc_text_in_the_executable_path() {
         let stderr = "Executable=/tmp/Signature=adhoc/x\n\
+             CodeDirectory v=20400 size=... flags=0x10000(runtime) hashes=...\n\
              Authority=Developer ID Application: Example Corp (TEAMID1234)\n\
              Authority=Developer ID Certification Authority\n\
              Authority=Apple Root CA\n";
