@@ -28,29 +28,46 @@ enum DvStatus {
 /// `CS_LINKER_SIGNED`, from `<Security/CSCommon.h>`'s `CodeDirectory` flag bits.
 const CS_LINKER_SIGNED: u32 = 0x20000;
 
-/// True if `codesign -dv` output indicates the linker-applied ad-hoc
-/// signature, as opposed to a hand-applied one. Prefers parsing the numeric
-/// `flags=0x<hex>` token and testing `CS_LINKER_SIGNED`, since a `codesign`
-/// that renders flags without the `(...,linker-signed)` text suffix would
-/// otherwise be misread as a hand-applied sign; falls back to the textual
-/// `"linker-signed"` match when the flags token is missing or malformed.
+/// False if `path`'s string form contains a newline or carriage return. Both
+/// `codesign` and `spctl` echo the scanned path back into the stderr we parse
+/// line-anchored; a path containing a line break could forge an extra line
+/// (e.g. a fake `source=` or `CodeDirectory` line) (§11.9/#31). Callers treat
+/// a `false` result as "couldn't check" (§11.8), never "clean".
+fn path_is_line_safe(path: &std::path::Path) -> bool {
+    let s = path.to_string_lossy();
+    !s.contains('\n') && !s.contains('\r')
+}
+
+/// True if the `CodeDirectory` line of `codesign -dv` output carries the
+/// linker-applied ad-hoc signature, as opposed to a hand-applied one. Prefers
+/// parsing that line's numeric `flags=0x<hex>` token and testing
+/// `CS_LINKER_SIGNED`; falls back to a textual `"linker-signed"` match on the
+/// same line when the flags token is missing or malformed. No `CodeDirectory`
+/// line at all means `false`.
 fn is_linker_signed(stderr: &str) -> bool {
-    let numeric_match = stderr
-        .split("flags=0x")
+    let Some(line) = stderr
+        .lines()
+        .find(|line| line.trim_start().starts_with("CodeDirectory "))
+    else {
+        return false;
+    };
+
+    line.split("flags=0x")
         .nth(1)
         .and_then(|rest| rest.split(|c: char| !c.is_ascii_hexdigit()).next())
         .and_then(|hex| u32::from_str_radix(hex, 16).ok())
         .map(|flags| flags & CS_LINKER_SIGNED != 0)
-        .unwrap_or(false);
-
-    numeric_match || stderr.contains("linker-signed")
+        .unwrap_or_else(|| line.contains("linker-signed"))
 }
 
 /// Parses `codesign -dv --verbose=4` output. `codesign -dv` writes its report
-/// to stderr, not stdout, regardless of exit status.
+/// to stderr, not stdout, regardless of exit status. Line-anchored (§11.9/#31)
+/// since `codesign` echoes the scanned path (e.g. `Executable=<path>`) into
+/// the same stream, and a crafted filename must not be able to forge a match.
 fn classify_dv(success: bool, stderr: &str) -> Result<DvStatus, RuleOutcome> {
     if success {
-        return Ok(if stderr.contains("Signature=adhoc") {
+        let is_adhoc = stderr.lines().any(|line| line.trim() == "Signature=adhoc");
+        return Ok(if is_adhoc {
             if is_linker_signed(stderr) {
                 DvStatus::AdHocLinkerSigned
             } else {
@@ -62,7 +79,12 @@ fn classify_dv(success: bool, stderr: &str) -> Result<DvStatus, RuleOutcome> {
     }
     // `codesign -dv` exits non-zero for unsigned binaries *and* for genuine
     // errors, so match the specific "not signed" message, not the exit code.
-    if stderr.contains("code object is not signed at all") {
+    let is_unsigned = stderr.lines().any(|line| {
+        let line = line.trim();
+        line == "code object is not signed at all"
+            || line.ends_with(": code object is not signed at all")
+    });
+    if is_unsigned {
         Ok(DvStatus::Unsigned)
     } else {
         // codesign missing or some other inconclusive error — don't claim
@@ -236,6 +258,9 @@ impl Rule for RevokedSignatureRule {
 /// call drops the result to `NotApplicable` rather than reporting a different
 /// object's revocation state.
 fn run_codesign_verify(ctx: &ScanContext) -> Result<bool, RuleOutcome> {
+    if !path_is_line_safe(&ctx.path) {
+        return Err(RuleOutcome::NotApplicable);
+    }
     let stderr = ctx
         .run_object_bound(|| spawn_codesign_verify(&ctx.path).ok())
         .ok_or(RuleOutcome::NotApplicable)?;
@@ -396,6 +421,9 @@ fn notarization_from_source(source: &str) -> Option<bool> {
 /// spawn is cached on `ctx` (§5.2) so notarization rules sharing a scan
 /// don't each spawn their own `spctl`.
 fn run_spctl_source(ctx: &ScanContext) -> Result<Option<String>, RuleOutcome> {
+    if !path_is_line_safe(&ctx.path) {
+        return Err(RuleOutcome::NotApplicable);
+    }
     let output = ctx
         .spctl_assessment(|| spawn_spctl_assess(&ctx.path).ok())
         .ok_or(RuleOutcome::NotApplicable)?;
@@ -403,8 +431,11 @@ fn run_spctl_source(ctx: &ScanContext) -> Result<Option<String>, RuleOutcome> {
 }
 
 fn parse_spctl_source(output: &str) -> Option<&str> {
+    // Skip line 0: spctl's own `<path>: accepted|rejected` verdict, which
+    // echoes the scanned path and could itself start with "source=" (#31).
     output
         .lines()
+        .skip(1)
         .find_map(|l| l.trim().strip_prefix("source="))
 }
 
@@ -436,6 +467,9 @@ fn spawn_spctl_assess(_path: &std::path::Path) -> Result<String, RuleOutcome> {
 /// `ctx` (§5.2) so the five rules sharing a scan spawn `codesign` once, not
 /// once each.
 fn run_codesign_dv(ctx: &ScanContext) -> Result<DvStatus, RuleOutcome> {
+    if !path_is_line_safe(&ctx.path) {
+        return Err(RuleOutcome::NotApplicable);
+    }
     let (success, stderr) = ctx
         .codesign_dv(|| spawn_codesign_dv(&ctx.path).ok())
         .ok_or(RuleOutcome::NotApplicable)?;
@@ -666,7 +700,8 @@ mod tests {
     #[test]
     fn is_linker_signed_matches_the_named_form() {
         assert!(is_linker_signed(
-            "flags=0x20002(adhoc,linker-signed) hashes=877+0"
+            "Executable=/tmp/x\n\
+             CodeDirectory v=20400 size=... flags=0x20002(adhoc,linker-signed) hashes=877+0\n"
         ));
     }
 
@@ -691,17 +726,94 @@ mod tests {
 
     #[test]
     fn is_linker_signed_is_false_without_the_bit_or_the_text() {
-        assert!(!is_linker_signed("flags=0x2(adhoc) hashes=877+0"));
-        assert!(!is_linker_signed("flags=0x2 hashes=877+0"));
+        assert!(!is_linker_signed(
+            "Executable=/tmp/x\n\
+             CodeDirectory v=20400 size=... flags=0x2(adhoc) hashes=877+0\n"
+        ));
+        assert!(!is_linker_signed(
+            "Executable=/tmp/x\n\
+             CodeDirectory v=20400 size=... flags=0x2 hashes=877+0\n"
+        ));
     }
 
     #[test]
     fn is_linker_signed_falls_back_to_text_when_flags_token_is_malformed() {
-        assert!(is_linker_signed("flags=0xZZ(adhoc,linker-signed)"));
+        assert!(is_linker_signed(
+            "Executable=/tmp/x\n\
+             CodeDirectory v=20400 size=... flags=0xZZ(adhoc,linker-signed)\n"
+        ));
     }
 
     #[test]
     fn is_linker_signed_is_false_when_flags_token_is_absent() {
         assert!(!is_linker_signed("Signature=adhoc\n"));
+    }
+
+    /// No `CodeDirectory` line at all (e.g. a truncated/odd `codesign`
+    /// output) must not fall back to scanning the whole blob for the text.
+    #[test]
+    fn is_linker_signed_is_false_without_a_codedirectory_line() {
+        assert!(!is_linker_signed(
+            "Executable=/tmp/flags=0x20002(adhoc,linker-signed)\nSignature=adhoc\n"
+        ));
+    }
+
+    #[test]
+    fn path_is_line_safe_true_for_a_normal_path() {
+        assert!(path_is_line_safe(std::path::Path::new("/tmp/normal/tool")));
+    }
+
+    #[test]
+    fn path_is_line_safe_false_for_paths_with_line_breaks() {
+        assert!(!path_is_line_safe(std::path::Path::new(
+            "/tmp/flags=0x20000\nCodeDirectory v=20400 flags=0x2(adhoc)"
+        )));
+        assert!(!path_is_line_safe(std::path::Path::new(
+            "/tmp/flags=0x20000\rmore"
+        )));
+    }
+
+    /// Regression for #31: a manually ad-hoc-signed binary named to embed a
+    /// bogus `flags=0x...` token before the real `CodeDirectory` line must
+    /// not be misread as linker-signed just because that text appears first
+    /// in the stream.
+    #[test]
+    fn classify_dv_ignores_flags_token_in_the_executable_path() {
+        let stderr = "Executable=/tmp/flags=0x20000\n\
+             Identifier=flags=0x20000\n\
+             CodeDirectory v=20400 size=... flags=0x2(adhoc) hashes=877+0\n\
+             Signature=adhoc\n";
+        assert_eq!(classify_dv(true, stderr), Ok(DvStatus::AdHocManual));
+    }
+
+    /// Same forgery attempt via the literal text `linker-signed` embedded in
+    /// the path, ahead of a `CodeDirectory` line with no such flag.
+    #[test]
+    fn classify_dv_ignores_linker_signed_text_in_the_executable_path() {
+        let stderr = "Executable=/tmp/linker-signed/x\n\
+             CodeDirectory v=20400 size=... flags=0x2(adhoc) hashes=877+0\n\
+             Signature=adhoc\n";
+        assert_eq!(classify_dv(true, stderr), Ok(DvStatus::AdHocManual));
+    }
+
+    /// A filename containing the literal text `Signature=adhoc` must not
+    /// forge an ad-hoc verdict on a genuinely Developer-ID-signed binary.
+    #[test]
+    fn classify_dv_ignores_signature_adhoc_text_in_the_executable_path() {
+        let stderr = "Executable=/tmp/Signature=adhoc/x\n\
+             Authority=Developer ID Application: Example Corp (TEAMID1234)\n\
+             Authority=Developer ID Certification Authority\n\
+             Authority=Apple Root CA\n";
+        assert_eq!(classify_dv(true, stderr), Ok(DvStatus::Signed));
+    }
+
+    /// Regression for #31: spctl's first line is the `<path>: accepted`
+    /// verdict, which echoes the scanned path — a path forging a `source=`
+    /// line there must not shadow the real `source=` line that follows.
+    #[test]
+    fn parse_spctl_source_ignores_a_forged_source_on_the_verdict_line() {
+        let out = "source=Notarized Developer ID: rejected\n\
+             source=Unnotarized Developer ID\n";
+        assert_eq!(parse_spctl_source(out), Some("Unnotarized Developer ID"));
     }
 }

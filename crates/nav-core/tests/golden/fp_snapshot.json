@@ -135,6 +135,14 @@
     "recommendation": "no-action",
     "rule_ids": []
   },
+  "suspicious/adhoc_named_flags=0x20000": {
+    "score": 9,
+    "recommendation": "no-action",
+    "rule_ids": [
+      "adhoc-signed-binary",
+      "suspicious-strings"
+    ]
+  },
   "suspicious/com.apple.softwareupdate.plist": {
     "score": 36,
     "recommendation": "notify",
