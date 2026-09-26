@@ -39,6 +39,8 @@ const LC_CODE_SIGNATURE: u32 = 0x1d;
 const CSMAGIC_EMBEDDED_SIGNATURE: u32 = 0xfade_0cc0;
 const CSMAGIC_EMBEDDED_ENTITLEMENTS: u32 = 0xfade_7171;
 const CSMAGIC_CODEDIRECTORY: u32 = 0xfade_0c02;
+/// `CSMAGIC_BLOBWRAPPER`: wraps the CMS (identity) signature blob.
+const CSMAGIC_BLOBWRAPPER: u32 = 0xfade_0b01;
 
 // CS_BlobIndex slot types (cs_blobs.h) identifying a blob's role within the
 // SuperBlob.
@@ -50,6 +52,9 @@ const CSSLOT_ENTITLEMENTS: u32 = 5;
 // binary's *only* CodeDirectory can legally sit here, not just in slot 0.
 const CSSLOT_ALTERNATE_CODEDIRECTORIES: u32 = 0x1000;
 const MAX_ALTERNATE_CODEDIRECTORIES: u32 = 5;
+/// `CSSLOT_SIGNATURESLOT`: holds the CMS blob wrapper carrying the actual
+/// signing identity's certificate chain, when there is one.
+const CSSLOT_SIGNATURESLOT: u32 = 0x10000;
 
 /// `CS_ADHOC`, from `<Security/CSCommon.h>`'s `CodeDirectory` flag bits:
 /// ad-hoc signed, no real identity. Shared by the `codesign`-backed rules
@@ -110,6 +115,13 @@ pub struct MachOImage {
     /// no signature, no CodeDirectory found, or the signature region lies
     /// past the bytes this parser holds — never read as "not ad-hoc".
     pub code_directory_flags: Option<u32>,
+    /// Whether the signature's SuperBlob contains a non-empty CMS blob
+    /// wrapper (`CSSLOT_SIGNATURESLOT`/`CSMAGIC_BLOBWRAPPER`, length > 8): a
+    /// real identity signature carries certificate data there, a hand
+    /// ad-hoc signature has the wrapper but empty, and a linker signature
+    /// has none. Only meaningful when `code_directory_flags` is `Some` —
+    /// otherwise the signature region couldn't be read at all.
+    pub has_cms_signature: bool,
 }
 
 /// Parse `data` as a single Mach-O image: the thin image, or the **first**
@@ -348,6 +360,7 @@ fn parse_thin(data: &[u8], base: usize, is_64: bool, be: bool, is_fat: bool) -> 
     let mut has_code_signature = false;
     let mut entitlements = None;
     let mut code_directory_flags = None;
+    let mut has_cms_signature = false;
 
     let mut off = cmds_start;
     for _ in 0..ncmds {
@@ -395,6 +408,7 @@ fn parse_thin(data: &[u8], base: usize, is_64: bool, be: bool, is_fat: bool) -> 
                 let facts = extract_signature_facts(data, base, dataoff, datasize);
                 entitlements = facts.entitlements;
                 code_directory_flags = facts.code_directory_flags;
+                has_cms_signature = facts.has_cms_signature;
             }
         }
 
@@ -410,6 +424,7 @@ fn parse_thin(data: &[u8], base: usize, is_64: bool, be: bool, is_fat: bool) -> 
         has_code_signature,
         entitlements,
         code_directory_flags,
+        has_cms_signature,
     })
 }
 
@@ -449,16 +464,18 @@ fn read_lc_str(r: &Reader, cmd_off: usize, cmd_end: usize, max_len: usize) -> Op
 struct SignatureFacts {
     entitlements: Option<Vec<u8>>,
     code_directory_flags: Option<u32>,
+    has_cms_signature: bool,
 }
 
-/// Recover the entitlements plist and the OR of every CodeDirectory's
-/// `flags` from a Mach-O's embedded code-signature SuperBlob, in one bounded
-/// walk of its blob index. `dataoff`/`datasize` are the `LC_CODE_SIGNATURE`
-/// fields (Mach-O endianness); the SuperBlob itself is always big-endian.
-/// `base` is where this image begins in `data`. Either field of the result is
-/// `None` if its blob is absent or the SuperBlob is malformed; both are
-/// `None` if the signature region lies past the bytes held (a truncated
-/// capture) — the caller must not read either `None` as a determined fact.
+/// Recover the entitlements, the OR of every CodeDirectory's `flags`, and
+/// whether a non-empty CMS blob wrapper is present, from a Mach-O's embedded
+/// code-signature SuperBlob, in one bounded walk of its blob index.
+/// `dataoff`/`datasize` are the `LC_CODE_SIGNATURE` fields (Mach-O
+/// endianness); the SuperBlob itself is always big-endian. `base` is where
+/// this image begins in `data`. `entitlements`/`code_directory_flags` are
+/// `None` if their blob is absent or the SuperBlob is malformed; every field
+/// stays at its default if the signature region lies past the bytes held (a
+/// truncated capture) — the caller must not read that as a determined fact.
 fn extract_signature_facts(
     data: &[u8],
     base: usize,
@@ -526,6 +543,16 @@ fn extract_signature_facts_checked(
                 if let Some(flags) = be_u32(data, blob_off.checked_add(12)?) {
                     facts.code_directory_flags =
                         Some(facts.code_directory_flags.unwrap_or(0) | flags);
+                }
+            }
+        } else if slot_type == CSSLOT_SIGNATURESLOT && magic == CSMAGIC_BLOBWRAPPER {
+            // CS_GenericBlob: magic(4)@0, length(4)@4 (total incl. header).
+            // length > 8 means a non-empty payload — a real identity's CMS
+            // blob. An ad-hoc signature carries this wrapper too, but empty
+            // (length exactly 8); a linker signature has no wrapper at all.
+            if let Some(len) = be_u32(data, blob_off.checked_add(4)?) {
+                if len > 8 {
+                    facts.has_cms_signature = true;
                 }
             }
         }
@@ -674,9 +701,9 @@ impl<'a> Reader<'a> {
 #[cfg(test)]
 pub(crate) mod tests_support {
     use super::{
-        CSMAGIC_CODEDIRECTORY, CSMAGIC_EMBEDDED_ENTITLEMENTS, CSMAGIC_EMBEDDED_SIGNATURE,
-        CSSLOT_CODEDIRECTORY, CSSLOT_ENTITLEMENTS, FAT_MAGIC, LC_CODE_SIGNATURE, LC_LOAD_DYLIB,
-        LC_RPATH, LC_SEGMENT_64,
+        CSMAGIC_BLOBWRAPPER, CSMAGIC_CODEDIRECTORY, CSMAGIC_EMBEDDED_ENTITLEMENTS,
+        CSMAGIC_EMBEDDED_SIGNATURE, CSSLOT_CODEDIRECTORY, CSSLOT_ENTITLEMENTS,
+        CSSLOT_SIGNATURESLOT, FAT_MAGIC, LC_CODE_SIGNATURE, LC_LOAD_DYLIB, LC_RPATH, LC_SEGMENT_64,
     };
     use std::ops::Range;
 
@@ -849,7 +876,16 @@ pub(crate) mod tests_support {
     /// caller once the file offset is known). `cds: &[]` omits the
     /// CodeDirectory blob(s) entirely, so existing callers that only pass
     /// entitlements produce identical bytes to before this blob was added.
-    fn build_signature_blob(entitlements_xml: Option<&[u8]>, cds: &[(u32, u32)]) -> Vec<u8> {
+    /// `cms_payload_len` adds a `CSSLOT_SIGNATURESLOT` CMS blob wrapper when
+    /// `Some`: `Some(0)` is an empty wrapper (a hand ad-hoc signature),
+    /// `Some(n>0)` a non-empty one (a real identity), `None` no wrapper at
+    /// all (a linker signature). `None` produces byte-identical output to
+    /// before this parameter was added.
+    fn build_signature_blob(
+        entitlements_xml: Option<&[u8]>,
+        cds: &[(u32, u32)],
+        cms_payload_len: Option<usize>,
+    ) -> Vec<u8> {
         let mut entries: Vec<(u32, Vec<u8>)> = Vec::new();
         for &(slot_type, flags) in cds {
             // Minimal CodeDirectory: magic(4), length(4), version(4), flags(4).
@@ -866,6 +902,13 @@ pub(crate) mod tests_support {
             blob.extend_from_slice(&((8 + xml.len()) as u32).to_be_bytes());
             blob.extend_from_slice(xml);
             entries.push((CSSLOT_ENTITLEMENTS, blob));
+        }
+        if let Some(payload_len) = cms_payload_len {
+            let mut blob = Vec::new();
+            blob.extend_from_slice(&CSMAGIC_BLOBWRAPPER.to_be_bytes());
+            blob.extend_from_slice(&((8 + payload_len) as u32).to_be_bytes());
+            blob.resize(blob.len() + payload_len, 0);
+            entries.push((CSSLOT_SIGNATURESLOT, blob));
         }
 
         let index_len = 12usize + 8 * entries.len();
@@ -952,6 +995,31 @@ pub(crate) mod tests_support {
         entitlements_xml: Option<&[u8]>,
         cds: &[(u32, u32)],
     ) -> (Vec<u8>, Range<u64>, usize) {
+        synth_macho_64_full_with_cds_and_cms(
+            text_payload,
+            dylibs,
+            rpaths,
+            code_signed,
+            entitlements_xml,
+            cds,
+            None,
+        )
+    }
+
+    /// As [`synth_macho_64_full_with_cds`], with a `CSSLOT_SIGNATURESLOT` CMS
+    /// blob wrapper controlled by `cms_payload_len` — see
+    /// [`build_signature_blob`]'s doc for what each value means.
+    /// `cms_payload_len: None` produces byte-identical output to
+    /// `synth_macho_64_full_with_cds`.
+    pub(crate) fn synth_macho_64_full_with_cds_and_cms(
+        text_payload: &[u8],
+        dylibs: &[&str],
+        rpaths: &[&str],
+        code_signed: bool,
+        entitlements_xml: Option<&[u8]>,
+        cds: &[(u32, u32)],
+        cms_payload_len: Option<usize>,
+    ) -> (Vec<u8>, Range<u64>, usize) {
         let header_size = 32usize;
         let seg_cmd_size = 72usize + 80usize; // segment_command_64 + one section_64
 
@@ -1034,7 +1102,7 @@ pub(crate) mod tests_support {
         let mut sig_off = 0usize;
         if code_signed {
             sig_off = v.len();
-            let blob = build_signature_blob(entitlements_xml, cds);
+            let blob = build_signature_blob(entitlements_xml, cds, cms_payload_len);
             let dataoff = sig_off as u32;
             let datasize = blob.len() as u32;
             v[sig_placeholder_at + 8..sig_placeholder_at + 12]
@@ -1126,7 +1194,7 @@ pub(crate) mod tests_support {
         let cds: Vec<(u32, u32)> = cd_flags
             .map(|flags| vec![(CSSLOT_CODEDIRECTORY, flags)])
             .unwrap_or_default();
-        let blob = build_signature_blob(entitlements_xml, &cds);
+        let blob = build_signature_blob(entitlements_xml, &cds, None);
         v[first_sig_cmd_at + 8..first_sig_cmd_at + 12]
             .copy_from_slice(&(sig_off as u32).to_le_bytes());
         v[first_sig_cmd_at + 12..first_sig_cmd_at + 16]
@@ -1143,6 +1211,7 @@ mod tests {
         synth_fat, synth_fat_with_bogus_arches, synth_fat_with_duplicate_offsets, synth_macho_64,
         synth_macho_64_duplicate_code_signature, synth_macho_64_full,
         synth_macho_64_full_with_cd_flags, synth_macho_64_full_with_cds,
+        synth_macho_64_full_with_cds_and_cms,
     };
     use super::*;
 
@@ -1403,6 +1472,23 @@ mod tests {
             parse(&identity).unwrap().code_directory_flags,
             Some(0x10000)
         );
+    }
+
+    #[test]
+    fn cms_signature_presence_requires_a_non_empty_wrapper() {
+        let cds = [(CSSLOT_CODEDIRECTORY, 0u32)];
+
+        let (no_cms, _, _) =
+            synth_macho_64_full_with_cds_and_cms(b"code", &[], &[], true, None, &cds, None);
+        assert!(!parse(&no_cms).unwrap().has_cms_signature);
+
+        let (empty_cms, _, _) =
+            synth_macho_64_full_with_cds_and_cms(b"code", &[], &[], true, None, &cds, Some(0));
+        assert!(!parse(&empty_cms).unwrap().has_cms_signature);
+
+        let (real_cms, _, _) =
+            synth_macho_64_full_with_cds_and_cms(b"code", &[], &[], true, None, &cds, Some(4));
+        assert!(parse(&real_cms).unwrap().has_cms_signature);
     }
 
     #[test]

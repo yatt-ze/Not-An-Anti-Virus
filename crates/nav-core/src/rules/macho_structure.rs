@@ -207,10 +207,14 @@ fn entitlements_finding(
 
     // Ad-hoc vs. a real signing identity, not signed vs. unsigned: entitlements
     // only ever come from inside a code signature, so `has_code_signature` is
-    // always true here. `None` means the CodeDirectory couldn't be recovered.
+    // always true here. The CS_ADHOC bit is self-declared by the signer, so a
+    // slice also counts as ad-hoc when it has no non-empty CMS blob — a real
+    // identity signature carries certificate data there, a hand ad-hoc one
+    // has the wrapper but empty, a linker signature has none (#37). `None`
+    // means no CodeDirectory could be recovered at all.
     let is_adhoc_known = image
         .code_directory_flags
-        .map(|flags| flags & CS_ADHOC != 0);
+        .map(|flags| flags & CS_ADHOC != 0 || !image.has_cms_signature);
     let is_adhoc = is_adhoc_known.unwrap_or(false); // unknown falls back to the real-identity weight
 
     let mut contributing: Vec<&'static str> = Vec::new();
@@ -295,7 +299,7 @@ mod tests {
     use crate::context::{ContentSource, ScanContext};
     use crate::macho::tests_support::{
         synth_fat, synth_fat_with_bogus_arches, synth_macho_64_full,
-        synth_macho_64_full_with_cd_flags,
+        synth_macho_64_full_with_cd_flags, synth_macho_64_full_with_cds_and_cms,
     };
     use std::path::PathBuf;
 
@@ -425,13 +429,37 @@ mod tests {
         assert_eq!(adhoc_sig.weight, ENTITLEMENT_WEIGHT_ADHOC);
         assert!(adhoc_sig.description.contains("ad-hoc"));
 
-        let (identity, _, _) = synth_macho_64_full_with_cd_flags(
+        // CS_ADHOC clear, but no non-empty CMS blob backing the signature —
+        // the ad-hoc bit alone isn't the whole story; a signer that never
+        // attached a real identity is still ad-hoc (#37).
+        let (claimed_identity, _, _) = synth_macho_64_full_with_cds_and_cms(
             b"code",
             &[],
             &[],
             true,
             Some(xml),
-            Some(0x10000), // no CS_ADHOC bit — a real identity, e.g. runtime-enabled
+            &[(0, 0)], // slot 0, flags=0 — no CS_ADHOC bit, but no CMS blob either
+            None,
+        );
+        let claimed_identity_sig = MachOStructureRule
+            .evaluate(&ctx_for(claimed_identity))
+            .unwrap()
+            .expect("should fire");
+        assert_eq!(
+            claimed_identity_sig.weight, ENTITLEMENT_WEIGHT_ADHOC,
+            "flags=0 with no CMS blob must still read as ad-hoc"
+        );
+        assert!(claimed_identity_sig.description.contains("ad-hoc"));
+
+        // CS_ADHOC clear AND a non-empty CMS blob: a genuine identity signature.
+        let (identity, _, _) = synth_macho_64_full_with_cds_and_cms(
+            b"code",
+            &[],
+            &[],
+            true,
+            Some(xml),
+            &[(0, 0)],
+            Some(4),
         );
         let identity_sig = MachOStructureRule
             .evaluate(&ctx_for(identity))
@@ -474,13 +502,14 @@ mod tests {
         let xml = br#"<?xml version="1.0"?><plist version="1.0"><dict>
             <key>com.apple.security.get-task-allow</key><true/>
         </dict></plist>"#;
-        let (image, _, _) = synth_macho_64_full_with_cd_flags(
+        let (image, _, _) = synth_macho_64_full_with_cds_and_cms(
             b"code",
             &[],
             &[],
             true,
             Some(xml),
-            Some(0x10000), // no CS_ADHOC bit — a real identity
+            &[(0, 0)], // slot 0, flags=0 — no CS_ADHOC bit
+            Some(4),   // and a non-empty CMS blob — a confirmed real identity
         );
         let sig = MachOStructureRule
             .evaluate(&ctx_for(image))
@@ -518,6 +547,29 @@ mod tests {
             <key>com.apple.security.get-task-allow</key><true/>
         </dict></plist>"#;
         let (image, _, _) = synth_macho_64_full(b"code", &[], &[], true, Some(xml));
+        assert!(matches!(
+            MachOStructureRule.evaluate(&ctx_for(image)),
+            Ok(None)
+        ));
+    }
+
+    #[test]
+    fn get_task_allow_scores_nothing_when_flags_are_zero_with_no_cms_blob() {
+        // flags=0 (no CS_ADHOC) but no CMS blob backing it reads as ad-hoc
+        // under the new rule, not a confirmed identity — get-task-allow must
+        // not score here either (#37).
+        let xml = br#"<?xml version="1.0"?><plist version="1.0"><dict>
+            <key>com.apple.security.get-task-allow</key><true/>
+        </dict></plist>"#;
+        let (image, _, _) = synth_macho_64_full_with_cds_and_cms(
+            b"code",
+            &[],
+            &[],
+            true,
+            Some(xml),
+            &[(0, 0)],
+            None,
+        );
         assert!(matches!(
             MachOStructureRule.evaluate(&ctx_for(image)),
             Ok(None)
@@ -713,6 +765,7 @@ mod fixture_gen {
     use crate::macho::tests_support::{
         synth_fat, synth_fat_with_bogus_arches_aligned, synth_macho_64_duplicate_code_signature,
         synth_macho_64_full, synth_macho_64_full_with_cd_flags,
+        synth_macho_64_full_with_cds_and_cms,
     };
     use crate::macho::CS_ADHOC;
     use std::path::Path;
@@ -886,6 +939,31 @@ mod fixture_gen {
         std::fs::write(
             root.join("suspicious/macho_duplicate_code_signature"),
             duplicate_cs,
+        )
+        .unwrap();
+
+        // Suspicious: a CodeDirectory with flags=0 (no CS_ADHOC bit) and no
+        // CMS blob at all — a signer that never attached a real identity.
+        // The CS_ADHOC bit is self-declared, so this must still read as
+        // ad-hoc rather than as an unrecognized "identity" (#37). An
+        // `osascript` string keeps suspicious-strings firing on Ubuntu CI.
+        let identity_claim_entitlements = br#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+    <key>com.apple.security.cs.disable-library-validation</key><true/>
+</dict></plist>"#;
+        let (identity_claim, _, _) = synth_macho_64_full_with_cds_and_cms(
+            b"\x55\x48\x89\xe5\x90 shells out via osascript for testing",
+            &["/usr/lib/libSystem.B.dylib"],
+            &[],
+            true,
+            Some(identity_claim_entitlements),
+            &[(0, 0)], // slot 0, flags=0
+            None,      // no CMS blob
+        );
+        std::fs::write(
+            root.join("suspicious/macho_identity_claim_without_cms"),
+            identity_claim,
         )
         .unwrap();
     }

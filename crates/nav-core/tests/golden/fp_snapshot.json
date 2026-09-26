@@ -277,6 +277,16 @@
     ],
     "completeness": "partial"
   },
+  "suspicious/macho_identity_claim_without_cms": {
+    "score": 28,
+    "recommendation": "notify",
+    "rule_ids": [
+      "macho-loader-anomaly",
+      "suspicious-strings",
+      "unsigned-binary"
+    ],
+    "completeness": "complete"
+  },
   "suspicious/macho_tmp_rpath_disable_lib_validation": {
     "score": 29,
     "recommendation": "notify",
