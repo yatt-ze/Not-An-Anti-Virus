@@ -10,6 +10,7 @@
 //! SuperBlob it can bound, and returns `None`/empty for anything it can't
 //! recognize or bound.
 
+use std::collections::HashMap;
 use std::ops::Range;
 
 // Magic read big-endian from the first four bytes. A little-endian file (every
@@ -37,9 +38,35 @@ const LC_CODE_SIGNATURE: u32 = 0x1d;
 // always big-endian, independent of the Mach-O's own endianness.
 const CSMAGIC_EMBEDDED_SIGNATURE: u32 = 0xfade_0cc0;
 const CSMAGIC_EMBEDDED_ENTITLEMENTS: u32 = 0xfade_7171;
+const CSMAGIC_CODEDIRECTORY: u32 = 0xfade_0c02;
+/// `CSMAGIC_BLOBWRAPPER`: wraps the CMS (identity) signature blob.
+const CSMAGIC_BLOBWRAPPER: u32 = 0xfade_0b01;
+
+// CS_BlobIndex slot types (cs_blobs.h) identifying a blob's role within the
+// SuperBlob.
+const CSSLOT_CODEDIRECTORY: u32 = 0;
+const CSSLOT_ENTITLEMENTS: u32 = 5;
+// XNU also accepts a CodeDirectory in any of 5 "alternate" slots (cs_blobs.h:
+// CSSLOT_ALTERNATE_CODEDIRECTORIES..+MAX_CODE_DIRECTORIES), used for a
+// signature carrying more than one digest algorithm's CodeDirectory. A
+// binary's *only* CodeDirectory can legally sit here, not just in slot 0.
+const CSSLOT_ALTERNATE_CODEDIRECTORIES: u32 = 0x1000;
+const MAX_ALTERNATE_CODEDIRECTORIES: u32 = 5;
+/// `CSSLOT_SIGNATURESLOT`: holds the CMS blob wrapper carrying the actual
+/// signing identity's certificate chain, when there is one.
+const CSSLOT_SIGNATURESLOT: u32 = 0x10000;
+
+/// `CS_ADHOC`, from `<Security/CSCommon.h>`'s `CodeDirectory` flag bits:
+/// ad-hoc signed, no real identity. Shared by the `codesign`-backed rules
+/// (parsed from `codesign -dv` text) and `macho-loader-anomaly` (read
+/// straight from a CodeDirectory's `flags` field here).
+pub(crate) const CS_ADHOC: u32 = 0x2;
+/// `CS_LINKER_SIGNED`, from `<Security/CSCommon.h>`'s `CodeDirectory` flag
+/// bits: the automatic ad-hoc signature the linker stamps on at build time,
+/// as distinct from a hand-applied one.
+pub(crate) const CS_LINKER_SIGNED: u32 = 0x20000;
 
 // Loop ceilings — far above any real Mach-O, but bound work on hostile input.
-const MAX_FAT_ARCHES: u32 = 64;
 const MAX_NCMDS: u32 = 4096;
 const MAX_NSECTS: u32 = 4096;
 const MAX_DYLIBS: usize = 4096;
@@ -47,6 +74,11 @@ const MAX_RPATHS: usize = 256;
 const MAX_LC_STR_BYTES: usize = 4096;
 const MAX_CS_BLOBS: u32 = 256;
 const MAX_ENTITLEMENTS_BYTES: usize = 256 * 1024;
+// Bounds work on hostile input; far above what the kernel accepts (a real fat
+// binary the kernel will run has been seen with dozens of bogus arch entries
+// alongside the real slice, #46) — don't lower it to exclude other formats,
+// an arch-count cap can hide a runnable binary.
+const MAX_FAT_ARCHES: u32 = 1024;
 
 /// A recognized Mach-O image: `__TEXT,__text`'s file range plus the loader
 /// facts (`dylibs`/`rpaths`/`has_code_signature`/`entitlements`) the
@@ -75,6 +107,21 @@ pub struct MachOImage {
     /// no signature, no entitlements blob in the SuperBlob, and a signature
     /// region lying past the bytes this parser holds (a truncated capture).
     pub entitlements: Option<Vec<u8>>,
+    /// Bitwise OR of `flags` (`CS_ADHOC` etc., `<Security/CSCommon.h>`) across
+    /// every CodeDirectory found in the embedded code signature's
+    /// SuperBlob — slot 0 and the 5 alternate CodeDirectory slots XNU also
+    /// accepts (`0x1000`..`0x1005`, cs_blobs.h), since an attacker can put
+    /// its only ad-hoc CodeDirectory in an alternate slot. `None` if there's
+    /// no signature, no CodeDirectory found, or the signature region lies
+    /// past the bytes this parser holds — never read as "not ad-hoc".
+    pub code_directory_flags: Option<u32>,
+    /// Whether the signature's SuperBlob contains a non-empty CMS blob
+    /// wrapper (`CSSLOT_SIGNATURESLOT`/`CSMAGIC_BLOBWRAPPER`, length > 8): a
+    /// real identity signature carries certificate data there, a hand
+    /// ad-hoc signature has the wrapper but empty, and a linker signature
+    /// has none. Only meaningful when `code_directory_flags` is `Some` —
+    /// otherwise the signature region couldn't be read at all.
+    pub has_cms_signature: bool,
 }
 
 /// Parse `data` as a single Mach-O image: the thin image, or the **first**
@@ -87,7 +134,26 @@ pub struct MachOImage {
 /// instead — judging a universal binary on one slice lets a malicious slice
 /// hide behind a benign one (§5.2).
 pub fn parse(data: &[u8]) -> Option<MachOImage> {
-    parse_all(data).into_iter().next()
+    match be_u32(data, 0) {
+        Some(FAT_MAGIC) | Some(FAT_MAGIC_64) => parse_first_fat_slice(data),
+        Some(magic) => {
+            let (is_64, be) = thin_kind(magic)?;
+            parse_thin(data, 0, is_64, be, false)
+        }
+        None => None,
+    }
+}
+
+/// The first walkable slice of a fat/universal binary's arch table, or
+/// `None` if none is — stops as soon as one is found, so a hostile table
+/// with many arches (up to `MAX_FAT_ARCHES`) costs one `parse_thin` call
+/// here, not one per declared arch.
+fn parse_first_fat_slice(data: &[u8]) -> Option<MachOImage> {
+    let (is_64, nfat) = plausible_fat_header(data, false)?;
+    (0..nfat as usize).find_map(|i| {
+        let obj_off = fat_arch_offset(data, is_64, i)?;
+        parse_fat_slice_at(data, obj_off)
+    })
 }
 
 /// Parse **every** Mach-O image in `data`: a single thin image, or all
@@ -95,25 +161,47 @@ pub fn parse(data: &[u8]) -> Option<MachOImage> {
 /// fat-table order. Empty for non-Mach-O input, a truncated stub, or a fat
 /// container with no walkable slice (incl. a Java `.class`). Structure rules
 /// iterate this so a fat binary is judged on all its slices, not just the
-/// first (§5.2).
+/// first (§5.2). A thin wrapper over [`parse_all_slices`] for callers that
+/// don't need the skipped-arch count or a truncation-aware fat/non-fat call;
+/// treats `data` as a complete read.
 pub fn parse_all(data: &[u8]) -> Vec<MachOImage> {
+    parse_all_slices(data, false).0
+}
+
+/// As [`parse_all`], plus the number of *declared* fat-table arches that
+/// couldn't be walked (bad table entry, an offset past the bytes held, a
+/// non-Mach-O slice magic, or a `parse_thin` failure) — nonzero here means a
+/// slice's contents genuinely couldn't be judged, not that there was nothing
+/// to judge. Always `0` for thin input or non-Mach-O input, since neither
+/// declares a slice count to compare against. `truncated` must match what
+/// [`is_macho_magic`] was told for the same bytes — see there for why it
+/// matters for a fat header.
+pub fn parse_all_slices(data: &[u8], truncated: bool) -> (Vec<MachOImage>, usize) {
     match be_u32(data, 0) {
-        Some(FAT_MAGIC) => parse_fat_all(data, false),
-        Some(FAT_MAGIC_64) => parse_fat_all(data, true),
+        Some(FAT_MAGIC) | Some(FAT_MAGIC_64) => parse_fat_all(data, truncated),
         Some(magic) => match thin_kind(magic) {
-            Some((is_64, be)) => parse_thin(data, 0, is_64, be, false).into_iter().collect(),
-            None => Vec::new(),
+            Some((is_64, be)) => (
+                parse_thin(data, 0, is_64, be, false).into_iter().collect(),
+                0,
+            ),
+            None => (Vec::new(), 0),
         },
-        None => Vec::new(),
+        None => (Vec::new(), 0),
     }
 }
 
 /// Whether `data` begins with any Mach-O magic (thin, either word size/endian,
 /// or fat). Cheaper and broader than [`parse`] — answers "is this a code object
 /// at all", including images `parse` declines to walk.
-pub fn is_macho_magic(data: &[u8]) -> bool {
+///
+/// `truncated` is whether `data` is a partial read of a larger file (§10/
+/// §11.8): for a fat header, a declared arch whose offset lands past `data`
+/// is only counted as a real slice when the read was truncated — otherwise a
+/// short, complete read (e.g. a whole Java `.class` file) correctly finds no
+/// evidence rather than being read as "couldn't check, assume Mach-O."
+pub fn is_macho_magic(data: &[u8], truncated: bool) -> bool {
     match be_u32(data, 0) {
-        Some(FAT_MAGIC) | Some(FAT_MAGIC_64) => true,
+        Some(FAT_MAGIC) | Some(FAT_MAGIC_64) => plausible_fat_header(data, truncated).is_some(),
         Some(magic) => thin_kind(magic).is_some(),
         None => false,
     }
@@ -131,36 +219,114 @@ fn thin_kind(magic: u32) -> Option<(bool, bool)> {
     }
 }
 
-/// Walk every arch of a fat/universal binary, collecting the slices this
-/// parser can read (in fat-table order). A zero/implausible `nfat_arch` also
-/// rejects a Java `.class` (its version number sits where `nfat_arch` would).
-fn parse_fat_all(data: &[u8], is_64: bool) -> Vec<MachOImage> {
-    let mut out = Vec::new();
-    // fat_header (always big-endian): magic(4), nfat_arch(4).
-    let nfat = match be_u32(data, 4) {
-        Some(n) if n != 0 && n <= MAX_FAT_ARCHES => n,
-        _ => return out,
+/// Recognize a plausible fat/universal Mach-O header: `FAT_MAGIC`/
+/// `FAT_MAGIC_64` with `0 < nfat_arch <= MAX_FAT_ARCHES`, and at least one
+/// declared arch that's real evidence of a Mach-O slice rather than a Java
+/// `.class` file's constant pool sharing `FAT_MAGIC` — see
+/// [`fat_references_real_slice`]. Returns `(is_64, nfat_arch)`.
+fn plausible_fat_header(data: &[u8], truncated: bool) -> Option<(bool, u32)> {
+    let is_64 = match be_u32(data, 0)? {
+        FAT_MAGIC => false,
+        FAT_MAGIC_64 => true,
+        _ => return None,
     };
-    for i in 0..nfat as usize {
-        if let Some(img) = fat_member(data, is_64, i) {
-            out.push(img);
-        }
-    }
-    out
+    // fat_header (always big-endian): magic(4), nfat_arch(4).
+    let nfat = be_u32(data, 4).filter(|&n| n != 0 && n <= MAX_FAT_ARCHES)?;
+    fat_references_real_slice(data, is_64, nfat, truncated).then_some((is_64, nfat))
 }
 
-/// Parse fat arch `i`'s slice, or `None` if its table entry or object offset
-/// can't be read within bounds (a bad entry skips just that arch).
-fn fat_member(data: &[u8], is_64: bool, i: usize) -> Option<MachOImage> {
-    // fat_arch: cputype(4), cpusubtype(4), offset, size, align[, reserved].
-    let arch_stride: usize = if is_64 { 32 } else { 20 };
-    let arch_off = 8usize.checked_add(i.checked_mul(arch_stride)?)?;
-    let obj_off = if is_64 {
-        be_u64(data, arch_off.checked_add(8)?)?
-    } else {
-        be_u32(data, arch_off.checked_add(8)?)? as u64
+/// True if the fat table's `nfat` declared arches contain real evidence of a
+/// Mach-O slice: an entry whose offset field we can read points at a thin
+/// Mach-O magic within `data`, or — only when `truncated` — points past the
+/// bytes held (the slice may lie beyond what this capture holds; "couldn't
+/// check" must not become "not a Mach-O", §11.8). A Java `.class` file has
+/// constant-pool bytes sitting where the arch table would be, which won't
+/// point at a Mach-O magic, so a non-truncated read of one finds nothing
+/// here.
+fn fat_references_real_slice(data: &[u8], is_64: bool, nfat: u32, truncated: bool) -> bool {
+    for i in 0..nfat as usize {
+        let Some(obj_off) = fat_arch_offset(data, is_64, i) else {
+            continue; // entry's own bytes lie outside what we hold
+        };
+        match usize::try_from(obj_off) {
+            Ok(off) if off < data.len() => {
+                if be_u32(data, off).and_then(thin_kind).is_some() {
+                    return true;
+                }
+            }
+            _ if truncated => return true,
+            _ => {}
+        }
+    }
+    false
+}
+
+/// Walk every arch of a fat/universal binary, collecting the slices this
+/// parser can read (in fat-table order) plus how many declared arches
+/// couldn't be. `(empty, 0)` for an implausible fat header (incl. a Java
+/// `.class`, see [`plausible_fat_header`]) — there's no declared arch count
+/// to trust in that case, so it's "not a fat binary," not "every arch
+/// skipped."
+fn parse_fat_all(data: &[u8], truncated: bool) -> (Vec<MachOImage>, usize) {
+    let mut out = Vec::new();
+    let mut skipped = 0usize;
+    let Some((is_64, nfat)) = plausible_fat_header(data, truncated) else {
+        return (out, skipped);
     };
 
+    // Distinct slice offsets walked so far: a hostile table can point
+    // MAX_FAT_ARCHES (1024) entries at one offset, and each `MachOImage`
+    // owns up to MAX_ENTITLEMENTS_BYTES — walking (and pushing) the same
+    // slice once per referring entry would be unbounded work for one file.
+    // Entries sharing an offset are one slice, not N: only the first is
+    // walked and pushed; later ones reuse that outcome, so a duplicate of a
+    // *walkable* slice is never counted in `skipped` (it's not unwalked —
+    // it just wasn't re-walked), while a duplicate of an offset that failed
+    // to walk still counts, once per declared arch, like any other failure.
+    let mut seen: HashMap<u64, bool> = HashMap::new(); // offset -> walked ok?
+    for i in 0..nfat as usize {
+        let Some(obj_off) = fat_arch_offset(data, is_64, i) else {
+            skipped += 1; // this entry's own bytes lie outside what we hold
+            continue;
+        };
+        match seen.get(&obj_off) {
+            Some(true) => {}
+            Some(false) => skipped += 1,
+            None => match parse_fat_slice_at(data, obj_off) {
+                Some(img) => {
+                    seen.insert(obj_off, true);
+                    out.push(img);
+                }
+                None => {
+                    seen.insert(obj_off, false);
+                    skipped += 1;
+                }
+            },
+        }
+    }
+    (out, skipped)
+}
+
+/// Read fat arch `i`'s declared object-file offset (the `fat_arch`/
+/// `fat_arch_64` `offset` field), or `None` if that entry's own bytes lie
+/// outside `data`. `is_64` selects the table's entry stride (`fat_arch_64`
+/// is wider than `fat_arch`) as well as the offset field's own width.
+fn fat_arch_offset(data: &[u8], is_64: bool, i: usize) -> Option<u64> {
+    // fat_arch: cputype(4), cpusubtype(4), offset, size, align[, reserved].
+    let stride: usize = if is_64 { 32 } else { 20 };
+    let arch_off = 8usize.checked_add(i.checked_mul(stride)?)?;
+    if is_64 {
+        be_u64(data, arch_off.checked_add(8)?)
+    } else {
+        be_u32(data, arch_off.checked_add(8)?).map(u64::from)
+    }
+}
+
+/// Parse the fat/universal slice at absolute offset `obj_off` within `data`,
+/// or `None` if the offset lies outside the bytes held or doesn't begin with
+/// a thin Mach-O magic. Keyed only by offset (not by which arch-table entry
+/// pointed here) so callers can dedupe entries that share one offset.
+fn parse_fat_slice_at(data: &[u8], obj_off: u64) -> Option<MachOImage> {
     // Slice must start within the bytes we hold (and not overflow usize).
     let base = match usize::try_from(obj_off) {
         Ok(b) if b < data.len() => b,
@@ -193,6 +359,8 @@ fn parse_thin(data: &[u8], base: usize, is_64: bool, be: bool, is_fat: bool) -> 
     let mut rpaths = Vec::new();
     let mut has_code_signature = false;
     let mut entitlements = None;
+    let mut code_directory_flags = None;
+    let mut has_cms_signature = false;
 
     let mut off = cmds_start;
     for _ in 0..ncmds {
@@ -225,12 +393,22 @@ fn parse_thin(data: &[u8], base: usize, is_64: bool, be: bool, is_fat: bool) -> 
                 }
             }
         } else if cmd == LC_CODE_SIGNATURE {
+            if has_code_signature {
+                // A second LC_CODE_SIGNATURE has no legitimate meaning and no
+                // documented kernel precedence — rather than guess which one
+                // wins (and risk a bogus second command silently erasing the
+                // real signature's facts, #37), the whole slice is malformed.
+                return None;
+            }
             has_code_signature = true;
             // linkedit_data_command: cmd(4), cmdsize(4), dataoff(4), datasize(4).
             if let (Some(dataoff), Some(datasize)) =
                 (r.u32(off.checked_add(8)?), r.u32(off.checked_add(12)?))
             {
-                entitlements = extract_entitlements(data, base, dataoff, datasize);
+                let facts = extract_signature_facts(data, base, dataoff, datasize);
+                entitlements = facts.entitlements;
+                code_directory_flags = facts.code_directory_flags;
+                has_cms_signature = facts.has_cms_signature;
             }
         }
 
@@ -245,6 +423,8 @@ fn parse_thin(data: &[u8], base: usize, is_64: bool, be: bool, is_fat: bool) -> 
         rpaths,
         has_code_signature,
         entitlements,
+        code_directory_flags,
+        has_cms_signature,
     })
 }
 
@@ -278,14 +458,49 @@ fn read_lc_str(r: &Reader, cmd_off: usize, cmd_end: usize, max_len: usize) -> Op
     Some(String::from_utf8_lossy(&bytes[..len]).into_owned())
 }
 
-/// Recover the entitlements plist embedded in a Mach-O's code-signature
-/// SuperBlob. `dataoff`/`datasize` are the `LC_CODE_SIGNATURE` fields (Mach-O
+/// Facts recovered from a Mach-O's embedded code-signature SuperBlob in one
+/// bounded walk — see [`extract_signature_facts`].
+#[derive(Default)]
+struct SignatureFacts {
+    entitlements: Option<Vec<u8>>,
+    code_directory_flags: Option<u32>,
+    has_cms_signature: bool,
+}
+
+/// Recover the entitlements, the OR of every CodeDirectory's `flags`, and
+/// whether a non-empty CMS blob wrapper is present, from a Mach-O's embedded
+/// code-signature SuperBlob, in one bounded walk of its blob index.
+/// `dataoff`/`datasize` are the `LC_CODE_SIGNATURE` fields (Mach-O
 /// endianness); the SuperBlob itself is always big-endian. `base` is where
-/// this image begins in `data`. `None` if there's no entitlements blob, the
-/// SuperBlob is malformed, or the signature region lies past the bytes held
-/// (a truncated capture) — the caller must not read `None` as "no
-/// entitlements".
-fn extract_entitlements(data: &[u8], base: usize, dataoff: u32, datasize: u32) -> Option<Vec<u8>> {
+/// this image begins in `data`. `entitlements`/`code_directory_flags` are
+/// `None` if their blob is absent or the SuperBlob is malformed; every field
+/// stays at its default if the signature region lies past the bytes held (a
+/// truncated capture) — the caller must not read that as a determined fact.
+fn extract_signature_facts(
+    data: &[u8],
+    base: usize,
+    dataoff: u32,
+    datasize: u32,
+) -> SignatureFacts {
+    extract_signature_facts_checked(data, base, dataoff, datasize).unwrap_or_default()
+}
+
+/// True for the primary CodeDirectory slot (0) or any of the 5 alternate
+/// CodeDirectory slots XNU also accepts (`CSSLOT_ALTERNATE_CODEDIRECTORIES`
+/// through `+MAX_ALTERNATE_CODEDIRECTORIES-1`, cs_blobs.h).
+fn is_codedirectory_slot(slot_type: u32) -> bool {
+    slot_type == CSSLOT_CODEDIRECTORY
+        || (CSSLOT_ALTERNATE_CODEDIRECTORIES
+            ..CSSLOT_ALTERNATE_CODEDIRECTORIES + MAX_ALTERNATE_CODEDIRECTORIES)
+            .contains(&slot_type)
+}
+
+fn extract_signature_facts_checked(
+    data: &[u8],
+    base: usize,
+    dataoff: u32,
+    datasize: u32,
+) -> Option<SignatureFacts> {
     let sig_off = base.checked_add(dataoff as usize)?;
     let sig_end = sig_off.checked_add(datasize as usize)?;
     if sig_end > data.len() {
@@ -299,37 +514,71 @@ fn extract_entitlements(data: &[u8], base: usize, dataoff: u32, datasize: u32) -
         return None;
     }
 
+    let mut facts = SignatureFacts::default();
+
     for i in 0..count as usize {
         // CS_BlobIndex: type(4), offset(4) — offset relative to `sig_off`.
         let entry_off = sig_off.checked_add(12)?.checked_add(i.checked_mul(8)?)?;
         if entry_off.checked_add(8)? > sig_end {
             break;
         }
+        let slot_type = be_u32(data, entry_off)?;
         let rel_off = be_u32(data, entry_off.checked_add(4)?)?;
         let blob_off = sig_off.checked_add(rel_off as usize)?;
         if blob_off.checked_add(8)? > sig_end {
             continue;
         }
-        if be_u32(data, blob_off)? != CSMAGIC_EMBEDDED_ENTITLEMENTS {
-            continue;
+        let magic = be_u32(data, blob_off)?;
+
+        if slot_type == CSSLOT_ENTITLEMENTS
+            && magic == CSMAGIC_EMBEDDED_ENTITLEMENTS
+            && facts.entitlements.is_none()
+        {
+            facts.entitlements = extract_blob_payload(data, blob_off, sig_end);
+        } else if is_codedirectory_slot(slot_type) && magic == CSMAGIC_CODEDIRECTORY {
+            // CodeDirectory: magic(4)@0, length(4)@4, version(4)@8, flags(4)@12.
+            // OR every CD's flags together: any one of them carrying CS_ADHOC
+            // means the binary is ad-hoc, wherever XNU found that CD (#37).
+            if blob_off.checked_add(16)? <= sig_end {
+                if let Some(flags) = be_u32(data, blob_off.checked_add(12)?) {
+                    facts.code_directory_flags =
+                        Some(facts.code_directory_flags.unwrap_or(0) | flags);
+                }
+            }
+        } else if slot_type == CSSLOT_SIGNATURESLOT && magic == CSMAGIC_BLOBWRAPPER {
+            // CS_GenericBlob: magic(4)@0, length(4)@4 (total incl. header).
+            // length > 8 means a non-empty payload — a real identity's CMS
+            // blob. An ad-hoc signature carries this wrapper too, but empty
+            // (length exactly 8); a linker signature has no wrapper at all.
+            if let Some(len) = be_u32(data, blob_off.checked_add(4)?) {
+                if len > 8 {
+                    facts.has_cms_signature = true;
+                }
+            }
         }
-        // Blob: magic(4), length(4, total incl. header), payload.
-        let blob_len = be_u32(data, blob_off.checked_add(4)?)? as usize;
-        if blob_len < 8 {
-            continue;
-        }
-        let payload_len = (blob_len - 8).min(MAX_ENTITLEMENTS_BYTES);
-        let payload_start = blob_off.checked_add(8)?;
-        let payload_end = payload_start
-            .checked_add(payload_len)?
-            .min(sig_end)
-            .min(data.len());
-        if payload_end <= payload_start {
-            continue;
-        }
-        return Some(data[payload_start..payload_end].to_vec());
     }
-    None
+    Some(facts)
+}
+
+/// Read a `CS_GenericBlob`'s payload (magic(4), length(4, total incl.
+/// header), payload) at `blob_off`, capped at `MAX_ENTITLEMENTS_BYTES` and
+/// never past `sig_end`/the bytes held. `None` if the declared length is
+/// implausible or the payload is empty.
+fn extract_blob_payload(data: &[u8], blob_off: usize, sig_end: usize) -> Option<Vec<u8>> {
+    let blob_len = be_u32(data, blob_off.checked_add(4)?)? as usize;
+    if blob_len < 8 {
+        return None;
+    }
+    let payload_len = (blob_len - 8).min(MAX_ENTITLEMENTS_BYTES);
+    let payload_start = blob_off.checked_add(8)?;
+    let payload_end = payload_start
+        .checked_add(payload_len)?
+        .min(sig_end)
+        .min(data.len());
+    if payload_end <= payload_start {
+        return None;
+    }
+    Some(data[payload_start..payload_end].to_vec())
 }
 
 /// If the segment command at `off` is `__TEXT`, return the absolute file range
@@ -452,8 +701,9 @@ impl<'a> Reader<'a> {
 #[cfg(test)]
 pub(crate) mod tests_support {
     use super::{
-        CSMAGIC_EMBEDDED_ENTITLEMENTS, CSMAGIC_EMBEDDED_SIGNATURE, FAT_MAGIC, LC_CODE_SIGNATURE,
-        LC_LOAD_DYLIB, LC_RPATH, LC_SEGMENT_64,
+        CSMAGIC_BLOBWRAPPER, CSMAGIC_CODEDIRECTORY, CSMAGIC_EMBEDDED_ENTITLEMENTS,
+        CSMAGIC_EMBEDDED_SIGNATURE, CSSLOT_CODEDIRECTORY, CSSLOT_ENTITLEMENTS,
+        CSSLOT_SIGNATURESLOT, FAT_MAGIC, LC_CODE_SIGNATURE, LC_LOAD_DYLIB, LC_RPATH, LC_SEGMENT_64,
     };
     use std::ops::Range;
 
@@ -483,6 +733,95 @@ pub(crate) mod tests_support {
         for (i, m) in members.iter().enumerate() {
             v.resize(offsets[i], 0); // pad to this slice's offset
             v.extend_from_slice(m);
+        }
+        v
+    }
+
+    /// A fat/universal binary with `count` arch-table entries that all point
+    /// at the same single embedded slice — the shape a hostile fat table
+    /// uses to make an offset-naive walker re-parse (and re-allocate) one
+    /// slice once per referring entry.
+    pub(crate) fn synth_fat_with_duplicate_offsets(member: &[u8], count: usize) -> Vec<u8> {
+        let header_len = 8 + 20 * count;
+        let offset = (header_len + 15) & !15;
+
+        let mut v = Vec::new();
+        v.extend_from_slice(&FAT_MAGIC.to_be_bytes());
+        v.extend_from_slice(&(count as u32).to_be_bytes());
+        for i in 0..count {
+            v.extend_from_slice(&0x0100_0007u32.to_be_bytes()); // cputype
+            v.extend_from_slice(&(i as u32).to_be_bytes()); // cpusubtype (distinct)
+            v.extend_from_slice(&(offset as u32).to_be_bytes()); // offset — same for every entry
+            v.extend_from_slice(&(member.len() as u32).to_be_bytes()); // size
+            v.extend_from_slice(&0u32.to_be_bytes()); // align
+        }
+        v.resize(offset, 0);
+        v.extend_from_slice(member);
+        v
+    }
+
+    /// A fat/universal binary with `bogus_count` arch entries pointing at
+    /// distinct, 16 KiB-aligned zeroed regions (no thin Mach-O magic) plus one
+    /// real slice (`real_member`) last in the table — the shape a real fat
+    /// binary the kernel will still run can take (#46: verified with 24 bogus
+    /// entries alongside one real arm64 slice).
+    pub(crate) fn synth_fat_with_bogus_arches(real_member: &[u8], bogus_count: usize) -> Vec<u8> {
+        synth_fat_with_bogus_arches_aligned(real_member, bogus_count, 16 * 1024)
+    }
+
+    /// As [`synth_fat_with_bogus_arches`], but with the bogus regions aligned
+    /// to `page` bytes instead of a fixed 16 KiB. A fixture that only needs
+    /// to be *parsed* (never mapped/executed) can pack them far tighter than
+    /// the kernel-runnable shape `synth_fat_with_bogus_arches` reproduces.
+    pub(crate) fn synth_fat_with_bogus_arches_aligned(
+        real_member: &[u8],
+        bogus_count: usize,
+        page: usize,
+    ) -> Vec<u8> {
+        const BOGUS_SIZE: usize = 16;
+
+        let total = bogus_count + 1;
+        let header_len = 8 + 20 * total;
+        let align_up = |x: usize| x.div_ceil(page) * page;
+
+        let mut offsets = Vec::with_capacity(total);
+        let mut cursor = header_len;
+        for _ in 0..bogus_count {
+            let aligned = align_up(cursor);
+            offsets.push(aligned);
+            cursor = aligned + BOGUS_SIZE;
+        }
+        let real_off = align_up(cursor);
+        offsets.push(real_off);
+
+        let mut v = Vec::new();
+        v.extend_from_slice(&FAT_MAGIC.to_be_bytes());
+        v.extend_from_slice(&(total as u32).to_be_bytes());
+        for (i, &off) in offsets.iter().enumerate() {
+            let is_real = i == bogus_count;
+            let cputype = if is_real {
+                0x0100_0007u32
+            } else {
+                0x7f00_0000u32 + i as u32
+            };
+            let size = if is_real {
+                real_member.len()
+            } else {
+                BOGUS_SIZE
+            };
+            v.extend_from_slice(&cputype.to_be_bytes());
+            v.extend_from_slice(&(i as u32).to_be_bytes()); // cpusubtype (distinct)
+            v.extend_from_slice(&(off as u32).to_be_bytes());
+            v.extend_from_slice(&(size as u32).to_be_bytes());
+            v.extend_from_slice(&0u32.to_be_bytes()); // align
+        }
+        for (i, &off) in offsets.iter().enumerate() {
+            v.resize(off, 0);
+            if i == bogus_count {
+                v.extend_from_slice(real_member);
+            } else {
+                v.resize(off + BOGUS_SIZE, 0);
+            }
         }
         v
     }
@@ -530,30 +869,64 @@ pub(crate) mod tests_support {
         v
     }
 
-    /// A code-signature SuperBlob holding zero or one entitlements blobs, and
-    /// the `LC_CODE_SIGNATURE` command pointing at it (`dataoff` filled in by
-    /// the caller once the file offset is known).
-    fn build_signature_blob(entitlements_xml: Option<&[u8]>) -> Vec<u8> {
-        let mut sb = Vec::new();
-        let count: u32 = entitlements_xml.is_some().into();
-        let index_len = 12usize + 8 * count as usize;
-
-        let mut blobs = Vec::new();
-        let mut index = Vec::new();
+    /// A code-signature SuperBlob holding, in slot order, one CodeDirectory
+    /// blob per `(slot_type, flags)` pair in `cds` and an optional
+    /// entitlements blob (`entitlements_xml`, if given), plus the
+    /// `LC_CODE_SIGNATURE` command pointing at it (`dataoff` filled in by the
+    /// caller once the file offset is known). `cds: &[]` omits the
+    /// CodeDirectory blob(s) entirely, so existing callers that only pass
+    /// entitlements produce identical bytes to before this blob was added.
+    /// `cms_payload_len` adds a `CSSLOT_SIGNATURESLOT` CMS blob wrapper when
+    /// `Some`: `Some(0)` is an empty wrapper (a hand ad-hoc signature),
+    /// `Some(n>0)` a non-empty one (a real identity), `None` no wrapper at
+    /// all (a linker signature). `None` produces byte-identical output to
+    /// before this parameter was added.
+    fn build_signature_blob(
+        entitlements_xml: Option<&[u8]>,
+        cds: &[(u32, u32)],
+        cms_payload_len: Option<usize>,
+    ) -> Vec<u8> {
+        let mut entries: Vec<(u32, Vec<u8>)> = Vec::new();
+        for &(slot_type, flags) in cds {
+            // Minimal CodeDirectory: magic(4), length(4), version(4), flags(4).
+            let mut cd = Vec::new();
+            cd.extend_from_slice(&CSMAGIC_CODEDIRECTORY.to_be_bytes());
+            cd.extend_from_slice(&16u32.to_be_bytes());
+            cd.extend_from_slice(&0x0002_0400u32.to_be_bytes()); // version
+            cd.extend_from_slice(&flags.to_be_bytes());
+            entries.push((slot_type, cd));
+        }
         if let Some(xml) = entitlements_xml {
-            let blob_off = index_len as u32;
-            index.extend_from_slice(&5u32.to_be_bytes()); // CSSLOT_ENTITLEMENTS
-            index.extend_from_slice(&blob_off.to_be_bytes());
+            let mut blob = Vec::new();
+            blob.extend_from_slice(&CSMAGIC_EMBEDDED_ENTITLEMENTS.to_be_bytes());
+            blob.extend_from_slice(&((8 + xml.len()) as u32).to_be_bytes());
+            blob.extend_from_slice(xml);
+            entries.push((CSSLOT_ENTITLEMENTS, blob));
+        }
+        if let Some(payload_len) = cms_payload_len {
+            let mut blob = Vec::new();
+            blob.extend_from_slice(&CSMAGIC_BLOBWRAPPER.to_be_bytes());
+            blob.extend_from_slice(&((8 + payload_len) as u32).to_be_bytes());
+            blob.resize(blob.len() + payload_len, 0);
+            entries.push((CSSLOT_SIGNATURESLOT, blob));
+        }
 
-            blobs.extend_from_slice(&CSMAGIC_EMBEDDED_ENTITLEMENTS.to_be_bytes());
-            blobs.extend_from_slice(&((8 + xml.len()) as u32).to_be_bytes());
-            blobs.extend_from_slice(xml);
+        let index_len = 12usize + 8 * entries.len();
+        let mut index = Vec::new();
+        let mut blobs = Vec::new();
+        let mut cursor = index_len as u32;
+        for (slot_type, blob) in &entries {
+            index.extend_from_slice(&slot_type.to_be_bytes());
+            index.extend_from_slice(&cursor.to_be_bytes());
+            blobs.extend_from_slice(blob);
+            cursor += blob.len() as u32;
         }
 
         let total_len = index_len + blobs.len();
+        let mut sb = Vec::new();
         sb.extend_from_slice(&CSMAGIC_EMBEDDED_SIGNATURE.to_be_bytes());
         sb.extend_from_slice(&(total_len as u32).to_be_bytes());
-        sb.extend_from_slice(&count.to_be_bytes());
+        sb.extend_from_slice(&(entries.len() as u32).to_be_bytes());
         sb.extend_from_slice(&index);
         sb.extend_from_slice(&blobs);
         sb
@@ -573,6 +946,79 @@ pub(crate) mod tests_support {
         rpaths: &[&str],
         code_signed: bool,
         entitlements_xml: Option<&[u8]>,
+    ) -> (Vec<u8>, Range<u64>, usize) {
+        synth_macho_64_full_with_cd_flags(
+            text_payload,
+            dylibs,
+            rpaths,
+            code_signed,
+            entitlements_xml,
+            None,
+        )
+    }
+
+    /// As [`synth_macho_64_full`], with an optional slot-0 CodeDirectory
+    /// carrying `cd_flags` (e.g. `CS_ADHOC`) added to the signature SuperBlob.
+    /// `cd_flags: None` produces byte-identical output to
+    /// `synth_macho_64_full`.
+    pub(crate) fn synth_macho_64_full_with_cd_flags(
+        text_payload: &[u8],
+        dylibs: &[&str],
+        rpaths: &[&str],
+        code_signed: bool,
+        entitlements_xml: Option<&[u8]>,
+        cd_flags: Option<u32>,
+    ) -> (Vec<u8>, Range<u64>, usize) {
+        let cds: Vec<(u32, u32)> = cd_flags
+            .map(|flags| vec![(CSSLOT_CODEDIRECTORY, flags)])
+            .unwrap_or_default();
+        synth_macho_64_full_with_cds(
+            text_payload,
+            dylibs,
+            rpaths,
+            code_signed,
+            entitlements_xml,
+            &cds,
+        )
+    }
+
+    /// As [`synth_macho_64_full`], with one CodeDirectory blob per
+    /// `(slot_type, flags)` pair in `cds` added to the signature SuperBlob —
+    /// e.g. `&[(CSSLOT_ALTERNATE_CODEDIRECTORIES, CS_ADHOC)]` puts the only
+    /// CodeDirectory in an alternate slot instead of slot 0. `cds: &[]`
+    /// produces byte-identical output to `synth_macho_64_full`.
+    pub(crate) fn synth_macho_64_full_with_cds(
+        text_payload: &[u8],
+        dylibs: &[&str],
+        rpaths: &[&str],
+        code_signed: bool,
+        entitlements_xml: Option<&[u8]>,
+        cds: &[(u32, u32)],
+    ) -> (Vec<u8>, Range<u64>, usize) {
+        synth_macho_64_full_with_cds_and_cms(
+            text_payload,
+            dylibs,
+            rpaths,
+            code_signed,
+            entitlements_xml,
+            cds,
+            None,
+        )
+    }
+
+    /// As [`synth_macho_64_full_with_cds`], with a `CSSLOT_SIGNATURESLOT` CMS
+    /// blob wrapper controlled by `cms_payload_len` — see
+    /// [`build_signature_blob`]'s doc for what each value means.
+    /// `cms_payload_len: None` produces byte-identical output to
+    /// `synth_macho_64_full_with_cds`.
+    pub(crate) fn synth_macho_64_full_with_cds_and_cms(
+        text_payload: &[u8],
+        dylibs: &[&str],
+        rpaths: &[&str],
+        code_signed: bool,
+        entitlements_xml: Option<&[u8]>,
+        cds: &[(u32, u32)],
+        cms_payload_len: Option<usize>,
     ) -> (Vec<u8>, Range<u64>, usize) {
         let header_size = 32usize;
         let seg_cmd_size = 72usize + 80usize; // segment_command_64 + one section_64
@@ -656,7 +1102,7 @@ pub(crate) mod tests_support {
         let mut sig_off = 0usize;
         if code_signed {
             sig_off = v.len();
-            let blob = build_signature_blob(entitlements_xml);
+            let blob = build_signature_blob(entitlements_xml, cds, cms_payload_len);
             let dataoff = sig_off as u32;
             let datasize = blob.len() as u32;
             v[sig_placeholder_at + 8..sig_placeholder_at + 12]
@@ -669,11 +1115,104 @@ pub(crate) mod tests_support {
         let range = text_off as u64..(text_off + text_payload.len()) as u64;
         (v, range, sig_off)
     }
+
+    /// A thin 64-bit Mach-O with **two** `LC_CODE_SIGNATURE` load commands:
+    /// the first pointing at a real SuperBlob (`entitlements_xml`/`cd_flags`
+    /// as given), the second pointing at zero-length data — the malformed
+    /// shape `parse_thin` must reject outright rather than let the second,
+    /// bogus command silently overwrite the first's facts (#37).
+    pub(crate) fn synth_macho_64_duplicate_code_signature(
+        text_payload: &[u8],
+        entitlements_xml: Option<&[u8]>,
+        cd_flags: Option<u32>,
+    ) -> Vec<u8> {
+        let header_size = 32usize;
+        let seg_cmd_size = 72usize + 80usize; // segment_command_64 + one section_64
+        let codesig_cmd_size = 16usize;
+        let ncmds = 3u32; // __TEXT segment + two LC_CODE_SIGNATURE
+        let cmdsize = seg_cmd_size + codesig_cmd_size * 2;
+        let text_off = header_size + cmdsize;
+
+        let mut v = Vec::new();
+        // --- mach_header_64 (little-endian) ---
+        v.extend_from_slice(&[0xCF, 0xFA, 0xED, 0xFE]); // magic -> BE 0xCFFAEDFE
+        v.extend_from_slice(&0x0100_0007u32.to_le_bytes()); // cputype x86_64
+        v.extend_from_slice(&3u32.to_le_bytes()); // cpusubtype
+        v.extend_from_slice(&2u32.to_le_bytes()); // filetype MH_EXECUTE
+        v.extend_from_slice(&ncmds.to_le_bytes());
+        v.extend_from_slice(&(cmdsize as u32).to_le_bytes());
+        v.extend_from_slice(&0u32.to_le_bytes()); // flags
+        v.extend_from_slice(&0u32.to_le_bytes()); // reserved
+
+        // --- LC_SEGMENT_64 for __TEXT ---
+        v.extend_from_slice(&LC_SEGMENT_64.to_le_bytes());
+        v.extend_from_slice(&(seg_cmd_size as u32).to_le_bytes());
+        v.extend_from_slice(&seg_name(b"__TEXT"));
+        v.extend_from_slice(&0u64.to_le_bytes()); // vmaddr
+        v.extend_from_slice(&0u64.to_le_bytes()); // vmsize
+        v.extend_from_slice(&(text_off as u64).to_le_bytes()); // fileoff
+        v.extend_from_slice(&(text_payload.len() as u64).to_le_bytes()); // filesize
+        v.extend_from_slice(&5u32.to_le_bytes()); // maxprot
+        v.extend_from_slice(&5u32.to_le_bytes()); // initprot
+        v.extend_from_slice(&1u32.to_le_bytes()); // nsects
+        v.extend_from_slice(&0u32.to_le_bytes()); // flags
+
+        // --- section_64 __text ---
+        v.extend_from_slice(&seg_name(b"__text"));
+        v.extend_from_slice(&seg_name(b"__TEXT"));
+        v.extend_from_slice(&0u64.to_le_bytes()); // addr
+        v.extend_from_slice(&(text_payload.len() as u64).to_le_bytes()); // size
+        v.extend_from_slice(&(text_off as u32).to_le_bytes()); // offset
+        v.extend_from_slice(&0u32.to_le_bytes()); // align
+        v.extend_from_slice(&0u32.to_le_bytes()); // reloff
+        v.extend_from_slice(&0u32.to_le_bytes()); // nreloc
+        v.extend_from_slice(&0u32.to_le_bytes()); // flags
+        v.extend_from_slice(&0u32.to_le_bytes()); // reserved1
+        v.extend_from_slice(&0u32.to_le_bytes()); // reserved2
+        v.extend_from_slice(&0u32.to_le_bytes()); // reserved3
+
+        // First LC_CODE_SIGNATURE: dataoff/datasize filled in once the trailing
+        // SuperBlob's offset is known.
+        let first_sig_cmd_at = v.len();
+        v.extend_from_slice(&LC_CODE_SIGNATURE.to_le_bytes());
+        v.extend_from_slice(&(codesig_cmd_size as u32).to_le_bytes());
+        v.extend_from_slice(&0u32.to_le_bytes()); // dataoff placeholder
+        v.extend_from_slice(&0u32.to_le_bytes()); // datasize placeholder
+
+        // Second LC_CODE_SIGNATURE: the duplicate. `parse_thin` must bail on
+        // seeing this command before ever reading its fields, so they're left
+        // as zero.
+        v.extend_from_slice(&LC_CODE_SIGNATURE.to_le_bytes());
+        v.extend_from_slice(&(codesig_cmd_size as u32).to_le_bytes());
+        v.extend_from_slice(&0u32.to_le_bytes()); // dataoff
+        v.extend_from_slice(&0u32.to_le_bytes()); // datasize
+
+        assert_eq!(v.len(), text_off);
+        v.extend_from_slice(text_payload);
+
+        let sig_off = v.len();
+        let cds: Vec<(u32, u32)> = cd_flags
+            .map(|flags| vec![(CSSLOT_CODEDIRECTORY, flags)])
+            .unwrap_or_default();
+        let blob = build_signature_blob(entitlements_xml, &cds, None);
+        v[first_sig_cmd_at + 8..first_sig_cmd_at + 12]
+            .copy_from_slice(&(sig_off as u32).to_le_bytes());
+        v[first_sig_cmd_at + 12..first_sig_cmd_at + 16]
+            .copy_from_slice(&(blob.len() as u32).to_le_bytes());
+        v.extend_from_slice(&blob);
+
+        v
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::tests_support::{synth_fat, synth_macho_64, synth_macho_64_full};
+    use super::tests_support::{
+        synth_fat, synth_fat_with_bogus_arches, synth_fat_with_duplicate_offsets, synth_macho_64,
+        synth_macho_64_duplicate_code_signature, synth_macho_64_full,
+        synth_macho_64_full_with_cd_flags, synth_macho_64_full_with_cds,
+        synth_macho_64_full_with_cds_and_cms,
+    };
     use super::*;
 
     #[test]
@@ -693,6 +1232,29 @@ mod tests {
             parse(&fat).unwrap().dylibs,
             vec!["/usr/lib/a.dylib".to_string()]
         );
+    }
+
+    #[test]
+    fn parse_returns_only_the_first_walkable_fat_slice() {
+        let (a, _, _) = synth_macho_64_full(b"aaaa", &["/usr/lib/a.dylib"], &[], false, None);
+        let (b, _, _) = synth_macho_64_full(b"bbbb", &["/tmp/b.dylib"], &[], false, None);
+        let fat = synth_fat(&[&a, &b]);
+        assert_eq!(
+            parse(&fat).unwrap().dylibs,
+            vec!["/usr/lib/a.dylib".to_string()]
+        );
+    }
+
+    #[test]
+    fn many_fat_arches_sharing_one_offset_parse_once_and_are_not_skipped() {
+        // A hostile fat table can point MAX_FAT_ARCHES entries at the same
+        // slice — that's one slice, not one per entry, and a duplicate of a
+        // walkable slice must not count toward `skipped`.
+        let (member, _, _) = synth_macho_64_full(b"shared slice", &[], &[], false, None);
+        let fat = synth_fat_with_duplicate_offsets(&member, 1024);
+        let (images, skipped) = parse_all_slices(&fat, false);
+        assert_eq!(images.len(), 1);
+        assert_eq!(skipped, 0);
     }
 
     #[test]
@@ -725,16 +1287,20 @@ mod tests {
     #[test]
     fn magic_detection_matches_what_parse_accepts() {
         let (image, _) = synth_macho_64(b"code");
-        assert!(is_macho_magic(&image));
-        // Fat magic counts even though this stub has no usable arch table.
-        assert!(is_macho_magic(&[0xCA, 0xFE, 0xBA, 0xBE, 0, 0, 0, 1]));
+        assert!(is_macho_magic(&image, false));
+        // Fat magic alone, with no arch table entry pointing at a real slice,
+        // is not enough (that's exactly what let a Java `.class` file through).
+        assert!(!is_macho_magic(
+            &[0xCA, 0xFE, 0xBA, 0xBE, 0, 0, 0, 1],
+            false
+        ));
         // Everything that is plainly not a code object.
-        assert!(!is_macho_magic(b"#!/bin/sh\n"));
-        assert!(!is_macho_magic(b"xar!"));
-        assert!(!is_macho_magic(b"just some text"));
-        assert!(!is_macho_magic(b"\x1f\x8b\x08\x00"));
-        assert!(!is_macho_magic(b""));
-        assert!(!is_macho_magic(b"\xCF\xFA"));
+        assert!(!is_macho_magic(b"#!/bin/sh\n", false));
+        assert!(!is_macho_magic(b"xar!", false));
+        assert!(!is_macho_magic(b"just some text", false));
+        assert!(!is_macho_magic(b"\x1f\x8b\x08\x00", false));
+        assert!(!is_macho_magic(b"", false));
+        assert!(!is_macho_magic(b"\xCF\xFA", false));
     }
 
     #[test]
@@ -745,6 +1311,65 @@ mod tests {
         v.extend_from_slice(&0x0000_0034u32.to_be_bytes()); // minor=0, major=52
         v.extend_from_slice(&[0u8; 64]);
         assert!(parse(&v).is_none());
+    }
+
+    #[test]
+    fn java_class_headers_are_not_macho() {
+        // CAFEBABE + (minor=0, major=52) and (minor=0, major=65) — real Java
+        // major versions (JDK 1.1 onward is 45+). The bytes following the
+        // magic are all zero, so every arch-table entry this reads either
+        // points at offset 0 (the CAFEBABE bytes themselves, not a thin
+        // Mach-O magic) or falls outside the 64-byte constant-pool stand-in —
+        // never real evidence of a slice.
+        for major in [0x34u32, 0x41] {
+            let mut v = vec![0xCA, 0xFE, 0xBA, 0xBE];
+            v.extend_from_slice(&major.to_be_bytes());
+            v.extend_from_slice(&[0u8; 64]);
+            assert!(!is_macho_magic(&v, false), "major {major:#x}");
+            assert!(parse_all(&v).is_empty(), "major {major:#x}");
+        }
+    }
+
+    #[test]
+    fn truncated_java_like_header_with_offset_past_eof_is_lenient() {
+        // Same CAFEBABE + major=52 shape, but the first arch entry's offset
+        // field is set past the end of the (short) buffer. A non-truncated
+        // read of this shape can only mean "not a fat binary" (#46); a
+        // truncated one can't rule out a real slice lying past what was
+        // captured, so it must not be read as "not a Mach-O" (§10/§11.8).
+        let mut v = vec![0xCA, 0xFE, 0xBA, 0xBE];
+        v.extend_from_slice(&0x0000_0034u32.to_be_bytes()); // minor=0, major=52
+        v.extend_from_slice(&[0u8; 64]);
+        // First fat_arch's offset field: bytes 16..20 (arch_off=8, +8).
+        let past_eof = v.len() as u32 + 1000;
+        v[16..20].copy_from_slice(&past_eof.to_be_bytes());
+        assert!(
+            !is_macho_magic(&v, false),
+            "complete read finds no evidence"
+        );
+        assert!(is_macho_magic(&v, true), "truncated read stays lenient");
+    }
+
+    #[test]
+    fn a_real_fat_header_with_a_handful_of_arches_is_still_macho() {
+        let (a, _, _) = synth_macho_64_full(b"aaaa", &[], &[], false, None);
+        let (b, _, _) = synth_macho_64_full(b"bbbb", &[], &[], false, None);
+        let fat = synth_fat(&[&a, &b]);
+        assert!(is_macho_magic(&fat, false));
+        assert_eq!(parse_all(&fat).len(), 2);
+    }
+
+    #[test]
+    fn many_bogus_arches_alongside_one_real_slice_is_still_macho() {
+        // #46: the kernel runs a fat binary with far more arch entries than
+        // any real toolchain emits, as long as one slice is real — an
+        // arch-count cap alone must not be the discriminator.
+        let (real, _, _) = synth_macho_64_full(b"real slice", &[], &[], false, None);
+        let fat = synth_fat_with_bogus_arches(&real, 24);
+        assert!(is_macho_magic(&fat, false));
+        let (images, skipped) = parse_all_slices(&fat, false);
+        assert_eq!(images.len(), 1);
+        assert_eq!(skipped, 24);
     }
 
     #[test]
@@ -836,6 +1461,135 @@ mod tests {
     }
 
     #[test]
+    fn code_directory_flags_are_read_back() {
+        let (adhoc, _, _) =
+            synth_macho_64_full_with_cd_flags(b"code", &[], &[], true, None, Some(CS_ADHOC));
+        assert_eq!(parse(&adhoc).unwrap().code_directory_flags, Some(CS_ADHOC));
+
+        let (identity, _, _) =
+            synth_macho_64_full_with_cd_flags(b"code", &[], &[], true, None, Some(0x10000));
+        assert_eq!(
+            parse(&identity).unwrap().code_directory_flags,
+            Some(0x10000)
+        );
+    }
+
+    #[test]
+    fn cms_signature_presence_requires_a_non_empty_wrapper() {
+        let cds = [(CSSLOT_CODEDIRECTORY, 0u32)];
+
+        let (no_cms, _, _) =
+            synth_macho_64_full_with_cds_and_cms(b"code", &[], &[], true, None, &cds, None);
+        assert!(!parse(&no_cms).unwrap().has_cms_signature);
+
+        let (empty_cms, _, _) =
+            synth_macho_64_full_with_cds_and_cms(b"code", &[], &[], true, None, &cds, Some(0));
+        assert!(!parse(&empty_cms).unwrap().has_cms_signature);
+
+        let (real_cms, _, _) =
+            synth_macho_64_full_with_cds_and_cms(b"code", &[], &[], true, None, &cds, Some(4));
+        assert!(parse(&real_cms).unwrap().has_cms_signature);
+    }
+
+    #[test]
+    fn no_code_directory_blob_is_none_not_zero() {
+        let (image, _, _) = synth_macho_64_full(b"code", &[], &[], true, None);
+        assert_eq!(parse(&image).unwrap().code_directory_flags, None);
+    }
+
+    /// A second `LC_CODE_SIGNATURE` has no legal meaning — rather than guess
+    /// which one the kernel would honor, the whole slice is malformed and a
+    /// thin file yields no image at all (#37).
+    #[test]
+    fn duplicate_code_signature_command_makes_the_thin_slice_malformed() {
+        let entitlements = br#"<?xml version="1.0"?><plist><dict>
+            <key>com.apple.security.cs.disable-library-validation</key><true/>
+        </dict></plist>"#;
+        let image =
+            synth_macho_64_duplicate_code_signature(b"code", Some(entitlements), Some(CS_ADHOC));
+        assert!(
+            parse(&image).is_none(),
+            "a duplicate LC_CODE_SIGNATURE must not silently keep or erase the first \
+             signature's facts"
+        );
+    }
+
+    /// As above, but as one slice of a fat binary: the malformed slice must
+    /// count as skipped rather than disappear silently or take down the
+    /// sibling slice (#37).
+    #[test]
+    fn duplicate_code_signature_in_one_fat_slice_is_skipped() {
+        let (clean, _, _) =
+            synth_macho_64_full(b"clean", &["/usr/lib/libSystem.B.dylib"], &[], false, None);
+        let bad = synth_macho_64_duplicate_code_signature(b"bad", None, Some(CS_ADHOC));
+        let fat = synth_fat(&[&clean, &bad]);
+
+        let (images, skipped) = parse_all_slices(&fat, false);
+        assert_eq!(images.len(), 1);
+        assert_eq!(skipped, 1);
+    }
+
+    /// XNU accepts a CodeDirectory in any of 5 alternate slots
+    /// (`CSSLOT_ALTERNATE_CODEDIRECTORIES`..+4), not just slot 0 — an
+    /// attacker can put its only, ad-hoc CD there (#37).
+    #[test]
+    fn ad_hoc_flag_from_alternate_codedirectory_slot_only() {
+        let (image, _, _) = synth_macho_64_full_with_cds(
+            b"code",
+            &[],
+            &[],
+            true,
+            None,
+            &[(CSSLOT_ALTERNATE_CODEDIRECTORIES, CS_ADHOC)],
+        );
+        let flags = parse(&image).unwrap().code_directory_flags.unwrap();
+        assert_ne!(flags & CS_ADHOC, 0);
+    }
+
+    /// A CodeDirectory in slot 0 saying "real identity" must not shadow an
+    /// ad-hoc one sitting in an alternate slot — the OR must catch it (#37).
+    #[test]
+    fn ad_hoc_flag_from_slot_0_plus_alternate_is_ored_in() {
+        let (image, _, _) = synth_macho_64_full_with_cds(
+            b"code",
+            &[],
+            &[],
+            true,
+            None,
+            &[
+                (CSSLOT_CODEDIRECTORY, 0x10000), // slot 0: identity, no CS_ADHOC
+                (CSSLOT_ALTERNATE_CODEDIRECTORIES, CS_ADHOC), // alternate: ad-hoc
+            ],
+        );
+        let flags = parse(&image).unwrap().code_directory_flags.unwrap();
+        assert_ne!(
+            flags & CS_ADHOC,
+            0,
+            "any CD being ad-hoc must OR in as ad-hoc"
+        );
+    }
+
+    /// A signature region fully held, but whose CodeDirectory blob is cut
+    /// short by `datasize` (`blob_off + 16 > sig_end`) — distinct from a
+    /// truncated *capture*: the parse of the header/load-commands must still
+    /// succeed, and the unreadable CD must not fabricate flags.
+    #[test]
+    fn code_directory_cut_short_by_datasize_yields_none_not_panic() {
+        let (mut image, _, _) =
+            synth_macho_64_full_with_cd_flags(b"code", &[], &[], true, None, Some(CS_ADHOC));
+        let lc_off = image
+            .windows(4)
+            .position(|w| w == LC_CODE_SIGNATURE.to_le_bytes())
+            .expect("LC_CODE_SIGNATURE present");
+        // index (12 + 8*1 entry = 20 bytes) + 12 bytes into the 16-byte CD
+        // blob: sig_end lands inside the CD, short of the flags field.
+        let new_datasize = 20u32 + 12;
+        image[lc_off + 12..lc_off + 16].copy_from_slice(&new_datasize.to_le_bytes());
+        let parsed = parse(&image).expect("full header/load-commands still parse");
+        assert_eq!(parsed.code_directory_flags, None);
+    }
+
+    #[test]
     fn dylib_and_rpath_counts_are_capped() {
         // MAX_RPATHS is 256 — build one more and confirm the parser doesn't
         // choke or unbounded-allocate; it just stops collecting.
@@ -844,5 +1598,52 @@ mod tests {
         let (image, _, _) = synth_macho_64_full(b"code", &[], &refs, false, None);
         let parsed = parse(&image).unwrap();
         assert!(parsed.rpaths.len() <= MAX_RPATHS);
+    }
+
+    #[test]
+    fn parse_all_slices_counts_unwalkable_arches() {
+        let (good, _, _) = synth_macho_64_full(b"good", &[], &[], false, None);
+        let garbage: &[u8] = &[0xDE, 0xAD, 0xBE, 0xEF, 0, 0, 0, 0];
+        let fat = synth_fat(&[&good, garbage]);
+        let (images, skipped) = parse_all_slices(&fat, false);
+        assert_eq!(images.len(), 1);
+        assert_eq!(skipped, 1);
+    }
+
+    #[test]
+    fn thin_and_two_clean_slices_report_zero_skipped() {
+        let (thin, _) = synth_macho_64(b"code");
+        assert_eq!(parse_all_slices(&thin, false), (parse_all(&thin), 0));
+
+        let (a, _, _) = synth_macho_64_full(b"aaaa", &[], &[], false, None);
+        let (b, _, _) = synth_macho_64_full(b"bbbb", &[], &[], false, None);
+        let fat = synth_fat(&[&a, &b]);
+        let (images, skipped) = parse_all_slices(&fat, false);
+        assert_eq!(images.len(), 2);
+        assert_eq!(skipped, 0);
+    }
+
+    #[test]
+    fn an_implausible_fat_header_reports_zero_skipped_not_all_skipped() {
+        // Java-.class-shaped header: not a fat binary at all, so this reads
+        // as "nothing declared," not "every arch skipped."
+        let mut v = vec![0xCA, 0xFE, 0xBA, 0xBE];
+        v.extend_from_slice(&0x0000_0034u32.to_be_bytes());
+        v.extend_from_slice(&[0u8; 64]);
+        assert_eq!(parse_all_slices(&v, false), (Vec::new(), 0));
+    }
+
+    #[test]
+    fn a_fat_table_entry_pointing_past_eof_is_skipped_and_counted() {
+        let (good, _, _) = synth_macho_64_full(b"good", &[], &[], false, None);
+        let mut fat = synth_fat(&[&good, &good]);
+        let total_len = fat.len() as u32;
+        // Corrupt the second fat_arch's offset field (bytes 36..40: the
+        // second 20-byte fat_arch entry starts at 28, offset is its 3rd u32)
+        // to point past EOF.
+        fat[36..40].copy_from_slice(&(total_len + 1000).to_be_bytes());
+        let (images, skipped) = parse_all_slices(&fat, false);
+        assert_eq!(images.len(), 1);
+        assert_eq!(skipped, 1);
     }
 }

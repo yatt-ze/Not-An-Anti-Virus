@@ -1,40 +1,83 @@
 //! Mach-O structural/entitlement anomaly detection (§5.2, NAV-007).
 //!
 //! Purely structural: reads what `macho::parse` already recovered (load
-//! paths, code-signature presence, embedded entitlements) and scores two
-//! narrow anomalies — a dylib/rpath load path into a writable/transient
-//! location, and a handful of specific "exempt me from platform protections"
-//! entitlements. Each is corroboration-only (§5.1): summed weight is capped
-//! well under the high-severity threshold, so this rule alone can never push
-//! a verdict past `Notify`.
+//! paths, code-signature presence, embedded entitlements, CodeDirectory
+//! flags) and scores two narrow anomalies — a dylib/rpath load path into a
+//! writable/transient location, and a handful of specific "exempt me from
+//! platform protections" entitlements, most weighted higher when the binary
+//! is only ad-hoc signed rather than under a real identity
+//! (`EntitlementPolicy::WeightedByIdentity`); `get-task-allow` is the
+//! exception — Xcode Debug builds are always ad-hoc and always request it, so
+//! it only scores on a confirmed identity-signed binary
+//! (`EntitlementPolicy::IdentityOnly`, #37). Each anomaly is
+//! corroboration-only (§5.1): summed weight is capped well under the
+//! high-severity threshold, so this rule alone can never push a verdict past
+//! `Notify`.
 
 use super::{Rule, RuleOutcome};
 use crate::context::ScanContext;
-use crate::macho::{self, MachOImage};
+use crate::macho::{self, MachOImage, CS_ADHOC};
 use crate::model::{MatchedSignal, SignalCategory};
 use crate::plist::{self, PlistValue};
+use std::collections::HashMap;
 
 /// Weight for at least one dylib/rpath load path in a writable/transient
 /// location. Flat, not per-path — the anomaly is "loads from somewhere an
 /// attacker can write," not "N such paths is N times worse."
 const TRANSIENT_LOCATION_WEIGHT: i32 = 15;
-/// Per-entitlement weight when the binary carries a real code signature.
+/// Per-entitlement weight for a real (non-ad-hoc) signing identity, and the
+/// safe default when the CodeDirectory's flags couldn't be determined.
 const ENTITLEMENT_WEIGHT_SIGNED: i32 = 10;
-/// Per-entitlement weight when there's no code signature at all — an
-/// unsigned/ad-hoc binary asking for these exemptions is more notable than a
-/// signed one (README's "suspicious entitlements on unsigned binaries").
-const ENTITLEMENT_WEIGHT_UNSIGNED: i32 = 18;
+/// Per-entitlement weight when the CodeDirectory's flags carry `CS_ADHOC` — an
+/// ad-hoc-signed binary asking for these exemptions is more notable than one
+/// under a real identity (README's "suspicious entitlements on unsigned
+/// binaries").
+const ENTITLEMENT_WEIGHT_ADHOC: i32 = 18;
 /// Ceiling on this rule's single signal — comfortably in `Notify` range,
 /// never near the §5.1 high-severity threshold on its own.
 const MAX_WEIGHT: i32 = 30;
 
-/// Entitlement keys that exempt a binary from a platform protection —
-/// meaningful on their own regardless of what else the binary does.
-const SUSPICIOUS_ENTITLEMENTS: &[&str] = &[
-    "com.apple.security.cs.disable-library-validation",
-    "com.apple.security.cs.allow-dyld-environment-variables",
-    "com.apple.security.cs.disable-executable-page-protection",
-    "com.apple.security.get-task-allow",
+/// When a suspicious entitlement contributes to the score.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum EntitlementPolicy {
+    /// Always contributes, weighted by ad-hoc-vs-identity like the rest of
+    /// this rule (`ENTITLEMENT_WEIGHT_ADHOC`/`ENTITLEMENT_WEIGHT_SIGNED`).
+    WeightedByIdentity,
+    /// Only contributes on a confirmed identity-signed binary (`CS_ADHOC`
+    /// known absent) — see `get-task-allow`'s entry below.
+    IdentityOnly,
+}
+
+/// An entitlement key that exempts a binary from a platform protection,
+/// meaningful on its own regardless of what else the binary does, together
+/// with when it's scored.
+struct SuspiciousEntitlement {
+    key: &'static str,
+    policy: EntitlementPolicy,
+}
+
+/// `com.apple.security.get-task-allow` only scores on an identity-signed
+/// binary: Xcode adds it to *every* Debug build, and Xcode Debug builds are
+/// always ad-hoc signed ("Sign to Run Locally") — so on an ad-hoc binary it's
+/// the ordinary dev-build state, not an anomaly. Notarization rejects it on
+/// a real identity, so there it's still meaningful (#37).
+const SUSPICIOUS_ENTITLEMENTS: &[SuspiciousEntitlement] = &[
+    SuspiciousEntitlement {
+        key: "com.apple.security.cs.disable-library-validation",
+        policy: EntitlementPolicy::WeightedByIdentity,
+    },
+    SuspiciousEntitlement {
+        key: "com.apple.security.cs.allow-dyld-environment-variables",
+        policy: EntitlementPolicy::WeightedByIdentity,
+    },
+    SuspiciousEntitlement {
+        key: "com.apple.security.cs.disable-executable-page-protection",
+        policy: EntitlementPolicy::WeightedByIdentity,
+    },
+    SuspiciousEntitlement {
+        key: "com.apple.security.get-task-allow",
+        policy: EntitlementPolicy::IdentityOnly,
+    },
 ];
 
 pub struct MachOStructureRule;
@@ -56,23 +99,30 @@ impl Rule for MachOStructureRule {
 
     fn evaluate(&self, ctx: &ScanContext) -> Result<Option<MatchedSignal>, RuleOutcome> {
         let content = ctx.content.as_ref().ok_or(RuleOutcome::NotApplicable)?;
-        if !macho::is_macho_magic(content) {
+        if !macho::is_macho_magic(content, ctx.truncated) {
             return Ok(None);
         }
         // Recognized Mach-O magic that the parser couldn't walk within its
         // bounds (truncated header, malformed load commands, or a fat container
         // with no walkable slice) — "couldn't check," not "clean" (§10/§11.8).
-        let images = macho::parse_all(content);
+        let (images, skipped_slices) = macho::parse_all_slices(content, ctx.truncated);
         if images.is_empty() {
             return Err(RuleOutcome::NotApplicable);
         }
 
         // Judge a fat binary on all its slices: a malicious arm64 slice must
         // not disappear behind a clean x86_64 one (§5.2). Load-path anomalies
-        // are unioned across slices; each slice's entitlements are scored on
-        // its own signed/unsigned status.
+        // and suspicious entitlement keys are each unioned across slices —
+        // one signal per distinct bad path / entitlement key, not one per
+        // slice that requests it — so a universal binary carrying the same
+        // anomaly in every slice doesn't inflate the score or repeat the
+        // text (§5.2). A key requested by more than one slice is weighted by
+        // the worst (most ad-hoc) of those slices. `skipped_slices > 0` means
+        // at least one *declared* arch couldn't be walked at all — a
+        // deliberately malformed slice must not hide behind the rest coming
+        // back clean.
         let mut bad_paths: Vec<&str> = Vec::new();
-        let mut findings: Vec<(i32, String)> = Vec::new();
+        let mut entitlement_weights: HashMap<&'static str, i32> = HashMap::new();
         let mut entitlements_gap = false;
 
         for image in &images {
@@ -87,7 +137,14 @@ impl Rule for MachOStructureRule {
                 }
             }
             match entitlements_finding(image, ctx.truncated) {
-                Ok(Some(f)) => findings.push(f),
+                Ok(Some(contributing)) => {
+                    for (key, weight) in contributing {
+                        entitlement_weights
+                            .entry(key)
+                            .and_modify(|w| *w = (*w).max(weight))
+                            .or_insert(weight);
+                    }
+                }
                 Ok(None) => {}
                 // Couldn't determine this slice's entitlements (truncated
                 // signature region, malformed blob). Only fatal if nothing
@@ -96,21 +153,41 @@ impl Rule for MachOStructureRule {
             }
         }
 
+        let mut findings: Vec<(i32, String)> = Vec::new();
         if !bad_paths.is_empty() {
-            findings.insert(
-                0,
-                (
-                    TRANSIENT_LOCATION_WEIGHT,
-                    format!(
-                        "loads from a writable/transient location: {}",
-                        bad_paths.join(", ")
-                    ),
+            findings.push((
+                TRANSIENT_LOCATION_WEIGHT,
+                format!(
+                    "loads from a writable/transient location: {}",
+                    bad_paths.join(", ")
                 ),
-            );
+            ));
+        }
+        if !entitlement_weights.is_empty() {
+            // List in SUSPICIOUS_ENTITLEMENTS's fixed order for a deterministic
+            // description regardless of slice/HashMap iteration order.
+            let keys: Vec<&'static str> = SUSPICIOUS_ENTITLEMENTS
+                .iter()
+                .map(|ent| ent.key)
+                .filter(|key| entitlement_weights.contains_key(key))
+                .collect();
+            let weight: i32 = entitlement_weights.values().sum();
+            let any_adhoc = entitlement_weights
+                .values()
+                .any(|&w| w == ENTITLEMENT_WEIGHT_ADHOC);
+            let description = if any_adhoc {
+                format!(
+                    "requests suspicious entitlement(s) on an ad-hoc-signed binary: {}",
+                    keys.join(", ")
+                )
+            } else {
+                format!("requests suspicious entitlement(s): {}", keys.join(", "))
+            };
+            findings.push((weight, description));
         }
 
         if findings.is_empty() {
-            return if entitlements_gap {
+            return if entitlements_gap || skipped_slices > 0 {
                 Err(RuleOutcome::NotApplicable)
             } else {
                 Ok(None)
@@ -137,19 +214,22 @@ impl Rule for MachOStructureRule {
     }
 }
 
-/// Score the binary's entitlements, if any were recovered. `Ok(None)` covers
-/// "no code signature at all" (entitlements live inside one, so there's
-/// nothing to examine), "signed and we held the whole file but found no
-/// entitlements blob" (a determined fact), and "signed, entitlements
-/// present, none of them suspicious." `Err(NotApplicable)` only when the read
-/// was `truncated` and signed with no entitlements recovered — the signature
-/// (near EOF) is exactly what an 8 MiB capture loses first, so that
-/// combination can't be told apart from "truncated past a real entitlements
-/// blob" (§10/§11.8) and must not be read as a clean bill of health.
+/// Score this slice's entitlements, if any were recovered — the suspicious
+/// keys it requests, each with its own ad-hoc/identity weight; the caller
+/// unions these across a fat binary's slices rather than scoring each slice
+/// separately (§5.2). `Ok(None)` covers "no code signature at all"
+/// (entitlements live inside one, so there's nothing to examine), "signed
+/// and we held the whole file but found no entitlements blob" (a determined
+/// fact), and "signed, entitlements present, none of them suspicious."
+/// `Err(NotApplicable)` only when the read was `truncated` and signed with no
+/// entitlements recovered — the signature (near EOF) is exactly what an 8
+/// MiB capture loses first, so that combination can't be told apart from
+/// "truncated past a real entitlements blob" (§10/§11.8) and must not be
+/// read as a clean bill of health.
 fn entitlements_finding(
     image: &MachOImage,
     truncated: bool,
-) -> Result<Option<(i32, String)>, RuleOutcome> {
+) -> Result<Option<Vec<(&'static str, i32)>>, RuleOutcome> {
     let Some(xml) = &image.entitlements else {
         return if image.has_code_signature && truncated {
             Err(RuleOutcome::NotApplicable)
@@ -161,29 +241,46 @@ fn entitlements_finding(
         return Err(RuleOutcome::NotApplicable); // malformed entitlements blob
     };
 
-    let bad = suspicious_entitlements(&parsed);
-    if bad.is_empty() {
-        return Ok(None);
+    // Ad-hoc vs. a real signing identity, not signed vs. unsigned: entitlements
+    // only ever come from inside a code signature, so `has_code_signature` is
+    // always true here. The CS_ADHOC bit is self-declared by the signer, so a
+    // slice also counts as ad-hoc when it has no non-empty CMS blob — a real
+    // identity signature carries certificate data there, a hand ad-hoc one
+    // has the wrapper but empty, a linker signature has none (#37). `None`
+    // means no CodeDirectory could be recovered at all.
+    let is_adhoc_known = image
+        .code_directory_flags
+        .map(|flags| flags & CS_ADHOC != 0 || !image.has_cms_signature);
+    let is_adhoc = is_adhoc_known.unwrap_or(false); // unknown falls back to the real-identity weight
+
+    let mut contributing: Vec<(&'static str, i32)> = Vec::new();
+    for ent in SUSPICIOUS_ENTITLEMENTS {
+        if parsed.get(ent.key).and_then(PlistValue::as_bool) != Some(true) {
+            continue;
+        }
+        match ent.policy {
+            EntitlementPolicy::WeightedByIdentity => {
+                let weight = if is_adhoc {
+                    ENTITLEMENT_WEIGHT_ADHOC
+                } else {
+                    ENTITLEMENT_WEIGHT_SIGNED
+                };
+                contributing.push((ent.key, weight));
+            }
+            // Ad-hoc or unknown flags: not identity-confirmed, so this
+            // entitlement contributes nothing and isn't listed.
+            EntitlementPolicy::IdentityOnly if is_adhoc_known == Some(false) => {
+                contributing.push((ent.key, ENTITLEMENT_WEIGHT_SIGNED));
+            }
+            EntitlementPolicy::IdentityOnly => {}
+        }
     }
 
-    let weight_each = if image.has_code_signature {
-        ENTITLEMENT_WEIGHT_SIGNED
+    if contributing.is_empty() {
+        Ok(None)
     } else {
-        ENTITLEMENT_WEIGHT_UNSIGNED
-    };
-    Ok(Some((
-        weight_each * bad.len() as i32,
-        format!("requests suspicious entitlement(s): {}", bad.join(", ")),
-    )))
-}
-
-/// Which of [`SUSPICIOUS_ENTITLEMENTS`] are set `true` in `plist`.
-fn suspicious_entitlements(plist: &PlistValue) -> Vec<&'static str> {
-    SUSPICIOUS_ENTITLEMENTS
-        .iter()
-        .copied()
-        .filter(|key| plist.get(key).and_then(PlistValue::as_bool) == Some(true))
-        .collect()
+        Ok(Some(contributing))
+    }
 }
 
 /// True if `path` is a load path worth flagging: an absolute path into a
@@ -207,14 +304,11 @@ fn is_writable_or_transient(path: &str) -> bool {
         return false;
     }
 
-    const TRANSIENT_PREFIXES: &[&str] = &[
-        "/tmp/",
-        "/private/tmp/",
-        "/var/tmp/",
-        "/private/var/tmp/",
-        "/Users/Shared/",
-    ];
-    if TRANSIENT_PREFIXES.iter().any(|p| path.starts_with(p)) || path.starts_with("/Users/") {
+    if super::TRANSIENT_PREFIXES
+        .iter()
+        .any(|p| path.starts_with(p))
+        || path.starts_with("/Users/")
+    {
         return true;
     }
 
@@ -226,7 +320,10 @@ fn is_writable_or_transient(path: &str) -> bool {
 mod tests {
     use super::*;
     use crate::context::{ContentSource, ScanContext};
-    use crate::macho::tests_support::{synth_fat, synth_macho_64_full};
+    use crate::macho::tests_support::{
+        synth_fat, synth_fat_with_bogus_arches, synth_macho_64_full,
+        synth_macho_64_full_with_cd_flags, synth_macho_64_full_with_cds_and_cms,
+    };
     use std::path::PathBuf;
 
     fn ctx_for(content: Vec<u8>) -> ScanContext {
@@ -341,6 +438,168 @@ mod tests {
     }
 
     #[test]
+    fn adhoc_signed_disable_lib_validation_weighs_more_than_identity_signed() {
+        let xml = br#"<?xml version="1.0"?><plist version="1.0"><dict>
+            <key>com.apple.security.cs.disable-library-validation</key><true/>
+        </dict></plist>"#;
+
+        let (adhoc, _, _) =
+            synth_macho_64_full_with_cd_flags(b"code", &[], &[], true, Some(xml), Some(CS_ADHOC));
+        let adhoc_sig = MachOStructureRule
+            .evaluate(&ctx_for(adhoc))
+            .unwrap()
+            .expect("should fire");
+        assert_eq!(adhoc_sig.weight, ENTITLEMENT_WEIGHT_ADHOC);
+        assert!(adhoc_sig.description.contains("ad-hoc"));
+
+        // CS_ADHOC clear, but no non-empty CMS blob backing the signature —
+        // the ad-hoc bit alone isn't the whole story; a signer that never
+        // attached a real identity is still ad-hoc (#37).
+        let (claimed_identity, _, _) = synth_macho_64_full_with_cds_and_cms(
+            b"code",
+            &[],
+            &[],
+            true,
+            Some(xml),
+            &[(0, 0)], // slot 0, flags=0 — no CS_ADHOC bit, but no CMS blob either
+            None,
+        );
+        let claimed_identity_sig = MachOStructureRule
+            .evaluate(&ctx_for(claimed_identity))
+            .unwrap()
+            .expect("should fire");
+        assert_eq!(
+            claimed_identity_sig.weight, ENTITLEMENT_WEIGHT_ADHOC,
+            "flags=0 with no CMS blob must still read as ad-hoc"
+        );
+        assert!(claimed_identity_sig.description.contains("ad-hoc"));
+
+        // CS_ADHOC clear AND a non-empty CMS blob: a genuine identity signature.
+        let (identity, _, _) = synth_macho_64_full_with_cds_and_cms(
+            b"code",
+            &[],
+            &[],
+            true,
+            Some(xml),
+            &[(0, 0)],
+            Some(4),
+        );
+        let identity_sig = MachOStructureRule
+            .evaluate(&ctx_for(identity))
+            .unwrap()
+            .expect("should fire");
+        assert_eq!(identity_sig.weight, ENTITLEMENT_WEIGHT_SIGNED);
+        assert!(!identity_sig.description.contains("ad-hoc"));
+
+        let (unknown, _, _) = synth_macho_64_full(b"code", &[], &[], true, Some(xml));
+        let unknown_sig = MachOStructureRule
+            .evaluate(&ctx_for(unknown))
+            .unwrap()
+            .expect("should fire");
+        assert_eq!(
+            unknown_sig.weight, ENTITLEMENT_WEIGHT_SIGNED,
+            "an unrecoverable CodeDirectory must not assume the worse case"
+        );
+    }
+
+    #[test]
+    fn get_task_allow_on_an_adhoc_binary_scores_nothing() {
+        // Xcode adds get-task-allow to every Debug build, and Debug builds
+        // are always ad-hoc signed ("Sign to Run Locally") — the ordinary
+        // dev-build state, not an anomaly (#37).
+        let xml = br#"<?xml version="1.0"?><plist version="1.0"><dict>
+            <key>com.apple.security.get-task-allow</key><true/>
+        </dict></plist>"#;
+        let (image, _, _) =
+            synth_macho_64_full_with_cd_flags(b"code", &[], &[], true, Some(xml), Some(CS_ADHOC));
+        assert!(matches!(
+            MachOStructureRule.evaluate(&ctx_for(image)),
+            Ok(None)
+        ));
+    }
+
+    #[test]
+    fn get_task_allow_on_an_identity_signed_binary_is_flagged() {
+        // Notarization rejects get-task-allow on a real identity, so there
+        // it's still meaningful.
+        let xml = br#"<?xml version="1.0"?><plist version="1.0"><dict>
+            <key>com.apple.security.get-task-allow</key><true/>
+        </dict></plist>"#;
+        let (image, _, _) = synth_macho_64_full_with_cds_and_cms(
+            b"code",
+            &[],
+            &[],
+            true,
+            Some(xml),
+            &[(0, 0)], // slot 0, flags=0 — no CS_ADHOC bit
+            Some(4),   // and a non-empty CMS blob — a confirmed real identity
+        );
+        let sig = MachOStructureRule
+            .evaluate(&ctx_for(image))
+            .unwrap()
+            .expect("should fire");
+        assert_eq!(sig.weight, ENTITLEMENT_WEIGHT_SIGNED);
+        assert!(sig.description.contains("get-task-allow"));
+    }
+
+    #[test]
+    fn get_task_allow_alongside_an_adhoc_weighted_entitlement_is_excluded_from_the_finding() {
+        let xml = br#"<?xml version="1.0"?><plist version="1.0"><dict>
+            <key>com.apple.security.cs.disable-library-validation</key><true/>
+            <key>com.apple.security.get-task-allow</key><true/>
+        </dict></plist>"#;
+        let (image, _, _) =
+            synth_macho_64_full_with_cd_flags(b"code", &[], &[], true, Some(xml), Some(CS_ADHOC));
+        let sig = MachOStructureRule
+            .evaluate(&ctx_for(image))
+            .unwrap()
+            .expect("should fire");
+        assert_eq!(
+            sig.weight, ENTITLEMENT_WEIGHT_ADHOC,
+            "only the ad-hoc-weighted entitlement should contribute"
+        );
+        assert!(sig.description.contains("disable-library-validation"));
+        assert!(!sig.description.contains("get-task-allow"));
+    }
+
+    #[test]
+    fn get_task_allow_with_unknown_flags_scores_nothing() {
+        // No CodeDirectory recovered at all: not confirmed identity-signed,
+        // so get-task-allow must not assume the worse case either.
+        let xml = br#"<?xml version="1.0"?><plist version="1.0"><dict>
+            <key>com.apple.security.get-task-allow</key><true/>
+        </dict></plist>"#;
+        let (image, _, _) = synth_macho_64_full(b"code", &[], &[], true, Some(xml));
+        assert!(matches!(
+            MachOStructureRule.evaluate(&ctx_for(image)),
+            Ok(None)
+        ));
+    }
+
+    #[test]
+    fn get_task_allow_scores_nothing_when_flags_are_zero_with_no_cms_blob() {
+        // flags=0 (no CS_ADHOC) but no CMS blob backing it reads as ad-hoc
+        // under the new rule, not a confirmed identity — get-task-allow must
+        // not score here either (#37).
+        let xml = br#"<?xml version="1.0"?><plist version="1.0"><dict>
+            <key>com.apple.security.get-task-allow</key><true/>
+        </dict></plist>"#;
+        let (image, _, _) = synth_macho_64_full_with_cds_and_cms(
+            b"code",
+            &[],
+            &[],
+            true,
+            Some(xml),
+            &[(0, 0)],
+            None,
+        );
+        assert!(matches!(
+            MachOStructureRule.evaluate(&ctx_for(image)),
+            Ok(None)
+        ));
+    }
+
+    #[test]
     fn entitlements_without_suspicious_keys_score_nothing() {
         let xml = br#"<?xml version="1.0"?><plist version="1.0"><dict>
             <key>com.apple.security.app-sandbox</key><true/>
@@ -413,6 +672,12 @@ mod tests {
         assert!(is_writable_or_transient("/Users/Shared/evil"));
         assert!(is_writable_or_transient("/Users/alice/evil"));
         assert!(is_writable_or_transient("/opt/app/.hidden/lib"));
+        assert!(is_writable_or_transient(
+            "/private/var/folders/xy/abc/T/libevil.dylib"
+        ));
+        assert!(is_writable_or_transient(
+            "/var/folders/xy/abc/T/libevil.dylib"
+        ));
 
         assert!(!is_writable_or_transient("@executable_path/../Frameworks"));
         assert!(!is_writable_or_transient("@loader_path/lib.dylib"));
@@ -446,10 +711,121 @@ mod tests {
     }
 
     #[test]
+    fn same_entitlement_in_two_ad_hoc_slices_is_unioned_not_repeated() {
+        let xml = br#"<?xml version="1.0"?><plist version="1.0"><dict>
+            <key>com.apple.security.cs.disable-library-validation</key><true/>
+        </dict></plist>"#;
+        let (a, _, _) =
+            synth_macho_64_full_with_cd_flags(b"aaaa", &[], &[], true, Some(xml), Some(CS_ADHOC));
+        let (b, _, _) =
+            synth_macho_64_full_with_cd_flags(b"bbbb", &[], &[], true, Some(xml), Some(CS_ADHOC));
+        let fat = synth_fat(&[&a, &b]);
+
+        let sig = MachOStructureRule
+            .evaluate(&ctx_for(fat))
+            .unwrap()
+            .expect("should fire");
+        assert_eq!(sig.weight, ENTITLEMENT_WEIGHT_ADHOC);
+        assert_eq!(
+            sig.description
+                .matches("disable-library-validation")
+                .count(),
+            1,
+            "the key must be listed once, not once per slice"
+        );
+    }
+
+    #[test]
+    fn same_entitlement_ad_hoc_in_one_slice_and_identity_in_another_takes_the_worse_weight() {
+        let xml = br#"<?xml version="1.0"?><plist version="1.0"><dict>
+            <key>com.apple.security.cs.disable-library-validation</key><true/>
+        </dict></plist>"#;
+        let (adhoc, _, _) =
+            synth_macho_64_full_with_cd_flags(b"aaaa", &[], &[], true, Some(xml), Some(CS_ADHOC));
+        let (identity, _, _) = synth_macho_64_full_with_cds_and_cms(
+            b"bbbb",
+            &[],
+            &[],
+            true,
+            Some(xml),
+            &[(0, 0)], // slot 0, flags=0
+            Some(4),   // non-empty CMS blob — a confirmed real identity
+        );
+        let fat = synth_fat(&[&adhoc, &identity]);
+
+        let sig = MachOStructureRule
+            .evaluate(&ctx_for(fat))
+            .unwrap()
+            .expect("should fire");
+        assert_eq!(
+            sig.weight, ENTITLEMENT_WEIGHT_ADHOC,
+            "a key requested by both an ad-hoc and an identity slice takes the worse weight"
+        );
+    }
+
+    #[test]
     fn malformed_macho_that_wont_parse_is_not_applicable() {
         // Valid magic, nothing else — recognized as Mach-O but unwalkable.
         assert!(matches!(
             MachOStructureRule.evaluate(&ctx_for(vec![0xCF, 0xFA, 0xED, 0xFE])),
+            Err(RuleOutcome::NotApplicable)
+        ));
+    }
+
+    #[test]
+    fn two_clean_fat_slices_score_nothing() {
+        let (a, _, _) =
+            synth_macho_64_full(b"aaaa", &["/usr/lib/libSystem.B.dylib"], &[], false, None);
+        let (b, _, _) =
+            synth_macho_64_full(b"bbbb", &["/usr/lib/libSystem.B.dylib"], &[], false, None);
+        let fat = synth_fat(&[&a, &b]);
+        assert!(matches!(
+            MachOStructureRule.evaluate(&ctx_for(fat)),
+            Ok(None)
+        ));
+    }
+
+    #[test]
+    fn an_unwalkable_slice_alongside_a_clean_one_is_not_applicable() {
+        // A malformed-on-purpose slice (bad magic) must not hide behind a
+        // clean slice reading as scored-fine (#38).
+        let (clean, _, _) =
+            synth_macho_64_full(b"clean", &["/usr/lib/libSystem.B.dylib"], &[], false, None);
+        let garbage: &[u8] = &[0xDE, 0xAD, 0xBE, 0xEF, 0, 0, 0, 0];
+        let fat = synth_fat(&[&clean, garbage]);
+        assert!(matches!(
+            MachOStructureRule.evaluate(&ctx_for(fat)),
+            Err(RuleOutcome::NotApplicable)
+        ));
+    }
+
+    #[test]
+    fn an_unwalkable_slice_does_not_hide_a_real_finding_in_the_good_slice() {
+        // Same shape as above, but the walkable slice has its own anomaly —
+        // that finding must still stand even though a sibling slice was
+        // unwalkable.
+        let (clean, _, _) = synth_macho_64_full(b"clean", &[], &["/tmp/evil-rpath"], false, None);
+        let garbage: &[u8] = &[0xDE, 0xAD, 0xBE, 0xEF, 0, 0, 0, 0];
+        let fat = synth_fat(&[&clean, garbage]);
+        let sig = MachOStructureRule
+            .evaluate(&ctx_for(fat))
+            .unwrap()
+            .expect("the good slice's finding must still surface");
+        assert!(sig.description.contains("writable/transient"));
+    }
+
+    #[test]
+    fn many_bogus_arches_alongside_one_clean_slice_is_not_applicable() {
+        // #46: a fat binary shaped like the verified regression — 24 bogus
+        // arch entries plus one real, clean slice. It must count as Mach-O
+        // (evasion would be scoring it as if it weren't), and the 24
+        // unwalkable declared arches must degrade the result to
+        // NotApplicable rather than let the clean slice read as fine.
+        let (real, _, _) =
+            synth_macho_64_full(b"clean", &["/usr/lib/libSystem.B.dylib"], &[], false, None);
+        let fat = synth_fat_with_bogus_arches(&real, 24);
+        assert!(matches!(
+            MachOStructureRule.evaluate(&ctx_for(fat)),
             Err(RuleOutcome::NotApplicable)
         ));
     }
@@ -462,7 +838,12 @@ mod tests {
 /// deliberate change; review the resulting `git diff` before committing.
 #[cfg(test)]
 mod fixture_gen {
-    use crate::macho::tests_support::synth_macho_64_full;
+    use crate::macho::tests_support::{
+        synth_fat, synth_fat_with_bogus_arches_aligned, synth_macho_64_duplicate_code_signature,
+        synth_macho_64_full, synth_macho_64_full_with_cd_flags,
+        synth_macho_64_full_with_cds_and_cms,
+    };
+    use crate::macho::CS_ADHOC;
     use std::path::Path;
 
     #[test]
@@ -495,6 +876,31 @@ mod fixture_gen {
         );
         std::fs::write(root.join("benign/macho_normal_loader"), benign).unwrap();
 
+        // Benign: an ad-hoc "Sign to Run Locally" Xcode Debug build shape —
+        // CS_ADHOC CodeDirectory flags, app-sandbox + get-task-allow
+        // entitlements (Xcode adds get-task-allow to every Debug build),
+        // benign system dylibs only. get-task-allow must not score on an
+        // ad-hoc binary (#37) — Xcode Debug builds are always ad-hoc-signed.
+        let adhoc_debug_entitlements = br#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+    <key>com.apple.security.app-sandbox</key><true/>
+    <key>com.apple.security.get-task-allow</key><true/>
+</dict></plist>"#;
+        let (adhoc_debug, _, _) = synth_macho_64_full_with_cd_flags(
+            b"\x55\x48\x89\xe5\x90adhoc debug build machine code padding to look real",
+            &["/usr/lib/libSystem.B.dylib"],
+            &[],
+            true,
+            Some(adhoc_debug_entitlements),
+            Some(CS_ADHOC),
+        );
+        std::fs::write(
+            root.join("benign/macho_adhoc_debug_get_task_allow"),
+            adhoc_debug,
+        )
+        .unwrap();
+
         // Suspicious: an rpath into /tmp plus a disable-library-validation
         // entitlement — both anomalies this rule looks for.
         let bad_entitlements = br#"<?xml version="1.0" encoding="UTF-8"?>
@@ -512,6 +918,128 @@ mod fixture_gen {
         std::fs::write(
             root.join("suspicious/macho_tmp_rpath_disable_lib_validation"),
             suspicious,
+        )
+        .unwrap();
+
+        // Suspicious: an LC_LOAD_DYLIB into per-user $TMPDIR
+        // (/private/var/folders/…), unsigned — the #39 gap this rule now covers.
+        let (tmpdir_dylib, _, _) = synth_macho_64_full(
+            b"\x55\x48\x89\xe5\x90tmpdir dylib machine code padding to look real",
+            &[
+                "/private/var/folders/zz/zyxvpxvq6csfxvn_n0000000000000/T/libupdate.dylib",
+                "/usr/lib/libSystem.B.dylib",
+            ],
+            &[],
+            false,
+            None,
+        );
+        std::fs::write(root.join("suspicious/macho_tmpdir_dylib"), tmpdir_dylib).unwrap();
+
+        // Suspicious: ad-hoc signed (CS_ADHOC) with disable-library-validation
+        // — the higher of the two entitlement weights (#37). Benign system
+        // dylibs only, so the entitlement is the sole anomaly.
+        let adhoc_entitlements = br#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+    <key>com.apple.security.cs.disable-library-validation</key><true/>
+</dict></plist>"#;
+        let (adhoc, _, _) = synth_macho_64_full_with_cd_flags(
+            b"\x55\x48\x89\xe5\x90adhoc machine code padding to look real",
+            &["/usr/lib/libSystem.B.dylib"],
+            &[],
+            true,
+            Some(adhoc_entitlements),
+            Some(CS_ADHOC),
+        );
+        std::fs::write(
+            root.join("suspicious/macho_adhoc_disable_lib_validation"),
+            adhoc,
+        )
+        .unwrap();
+
+        // Suspicious: a fat binary with one clean slice and one malformed
+        // (bad-magic) slice — the malformed slice must degrade the scan to
+        // NotApplicable/Partial rather than let the clean slice look fine on
+        // its own (#38). The clean slice carries an `osascript` string so the
+        // cross-platform suspicious-strings rule still fires on Ubuntu, where
+        // the codesign-backed rules don't run.
+        let (clean_slice, _, _) = synth_macho_64_full(
+            b"\x55\x48\x89\xe5\x90 shells out via osascript for testing",
+            &["/usr/lib/libSystem.B.dylib"],
+            &[],
+            false,
+            None,
+        );
+        let malformed_slice: &[u8] = &[0xDE, 0xAD, 0xBE, 0xEF, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+        let fat = synth_fat(&[&clean_slice, malformed_slice]);
+        std::fs::write(root.join("suspicious/macho_fat_malformed_slice"), fat).unwrap();
+
+        // Suspicious: a fat binary shaped like the #46 regression — 24 bogus
+        // arch entries (the kernel runs binaries like this; an arch-count cap
+        // alone must not be the discriminator) alongside one real, clean
+        // slice. The 24 unwalkable declared arches must degrade the scan to
+        // Partial rather than let the clean slice score fine. The slice
+        // carries an `osascript` string so suspicious-strings still fires on
+        // Ubuntu CI, where the codesign-backed rules don't run. This fixture
+        // is only ever parsed, never executed, so the bogus regions are
+        // packed tight (16-byte alignment) instead of the real 16 KiB the
+        // kernel requires — keeps the checked-in file a few KiB instead of ~400KB.
+        let (many_arches_slice, _, _) = synth_macho_64_full(
+            b"\x55\x48\x89\xe5\x90 shells out via osascript for testing",
+            &["/usr/lib/libSystem.B.dylib"],
+            &[],
+            false,
+            None,
+        );
+        let many_arches = synth_fat_with_bogus_arches_aligned(&many_arches_slice, 24, 16);
+        std::fs::write(root.join("suspicious/macho_fat_many_arches"), many_arches).unwrap();
+
+        // Suspicious: thin, two LC_CODE_SIGNATURE commands — the first
+        // carrying a real ad-hoc signature with disable-library-validation,
+        // the second pointing at zero-length data. `parse_thin` must reject
+        // this as malformed rather than let the second command silently
+        // erase the first's facts (#37); an `osascript` string keeps
+        // suspicious-strings firing on Ubuntu CI, where this rule reads back
+        // as NotApplicable (no walkable image) and the completeness gate is
+        // what pins this fixture's `partial` golden entry.
+        let duplicate_cs_entitlements = br#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+    <key>com.apple.security.cs.disable-library-validation</key><true/>
+</dict></plist>"#;
+        let duplicate_cs = synth_macho_64_duplicate_code_signature(
+            b"\x55\x48\x89\xe5\x90 shells out via osascript for testing",
+            Some(duplicate_cs_entitlements),
+            Some(CS_ADHOC),
+        );
+        std::fs::write(
+            root.join("suspicious/macho_duplicate_code_signature"),
+            duplicate_cs,
+        )
+        .unwrap();
+
+        // Suspicious: a CodeDirectory with flags=0 (no CS_ADHOC bit) and no
+        // CMS blob at all — a signer that never attached a real identity.
+        // The CS_ADHOC bit is self-declared, so this must still read as
+        // ad-hoc rather than as an unrecognized "identity" (#37). An
+        // `osascript` string keeps suspicious-strings firing on Ubuntu CI.
+        let identity_claim_entitlements = br#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+    <key>com.apple.security.cs.disable-library-validation</key><true/>
+</dict></plist>"#;
+        let (identity_claim, _, _) = synth_macho_64_full_with_cds_and_cms(
+            b"\x55\x48\x89\xe5\x90 shells out via osascript for testing",
+            &["/usr/lib/libSystem.B.dylib"],
+            &[],
+            true,
+            Some(identity_claim_entitlements),
+            &[(0, 0)], // slot 0, flags=0
+            None,      // no CMS blob
+        );
+        std::fs::write(
+            root.join("suspicious/macho_identity_claim_without_cms"),
+            identity_claim,
         )
         .unwrap();
     }

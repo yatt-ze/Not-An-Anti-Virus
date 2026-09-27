@@ -2,138 +2,176 @@
   "benign/CHANGELOG.md": {
     "score": 0,
     "recommendation": "no-action",
-    "rule_ids": []
+    "rule_ids": [],
+    "completeness": "complete"
   },
   "benign/ElectronDemo.app": {
     "score": 0,
     "recommendation": "no-action",
-    "rule_ids": []
+    "rule_ids": [],
+    "completeness": "complete"
+  },
+  "benign/Hello.class": {
+    "score": 0,
+    "recommendation": "no-action",
+    "rule_ids": [],
+    "completeness": "complete"
   },
   "benign/NamedDiff.app": {
     "score": 0,
     "recommendation": "no-action",
-    "rule_ids": []
+    "rule_ids": [],
+    "completeness": "complete"
   },
   "benign/SampleHelper.app": {
     "score": 8,
     "recommendation": "no-action",
     "rule_ids": [
       "launchd-persistence-plist"
-    ]
+    ],
+    "completeness": "complete"
   },
   "benign/admin_reset_prefs.sh": {
     "score": 0,
     "recommendation": "no-action",
-    "rule_ids": []
+    "rule_ids": [],
+    "completeness": "complete"
   },
   "benign/admin_toggle_wifi.sh": {
     "score": 0,
     "recommendation": "no-action",
-    "rule_ids": []
+    "rule_ids": [],
+    "completeness": "complete"
   },
   "benign/app_settings.json": {
     "score": 0,
     "recommendation": "no-action",
-    "rule_ids": []
+    "rule_ids": [],
+    "completeness": "complete"
   },
   "benign/build.sh": {
     "score": 0,
     "recommendation": "no-action",
-    "rule_ids": []
+    "rule_ids": [],
+    "completeness": "complete"
   },
   "benign/com.example.devtool.plist": {
     "score": 8,
     "recommendation": "no-action",
     "rule_ids": [
       "launchd-persistence-plist"
-    ]
+    ],
+    "completeness": "complete"
   },
   "benign/com.example.helper.plist": {
     "score": 0,
     "recommendation": "no-action",
-    "rule_ids": []
+    "rule_ids": [],
+    "completeness": "complete"
   },
   "benign/com.example.menubar.plist": {
     "score": 0,
     "recommendation": "no-action",
-    "rule_ids": []
+    "rule_ids": [],
+    "completeness": "complete"
   },
   "benign/compressed_archive.tar.gz": {
     "score": 0,
     "recommendation": "no-action",
-    "rule_ids": []
+    "rule_ids": [],
+    "completeness": "complete"
   },
   "benign/csv_report.py": {
     "score": 0,
     "recommendation": "no-action",
-    "rule_ids": []
+    "rule_ids": [],
+    "completeness": "complete"
   },
   "benign/formula.rb": {
     "score": 3,
     "recommendation": "no-action",
     "rule_ids": [
       "suspicious-strings"
-    ]
+    ],
+    "completeness": "complete"
   },
   "benign/formula_cmake.rb": {
     "score": 0,
     "recommendation": "no-action",
-    "rule_ids": []
+    "rule_ids": [],
+    "completeness": "complete"
   },
   "benign/formula_git_clone.rb": {
     "score": 0,
     "recommendation": "no-action",
-    "rule_ids": []
+    "rule_ids": [],
+    "completeness": "complete"
   },
   "benign/installer_nested.pkg": {
     "score": 6,
     "recommendation": "no-action",
     "rule_ids": [
       "unsigned-installer-package"
-    ]
+    ],
+    "completeness": "complete"
   },
   "benign/installer_no_scripts.pkg": {
     "score": 6,
     "recommendation": "no-action",
     "rule_ids": [
       "unsigned-installer-package"
-    ]
+    ],
+    "completeness": "complete"
   },
   "benign/installer_ordinary.pkg": {
     "score": 6,
     "recommendation": "no-action",
     "rule_ids": [
       "unsigned-installer-package"
-    ]
+    ],
+    "completeness": "complete"
+  },
+  "benign/macho_adhoc_debug_get_task_allow": {
+    "score": 4,
+    "recommendation": "no-action",
+    "rule_ids": [
+      "unsigned-binary"
+    ],
+    "completeness": "complete"
   },
   "benign/macho_like_but_incomplete": {
     "score": 4,
     "recommendation": "no-action",
     "rule_ids": [
       "unsigned-binary"
-    ]
+    ],
+    "completeness": "complete"
   },
   "benign/macho_normal_loader": {
     "score": 4,
     "recommendation": "no-action",
     "rule_ids": [
       "unsigned-binary"
-    ]
+    ],
+    "completeness": "complete"
   },
   "benign/pipe_to_checksum.sh": {
     "score": 0,
     "recommendation": "no-action",
-    "rule_ids": []
+    "rule_ids": [],
+    "completeness": "complete"
   },
   "benign/readme.txt": {
     "score": 0,
     "recommendation": "no-action",
-    "rule_ids": []
+    "rule_ids": [],
+    "completeness": "complete"
   },
   "benign/tiny_hello_arm64": {
     "score": 0,
     "recommendation": "no-action",
-    "rule_ids": []
+    "rule_ids": [],
+    "completeness": "complete"
   },
   "suspicious/adhoc_named_flags=0x20000": {
     "score": 9,
@@ -141,7 +179,8 @@
     "rule_ids": [
       "adhoc-signed-binary",
       "suspicious-strings"
-    ]
+    ],
+    "completeness": "complete"
   },
   "suspicious/com.apple.softwareupdate.plist": {
     "score": 36,
@@ -149,35 +188,40 @@
     "rule_ids": [
       "launchd-persistence-plist",
       "suspicious-strings"
-    ]
+    ],
+    "completeness": "complete"
   },
   "suspicious/dropper.sh": {
     "score": 23,
     "recommendation": "notify",
     "rule_ids": [
       "suspicious-strings"
-    ]
+    ],
+    "completeness": "complete"
   },
   "suspicious/dropper_base64_exec.sh": {
     "score": 13,
     "recommendation": "no-action",
     "rule_ids": [
       "suspicious-strings"
-    ]
+    ],
+    "completeness": "complete"
   },
   "suspicious/dropper_curl_pipe_bash.sh": {
     "score": 13,
     "recommendation": "no-action",
     "rule_ids": [
       "suspicious-strings"
-    ]
+    ],
+    "completeness": "complete"
   },
   "suspicious/dropper_osascript_fetch.sh": {
     "score": 9,
     "recommendation": "no-action",
     "rule_ids": [
       "suspicious-strings"
-    ]
+    ],
+    "completeness": "complete"
   },
   "suspicious/installer_applescript_preinstall.pkg": {
     "score": 15,
@@ -185,7 +229,8 @@
     "rule_ids": [
       "installer-script-suspicious",
       "unsigned-installer-package"
-    ]
+    ],
+    "completeness": "complete"
   },
   "suspicious/installer_curl_pipe_preinstall.pkg": {
     "score": 15,
@@ -193,7 +238,54 @@
     "rule_ids": [
       "installer-script-suspicious",
       "unsigned-installer-package"
-    ]
+    ],
+    "completeness": "complete"
+  },
+  "suspicious/macho_adhoc_disable_lib_validation": {
+    "score": 22,
+    "recommendation": "notify",
+    "rule_ids": [
+      "macho-loader-anomaly",
+      "unsigned-binary"
+    ],
+    "completeness": "complete"
+  },
+  "suspicious/macho_duplicate_code_signature": {
+    "score": 10,
+    "recommendation": "no-action",
+    "rule_ids": [
+      "suspicious-strings",
+      "unsigned-binary"
+    ],
+    "completeness": "partial"
+  },
+  "suspicious/macho_fat_malformed_slice": {
+    "score": 10,
+    "recommendation": "no-action",
+    "rule_ids": [
+      "suspicious-strings",
+      "unsigned-binary"
+    ],
+    "completeness": "partial"
+  },
+  "suspicious/macho_fat_many_arches": {
+    "score": 10,
+    "recommendation": "no-action",
+    "rule_ids": [
+      "suspicious-strings",
+      "unsigned-binary"
+    ],
+    "completeness": "partial"
+  },
+  "suspicious/macho_identity_claim_without_cms": {
+    "score": 28,
+    "recommendation": "notify",
+    "rule_ids": [
+      "macho-loader-anomaly",
+      "suspicious-strings",
+      "unsigned-binary"
+    ],
+    "completeness": "complete"
   },
   "suspicious/macho_tmp_rpath_disable_lib_validation": {
     "score": 29,
@@ -201,7 +293,17 @@
     "rule_ids": [
       "macho-loader-anomaly",
       "unsigned-binary"
-    ]
+    ],
+    "completeness": "complete"
+  },
+  "suspicious/macho_tmpdir_dylib": {
+    "score": 19,
+    "recommendation": "notify",
+    "rule_ids": [
+      "macho-loader-anomaly",
+      "unsigned-binary"
+    ],
+    "completeness": "complete"
   },
   "suspicious/packed_payload.sh": {
     "score": 31,
@@ -209,27 +311,31 @@
     "rule_ids": [
       "high-entropy-content",
       "suspicious-strings"
-    ]
+    ],
+    "completeness": "complete"
   },
   "suspicious/packed_payload_variant.py": {
     "score": 15,
     "recommendation": "notify",
     "rule_ids": [
       "high-entropy-content"
-    ]
+    ],
+    "completeness": "complete"
   },
   "suspicious/persistence_beacon.plist": {
     "score": 26,
     "recommendation": "notify",
     "rule_ids": [
       "launchd-persistence-plist"
-    ]
+    ],
+    "completeness": "complete"
   },
   "suspicious/tcc_keychain_exfil.sh": {
     "score": 21,
     "recommendation": "notify",
     "rule_ids": [
       "suspicious-strings"
-    ]
+    ],
+    "completeness": "complete"
   }
 }
