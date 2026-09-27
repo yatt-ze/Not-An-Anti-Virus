@@ -545,6 +545,7 @@ mod tests {
             file_len: Some(body.len() as u64),
             identity: None,
             source: ContentSource::File,
+            file: None,
             codesign_dv_cache: std::sync::OnceLock::new(),
             spctl_cache: std::sync::OnceLock::new(),
         }

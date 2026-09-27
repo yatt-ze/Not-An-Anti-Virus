@@ -301,6 +301,7 @@ mod tests {
             file_len: Some(body.len() as u64),
             identity: None,
             source: crate::context::ContentSource::File,
+            file: None,
             codesign_dv_cache: std::sync::OnceLock::new(),
             spctl_cache: std::sync::OnceLock::new(),
         }
@@ -446,6 +447,7 @@ mod tests {
             file_len: Some(64 * 1024 * 1024),
             identity: None,
             source: crate::context::ContentSource::File,
+            file: None,
             codesign_dv_cache: std::sync::OnceLock::new(),
             spctl_cache: std::sync::OnceLock::new(),
         };
@@ -494,6 +496,7 @@ mod tests {
             file_len: None,
             identity: None,
             source: crate::context::ContentSource::File,
+            file: None,
             codesign_dv_cache: std::sync::OnceLock::new(),
             spctl_cache: std::sync::OnceLock::new(),
         };
