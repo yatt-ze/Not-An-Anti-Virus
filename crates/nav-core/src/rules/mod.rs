@@ -60,6 +60,16 @@ pub trait Rule: Send + Sync {
     /// found nothing, and `Err(RuleOutcome::NotApplicable)` when the rule
     /// itself couldn't run here.
     fn evaluate(&self, ctx: &ScanContext) -> Result<Option<MatchedSignal>, RuleOutcome>;
+
+    /// True only when this rule's result for `ctx` doesn't depend on bytes
+    /// past `ctx.content` — it doesn't read content, or it read what it
+    /// needed itself (`read_at`/`for_each_window`) and returns
+    /// `NotApplicable` when it couldn't. Only consulted when `ctx` is
+    /// truncated; the default keeps "truncated ⇒ Partial" for any rule
+    /// that hasn't been checked.
+    fn covers_truncation(&self, _ctx: &ScanContext) -> bool {
+        false
+    }
 }
 
 /// The default built-in ruleset. Small for Phase 0a (§12) — the goal is
