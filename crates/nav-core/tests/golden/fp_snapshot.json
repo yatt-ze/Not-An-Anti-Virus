@@ -107,6 +107,12 @@
     "rule_ids": [],
     "completeness": "complete"
   },
+  "benign/inline_image_data_uri.js": {
+    "score": 0,
+    "recommendation": "no-action",
+    "rule_ids": [],
+    "completeness": "complete"
+  },
   "benign/installer_nested.pkg": {
     "score": 6,
     "recommendation": "no-action",
@@ -153,6 +159,12 @@
     "rule_ids": [
       "unsigned-binary"
     ],
+    "completeness": "complete"
+  },
+  "benign/pem_bundle.sh": {
+    "score": 0,
+    "recommendation": "no-action",
+    "rule_ids": [],
     "completeness": "complete"
   },
   "benign/pipe_to_checksum.sh": {
@@ -207,6 +219,33 @@
     ],
     "completeness": "complete"
   },
+  "suspicious/dropper_base64_narrow_wrap.sh": {
+    "score": 18,
+    "recommendation": "notify",
+    "rule_ids": [
+      "high-entropy-content",
+      "suspicious-strings"
+    ],
+    "completeness": "complete"
+  },
+  "suspicious/dropper_base64_packed.sh": {
+    "score": 18,
+    "recommendation": "notify",
+    "rule_ids": [
+      "high-entropy-content",
+      "suspicious-strings"
+    ],
+    "completeness": "complete"
+  },
+  "suspicious/dropper_base64_unquoted_assign.sh": {
+    "score": 18,
+    "recommendation": "notify",
+    "rule_ids": [
+      "high-entropy-content",
+      "suspicious-strings"
+    ],
+    "completeness": "complete"
+  },
   "suspicious/dropper_curl_pipe_bash.sh": {
     "score": 13,
     "recommendation": "no-action",
@@ -219,6 +258,15 @@
     "score": 9,
     "recommendation": "no-action",
     "rule_ids": [
+      "suspicious-strings"
+    ],
+    "completeness": "complete"
+  },
+  "suspicious/dropper_spoofed_data_uri.sh": {
+    "score": 18,
+    "recommendation": "notify",
+    "rule_ids": [
+      "high-entropy-content",
       "suspicious-strings"
     ],
     "completeness": "complete"

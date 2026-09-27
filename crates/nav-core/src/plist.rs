@@ -391,6 +391,7 @@ mod binary {
 
 mod xml_reader {
     use super::{PlistValue, MAX_DATA_BYTES, MAX_DEPTH, MAX_NODES};
+    use crate::base64;
     use crate::xml;
 
     pub(super) fn parse(bytes: &[u8]) -> Option<PlistValue> {
@@ -559,37 +560,10 @@ mod xml_reader {
 
     /// Best-effort bounded base64 decode. A malformed blob yields an empty vec
     /// rather than failing the parse — callers only need the value's shape.
+    /// Tolerant: any byte outside the alphabet (padding included) is skipped
+    /// rather than ending the decode, unlike `entropy`'s run decoder.
     fn decode_base64_bounded(s: &str) -> Vec<u8> {
-        fn val(c: u8) -> Option<u8> {
-            match c {
-                b'A'..=b'Z' => Some(c - b'A'),
-                b'a'..=b'z' => Some(c - b'a' + 26),
-                b'0'..=b'9' => Some(c - b'0' + 52),
-                b'+' => Some(62),
-                b'/' => Some(63),
-                _ => None,
-            }
-        }
-        let symbols: Vec<u8> = s.bytes().filter_map(val).collect();
-        let mut out = Vec::with_capacity(symbols.len() / 4 * 3);
-        for chunk in symbols.chunks(4) {
-            if chunk.len() < 2 {
-                break;
-            }
-            let b = |i: usize| chunk.get(i).copied().unwrap_or(0);
-            out.push((b(0) << 2) | (b(1) >> 4));
-            if chunk.len() >= 3 {
-                out.push((b(1) << 4) | (b(2) >> 2));
-            }
-            if chunk.len() >= 4 {
-                out.push((b(2) << 6) | b(3));
-            }
-            if out.len() > MAX_DATA_BYTES {
-                out.truncate(MAX_DATA_BYTES);
-                break;
-            }
-        }
-        out
+        base64::decode_bounded(s.as_bytes(), MAX_DATA_BYTES, base64::OnInvalid::Skip).0
     }
 }
 
