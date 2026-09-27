@@ -10,7 +10,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 use crate::bundle::{self, BundleLayout};
-use crate::context::MAX_CONTENT_BYTES;
+use crate::context::MAX_STREAM_BYTES;
 use crate::model::{Recommendation, ScanCompleteness, ScanResult};
 use crate::scan::scan_file;
 
@@ -233,7 +233,8 @@ fn outcome(collect_limit: Option<BudgetLimit>, byte_limit: Option<BudgetLimit>) 
 }
 
 /// Scan `files` in order until the summed read (each file's length clipped to
-/// the §3 per-file cap) would exceed `max_total_bytes`. Returns the results
+/// `MAX_STREAM_BYTES`, the most a rule streams from one file) would exceed
+/// `max_total_bytes`. Returns the results
 /// scored and `Some(TotalBytes)` if the cap stopped it short.
 fn scan_within_bytes(
     files: &[PathBuf],
@@ -243,7 +244,7 @@ fn scan_within_bytes(
     let mut used: u64 = 0;
     for f in files {
         let read_len = std::fs::metadata(f)
-            .map(|m| m.len().min(MAX_CONTENT_BYTES as u64))
+            .map(|m| m.len().min(MAX_STREAM_BYTES))
             .unwrap_or(0);
         // Always allow the first file through, so one large file still scans.
         if !results.is_empty() && used.saturating_add(read_len) > budget.max_total_bytes {
