@@ -312,6 +312,7 @@ mod tests {
             file: None,
             codesign_dv_cache: std::sync::OnceLock::new(),
             spctl_cache: std::sync::OnceLock::new(),
+            macho_cache: std::sync::OnceLock::new(),
         }
     }
 
@@ -458,6 +459,7 @@ mod tests {
             file: None,
             codesign_dv_cache: std::sync::OnceLock::new(),
             spctl_cache: std::sync::OnceLock::new(),
+            macho_cache: std::sync::OnceLock::new(),
         };
         assert!(matches!(
             LaunchdPersistenceRule.evaluate(&c),
@@ -537,6 +539,7 @@ mod tests {
             file: None,
             codesign_dv_cache: std::sync::OnceLock::new(),
             spctl_cache: std::sync::OnceLock::new(),
+            macho_cache: std::sync::OnceLock::new(),
         };
         assert!(matches!(
             LaunchdPersistenceRule.evaluate(&c),

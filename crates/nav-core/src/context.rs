@@ -118,6 +118,10 @@ pub struct ScanContext {
     pub(crate) codesign_dv_cache: OnceLock<Option<(bool, String)>>,
     /// Memoized `spctl` assessment spawn (§5.2), same reasoning as above.
     pub(crate) spctl_cache: OnceLock<Option<String>>,
+    /// Memoized offset-based Mach-O scan (§5.2, #45) — several rules ask
+    /// about the same file. `pub(crate)` for the same reason as the caches
+    /// above; use [`ScanContext::macho`] to read it.
+    pub(crate) macho_cache: OnceLock<crate::macho::MachOScan>,
 }
 
 impl ScanContext {
@@ -159,6 +163,7 @@ impl ScanContext {
             file,
             codesign_dv_cache: OnceLock::new(),
             spctl_cache: OnceLock::new(),
+            macho_cache: OnceLock::new(),
         }
     }
 
@@ -182,6 +187,7 @@ impl ScanContext {
             file: None,
             codesign_dv_cache: OnceLock::new(),
             spctl_cache: OnceLock::new(),
+            macho_cache: OnceLock::new(),
         }
     }
 
@@ -339,6 +345,25 @@ impl ScanContext {
             Some(at_load) if ObjectIdentity::of_path(&self.path) != Some(at_load) => None,
             _ => Some(out),
         }
+    }
+
+    /// Runs [`crate::macho::scan_ranged`] against this context at most once
+    /// per scan and returns the cached result — the offset-based Mach-O scan
+    /// several rules ask about (§5.2, #45). An unreadable context (no
+    /// `file_len`) scans as `is_macho: false` rather than panicking.
+    pub fn macho(&self) -> &crate::macho::MachOScan {
+        self.macho_cache
+            .get_or_init(|| crate::macho::scan_ranged(self))
+    }
+}
+
+impl crate::macho::ByteSource for ScanContext {
+    fn source_len(&self) -> u64 {
+        self.file_len.unwrap_or(0)
+    }
+
+    fn read_range(&self, off: u64, len: usize) -> Option<Vec<u8>> {
+        self.read_at(off, len)
     }
 }
 

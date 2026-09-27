@@ -1,13 +1,13 @@
 //! Mach-O structural/entitlement anomaly detection (§5.2, NAV-007).
 //!
-//! Purely structural: reads what `macho::parse` already recovered (load
-//! paths, code-signature presence, embedded entitlements, CodeDirectory
-//! flags) and scores two narrow anomalies — a dylib/rpath load path into a
-//! writable/transient location, and a handful of specific "exempt me from
-//! platform protections" entitlements, most weighted higher when the binary
-//! is only ad-hoc signed rather than under a real identity
-//! (`EntitlementPolicy::WeightedByIdentity`); `get-task-allow` is the
-//! exception — Xcode Debug builds are always ad-hoc and always request it, so
+//! Purely structural: reads what `ctx.macho()` (an offset-based scan, §5.2,
+//! #45) already recovered — load paths, code-signature presence, embedded
+//! entitlements, CodeDirectory flags — and scores two narrow anomalies: a
+//! dylib/rpath load path into a writable/transient location, and a handful
+//! of specific "exempt me from platform protections" entitlements, most
+//! weighted higher when the binary is only ad-hoc signed rather than under a
+//! real identity (`EntitlementPolicy::WeightedByIdentity`); `get-task-allow`
+//! is the exception — Xcode Debug builds are always ad-hoc and always request it, so
 //! it only scores on a confirmed identity-signed binary
 //! (`EntitlementPolicy::IdentityOnly`, #37). Each anomaly is
 //! corroboration-only (§5.1): summed weight is capped well under the
@@ -16,7 +16,7 @@
 
 use super::{Rule, RuleOutcome};
 use crate::context::ScanContext;
-use crate::macho::{self, MachOImage, CS_ADHOC};
+use crate::macho::{MachOImage, CS_ADHOC};
 use crate::model::{MatchedSignal, SignalCategory};
 use crate::plist::{self, PlistValue};
 use std::collections::HashMap;
@@ -98,17 +98,21 @@ impl Rule for MachOStructureRule {
     }
 
     fn evaluate(&self, ctx: &ScanContext) -> Result<Option<MatchedSignal>, RuleOutcome> {
-        let content = ctx.content.as_ref().ok_or(RuleOutcome::NotApplicable)?;
-        if !macho::is_macho_magic(content, ctx.truncated) {
+        if ctx.content.is_none() {
+            return Err(RuleOutcome::NotApplicable);
+        }
+        let scan = ctx.macho();
+        if !scan.is_macho {
             return Ok(None);
         }
         // Recognized Mach-O magic that the parser couldn't walk within its
-        // bounds (truncated header, malformed load commands, or a fat container
-        // with no walkable slice) — "couldn't check," not "clean" (§10/§11.8).
-        let (images, skipped_slices) = macho::parse_all_slices(content, ctx.truncated);
+        // bounds (malformed load commands, or a fat container with no
+        // walkable slice) — "couldn't check," not "clean" (§10/§11.8).
+        let images = &scan.images;
         if images.is_empty() {
             return Err(RuleOutcome::NotApplicable);
         }
+        let skipped_slices = scan.skipped_slices;
 
         // Judge a fat binary on all its slices: a malicious arm64 slice must
         // not disappear behind a clean x86_64 one (§5.2). Load-path anomalies
@@ -125,7 +129,7 @@ impl Rule for MachOStructureRule {
         let mut entitlement_weights: HashMap<&'static str, i32> = HashMap::new();
         let mut entitlements_gap = false;
 
-        for image in &images {
+        for image in images {
             for p in image
                 .dylibs
                 .iter()
@@ -136,7 +140,7 @@ impl Rule for MachOStructureRule {
                     bad_paths.push(p);
                 }
             }
-            match entitlements_finding(image, ctx.truncated) {
+            match entitlements_finding(image) {
                 Ok(Some(contributing)) => {
                     for (key, weight) in contributing {
                         entitlement_weights
@@ -212,6 +216,14 @@ impl Rule for MachOStructureRule {
             category: self.category(),
         }))
     }
+
+    /// Covered when the content is determined not to be Mach-O at all (a
+    /// header-level fact, never past the prefix), or when every slice and
+    /// every held code signature was read by offset (§5.2, #45).
+    fn covers_truncation(&self, ctx: &ScanContext) -> bool {
+        let scan = ctx.macho();
+        !scan.is_macho || scan.fully_examined()
+    }
 }
 
 /// Score this slice's entitlements, if any were recovered — the suspicious
@@ -221,17 +233,15 @@ impl Rule for MachOStructureRule {
 /// (entitlements live inside one, so there's nothing to examine), "signed
 /// and we held the whole file but found no entitlements blob" (a determined
 /// fact), and "signed, entitlements present, none of them suspicious."
-/// `Err(NotApplicable)` only when the read was `truncated` and signed with no
-/// entitlements recovered — the signature (near EOF) is exactly what an 8
-/// MiB capture loses first, so that combination can't be told apart from
-/// "truncated past a real entitlements blob" (§10/§11.8) and must not be
-/// read as a clean bill of health.
+/// `Err(NotApplicable)` only when the slice is signed and its
+/// `LC_CODE_SIGNATURE` region wasn't read (§5.2, #45) — that combination
+/// can't be told apart from "unread past a real entitlements blob"
+/// (§10/§11.8) and must not be read as a clean bill of health.
 fn entitlements_finding(
     image: &MachOImage,
-    truncated: bool,
 ) -> Result<Option<Vec<(&'static str, i32)>>, RuleOutcome> {
     let Some(xml) = &image.entitlements else {
-        return if image.has_code_signature && truncated {
+        return if image.has_code_signature && !image.signature_region_read {
             Err(RuleOutcome::NotApplicable)
         } else {
             Ok(None)
@@ -319,11 +329,12 @@ fn is_writable_or_transient(path: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::context::{ContentSource, ScanContext};
+    use crate::context::{ContentSource, ScanContext, MAX_CONTENT_BYTES};
     use crate::macho::tests_support::{
         synth_fat, synth_fat_with_bogus_arches, synth_macho_64_full,
         synth_macho_64_full_with_cd_flags, synth_macho_64_full_with_cds_and_cms,
     };
+    use crate::macho::MAX_SIGNATURE_BYTES;
     use std::path::PathBuf;
 
     fn ctx_for(content: Vec<u8>) -> ScanContext {
@@ -331,16 +342,22 @@ mod tests {
     }
 
     fn ctx_for_truncated(content: Vec<u8>, truncated: bool) -> ScanContext {
+        // `file_len` must match `content` for these in-memory-only fixtures:
+        // `ctx.macho()` reads through `ByteSource::source_len`, not `content`
+        // directly, so an unset length would make every offset look
+        // out-of-bounds.
+        let file_len = Some(content.len() as u64);
         ScanContext {
             path: PathBuf::from("test-binary"),
             content: Some(content),
             truncated,
-            file_len: None,
+            file_len,
             identity: None,
             source: ContentSource::File,
             file: None,
             codesign_dv_cache: std::sync::OnceLock::new(),
             spctl_cache: std::sync::OnceLock::new(),
+            macho_cache: std::sync::OnceLock::new(),
         }
     }
 
@@ -364,6 +381,7 @@ mod tests {
             file: None,
             codesign_dv_cache: std::sync::OnceLock::new(),
             spctl_cache: std::sync::OnceLock::new(),
+            macho_cache: std::sync::OnceLock::new(),
         };
         assert!(matches!(
             MachOStructureRule.evaluate(&c),
@@ -830,6 +848,106 @@ mod tests {
             MachOStructureRule.evaluate(&ctx_for(fat)),
             Err(RuleOutcome::NotApplicable)
         ));
+    }
+
+    /// A real temp file's worth of bytes, for the offset-based tests below
+    /// where the synthetic Mach-O itself must exceed `MAX_CONTENT_BYTES` —
+    /// mirrors `context.rs`/`strings.rs`'s temp-file test helpers.
+    fn write_temp_file(tag: &str, content: &[u8]) -> PathBuf {
+        let p = std::env::temp_dir().join(format!(
+            "nav-macho-structure-{tag}-{}-{:?}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::write(&p, content).unwrap();
+        p
+    }
+
+    /// A thin Mach-O whose code signature (entitlements + ad-hoc CD flags)
+    /// sits past the 8 MiB prefix must still be examined by offset: the rule
+    /// reports the entitlement, and `covers_truncation` confirms the scan was
+    /// complete despite `ctx.truncated` (§5.2, #45).
+    #[test]
+    fn signature_past_8mib_is_examined_by_offset() {
+        let xml = br#"<?xml version="1.0"?><plist version="1.0"><dict>
+            <key>com.apple.security.cs.disable-library-validation</key><true/>
+        </dict></plist>"#;
+        let padding = vec![0u8; MAX_CONTENT_BYTES + 4096];
+        let (bytes, _, sig_off) =
+            synth_macho_64_full_with_cd_flags(&padding, &[], &[], true, Some(xml), Some(CS_ADHOC));
+        assert!(
+            sig_off > MAX_CONTENT_BYTES,
+            "fixture must actually place the signature past the prefix"
+        );
+
+        let path = write_temp_file("sig-past-prefix", &bytes);
+        let ctx = ScanContext::load(&path);
+        assert!(ctx.truncated);
+
+        let sig = MachOStructureRule
+            .evaluate(&ctx)
+            .unwrap()
+            .expect("the entitlement past the prefix must still be reported");
+        assert!(sig.description.contains("disable-library-validation"));
+        assert!(MachOStructureRule.covers_truncation(&ctx));
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A fat binary whose second slice (and the dylib load path inside it)
+    /// lies entirely past the 8 MiB prefix must still be judged on that
+    /// slice, not just the first (§5.2, #45).
+    #[test]
+    fn a_fat_slice_past_8mib_loading_from_tmp_is_reported() {
+        let padding = vec![0u8; MAX_CONTENT_BYTES + 4096];
+        let (first, _, _) = synth_macho_64_full(&padding, &[], &[], false, None);
+        let (second, _, _) = synth_macho_64_full(b"evil", &["/tmp/evil.dylib"], &[], false, None);
+        let fat = synth_fat(&[&first, &second]);
+
+        let path = write_temp_file("fat-slice-past-prefix", &fat);
+        let ctx = ScanContext::load(&path);
+        assert!(ctx.truncated);
+
+        let sig = MachOStructureRule
+            .evaluate(&ctx)
+            .unwrap()
+            .expect("the second slice's dylib load must still be reported");
+        assert!(sig.description.contains("/tmp/evil.dylib"));
+        assert!(MachOStructureRule.covers_truncation(&ctx));
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A signature whose declared `datasize` exceeds `MAX_SIGNATURE_BYTES`
+    /// must not be read at all: `covers_truncation` is false, and — with no
+    /// other finding — the rule reports `NotApplicable` rather than a clean
+    /// bill of health (§5.2, #45).
+    #[test]
+    fn signature_declaring_more_than_the_signature_cap_is_not_read() {
+        let padding = vec![0u8; MAX_CONTENT_BYTES + 4096];
+        let (mut bytes, _, _) =
+            synth_macho_64_full_with_cd_flags(&padding, &[], &[], true, None, Some(CS_ADHOC));
+        let lc_off = bytes
+            .windows(4)
+            .position(|w| w == [0x1d, 0, 0, 0]) // LC_CODE_SIGNATURE, little-endian
+            .expect("LC_CODE_SIGNATURE present");
+        let huge_datasize = (MAX_SIGNATURE_BYTES as u32) + 1;
+        bytes[lc_off + 12..lc_off + 16].copy_from_slice(&huge_datasize.to_le_bytes());
+
+        let path = write_temp_file("signature-over-cap", &bytes);
+        let ctx = ScanContext::load(&path);
+        assert!(ctx.truncated);
+
+        assert!(!MachOStructureRule.covers_truncation(&ctx));
+        assert!(matches!(
+            MachOStructureRule.evaluate(&ctx),
+            Err(RuleOutcome::NotApplicable)
+        ));
+
+        let _ = std::fs::remove_file(&path);
     }
 }
 
