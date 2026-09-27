@@ -55,29 +55,13 @@ pub fn for_result(result: &ScanResult) -> u8 {
     }
 }
 
-/// Ranks exit codes by severity (HIGH_RISK > SUSPICIOUS > INDETERMINATE >
-/// CLEAN) for aggregation — distinct from the codes' numeric values, which
-/// are a public contract and stay fixed.
-fn severity(code: u8) -> u8 {
-    match code {
-        HIGH_RISK => 3,
-        SUSPICIOUS => 2,
-        INDETERMINATE => 1,
-        _ => 0, // CLEAN, and any other value
-    }
-}
-
-/// Exit code for a whole-target scan (§8): the most severe per-file code
-/// (`CLEAN` when `results` is empty), raised to `INDETERMINATE` if coverage
-/// was cut short (§11.12) and that severity was `CLEAN` — a real finding
-/// still outranks "couldn't finish," but incompleteness is never `CLEAN`.
+/// Exit code for a whole-target scan (§8): the worst file's, per
+/// [`TargetScan::worst`] (`CLEAN` when `results` is empty), raised to
+/// `INDETERMINATE` if coverage was cut short (§11.12) and that severity was
+/// `CLEAN` — a real finding still outranks "couldn't finish," but
+/// incompleteness is never `CLEAN`.
 pub fn for_target(scan: &TargetScan) -> u8 {
-    let worst = scan
-        .results
-        .iter()
-        .map(for_result)
-        .max_by_key(|&code| severity(code))
-        .unwrap_or(CLEAN);
+    let worst = scan.worst().map(for_result).unwrap_or(CLEAN);
     if !scan.coverage_complete() && worst == CLEAN {
         INDETERMINATE
     } else {
