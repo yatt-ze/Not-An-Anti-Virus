@@ -8,11 +8,12 @@
 //!   entropy and is deliberately not this rule's signal (issue #35).
 //! - **any other opaque binary**: not scored — expected to be high-entropy.
 
+use std::ops::Range;
 use std::path::Path;
 
 use super::{Rule, RuleOutcome};
 use crate::base64;
-use crate::context::ScanContext;
+use crate::context::{ScanContext, MAX_STREAM_BYTES};
 use crate::macho;
 use crate::model::{MatchedSignal, SignalCategory};
 
@@ -80,8 +81,10 @@ impl Rule for HighEntropyRule {
             return Ok(None);
         }
 
-        if let Some(image) = macho::parse(content) {
-            return Ok(self.eval_macho_text(content, &image));
+        // `images` empty (whether or not `is_macho`) falls through exactly as
+        // a `macho::parse` miss did — a non-Mach-O or unwalkable file.
+        if let Some(image) = ctx.macho().images.first() {
+            return self.eval_macho_text(ctx, content, image);
         }
 
         if looks_like_script_or_text(content, &ctx.path) {
@@ -91,22 +94,79 @@ impl Rule for HighEntropyRule {
         // Opaque non-Mach-O binary: high entropy is expected, so no suspicion.
         Ok(None)
     }
+
+    /// Covered when there's no `__TEXT` range to miss, or its EOF-clipped
+    /// range is small enough to stream and file-backed (§5.2, #45); a
+    /// script/text file whose content is itself unread stays uncovered.
+    fn covers_truncation(&self, ctx: &ScanContext) -> bool {
+        if let Some(image) = ctx.macho().images.first() {
+            return match &image.text_range {
+                None => true,
+                Some(range) => {
+                    let range = clip_to_file_len(ctx, range.clone());
+                    (range.end - range.start) <= MAX_STREAM_BYTES && ctx.is_file_backed()
+                }
+            };
+        }
+        if ctx.macho().is_macho {
+            return false;
+        }
+        ctx.content
+            .as_ref()
+            .is_some_and(|content| !looks_like_script_or_text(content, &ctx.path))
+    }
 }
 
 impl HighEntropyRule {
-    /// Score the entropy of a Mach-O's `__TEXT` code, clipped to the bytes we
-    /// actually captured (a bounded scan may not hold the whole section).
-    fn eval_macho_text(&self, content: &[u8], image: &macho::MachOImage) -> Option<MatchedSignal> {
-        let range = image.text_range.clone()?;
-        let start = usize::try_from(range.start).ok()?.min(content.len());
-        let end = usize::try_from(range.end).ok()?.min(content.len());
-        let text = content.get(start..end)?;
-        if text.len() < MIN_SAMPLE_BYTES {
-            return None;
+    /// Score a Mach-O's `__TEXT` code: streamed over its whole (EOF-clipped)
+    /// range when that fits `MAX_STREAM_BYTES`, else — as before #45 — only
+    /// over the part inside `content`.
+    fn eval_macho_text(
+        &self,
+        ctx: &ScanContext,
+        content: &[u8],
+        image: &macho::MachOImage,
+    ) -> Result<Option<MatchedSignal>, RuleOutcome> {
+        let Some(range) = image.text_range.clone() else {
+            return Ok(None);
+        };
+        let range = clip_to_file_len(ctx, range);
+        if range.is_empty() {
+            return Ok(None);
         }
 
-        let entropy = shannon_entropy(text);
-        if entropy < self.threshold {
+        if range.end - range.start <= MAX_STREAM_BYTES {
+            let mut counts = [0u64; 256];
+            let mut total = 0u64;
+            let delivered = ctx.for_each_window(range, 0, |window, _is_last| {
+                for &b in window {
+                    counts[b as usize] += 1;
+                }
+                total += window.len() as u64;
+            });
+            if !delivered {
+                return Err(RuleOutcome::NotApplicable);
+            }
+            return Ok(self.macho_signal(total, entropy_from_histogram(&counts, total)));
+        }
+
+        let start = usize::try_from(range.start)
+            .ok()
+            .map(|s| s.min(content.len()));
+        let end = usize::try_from(range.end)
+            .ok()
+            .map(|e| e.min(content.len()));
+        let Some(text) = start.zip(end).and_then(|(s, e)| content.get(s..e)) else {
+            return Ok(None);
+        };
+        Ok(self.macho_signal(text.len() as u64, shannon_entropy(text)))
+    }
+
+    /// Build the `__TEXT`-section signal if `entropy` over `len` bytes clears
+    /// [`MIN_SAMPLE_BYTES`]/[`Self::threshold`] — shared by the streamed and
+    /// content-only paths so their description format can't drift apart.
+    fn macho_signal(&self, len: u64, entropy: f64) -> Option<MatchedSignal> {
+        if len < MIN_SAMPLE_BYTES as u64 || entropy < self.threshold {
             return None;
         }
         Some(MatchedSignal {
@@ -115,8 +175,7 @@ impl HighEntropyRule {
             description: format!(
                 "high-entropy __TEXT section (entropy: {:.1} bits/byte over {} bytes) — \
                  consistent with packed/obfuscated code",
-                entropy,
-                text.len()
+                entropy, len
             ),
             category: self.category(),
         })
@@ -553,12 +612,30 @@ fn looks_like_script_or_text(content: &[u8], path: &Path) -> bool {
     printable * 100 / prefix.len() >= 85
 }
 
+/// Clip `range`'s end to `ctx`'s real length — tolerates a section size
+/// claiming bytes past EOF. Never returns a range with `end < start`.
+fn clip_to_file_len(ctx: &ScanContext, range: Range<u64>) -> Range<u64> {
+    let file_len = ctx.file_len.unwrap_or(0);
+    let end = range.end.min(file_len).max(range.start);
+    range.start..end
+}
+
 fn shannon_entropy(data: &[u8]) -> f64 {
     let mut counts = [0u64; 256];
     for &b in data {
         counts[b as usize] += 1;
     }
-    let len = data.len() as f64;
+    entropy_from_histogram(&counts, data.len() as u64)
+}
+
+/// Shannon entropy (bits/byte) of a byte distribution given as a 256-bucket
+/// histogram plus its total count — the shared core [`shannon_entropy`] and
+/// the streamed Mach-O path both use, so they can't disagree.
+fn entropy_from_histogram(counts: &[u64; 256], total: u64) -> f64 {
+    if total == 0 {
+        return 0.0;
+    }
+    let len = total as f64;
     counts
         .iter()
         .filter(|&&c| c > 0)
@@ -572,6 +649,7 @@ fn shannon_entropy(data: &[u8]) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::context::MAX_CONTENT_BYTES;
     use std::path::PathBuf;
 
     /// `total_len` high-entropy bytes, starting with `magic` — for building
@@ -595,6 +673,23 @@ mod tests {
             .collect()
     }
 
+    /// Write `body` to a fresh, uniquely-named temp file and return its path
+    /// — for tests that need a real file on disk, since bytes past
+    /// `MAX_CONTENT_BYTES` only reach a rule through `ScanContext`'s file
+    /// handle, never in-memory content (mirrors `context.rs`'s test helper).
+    fn write_temp_file(tag: &str, body: &[u8]) -> PathBuf {
+        let p = std::env::temp_dir().join(format!(
+            "nav-entropy-{tag}-{}-{:?}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::write(&p, body).unwrap();
+        p
+    }
+
     #[test]
     fn zero_bytes_all_same_is_low_entropy() {
         let data = vec![0u8; 4096];
@@ -604,6 +699,103 @@ mod tests {
     #[test]
     fn uniform_random_bytes_are_high_entropy() {
         assert!(shannon_entropy(&high_entropy_blob(65536)) > 7.5);
+    }
+
+    /// The histogram helper backing the streamed path must agree exactly
+    /// with the whole-buffer helper it now shares its core with.
+    #[test]
+    fn histogram_entropy_matches_shannon_entropy() {
+        let cycled_256: Vec<u8> = (0..4096u32).map(|i| (i % 256) as u8).collect();
+        for data in [
+            vec![0u8; 4096],
+            cycled_256,
+            high_entropy_blob(65536),
+            Vec::new(),
+        ] {
+            let mut counts = [0u64; 256];
+            for &b in &data {
+                counts[b as usize] += 1;
+            }
+            assert_eq!(
+                entropy_from_histogram(&counts, data.len() as u64),
+                shannon_entropy(&data)
+            );
+        }
+    }
+
+    /// A `__TEXT` section whose 8 MiB-clipped prefix is pure low-entropy but
+    /// whose full range (low prefix + a high-entropy tail past 8 MiB) clears
+    /// the threshold overall: streaming the whole section, not just the
+    /// captured prefix, is what makes this fire (§5.2, #45).
+    #[test]
+    fn macho_text_past_8mib_is_scored_on_the_whole_section() {
+        // LOW_LEN fills the entire captured prefix with zero bytes; HIGH_LEN
+        // (divisible by 256) cycles every byte value equally past it, giving
+        // an exact combined histogram: ~7.30 bits/byte overall (clears 7.0
+        // with margin) while the zero-only clipped prefix reads as 0.0.
+        const LOW_LEN: usize = MAX_CONTENT_BYTES;
+        const HIGH_LEN: usize = 40 * 1024 * 1024;
+        let mut payload = vec![0u8; LOW_LEN];
+        payload.extend((0..HIGH_LEN as u32).map(|i| (i % 256) as u8));
+        let full_len = payload.len() as u64;
+
+        let (image_bytes, range) = crate::macho::tests_support::synth_macho_64(&payload);
+        let path = write_temp_file("macho-past-8mib", &image_bytes);
+        let ctx = ScanContext::load(&path);
+        assert!(ctx.truncated, "fixture must exceed the 8 MiB capture");
+
+        // Confirm the premise: the clipped-to-content prefix alone is below
+        // the threshold — the old in-memory-only rule would not have fired.
+        let content = ctx.content.as_ref().unwrap();
+        let prefix_start = usize::try_from(range.start).unwrap();
+        assert!(shannon_entropy(&content[prefix_start..]) < ENTROPY_THRESHOLD);
+
+        let signal = HighEntropyRule::default()
+            .evaluate(&ctx)
+            .unwrap()
+            .expect("the whole __TEXT section should clear the threshold");
+        assert!(signal
+            .description
+            .contains(&format!("over {full_len} bytes")));
+        assert!(HighEntropyRule::default().covers_truncation(&ctx));
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A truncated file with no Mach-O magic and no text-like structure is
+    /// opaque-binary territory: never scored, and unread bytes past 8 MiB
+    /// can't change that, so the rule covers the truncation.
+    #[test]
+    fn truncated_opaque_binary_is_not_scored_and_covers_truncation() {
+        let path = write_temp_file(
+            "opaque-past-8mib",
+            &high_entropy_blob(MAX_CONTENT_BYTES + 1024 * 1024),
+        );
+        let ctx = ScanContext::load(&path);
+        assert!(ctx.truncated);
+
+        assert!(HighEntropyRule::default().evaluate(&ctx).unwrap().is_none());
+        assert!(HighEntropyRule::default().covers_truncation(&ctx));
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A truncated script/text file stays `Partial` by design: the
+    /// whole-content and base64 checks only see the captured prefix, so
+    /// bytes past it could still hide a payload.
+    #[test]
+    fn truncated_script_does_not_cover_truncation() {
+        let mut content = b"#!/bin/sh\n".to_vec();
+        while content.len() <= MAX_CONTENT_BYTES {
+            content.extend_from_slice(b"# padding line to keep this script large.\n");
+        }
+        let path = write_temp_file("script-past-8mib", &content);
+        let ctx = ScanContext::load(&path);
+        assert!(ctx.truncated);
+
+        assert!(!HighEntropyRule::default().covers_truncation(&ctx));
+
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
@@ -628,11 +820,12 @@ mod tests {
     fn high_entropy_payload_in_a_script_is_scored() {
         let mut content = b"#!/bin/sh\n# stage two:\n".to_vec();
         content.extend_from_slice(&high_entropy_blob(4096));
+        let file_len = Some(content.len() as u64);
         let ctx = ScanContext {
             path: PathBuf::from("dropper.sh"),
             content: Some(content),
             truncated: false,
-            file_len: None,
+            file_len,
             identity: None,
             source: crate::context::ContentSource::File,
             file: None,
@@ -648,11 +841,12 @@ mod tests {
     fn high_entropy_macho_text_is_scored() {
         let (image_bytes, _range) =
             crate::macho::tests_support::synth_macho_64(&high_entropy_blob(4096));
+        let file_len = Some(image_bytes.len() as u64);
         let ctx = ScanContext {
             path: PathBuf::from("packed"),
             content: Some(image_bytes),
             truncated: false,
-            file_len: None,
+            file_len,
             identity: None,
             source: crate::context::ContentSource::File,
             file: None,
@@ -669,11 +863,12 @@ mod tests {
     }
 
     fn make_ctx(path: &str, content: Vec<u8>) -> ScanContext {
+        let file_len = Some(content.len() as u64);
         ScanContext {
             path: PathBuf::from(path),
             content: Some(content),
             truncated: false,
-            file_len: None,
+            file_len,
             identity: None,
             source: crate::context::ContentSource::File,
             file: None,
