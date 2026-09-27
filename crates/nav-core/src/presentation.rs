@@ -36,32 +36,36 @@ pub const HIGH_RISK: u8 = 2;
 pub const INDETERMINATE: u8 = 3;
 pub const OPERATIONAL_ERROR: u8 = 4;
 
-/// Exit code for one file's [`ScanResult`] (§8): completeness dominates the
-/// verdict — anything short of `Complete` maps to `INDETERMINATE` regardless
-/// of score, never folded into `CLEAN` (§10/§11.8).
+/// Exit code for one file's [`ScanResult`] (§8): a real finding (`Notify` or
+/// `NotifyAndSuggestQuarantine`) always reports its severity regardless of
+/// completeness. `NoAction` maps to `CLEAN` only when `completeness` is
+/// `Complete`; otherwise `INDETERMINATE` — incompleteness never reads as
+/// `CLEAN` (§10/§11.8).
 pub fn for_result(result: &ScanResult) -> u8 {
-    if !matches!(result.completeness, ScanCompleteness::Complete) {
-        return INDETERMINATE;
-    }
     match result.recommendation {
-        Recommendation::NoAction => CLEAN,
-        Recommendation::Notify => SUSPICIOUS,
         Recommendation::NotifyAndSuggestQuarantine => HIGH_RISK,
+        Recommendation::Notify => SUSPICIOUS,
+        Recommendation::NoAction => {
+            if matches!(result.completeness, ScanCompleteness::Complete) {
+                CLEAN
+            } else {
+                INDETERMINATE
+            }
+        }
     }
 }
 
-/// Exit code for a whole-target scan: the worst scored file's code, raised to
-/// `INDETERMINATE` when the target's coverage was cut short by the scan
-/// budget (§11.12) — "couldn't finish scanning the target" is not "clean,"
-/// the target-level counterpart to [`for_result`]. `CLEAN` when nothing was
-/// scanned (callers that must tell "clean" from "empty" check `results`
-/// first).
+/// Exit code for a whole-target scan (§8): the worst file's, per
+/// [`TargetScan::worst`] (`CLEAN` when `results` is empty), raised to
+/// `INDETERMINATE` if coverage was cut short (§11.12) and that severity was
+/// `CLEAN` — a real finding still outranks "couldn't finish," but
+/// incompleteness is never `CLEAN`.
 pub fn for_target(scan: &TargetScan) -> u8 {
-    let worst = scan.results.iter().map(for_result).max().unwrap_or(CLEAN);
-    if scan.coverage_complete() {
-        worst
+    let worst = scan.worst().map(for_result).unwrap_or(CLEAN);
+    if !scan.coverage_complete() && worst == CLEAN {
+        INDETERMINATE
     } else {
-        worst.max(INDETERMINATE)
+        worst
     }
 }
 
@@ -89,6 +93,70 @@ mod tests {
             engine_version: "test".to_string(),
             evaluated_at: SystemTime::UNIX_EPOCH,
         }
+    }
+
+    /// A real finding reports its severity even when the result is partial.
+    #[test]
+    fn for_result_partial_high_risk_is_high_risk() {
+        let result = ScanResult {
+            completeness: ScanCompleteness::Partial,
+            recommendation: Recommendation::NotifyAndSuggestQuarantine,
+            ..sample_result()
+        };
+        assert_eq!(for_result(&result), HIGH_RISK);
+    }
+
+    /// A real finding reports its severity even when the result is partial.
+    #[test]
+    fn for_result_partial_notify_is_suspicious() {
+        let result = ScanResult {
+            completeness: ScanCompleteness::Partial,
+            recommendation: Recommendation::Notify,
+            ..sample_result()
+        };
+        assert_eq!(for_result(&result), SUSPICIOUS);
+    }
+
+    /// A partial "nothing found" result is indeterminate, not clean.
+    #[test]
+    fn for_result_partial_no_action_is_indeterminate() {
+        let result = ScanResult {
+            completeness: ScanCompleteness::Partial,
+            recommendation: Recommendation::NoAction,
+            ..sample_result()
+        };
+        assert_eq!(for_result(&result), INDETERMINATE);
+    }
+
+    /// An indeterminate "nothing found" result is indeterminate, not clean.
+    #[test]
+    fn for_result_indeterminate_no_action_is_indeterminate() {
+        let result = ScanResult {
+            completeness: ScanCompleteness::Indeterminate,
+            recommendation: Recommendation::NoAction,
+            ..sample_result()
+        };
+        assert_eq!(for_result(&result), INDETERMINATE);
+    }
+
+    /// A complete result maps each recommendation to its exit code directly.
+    #[test]
+    fn for_result_complete_maps_each_recommendation() {
+        let no_action = ScanResult {
+            recommendation: Recommendation::NoAction,
+            ..sample_result()
+        };
+        let notify = ScanResult {
+            recommendation: Recommendation::Notify,
+            ..sample_result()
+        };
+        let quarantine = ScanResult {
+            recommendation: Recommendation::NotifyAndSuggestQuarantine,
+            ..sample_result()
+        };
+        assert_eq!(for_result(&no_action), CLEAN);
+        assert_eq!(for_result(&notify), SUSPICIOUS);
+        assert_eq!(for_result(&quarantine), HIGH_RISK);
     }
 
     #[test]
@@ -149,5 +217,114 @@ mod tests {
         };
         assert!(!scan.coverage_complete());
         assert_eq!(for_target(&scan), INDETERMINATE);
+    }
+
+    /// #34: a high-risk file's exit code isn't masked by an unrelated
+    /// partial file in the same target.
+    #[test]
+    fn issue_34_high_risk_outranks_a_partial_sibling() {
+        let high_risk = ScanResult {
+            recommendation: Recommendation::NotifyAndSuggestQuarantine,
+            ..sample_result()
+        };
+        let partial_no_action = ScanResult {
+            completeness: ScanCompleteness::Partial,
+            ..sample_result()
+        };
+        let scan = TargetScan {
+            root: PathBuf::from("/tmp"),
+            kind: TargetKind::Directory,
+            primary: None,
+            skipped: Vec::new(),
+            unreadable: Vec::new(),
+            results: vec![high_risk, partial_no_action],
+            budget: BudgetOutcome::Within,
+        };
+        assert!(scan.coverage_complete());
+        assert_eq!(for_target(&scan), HIGH_RISK);
+    }
+
+    /// A `Notify` finding outranks an unrelated partial sibling the same way.
+    #[test]
+    fn suspicious_outranks_a_partial_sibling() {
+        let notify = ScanResult {
+            recommendation: Recommendation::Notify,
+            ..sample_result()
+        };
+        let partial_no_action = ScanResult {
+            completeness: ScanCompleteness::Partial,
+            ..sample_result()
+        };
+        let scan = TargetScan {
+            root: PathBuf::from("/tmp"),
+            kind: TargetKind::Directory,
+            primary: None,
+            skipped: Vec::new(),
+            unreadable: Vec::new(),
+            results: vec![notify, partial_no_action],
+            budget: BudgetOutcome::Within,
+        };
+        assert_eq!(for_target(&scan), SUSPICIOUS);
+    }
+
+    /// Two clean-or-nothing files, one partial, is indeterminate — there's no
+    /// real finding to outrank the incompleteness.
+    #[test]
+    fn no_finding_and_a_partial_sibling_is_indeterminate() {
+        let partial_no_action = ScanResult {
+            completeness: ScanCompleteness::Partial,
+            ..sample_result()
+        };
+        let scan = TargetScan {
+            root: PathBuf::from("/tmp"),
+            kind: TargetKind::Directory,
+            primary: None,
+            skipped: Vec::new(),
+            unreadable: Vec::new(),
+            results: vec![sample_result(), partial_no_action],
+            budget: BudgetOutcome::Within,
+        };
+        assert_eq!(for_target(&scan), INDETERMINATE);
+    }
+
+    /// A budget-exhausted target with a complete high-risk file still exits
+    /// high-risk — the finding outranks "couldn't finish."
+    #[test]
+    fn budget_exhausted_with_a_high_risk_file_is_high_risk() {
+        let high_risk = ScanResult {
+            recommendation: Recommendation::NotifyAndSuggestQuarantine,
+            ..sample_result()
+        };
+        let scan = TargetScan {
+            root: PathBuf::from("/tmp"),
+            kind: TargetKind::Directory,
+            primary: None,
+            skipped: Vec::new(),
+            unreadable: Vec::new(),
+            results: vec![high_risk],
+            budget: BudgetOutcome::Exhausted(BudgetLimit::Files),
+        };
+        assert_eq!(for_target(&scan), HIGH_RISK);
+    }
+
+    /// An unreadable subdirectory alongside a complete `Notify` file still
+    /// exits suspicious — the finding outranks "couldn't finish."
+    #[test]
+    fn unreadable_subdirectory_with_a_notify_file_is_suspicious() {
+        let notify = ScanResult {
+            recommendation: Recommendation::Notify,
+            ..sample_result()
+        };
+        let scan = TargetScan {
+            root: PathBuf::from("/tmp"),
+            kind: TargetKind::Directory,
+            primary: None,
+            skipped: Vec::new(),
+            unreadable: vec![PathBuf::from("/tmp/locked")],
+            results: vec![notify],
+            budget: BudgetOutcome::Within,
+        };
+        assert!(!scan.coverage_complete());
+        assert_eq!(for_target(&scan), SUSPICIOUS);
     }
 }
