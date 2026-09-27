@@ -406,10 +406,12 @@ mod tests {
         );
     }
 
-    /// The codesign/quarantine/persistence/package rules now opt into
-    /// `covers_truncation`, but the content rules (`HighEntropyRule`,
-    /// `SuspiciousStringsRule`, `MachOStructureRule`) still don't — so a
-    /// truncated real ruleset stays `Partial`, unchanged by this commit.
+    /// The codesign/quarantine/persistence/package rules opt into
+    /// `covers_truncation` unconditionally; `SuspiciousStringsRule` opts in
+    /// only for a file-backed context within the streaming cap, which this
+    /// fixture's `u64::MAX` length exceeds. `HighEntropyRule` and
+    /// `MachOStructureRule` still don't opt in at all — so a truncated real
+    /// ruleset here stays `Partial`.
     #[test]
     fn default_ruleset_on_truncated_macho_content_is_still_partial() {
         use crate::context::ContentSource;

@@ -241,7 +241,10 @@ impl ScanContext {
     /// `STREAM_CHUNK` new bytes, so any byte string of length `<= overlap + 1`
     /// lying in `range` appears whole in at least one window. At most one
     /// window is alive at a time. `overlap` must be `< STREAM_CHUNK`
-    /// (debug-asserted; clamped in release).
+    /// (debug-asserted; clamped in release). `f`'s bool argument is `true`
+    /// only for the window that ends at `range.end` — the true end of the
+    /// streamed range, as opposed to a window edge that a later window will
+    /// still extend.
     ///
     /// Returns `true` only if the whole range was delivered. Returns `false`,
     /// having delivered whatever it already had, if the range is inverted,
@@ -253,7 +256,7 @@ impl ScanContext {
         &self,
         range: std::ops::Range<u64>,
         overlap: usize,
-        mut f: impl FnMut(&[u8]),
+        mut f: impl FnMut(&[u8], bool),
     ) -> bool {
         debug_assert!(overlap < STREAM_CHUNK);
         let overlap = overlap.min(STREAM_CHUNK.saturating_sub(1));
@@ -283,10 +286,11 @@ impl ScanContext {
             };
             let mut window = carry;
             window.extend_from_slice(&chunk);
-            f(&window);
+            pos += want as u64;
+            let is_last = pos == range.end;
+            f(&window, is_last);
             let keep = overlap.min(window.len());
             carry = window[window.len() - keep..].to_vec();
-            pos += want as u64;
         }
         true
     }
@@ -534,7 +538,7 @@ mod tests {
         let mut call_count = 0u64;
         let mut total_new_bytes = 0u64;
         let mut found_marker = false;
-        let ok = ctx.for_each_window(range.clone(), overlap, |window| {
+        let ok = ctx.for_each_window(range.clone(), overlap, |window, is_last| {
             if window.windows(marker.len()).any(|w| w == marker) {
                 found_marker = true;
             }
@@ -545,6 +549,7 @@ mod tests {
             };
             total_new_bytes += new_bytes as u64;
             call_count += 1;
+            assert_eq!(is_last, total_new_bytes == range.end - range.start);
         });
 
         assert!(ok);
@@ -561,7 +566,7 @@ mod tests {
     fn for_each_window_rejects_a_range_past_eof() {
         let path = temp_file("for-each-window-eof", b"hello world");
         let ctx = ScanContext::load(&path);
-        assert!(!ctx.for_each_window(0..1000, 0, |_| {}));
+        assert!(!ctx.for_each_window(0..1000, 0, |_, _| {}));
         let _ = std::fs::remove_file(&path);
     }
 
@@ -571,7 +576,7 @@ mod tests {
     fn for_each_window_rejects_a_range_longer_than_max_stream_bytes_without_reading() {
         let ctx = ScanContext::from_embedded_bytes("x", vec![1, 2, 3], false);
         let mut calls = 0u32;
-        let ok = ctx.for_each_window(0..(MAX_STREAM_BYTES + 1), 0, |_| {
+        let ok = ctx.for_each_window(0..(MAX_STREAM_BYTES + 1), 0, |_, _| {
             calls += 1;
         });
         assert!(!ok);
