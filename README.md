@@ -86,14 +86,16 @@ navctl rules list
 ```
 
 **Exit codes** report scan completeness as well as verdict, so a script can
-tell "checked, clean" apart from "couldn't finish":
+tell "checked, clean" apart from "couldn't finish". A finding outranks an
+incomplete scan: a flagged file returns `1`/`2` even if part of the scan
+came up short (`--json` carries `completeness`):
 
 | Code | Meaning |
 |---|---|
 | `0` | Clean, scan complete |
 | `1` | Suspicious |
 | `2` | High risk |
-| `3` | Indeterminate or incomplete (e.g. the file couldn't be fully read) |
+| `3` | Nothing flagged, but the scan was incomplete (e.g. the file couldn't be fully read) |
 | `4` | Operational error |
 
 ## Repository layout
