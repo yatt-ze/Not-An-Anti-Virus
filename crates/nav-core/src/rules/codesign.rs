@@ -7,6 +7,7 @@
 
 use super::{Rule, RuleOutcome};
 use crate::context::ScanContext;
+use crate::macho::{CS_ADHOC, CS_LINKER_SIGNED};
 use crate::model::{MatchedSignal, SignalCategory};
 
 /// What `codesign -dv` says about a code object's signature. Doesn't yet say
@@ -24,11 +25,6 @@ enum DvStatus {
     /// A real (non-ad-hoc) identity — Developer ID, Apple, or otherwise.
     Signed,
 }
-
-/// `CS_ADHOC`, from `<Security/CSCommon.h>`'s `CodeDirectory` flag bits.
-const CS_ADHOC: u32 = 0x2;
-/// `CS_LINKER_SIGNED`, from `<Security/CSCommon.h>`'s `CodeDirectory` flag bits.
-const CS_LINKER_SIGNED: u32 = 0x20000;
 
 /// False if `path`'s string form contains a newline or carriage return. Both
 /// `codesign` and `spctl` echo the scanned path back into the stderr we parse
@@ -150,7 +146,7 @@ impl Rule for UnsignedBinaryRule {
         // recognize (text, tarball, `.pkg` — whose xar signature it can't
         // read), so gate on Mach-O magic first or the rule calls a README an
         // unsigned binary (§10/§11.8).
-        if !crate::macho::is_macho_magic(content) {
+        if !crate::macho::is_macho_magic(content, ctx.truncated) {
             return Ok(None);
         }
 
@@ -196,7 +192,7 @@ impl Rule for AdHocSignedRule {
             return Err(RuleOutcome::NotApplicable);
         }
         let content = ctx.content.as_ref().ok_or(RuleOutcome::NotApplicable)?;
-        if !crate::macho::is_macho_magic(content) {
+        if !crate::macho::is_macho_magic(content, ctx.truncated) {
             return Ok(None);
         }
 
@@ -252,7 +248,7 @@ impl Rule for RevokedSignatureRule {
             return Err(RuleOutcome::NotApplicable);
         }
         let content = ctx.content.as_ref().ok_or(RuleOutcome::NotApplicable)?;
-        if !crate::macho::is_macho_magic(content) {
+        if !crate::macho::is_macho_magic(content, ctx.truncated) {
             return Ok(None);
         }
 
@@ -371,7 +367,7 @@ impl Rule for UnnotarizedSignedRule {
             return Err(RuleOutcome::NotApplicable);
         }
         let content = ctx.content.as_ref().ok_or(RuleOutcome::NotApplicable)?;
-        if !crate::macho::is_macho_magic(content) {
+        if !crate::macho::is_macho_magic(content, ctx.truncated) {
             return Ok(None);
         }
         // Notarization presupposes a real identity to submit for notarization.
@@ -418,7 +414,7 @@ impl Rule for NotarizedRule {
             return Err(RuleOutcome::NotApplicable);
         }
         let content = ctx.content.as_ref().ok_or(RuleOutcome::NotApplicable)?;
-        if !crate::macho::is_macho_magic(content) {
+        if !crate::macho::is_macho_magic(content, ctx.truncated) {
             return Ok(None);
         }
         if run_codesign_dv(ctx)? != DvStatus::Signed {
