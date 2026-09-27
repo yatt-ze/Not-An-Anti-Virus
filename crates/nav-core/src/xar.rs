@@ -180,13 +180,19 @@ pub enum XarEntryError {
     Undecodable(InflateError),
 }
 
+/// True if `data` opens with the xar magic (`xar!`). [`parse`] uses this same
+/// check to decide whether `data` is a package at all, so the two can't drift.
+pub(crate) fn has_xar_magic(data: &[u8]) -> bool {
+    be_u32(data, 0) == Some(XAR_MAGIC)
+}
+
 /// Parse a xar container's header and table of contents.
 ///
 /// `None` only when `data` doesn't start with the xar magic (not a package).
 /// Once the magic matches, every later failure yields an archive carrying a
 /// [`XarHalt`] — the header and recovered entries are still evidence.
 pub fn parse(data: &[u8], limits: &XarLimits) -> Option<XarArchive> {
-    if be_u32(data, 0)? != XAR_MAGIC {
+    if !has_xar_magic(data) {
         return None;
     }
 
@@ -721,6 +727,14 @@ mod tests {
         assert!(a.files.iter().all(|f| f.name != "Scripts"));
         // Absence of scripts must not look like a failure to read them.
         assert!(a.metadata_entries().any(|f| f.name == "PackageInfo"));
+    }
+
+    /// Mirrors `parse`'s own magic check.
+    #[test]
+    fn has_xar_magic_matches_parses_gate() {
+        assert!(has_xar_magic(b"xar!\x00\x1c\x00\x01"));
+        assert!(!has_xar_magic(b""));
+        assert!(!has_xar_magic(b"PK\x03\x04"));
     }
 
     #[test]

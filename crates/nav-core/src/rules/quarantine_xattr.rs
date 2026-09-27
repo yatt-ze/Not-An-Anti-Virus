@@ -31,6 +31,11 @@ impl Rule for QuarantineXattrRule {
         }
         has_quarantine_xattr(&ctx.path)
     }
+
+    /// Reads an xattr, never `ctx.content` — the content cap is irrelevant.
+    fn covers_truncation(&self, _ctx: &ScanContext) -> bool {
+        true
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -51,4 +56,28 @@ fn has_quarantine_xattr(path: &std::path::Path) -> Result<Option<MatchedSignal>,
 #[cfg(not(target_os = "macos"))]
 fn has_quarantine_xattr(_path: &std::path::Path) -> Result<Option<MatchedSignal>, RuleOutcome> {
     Err(RuleOutcome::NotApplicable)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::context::ContentSource;
+    use std::path::PathBuf;
+
+    /// Reads an xattr, so a truncated content prefix has nothing to miss.
+    #[test]
+    fn covers_truncation_is_true() {
+        let c = ScanContext {
+            path: PathBuf::from("app"),
+            content: Some(b"anything".to_vec()),
+            truncated: true,
+            file_len: Some(8),
+            identity: None,
+            source: ContentSource::File,
+            file: None,
+            codesign_dv_cache: std::sync::OnceLock::new(),
+            spctl_cache: std::sync::OnceLock::new(),
+        };
+        assert!(QuarantineXattrRule.covers_truncation(&c));
+    }
 }

@@ -161,6 +161,12 @@ impl Rule for UnsignedBinaryRule {
             Ok(None) // signed (ad-hoc or real) — other rules' concern
         }
     }
+
+    /// `ctx.content` is only consulted for the Mach-O magic gate at the
+    /// header; the verdict itself comes from `codesign` run on the whole file.
+    fn covers_truncation(&self, _ctx: &ScanContext) -> bool {
+        true
+    }
 }
 
 /// Weight for a binary carrying a hand-applied ad-hoc signature — no real
@@ -207,6 +213,11 @@ impl Rule for AdHocSignedRule {
         } else {
             Ok(None)
         }
+    }
+
+    /// Same as `UnsignedBinaryRule`: content only gates on the Mach-O magic.
+    fn covers_truncation(&self, _ctx: &ScanContext) -> bool {
+        true
     }
 }
 
@@ -268,6 +279,11 @@ impl Rule for RevokedSignatureRule {
         } else {
             Ok(None)
         }
+    }
+
+    /// Same as `UnsignedBinaryRule`: content only gates on the Mach-O magic.
+    fn covers_truncation(&self, _ctx: &ScanContext) -> bool {
+        true
     }
 }
 
@@ -387,6 +403,11 @@ impl Rule for UnnotarizedSignedRule {
             _ => Ok(None),
         }
     }
+
+    /// Same as `UnsignedBinaryRule`: content only gates on the Mach-O magic.
+    fn covers_truncation(&self, _ctx: &ScanContext) -> bool {
+        true
+    }
 }
 
 /// Notes a binary that Apple has notarized — a contributing negative signal
@@ -432,6 +453,11 @@ impl Rule for NotarizedRule {
             }
             _ => Ok(None),
         }
+    }
+
+    /// Same as `UnsignedBinaryRule`: content only gates on the Mach-O magic.
+    fn covers_truncation(&self, _ctx: &ScanContext) -> bool {
+        true
     }
 }
 
@@ -549,6 +575,25 @@ mod tests {
             codesign_dv_cache: std::sync::OnceLock::new(),
             spctl_cache: std::sync::OnceLock::new(),
         }
+    }
+
+    fn truncated_ctx(name: &str, body: &[u8]) -> ScanContext {
+        ScanContext {
+            truncated: true,
+            ..ctx(name, body)
+        }
+    }
+
+    /// All five rules' verdicts come from `codesign`/`spctl` on the whole
+    /// file, not the truncated prefix — see the module-level doc comments.
+    #[test]
+    fn all_codesign_rules_cover_truncation_on_a_truncated_macho_context() {
+        let c = truncated_ctx("app", b"\xfe\xed\xfa\xcf");
+        assert!(UnsignedBinaryRule.covers_truncation(&c));
+        assert!(AdHocSignedRule.covers_truncation(&c));
+        assert!(RevokedSignatureRule.covers_truncation(&c));
+        assert!(UnnotarizedSignedRule.covers_truncation(&c));
+        assert!(NotarizedRule.covers_truncation(&c));
     }
 
     /// Without the Mach-O gate this rule fired on every non-binary file

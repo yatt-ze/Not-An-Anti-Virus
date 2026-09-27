@@ -81,22 +81,26 @@ impl PlistValue {
     }
 }
 
+/// True if `bytes` opens with either recognized plist form (binary or XML,
+/// after a BOM/whitespace prefix). [`parse`] uses this same check to dispatch,
+/// so the two can't drift.
+pub(crate) fn could_be_plist(bytes: &[u8]) -> bool {
+    bytes.starts_with(b"bplist00") || skip_bom_and_ws(bytes).first() == Some(&b'<')
+}
+
 /// Parse `bytes` as a binary (`bplist00`) or XML property list.
 ///
 /// Returns `None` for anything that isn't a plist this reader recognizes, or
 /// that it can't walk within its bounds — truncated, malformed, cyclic, an
 /// unsupported object type, or past the depth/node ceilings. Never panics.
 pub fn parse(bytes: &[u8]) -> Option<PlistValue> {
+    if !could_be_plist(bytes) {
+        return None;
+    }
     if bytes.starts_with(b"bplist00") {
         return binary::parse(bytes);
     }
-
-    let text = skip_bom_and_ws(bytes);
-    if text.first() == Some(&b'<') {
-        return xml_reader::parse(text);
-    }
-
-    None
+    xml_reader::parse(skip_bom_and_ws(bytes))
 }
 
 /// Skip a UTF-8 BOM and leading ASCII whitespace, returning the remaining slice.
@@ -752,6 +756,18 @@ mod tests {
             .unwrap();
         assert_eq!(args.len(), 3);
         assert_eq!(args[2].as_str(), Some("payload"));
+    }
+
+    /// Mirrors `parse`'s own dispatch: binary magic, XML after a BOM/whitespace
+    /// prefix, and everything else.
+    #[test]
+    fn could_be_plist_matches_parses_dispatch() {
+        assert!(could_be_plist(b"bplist00"));
+        assert!(could_be_plist(b"  \n<plist>"));
+        assert!(could_be_plist(&[0xEF, 0xBB, 0xBF, b'<']));
+        assert!(!could_be_plist(b""));
+        assert!(!could_be_plist(b"#!/bin/sh\necho hi\n"));
+        assert!(!could_be_plist(b"\x7fELF\x02\x01\x01\x00"));
     }
 
     #[test]

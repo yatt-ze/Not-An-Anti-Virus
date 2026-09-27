@@ -125,6 +125,14 @@ impl Rule for LaunchdPersistenceRule {
             category: self.category(),
         }))
     }
+
+    /// A truncated prefix that can't even look like a plist has nothing this
+    /// rule could have missed in the unread bytes.
+    fn covers_truncation(&self, ctx: &ScanContext) -> bool {
+        ctx.content
+            .as_deref()
+            .is_some_and(|c| !plist::could_be_plist(c))
+    }
 }
 
 /// The launchd job keys this rule looks at, extracted from a parsed plist.
@@ -485,6 +493,36 @@ mod tests {
             eval("/usr/local/bin/tool", b"#!/bin/sh\necho hi\n"),
             Ok(None)
         ));
+    }
+
+    fn truncated_ctx(path: &str, body: &[u8]) -> ScanContext {
+        ScanContext {
+            truncated: true,
+            ..ctx(path, body)
+        }
+    }
+
+    /// Content that can't parse as a plist even from a prefix — nothing past
+    /// the cap could change that.
+    #[test]
+    fn covers_truncation_true_for_non_plist_prefixes() {
+        assert!(LaunchdPersistenceRule.covers_truncation(&truncated_ctx("x", b"\xfe\xed\xfa\xcf")));
+        assert!(LaunchdPersistenceRule.covers_truncation(&truncated_ctx("x", b"plain text\n")));
+    }
+
+    /// A truncated prefix that does look like a plist (any of the forms
+    /// `plist::could_be_plist` recognizes) might hide the deciding keys past
+    /// the cap — not covered.
+    #[test]
+    fn covers_truncation_false_for_plist_looking_prefixes() {
+        assert!(!LaunchdPersistenceRule
+            .covers_truncation(&truncated_ctx("x", b"<?xml version=\"1.0\"?><plist>")));
+        assert!(!LaunchdPersistenceRule
+            .covers_truncation(&truncated_ctx("x", b"   \n<plist version=\"1.0\">")));
+        let mut bom_prefixed = vec![0xEF, 0xBB, 0xBF];
+        bom_prefixed.extend_from_slice(b"<plist>");
+        assert!(!LaunchdPersistenceRule.covers_truncation(&truncated_ctx("x", &bom_prefixed)));
+        assert!(!LaunchdPersistenceRule.covers_truncation(&truncated_ctx("x", b"bplist00")));
     }
 
     #[test]

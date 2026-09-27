@@ -405,4 +405,30 @@ mod tests {
             ScanCompleteness::Partial
         );
     }
+
+    /// The codesign/quarantine/persistence/package rules now opt into
+    /// `covers_truncation`, but the content rules (`HighEntropyRule`,
+    /// `SuspiciousStringsRule`, `MachOStructureRule`) still don't — so a
+    /// truncated real ruleset stays `Partial`, unchanged by this commit.
+    #[test]
+    fn default_ruleset_on_truncated_macho_content_is_still_partial() {
+        use crate::context::ContentSource;
+        use std::sync::OnceLock;
+
+        let ctx = ScanContext {
+            path: "app".into(),
+            content: Some(b"\xfe\xed\xfa\xcf".to_vec()),
+            truncated: true,
+            file_len: Some(u64::MAX),
+            identity: None,
+            source: ContentSource::File,
+            file: None,
+            codesign_dv_cache: OnceLock::new(),
+            spctl_cache: OnceLock::new(),
+        };
+        assert_eq!(
+            scan_context(&ctx, &default_ruleset()).completeness,
+            ScanCompleteness::Partial
+        );
+    }
 }
