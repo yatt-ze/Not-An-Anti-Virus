@@ -88,7 +88,7 @@ navctl rules list
 **Exit codes** report scan completeness as well as verdict, so a script can
 tell "checked, clean" apart from "couldn't finish". A finding outranks an
 incomplete scan: a flagged file returns `1`/`2` even if part of the scan
-came up short (`--json` carries `completeness`):
+came up short (check each file's `completeness` in `--json`, and stderr for skipped coverage):
 
 | Code | Meaning |
 |---|---|
