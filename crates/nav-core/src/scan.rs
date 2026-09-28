@@ -410,15 +410,18 @@ mod tests {
         );
     }
 
-    /// The codesign/quarantine rules opt into `covers_truncation`
-    /// unconditionally, and persistence/package do too for content that
-    /// doesn't look like their own format (true here). `HighEntropyRule` and
-    /// `MachOStructureRule` also cover this fixture — its unreadable
-    /// Mach-O-shaped content reads as "not Mach-O" here, which both treat as
-    /// covered. `SuspiciousStringsRule` is the one holdout: it opts in only
-    /// for a file-backed context within the streaming cap, which this
-    /// fixture's `u64::MAX` length exceeds — so a truncated real ruleset
-    /// here still stays `Partial`.
+    /// The codesign rules are NotApplicable — `codesign` can't run against a
+    /// path ("app") that doesn't exist — and persistence/package are covered
+    /// for content that doesn't look like their own format (true here).
+    /// `ctx.macho()` recognizes this fixture's magic as Mach-O rather than
+    /// misreading the unreadable-past-content structure as "not Mach-O"
+    /// (§10/§11.8, #45 follow-up): `MachOStructureRule` is NotApplicable
+    /// (magic recognized, nothing walkable), and `HighEntropyRule` no longer
+    /// covers truncation either, since this isn't the "definitely not
+    /// Mach-O" case it used to fall into. `SuspiciousStringsRule` never
+    /// covers here regardless: it opts in only for a file-backed context
+    /// within the streaming cap, which this fixture's `u64::MAX` length
+    /// exceeds — so a truncated real ruleset here still stays `Partial`.
     #[test]
     fn default_ruleset_on_truncated_macho_content_is_still_partial() {
         use crate::context::ContentSource;

@@ -502,8 +502,21 @@ pub fn scan_ranged(src: &(impl ByteSource + ?Sized)) -> MachOScan {
     };
 
     let head_len = (8u64.saturating_add(MAX_FAT_ARCHES as u64 * 32)).min(source_len) as usize;
-    let Some(head) = read_budgeted(src, &mut budget, 0, head_len) else {
-        return not_macho_scan();
+    let head = match read_budgeted(src, &mut budget, 0, head_len) {
+        Some(head) => head,
+        // The full head couldn't be read — e.g. `source_len` is stale (the
+        // real object shrank after it was captured) and there's no handle to
+        // serve the rest. Fall back to whatever's already held in memory
+        // rather than reading a read failure as "not Mach-O" (§10/§11.8).
+        None => match read_budgeted(
+            src,
+            &mut budget,
+            0,
+            src.held_len().min(head_len as u64) as usize,
+        ) {
+            Some(head) if head.len() >= 4 => head,
+            _ => return not_macho_scan(),
+        },
     };
 
     match be_u32(&head, 0) {
@@ -511,16 +524,21 @@ pub fn scan_ranged(src: &(impl ByteSource + ?Sized)) -> MachOScan {
             scan_ranged_fat(src, &head, source_len, &mut budget)
         }
         Some(magic) => match thin_kind(magic) {
-            Some(_) => {
-                let images = scan_ranged_slice(src, 0, false, source_len, &mut budget)
-                    .into_iter()
-                    .collect();
-                MachOScan {
+            Some(_) => match scan_ranged_slice(src, 0, false, source_len, &mut budget) {
+                Some(image) => MachOScan {
                     is_macho: true,
-                    images,
+                    images: vec![image],
                     skipped_slices: 0,
-                }
-            }
+                },
+                // Recognized magic, but the structure itself couldn't be
+                // walked (the same short-head situation, or a genuinely
+                // malformed slice) — still Mach-O, not clean.
+                None => MachOScan {
+                    is_macho: true,
+                    images: Vec::new(),
+                    skipped_slices: 1,
+                },
+            },
             None => not_macho_scan(),
         },
         None => not_macho_scan(),
@@ -584,7 +602,18 @@ fn scan_ranged_fat(
         _ => return not_macho_scan(),
     };
     let Some(nfat) = be_u32(head, 4).filter(|&n| n != 0 && n <= MAX_FAT_ARCHES) else {
-        return not_macho_scan();
+        // A recognized fat magic, but not even `nfat_arch` was available to
+        // read (the short in-memory retry after the full head read failed) —
+        // the table may still exist; undetermined, not clean (§10/§11.8).
+        return if head.len() < 8 {
+            MachOScan {
+                is_macho: true,
+                images: Vec::new(),
+                skipped_slices: 1,
+            }
+        } else {
+            not_macho_scan()
+        };
     };
 
     let offsets: Vec<Option<u64>> = (0..nfat as usize)
@@ -2146,6 +2175,66 @@ mod tests {
         let scan = scan_ranged(&v[..]);
         assert!(!scan.is_macho);
         assert!(scan.images.is_empty());
+    }
+
+    /// A `ByteSource` that reports a `source_len` bigger than the bytes it
+    /// can actually serve — the shape a stale, larger `file_len` takes after
+    /// the real object shrank underneath a loaded `ScanContext` with no
+    /// handle left to serve the difference (§10/§11.8, PR #52 review).
+    struct StaleLenSource<'a> {
+        data: &'a [u8],
+        claimed_len: u64,
+    }
+
+    impl ByteSource for StaleLenSource<'_> {
+        fn source_len(&self) -> u64 {
+            self.claimed_len
+        }
+
+        fn held_len(&self) -> u64 {
+            self.data.len() as u64
+        }
+
+        fn read_range(&self, off: u64, len: usize) -> Option<Cow<'_, [u8]>> {
+            self.data.read_range(off, len)
+        }
+    }
+
+    /// A stale `source_len` far bigger than what's actually held must not
+    /// make `scan_ranged` read a real magic as "not Mach-O": the full head
+    /// read fails (nothing to serve past the held bytes), but the magic
+    /// itself is still recognized from what is held, so the result stays
+    /// `is_macho: true` with the unwalkable slice counted as skipped — never
+    /// a clean bill of health (§10/§11.8, PR #52 review).
+    #[test]
+    fn scan_ranged_recognizes_a_thin_magic_when_the_full_head_read_fails() {
+        let src = StaleLenSource {
+            data: &[0xFE, 0xED, 0xFA, 0xCF], // MH_MAGIC_64
+            claimed_len: u64::MAX,
+        };
+        let scan = scan_ranged(&src);
+        assert!(scan.is_macho, "a real magic must not read as not Mach-O");
+        assert!(scan.images.is_empty());
+        assert_eq!(scan.skipped_slices, 1);
+        assert!(!scan.fully_examined());
+    }
+
+    /// Same shape with a fat magic: the retry only recovers the magic
+    /// itself, not even `nfat_arch` — still undetermined, not clean.
+    #[test]
+    fn scan_ranged_recognizes_a_fat_magic_when_the_full_head_read_fails_before_nfat() {
+        let src = StaleLenSource {
+            data: &[0xCA, 0xFE, 0xBA, 0xBE], // FAT_MAGIC, nfat_arch unreadable
+            claimed_len: u64::MAX,
+        };
+        let scan = scan_ranged(&src);
+        assert!(
+            scan.is_macho,
+            "a real fat magic must not read as not Mach-O"
+        );
+        assert!(scan.images.is_empty());
+        assert_eq!(scan.skipped_slices, 1);
+        assert!(!scan.fully_examined());
     }
 
     /// A `ByteSource` wrapping `data` but reporting a caller-chosen

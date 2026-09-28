@@ -392,6 +392,35 @@ mod tests {
         ));
     }
 
+    /// A stale, much larger `file_len` with no file handle to serve bytes
+    /// past `content` (the shape a real object shrinking after load takes)
+    /// must not make `ctx.macho()` read a real magic in `content` as "not
+    /// Mach-O": it's still recognized, just unwalkable, so `covers_truncation`
+    /// must not claim coverage over a scan that couldn't finish (§10/§11.8,
+    /// PR #52 review).
+    #[test]
+    fn stale_file_len_with_no_handle_is_undetermined_not_covered() {
+        let c = ScanContext {
+            path: PathBuf::from("app"),
+            content: Some(b"\xfe\xed\xfa\xcf".to_vec()), // MH_MAGIC_64
+            truncated: true,
+            file_len: Some(u64::MAX),
+            identity: None,
+            source: ContentSource::File,
+            file: None,
+            codesign_dv_cache: std::sync::OnceLock::new(),
+            spctl_cache: std::sync::OnceLock::new(),
+            macho_cache: std::sync::OnceLock::new(),
+            stream_failed: std::sync::atomic::AtomicBool::new(false),
+        };
+        assert!(
+            c.macho().is_macho,
+            "the magic in content must be recognized"
+        );
+        assert!(!c.macho().fully_examined());
+        assert!(!MachOStructureRule.covers_truncation(&c));
+    }
+
     #[test]
     fn normal_dylibs_and_rpaths_score_nothing() {
         let (image, _, _) = synth_macho_64_full(
