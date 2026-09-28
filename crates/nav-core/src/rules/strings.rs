@@ -422,8 +422,8 @@ mod tests {
     /// A context that looks file-backed but has no actual file handle (the
     /// shape a non-unix platform's `read_at_file` always leaves, since it
     /// never serves a real read either way) must not claim coverage — every
-    /// streamed byte past `content` would in fact be unreachable (§5.2, #45
-    /// review).
+    /// streamed byte past `content` would in fact be unreachable (§5.2,
+    /// #45).
     #[test]
     fn file_backed_without_a_handle_does_not_cover_truncation() {
         let ctx = crate::context::ScanContext {

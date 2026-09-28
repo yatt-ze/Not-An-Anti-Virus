@@ -120,8 +120,8 @@ impl Rule for HighEntropyRule {
 
 impl HighEntropyRule {
     /// Score a Mach-O's `__TEXT` code: streamed over its whole (EOF-clipped)
-    /// range when that fits `MAX_STREAM_BYTES`, else — as before #45 — only
-    /// over the part inside `content`.
+    /// range when that fits `MAX_STREAM_BYTES`, else only over the part
+    /// inside `content`.
     fn eval_macho_text(
         &self,
         ctx: &ScanContext,
@@ -746,7 +746,7 @@ mod tests {
         assert!(ctx.truncated, "fixture must exceed the 8 MiB capture");
 
         // Confirm the premise: the clipped-to-content prefix alone is below
-        // the threshold — the old in-memory-only rule would not have fired.
+        // the threshold, so only streaming past it can find the signal.
         let content = ctx.content.as_ref().unwrap();
         let prefix_start = usize::try_from(range.start).unwrap();
         assert!(shannon_entropy(&content[prefix_start..]) < ENTROPY_THRESHOLD);

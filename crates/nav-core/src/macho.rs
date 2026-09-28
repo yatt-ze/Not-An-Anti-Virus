@@ -567,7 +567,7 @@ fn classify_slice_magic(
 /// an offset past a non-authoritative `source_len` — e.g. a truncated
 /// embedded/container member), this still reports `is_macho: true` with
 /// those counted as skipped, rather than reading "couldn't check" as "clean"
-/// (§10/§11.8, §5.2 review).
+/// (§10/§11.8, §5.2).
 fn scan_ranged_fat(
     src: &(impl ByteSource + ?Sized),
     head: &[u8],
@@ -1281,7 +1281,7 @@ pub(crate) mod tests_support {
     /// command (`filler_cmdsize` bytes, zero-filled) followed by an
     /// `LC_LOAD_DYLIB` for `dylib_path` — the shape a `sizeofcmds` well past
     /// `MAX_SIZEOFCMDS` takes when every byte of it is real and already held
-    /// in memory (§5.2, #45 review).
+    /// in memory (§5.2, #45).
     pub(crate) fn build_thin_with_filler_then_dylib(
         filler_cmdsize: usize,
         dylib_path: &str,
@@ -2132,10 +2132,8 @@ mod tests {
         assert_scan_ranged_agrees(&synth_fat(&[&real, garbage]));
     }
 
-    /// A Java `.class`-shaped header must not be read as Mach-O by the
-    /// offset-based path either — the whole point of #46's fix, now without
-    /// the prefix path's `truncated` leniency, which `scan_ranged` doesn't
-    /// need (it can always check the real bytes).
+    /// A Java `.class`-shaped, complete (non-truncated) header must not be
+    /// read as Mach-O by the offset-based path either (#46).
     #[test]
     fn scan_ranged_java_class_like_fat_header_is_not_macho() {
         let mut v = vec![0xCA, 0xFE, 0xBA, 0xBE];
@@ -2150,7 +2148,7 @@ mod tests {
     /// `held_len` instead of `data.len()` — lets a test exercise the
     /// offset-read path (bytes genuinely past what's in memory) against a
     /// plain in-memory buffer, which would otherwise report its whole length
-    /// as held (§5.2, #45 review).
+    /// as held (§5.2, #45).
     struct LimitedHeldSource<'a> {
         data: &'a [u8],
         held: u64,
@@ -2193,7 +2191,7 @@ mod tests {
 
     /// A thin Mach-O with a >2 MiB filler load command followed by a real
     /// `LC_LOAD_DYLIB`, entirely inside the in-memory prefix: `MAX_SIZEOFCMDS`
-    /// must not stop this from walking to the dylib (§5.2, #45 review).
+    /// must not stop this from walking to the dylib (§5.2, #45).
     #[test]
     fn scan_ranged_walks_past_an_oversized_filler_command_when_all_held() {
         let filler_len = MAX_SIZEOFCMDS + 4096;
@@ -2207,10 +2205,9 @@ mod tests {
     }
 
     /// An ≤8 MiB fat file of decoy slices, each declaring `sizeofcmds` near
-    /// `MAX_SIZEOFCMDS`, followed by one real, malicious slice: charging the
-    /// old whole-length budget for each decoy's read would exhaust it well
-    /// before reaching the real slice, but the whole file here is held in
-    /// memory, so none of it should be charged at all (§5.2, #45 review).
+    /// `MAX_SIZEOFCMDS`, followed by one real, malicious slice: the whole
+    /// file is held in memory, so none of it should be charged against the
+    /// ranged budget, leaving it for the real slice (§5.2, #45).
     #[test]
     fn scan_ranged_decoy_slices_within_the_held_prefix_do_not_exhaust_the_budget() {
         const DECOY_COUNT: usize = 32;

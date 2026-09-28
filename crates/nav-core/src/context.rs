@@ -493,7 +493,7 @@ mod tests {
     }
 
     /// A real, opened file supports ranged reads; embedded content (no file
-    /// at all) never does, on any platform (§5.2, #45 review).
+    /// at all) never does, on any platform (§5.2, #45).
     #[test]
     fn supports_ranged_reads_requires_an_actual_file_handle() {
         let path = temp_file("supports-ranged-reads", b"hello world");

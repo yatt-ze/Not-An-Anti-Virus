@@ -928,7 +928,7 @@ mod tests {
     /// every slice-magic read): the scan must report `is_macho: true` with
     /// both slices skipped as undetermined, never "not Mach-O" — and the
     /// rule must not claim `covers_truncation` over a scan it couldn't
-    /// finish (§10/§11.8, §5.2 review).
+    /// finish (§10/§11.8, §5.2).
     #[test]
     fn fat_header_whose_slices_become_unreadable_is_undetermined_not_clean() {
         // Both slices placed well past the 8 MiB prefix (unlike `synth_fat`,
@@ -993,7 +993,7 @@ mod tests {
     /// budget) whose fat table declares a slice past the captured bytes:
     /// unlike a real file's EOF, `source_len` here is only how much was
     /// captured, not the member's true size, so this must read as
-    /// `NotApplicable`, not `Ok(None)` (§10/§11.8, §5.2 review).
+    /// `NotApplicable`, not `Ok(None)` (§10/§11.8, §5.2).
     #[test]
     fn truncated_embedded_fat_header_whose_slice_lies_beyond_the_capture_is_not_applicable() {
         let (real, _, _) = synth_macho_64_full(b"real", &[], &[], false, None);
