@@ -234,14 +234,15 @@ impl Rule for MachOStructureRule {
 /// and we held the whole file but found no entitlements blob" (a determined
 /// fact), and "signed, entitlements present, none of them suspicious."
 /// `Err(NotApplicable)` only when the slice is signed and its
-/// `LC_CODE_SIGNATURE` region wasn't read (§5.2, #45) — that combination
+/// `LC_CODE_SIGNATURE` region is undetermined (unread, §5.2, #45): that
 /// can't be told apart from "unread past a real entitlements blob"
-/// (§10/§11.8) and must not be read as a clean bill of health.
+/// (§10/§11.8). A region past an authoritative EOF is determined: no
+/// entitlements.
 fn entitlements_finding(
     image: &MachOImage,
 ) -> Result<Option<Vec<(&'static str, i32)>>, RuleOutcome> {
     let Some(xml) = &image.entitlements else {
-        return if image.has_code_signature && !image.signature_region_read {
+        return if image.has_code_signature && !image.signature_region.is_determined() {
             Err(RuleOutcome::NotApplicable)
         } else {
             Ok(None)
@@ -682,9 +683,12 @@ mod tests {
         // Truncate away the signature blob — same shape as an 8 MiB capture
         // cutting off the code signature near EOF — and mark the read as
         // truncated, which is what actually makes this ambiguous.
+        let full_len = image.len() as u64;
         image.truncate(sig_off + 4);
+        let mut ctx = ctx_for_truncated(image, true);
+        ctx.file_len = Some(full_len); // the real file is longer than the capture
         assert!(matches!(
-            MachOStructureRule.evaluate(&ctx_for_truncated(image, true)),
+            MachOStructureRule.evaluate(&ctx),
             Err(RuleOutcome::NotApplicable)
         ));
     }
@@ -1032,6 +1036,40 @@ mod tests {
 
         let ctx = ScanContext::from_embedded_bytes("x.pkg!member", captured, true);
         assert!(!MachOStructureRule.covers_truncation(&ctx));
+        assert!(matches!(
+            MachOStructureRule.evaluate(&ctx),
+            Err(RuleOutcome::NotApplicable)
+        ));
+    }
+
+    /// A signed Mach-O whose `LC_CODE_SIGNATURE` datasize runs 1000 bytes
+    /// past the end of the bytes.
+    fn signature_past_eof_bytes() -> Vec<u8> {
+        let (mut image, _, sig_off) = synth_macho_64_full(b"code", &[], &[], true, None);
+        let lc_off = image
+            .windows(4)
+            .position(|w| w == 0x1du32.to_le_bytes())
+            .expect("LC_CODE_SIGNATURE present");
+        let huge = (image.len() - sig_off) as u32 + 1000;
+        image[lc_off + 12..lc_off + 16].copy_from_slice(&huge.to_le_bytes());
+        image
+    }
+
+    /// A complete small Mach-O whose signature is declared past its own EOF
+    /// has nothing to read: determined, no entitlements, coverage kept.
+    #[test]
+    fn signature_declared_past_an_authoritative_eof_is_determined() {
+        let ctx = ctx_for(signature_past_eof_bytes());
+        assert!(MachOStructureRule.covers_truncation(&ctx));
+        assert!(matches!(MachOStructureRule.evaluate(&ctx), Ok(None)));
+    }
+
+    /// The same bytes as a truncated embedded member: the true length is
+    /// unknown, so the region is undetermined.
+    #[test]
+    fn signature_declared_past_a_truncated_embedded_capture_is_not_applicable() {
+        let ctx =
+            ScanContext::from_embedded_bytes("x.pkg!member", signature_past_eof_bytes(), true);
         assert!(matches!(
             MachOStructureRule.evaluate(&ctx),
             Err(RuleOutcome::NotApplicable)

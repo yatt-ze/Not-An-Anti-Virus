@@ -99,6 +99,26 @@ pub(crate) const MAX_SIGNATURE_BYTES: usize = 16 * 1024 * 1024;
 /// signature; once exhausted, remaining slices count as skipped.
 const MAX_RANGED_BYTES: u64 = 64 * 1024 * 1024;
 
+/// Whether a slice's `LC_CODE_SIGNATURE` region was examined.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SignatureRegion {
+    /// The whole region was read; the signature facts are determined.
+    Read,
+    /// The region lies past an authoritative end of the object: there is
+    /// nothing to read, so "no readable signature" is a determined fact.
+    PastEof,
+    /// Not read (truncated prefix, size cap, budget, non-authoritative
+    /// length, read failure): whatever it holds is unknown (§10/§11.8).
+    Unread,
+}
+
+impl SignatureRegion {
+    /// True when the region's contents (or absence) are determined.
+    pub fn is_determined(self) -> bool {
+        !matches!(self, SignatureRegion::Unread)
+    }
+}
+
 /// A recognized Mach-O image: `__TEXT,__text`'s file range plus the loader
 /// facts (`dylibs`/`rpaths`/`has_code_signature`/`entitlements`) the
 /// structural-anomaly rule scores.
@@ -141,11 +161,10 @@ pub struct MachOImage {
     /// has none. Only meaningful when `code_directory_flags` is `Some` —
     /// otherwise the signature region couldn't be read at all.
     pub has_cms_signature: bool,
-    /// True when the whole `LC_CODE_SIGNATURE` region (`dataoff..dataoff+
-    /// datasize`, slice-relative) was within the bytes this parse held.
-    /// False when there's no signature, or the region wasn't held — a
-    /// truncated prefix, or [`scan_ranged`] skipping it for size/budget.
-    pub signature_region_read: bool,
+    /// How much is known about the `LC_CODE_SIGNATURE` region
+    /// (`dataoff..dataoff+datasize`, slice-relative). [`SignatureRegion::Unread`]
+    /// also when there's no signature at all.
+    pub signature_region: SignatureRegion,
     /// Slice-relative `LC_CODE_SIGNATURE` `(dataoff, datasize)`, so
     /// [`scan_ranged`] can find and re-read the region by absolute offset.
     /// `None` if there's no `LC_CODE_SIGNATURE` load command.
@@ -440,7 +459,7 @@ impl MachOScan {
             && self
                 .images
                 .iter()
-                .all(|i| !i.has_code_signature || i.signature_region_read)
+                .all(|i| !i.has_code_signature || i.signature_region.is_determined())
     }
 }
 
@@ -759,9 +778,9 @@ fn scan_ranged_slice(
 
 /// Read a slice's `LC_CODE_SIGNATURE` region by its real, absolute offset and
 /// fill in `image`'s signature facts — the part an in-memory prefix parse
-/// can't do once the region lies past what's held. Leaves `image` unchanged
-/// (`signature_region_read` stays `false`) if the region is too big, out of
-/// bounds, or the budget can't cover it.
+/// can't do once the region lies past what's held. A region ending past an
+/// authoritative `source_len` sets [`SignatureRegion::PastEof`]; one that is
+/// too big or that the budget can't cover leaves `image` unchanged.
 fn read_signature_ranged(
     src: &(impl ByteSource + ?Sized),
     slice_off: u64,
@@ -781,6 +800,9 @@ fn read_signature_ranged(
         return;
     };
     if sig_end > source_len {
+        if src.source_len_is_authoritative() {
+            image.signature_region = SignatureRegion::PastEof;
+        }
         return;
     }
     let Some(sig_bytes) = read_budgeted(src, budget, sig_off, datasize as usize) else {
@@ -790,7 +812,7 @@ fn read_signature_ranged(
     image.entitlements = facts.entitlements;
     image.code_directory_flags = facts.code_directory_flags;
     image.has_cms_signature = facts.has_cms_signature;
-    image.signature_region_read = true;
+    image.signature_region = SignatureRegion::Read;
 }
 
 fn parse_thin(data: &[u8], base: usize, is_64: bool, be: bool, is_fat: bool) -> Option<MachOImage> {
@@ -818,7 +840,7 @@ fn parse_thin(data: &[u8], base: usize, is_64: bool, be: bool, is_fat: bool) -> 
     let mut code_directory_flags = None;
     let mut has_cms_signature = false;
     let mut code_signature = None;
-    let mut signature_region_read = false;
+    let mut signature_region = SignatureRegion::Unread;
 
     let mut off = cmds_start;
     for _ in 0..ncmds {
@@ -868,10 +890,15 @@ fn parse_thin(data: &[u8], base: usize, is_64: bool, be: bool, is_fat: bool) -> 
                 entitlements = facts.entitlements;
                 code_directory_flags = facts.code_directory_flags;
                 has_cms_signature = facts.has_cms_signature;
-                signature_region_read = base
+                let held = base
                     .checked_add(dataoff as usize)
                     .and_then(|s| s.checked_add(datasize as usize))
                     .is_some_and(|end| end <= data.len());
+                signature_region = if held {
+                    SignatureRegion::Read
+                } else {
+                    SignatureRegion::Unread
+                };
             }
         }
 
@@ -888,7 +915,7 @@ fn parse_thin(data: &[u8], base: usize, is_64: bool, be: bool, is_fat: bool) -> 
         entitlements,
         code_directory_flags,
         has_cms_signature,
-        signature_region_read,
+        signature_region,
         code_signature,
     })
 }
@@ -2161,7 +2188,7 @@ mod tests {
     /// signature by offset) so the rest of `MachOImage` can be compared.
     fn strip_ranged_only_fields(img: &MachOImage) -> MachOImage {
         let mut img = img.clone();
-        img.signature_region_read = false;
+        img.signature_region = SignatureRegion::Unread;
         img.code_signature = None;
         img
     }
@@ -2531,12 +2558,11 @@ mod tests {
         );
     }
 
-    /// A signature region whose `dataoff + datasize` runs past the source's
-    /// total length must not be read — `signature_region_read` stays false,
-    /// distinct from `has_code_signature` staying true (the load command
-    /// itself is intact).
+    /// A signature region whose `dataoff + datasize` runs past an
+    /// authoritative source length is never read and is `PastEof`;
+    /// `has_code_signature` stays true (the load command itself is intact).
     #[test]
-    fn scan_ranged_signature_past_source_len_is_not_read() {
+    fn scan_ranged_signature_past_source_len_is_past_eof() {
         let (mut image, _, sig_off) = synth_macho_64_full(b"code", &[], &[], true, None);
         let lc_off = image
             .windows(4)
@@ -2550,6 +2576,7 @@ mod tests {
         assert!(scan.is_macho);
         let img = scan.images.first().expect("thin slice should still parse");
         assert!(img.has_code_signature);
-        assert!(!img.signature_region_read);
+        assert_eq!(img.signature_region, SignatureRegion::PastEof);
+        assert!(scan.fully_examined());
     }
 }
