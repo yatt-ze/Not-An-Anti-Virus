@@ -403,43 +403,7 @@ impl crate::macho::ByteSource for ScanContext {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::{Seek, SeekFrom, Write};
-
-    fn temp_file(tag: &str, body: &[u8]) -> PathBuf {
-        let p = std::env::temp_dir().join(format!(
-            "nav-ctx-{tag}-{}-{:?}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        std::fs::File::create(&p).unwrap().write_all(body).unwrap();
-        p
-    }
-
-    /// A zero-filled (sparse) temp file of exactly `total_len` bytes, for
-    /// tests that need a file bigger than `MAX_CONTENT_BYTES` without writing
-    /// that many bytes.
-    fn sparse_temp_file(tag: &str, total_len: u64) -> PathBuf {
-        let p = std::env::temp_dir().join(format!(
-            "nav-ctx-{tag}-{}-{:?}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        let f = std::fs::File::create(&p).unwrap();
-        f.set_len(total_len).unwrap();
-        p
-    }
-
-    fn write_at(path: &Path, offset: u64, bytes: &[u8]) {
-        let mut f = std::fs::OpenOptions::new().write(true).open(path).unwrap();
-        f.seek(SeekFrom::Start(offset)).unwrap();
-        f.write_all(bytes).unwrap();
-    }
+    use crate::test_support::{sparse_temp_file, write_at, write_temp_file};
 
     /// A signing result is trusted only while the scanned object is unchanged:
     /// if the path is swapped/rewritten between the content read and the tool
@@ -447,7 +411,7 @@ mod tests {
     /// rather than trusted (§11.7, NAV-003).
     #[test]
     fn signing_result_is_dropped_when_the_object_changes_underneath() {
-        let path = temp_file("toctou", b"original bytes");
+        let path = write_temp_file("toctou", b"original bytes");
         let ctx = ScanContext::load(&path);
         assert!(ctx.identity.is_some());
 
@@ -483,7 +447,7 @@ mod tests {
     /// through, not a separate pre-open `stat` (§11.7).
     #[test]
     fn identity_is_derived_from_the_opened_and_read_object() {
-        let path = temp_file("fd-identity", b"twelve bytes");
+        let path = write_temp_file("fd-identity", b"twelve bytes");
         let ctx = ScanContext::load(&path);
         let id = ctx.identity.expect("a readable file has an identity");
         assert_eq!(id.size, ctx.file_len.expect("length from the same fstat"));
@@ -496,7 +460,7 @@ mod tests {
     /// at all) never does, on any platform (§5.2, #45).
     #[test]
     fn supports_ranged_reads_requires_an_actual_file_handle() {
-        let path = temp_file("supports-ranged-reads", b"hello world");
+        let path = write_temp_file("supports-ranged-reads", b"hello world");
         let ctx = ScanContext::load(&path);
         assert!(ctx.file.is_some());
         assert_eq!(ctx.supports_ranged_reads(), cfg!(unix));
@@ -525,7 +489,7 @@ mod tests {
 
     #[test]
     fn read_at_inside_content_returns_the_right_bytes() {
-        let path = temp_file("read-at-inside", b"hello world");
+        let path = write_temp_file("read-at-inside", b"hello world");
         let ctx = ScanContext::load(&path);
         assert_eq!(ctx.read_at(0, 5), Some(b"hello".to_vec()));
         assert_eq!(ctx.read_at(6, 5), Some(b"world".to_vec()));
@@ -570,7 +534,7 @@ mod tests {
 
     #[test]
     fn read_at_rejects_out_of_range_requests() {
-        let path = temp_file("read-at-bounds", b"hello world");
+        let path = write_temp_file("read-at-bounds", b"hello world");
         let ctx = ScanContext::load(&path);
 
         // Past EOF.
@@ -636,7 +600,7 @@ mod tests {
 
     #[test]
     fn for_each_window_rejects_a_range_past_eof() {
-        let path = temp_file("for-each-window-eof", b"hello world");
+        let path = write_temp_file("for-each-window-eof", b"hello world");
         let ctx = ScanContext::load(&path);
         assert!(!ctx.for_each_window(0..1000, 0, |_, _| {}));
         let _ = std::fs::remove_file(&path);

@@ -208,8 +208,7 @@ fn can_stream(ctx: &ScanContext) -> bool {
 mod tests {
     use super::*;
     use crate::context::{MAX_CONTENT_BYTES, STREAM_CHUNK};
-    use std::io::{Seek, SeekFrom, Write};
-    use std::path::{Path, PathBuf};
+    use crate::test_support::{sparse_temp_file, write_at};
 
     #[test]
     fn rejects_word_extensions() {
@@ -242,30 +241,6 @@ mod tests {
     #[test]
     fn a_match_at_the_end_of_a_non_final_window_is_not_counted() {
         assert!(!contains_token("curl x | sh", "| sh", false));
-    }
-
-    /// A zero-filled (sparse) temp file of exactly `total_len` bytes, for
-    /// tests that need a file bigger than `MAX_CONTENT_BYTES` (or
-    /// `MAX_STREAM_BYTES`) without writing that many bytes. Mirrors
-    /// `context.rs`'s private test helper of the same name.
-    fn sparse_temp_file(tag: &str, total_len: u64) -> PathBuf {
-        let p = std::env::temp_dir().join(format!(
-            "nav-strings-{tag}-{}-{:?}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        let f = std::fs::File::create(&p).unwrap();
-        f.set_len(total_len).unwrap();
-        p
-    }
-
-    fn write_at(path: &Path, offset: u64, bytes: &[u8]) {
-        let mut f = std::fs::OpenOptions::new().write(true).open(path).unwrap();
-        f.seek(SeekFrom::Start(offset)).unwrap();
-        f.write_all(bytes).unwrap();
     }
 
     /// A marker past the 8 MiB prefix is invisible to a prefix-only scan, but

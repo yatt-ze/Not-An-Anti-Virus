@@ -335,6 +335,7 @@ mod tests {
         synth_macho_64_full_with_cd_flags, synth_macho_64_full_with_cds_and_cms,
     };
     use crate::macho::MAX_SIGNATURE_BYTES;
+    use crate::test_support::write_temp_file;
     use std::path::PathBuf;
 
     fn ctx_for(content: Vec<u8>) -> ScanContext {
@@ -850,22 +851,6 @@ mod tests {
             MachOStructureRule.evaluate(&ctx_for(fat)),
             Err(RuleOutcome::NotApplicable)
         ));
-    }
-
-    /// A real temp file's worth of bytes, for the offset-based tests below
-    /// where the synthetic Mach-O itself must exceed `MAX_CONTENT_BYTES` —
-    /// mirrors `context.rs`/`strings.rs`'s temp-file test helpers.
-    fn write_temp_file(tag: &str, content: &[u8]) -> PathBuf {
-        let p = std::env::temp_dir().join(format!(
-            "nav-macho-structure-{tag}-{}-{:?}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        std::fs::write(&p, content).unwrap();
-        p
     }
 
     /// A thin Mach-O whose code signature (entitlements + ad-hoc CD flags)

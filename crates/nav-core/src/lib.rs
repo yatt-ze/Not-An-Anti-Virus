@@ -21,6 +21,8 @@ pub mod presentation;
 pub mod rules;
 pub mod scan;
 pub mod target;
+#[cfg(test)]
+pub(crate) mod test_support;
 pub mod xar;
 pub mod xml;
 

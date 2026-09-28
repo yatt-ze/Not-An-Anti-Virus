@@ -651,6 +651,7 @@ fn entropy_from_histogram(counts: &[u64; 256], total: u64) -> f64 {
 mod tests {
     use super::*;
     use crate::context::MAX_CONTENT_BYTES;
+    use crate::test_support::write_temp_file;
     use std::path::PathBuf;
 
     /// `total_len` high-entropy bytes, starting with `magic` — for building
@@ -672,23 +673,6 @@ mod tests {
                 (state & 0xff) as u8
             })
             .collect()
-    }
-
-    /// Write `body` to a fresh, uniquely-named temp file and return its path
-    /// — for tests that need a real file on disk, since bytes past
-    /// `MAX_CONTENT_BYTES` only reach a rule through `ScanContext`'s file
-    /// handle, never in-memory content (mirrors `context.rs`'s test helper).
-    fn write_temp_file(tag: &str, body: &[u8]) -> PathBuf {
-        let p = std::env::temp_dir().join(format!(
-            "nav-entropy-{tag}-{}-{:?}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        std::fs::write(&p, body).unwrap();
-        p
     }
 
     #[test]
