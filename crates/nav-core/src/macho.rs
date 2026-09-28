@@ -687,11 +687,14 @@ fn scan_ranged_fat(
 }
 
 /// Parse the slice at absolute offset `off`: read its header and load
-/// commands by offset (never more than `MAX_SIZEOFCMDS` of load-command
-/// bytes), then its code signature by offset if one is declared and fits
-/// within `MAX_SIGNATURE_BYTES`/`source_len`/the remaining budget. `None` if
-/// the offset is out of bounds, the header/magic doesn't check out, or
-/// `sizeofcmds` is unwalkable — the caller counts that as skipped.
+/// commands by offset, capped to `source_len` (a declared `sizeofcmds` can
+/// overrun the object itself) and, beyond what's already held, to
+/// `MAX_SIZEOFCMDS`; then its code signature by offset if one is declared
+/// and fits within `MAX_SIGNATURE_BYTES`/`source_len`/the remaining budget.
+/// `None` if the offset is out of bounds, the header/magic doesn't check
+/// out, the declared load commands run past a non-authoritative
+/// `source_len` (a truncated capture), or `sizeofcmds` is unwalkable — the
+/// caller counts that as skipped.
 fn scan_ranged_slice(
     src: &(impl ByteSource + ?Sized),
     off: u64,
@@ -713,15 +716,27 @@ fn scan_ranged_slice(
     let cmds_end = off
         .checked_add(header_size as u64)?
         .checked_add(sizeofcmds as u64)?;
-    if cmds_end > src.held_len() && sizeofcmds > MAX_SIZEOFCMDS {
-        // Far more load-command bytes than any real image declares, and
-        // reading them means real I/O past what's already in memory.
+    if cmds_end > source_len && !src.source_len_is_authoritative() {
+        // Declared load commands run past a capture that stopped short of
+        // the real object's end (a truncated embedded/container member) —
+        // what's cut off could hold anything; skip rather than silently
+        // treat it as absent (§10/§11.8).
+        return None;
+    }
+    // Cap `cmds_end` to what the source actually has before comparing
+    // against `held_len`: a slice on a complete file can declare far more
+    // load-command bytes than the file itself has left, and none of that
+    // excess is real I/O to bound — there's simply nothing there to read.
+    let walk_end = cmds_end.min(source_len);
+    if walk_end > src.held_len() && sizeofcmds > MAX_SIZEOFCMDS {
+        // Far more load-command bytes than any real image declares, and at
+        // least some of them require real I/O past what's already in
+        // memory.
         return None;
     }
 
-    let want = header_size.checked_add(sizeofcmds)?;
-    let avail = (source_len - off) as usize;
-    let buf = read_budgeted(src, budget, off, want.min(avail))?;
+    let want = (walk_end - off) as usize;
+    let buf = read_budgeted(src, budget, off, want)?;
     let mut image = parse_thin(&buf, 0, is_64, be, is_fat)?;
 
     image.text_range = image.text_range.and_then(|range| {
@@ -2309,6 +2324,27 @@ mod tests {
         let scan = scan_ranged(&bytes[..]);
         assert!(scan.is_macho);
         let image = scan.images.first().expect("the thin slice must be walked");
+        assert_eq!(image.dylibs, vec!["/tmp/evil.dylib".to_string()]);
+    }
+
+    /// A thin Mach-O whose declared `sizeofcmds` overruns the whole (complete,
+    /// non-truncated) file, not just `MAX_SIZEOFCMDS`: none of that excess is
+    /// real I/O to bound, so the slice must still be walked up to EOF rather
+    /// than skipped outright (§5.2, #45).
+    #[test]
+    fn scan_ranged_walks_a_thin_slice_whose_sizeofcmds_overruns_the_whole_file() {
+        let (mut bytes, _, _) =
+            synth_macho_64_full(b"evil", &["/tmp/evil.dylib"], &[], false, None);
+        let huge = 0x1000_0000u32; // far beyond both MAX_SIZEOFCMDS and the file itself
+        bytes[20..24].copy_from_slice(&huge.to_le_bytes()); // sizeofcmds, LE u32 @ offset 20
+
+        let scan = scan_ranged(&bytes[..]);
+        assert!(scan.is_macho);
+        assert_eq!(scan.skipped_slices, 0);
+        let image = scan
+            .images
+            .first()
+            .expect("the thin slice must still be walked");
         assert_eq!(image.dylibs, vec!["/tmp/evil.dylib".to_string()]);
     }
 

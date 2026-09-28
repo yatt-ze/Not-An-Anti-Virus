@@ -1022,6 +1022,23 @@ mod tests {
         ));
     }
 
+    /// As above, for a thin slice: a truncated embedded member whose header
+    /// declares load commands running past the captured bytes must not be
+    /// read as if the missing tail (an `LC_LOAD_DYLIB`, say) were simply
+    /// absent (§10/§11.8, §5.2).
+    #[test]
+    fn truncated_embedded_thin_header_whose_load_commands_run_past_the_capture_is_not_applicable() {
+        let (full, _, _) = synth_macho_64_full(b"x", &["/tmp/evil.dylib"], &[], false, None);
+        let captured = full[..40].to_vec(); // header plus a few bytes, well short of sizeofcmds
+
+        let ctx = ScanContext::from_embedded_bytes("x.pkg!member", captured, true);
+        assert!(!MachOStructureRule.covers_truncation(&ctx));
+        assert!(matches!(
+            MachOStructureRule.evaluate(&ctx),
+            Err(RuleOutcome::NotApplicable)
+        ));
+    }
+
     /// A signature whose declared `datasize` exceeds `MAX_SIGNATURE_BYTES`
     /// must not be read at all: `covers_truncation` is false, and — with no
     /// other finding — the rule reports `NotApplicable` rather than a clean
