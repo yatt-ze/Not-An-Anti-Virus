@@ -223,10 +223,12 @@ impl HighEntropyRule {
         }
     }
 
-    /// Score one already-budgeted, EOF-clipped `__TEXT` range: streamed over
-    /// the whole range when that fits `MAX_STREAM_BYTES`, else only over the
-    /// part inside `content`. Returns the entropy alongside the signal so
-    /// the caller can compare candidates across a fat binary's slices.
+    /// Score one `__TEXT` range from [`budgeted_text_ranges`] (EOF-clipped,
+    /// at most `MAX_STREAM_BYTES`): read from `content` when resident, else
+    /// streamed; if the stream fails, only the part inside `content` is
+    /// scored and the failure is recorded. Returns the entropy alongside the
+    /// signal so the caller can compare candidates across a fat binary's
+    /// slices.
     fn eval_macho_text(
         &self,
         ctx: &ScanContext,
@@ -239,30 +241,28 @@ impl HighEntropyRule {
             return self.macho_signal_from_content(content, range);
         }
 
-        if range.end - range.start <= MAX_STREAM_BYTES {
-            let mut counts = [0u64; 256];
-            let mut total = 0u64;
-            let delivered = ctx.for_each_window(range.clone(), 0, |window, _is_last| {
-                for &b in window {
-                    counts[b as usize] += 1;
-                }
-                total += window.len() as u64;
-            });
-            if delivered {
-                return self.macho_signal(total, entropy_from_histogram(&counts, total));
+        let mut counts = [0u64; 256];
+        let mut total = 0u64;
+        let delivered = ctx.for_each_window(range.clone(), 0, |window, _is_last| {
+            for &b in window {
+                counts[b as usize] += 1;
             }
-            // The stream failed partway — fall back to what the captured
-            // prefix can still show rather than discarding a score it would
-            // have found there (§10/§11.8).
-            ctx.mark_stream_failed(self.id());
+            total += window.len() as u64;
+        });
+        if delivered {
+            return self.macho_signal(total, entropy_from_histogram(&counts, total));
         }
+        // The stream failed (or ranged reads are unavailable) — fall back to
+        // what the captured prefix can still show rather than discarding a
+        // score it would have found there (§10/§11.8).
+        ctx.mark_stream_failed(self.id());
 
         self.macho_signal_from_content(content, range)
     }
 
     /// Score the part of `range` that lies inside `content`, clamped — used
-    /// both when the whole range is already held and as the fallback when it
-    /// can't be streamed (too large, or the stream failed partway).
+    /// both when the whole range is already held and as the fallback after a
+    /// failed stream.
     fn macho_signal_from_content(
         &self,
         content: &[u8],
