@@ -87,7 +87,10 @@ const MAX_ENTITLEMENTS_BYTES: usize = 256 * 1024;
 // an arch-count cap can hide a runnable binary.
 const MAX_FAT_ARCHES: u32 = 1024;
 /// A slice declaring more load-command bytes than this is unwalkable by
-/// [`scan_ranged`] — it skips the slice rather than read that much by offset.
+/// offset once its load commands extend past what [`ByteSource::held_len`]
+/// already holds — [`scan_ranged`] skips the slice rather than read that much
+/// by offset. Doesn't bound a slice whose load commands are already in
+/// memory; there's no I/O to cap.
 const MAX_SIZEOFCMDS: usize = 2 * 1024 * 1024;
 /// Largest `LC_CODE_SIGNATURE` region [`scan_ranged`] will read by offset.
 pub(crate) const MAX_SIGNATURE_BYTES: usize = 16 * 1024 * 1024;
@@ -155,6 +158,14 @@ pub struct MachOImage {
 pub trait ByteSource {
     /// Total length of the underlying object.
     fn source_len(&self) -> u64;
+    /// Leading bytes already resident in memory — readable at no I/O cost.
+    /// `0` by default. `[u8]` overrides this to its whole length (it's all
+    /// memory already); [`crate::context::ScanContext`] to `content`'s
+    /// length. [`read_budgeted`] only charges a read for the part of its
+    /// range beyond this.
+    fn held_len(&self) -> u64 {
+        0
+    }
     /// Reads exactly `len` bytes starting at `off`, or `None` if the range
     /// doesn't fit or the read fails.
     fn read_range(&self, off: u64, len: usize) -> Option<Vec<u8>>;
@@ -162,6 +173,10 @@ pub trait ByteSource {
 
 impl ByteSource for [u8] {
     fn source_len(&self) -> u64 {
+        self.len() as u64
+    }
+
+    fn held_len(&self) -> u64 {
         self.len() as u64
     }
 
@@ -444,16 +459,20 @@ impl RangeBudget {
     }
 }
 
-/// Reads `len` bytes at `off` through `src`, charging them against `budget`
-/// first — a read that would exceed the remaining budget is refused before
-/// it happens.
+/// Reads `len` bytes at `off` through `src`, charging `budget` only for the
+/// part of `[off, off+len)` beyond `src.held_len()` — bytes already resident
+/// in memory cost nothing to re-read. Refuses the read up front if the
+/// chargeable part alone would exceed the remaining budget.
 fn read_budgeted(
     src: &(impl ByteSource + ?Sized),
     budget: &mut RangeBudget,
     off: u64,
     len: usize,
 ) -> Option<Vec<u8>> {
-    if !budget.take(len as u64) {
+    let end = off.checked_add(len as u64)?;
+    let held = src.held_len();
+    let chargeable = end.saturating_sub(held.max(off));
+    if !budget.take(chargeable) {
         return None;
     }
     src.read_range(off, len)
@@ -590,8 +609,13 @@ fn scan_ranged_slice(
         return None; // header itself truncated at EOF
     }
     let sizeofcmds = Reader { data: &probe, be }.u32(20)? as usize;
-    if sizeofcmds > MAX_SIZEOFCMDS {
-        return None; // far more load-command bytes than any real image declares
+    let cmds_end = off
+        .checked_add(header_size as u64)?
+        .checked_add(sizeofcmds as u64)?;
+    if cmds_end > src.held_len() && sizeofcmds > MAX_SIZEOFCMDS {
+        // Far more load-command bytes than any real image declares, and
+        // reading them means real I/O past what's already in memory.
+        return None;
     }
 
     let want = header_size.checked_add(sizeofcmds)?;
@@ -1186,6 +1210,38 @@ pub(crate) mod tests_support {
         v.extend_from_slice(str_bytes);
         v.resize(v.len() + (padded - content_len) + 1, 0); // NUL + padding
         assert_eq!(v.len(), cmdsize);
+        v
+    }
+
+    /// A thin 64-bit Mach-O whose first load command is an oversized, unknown
+    /// command (`filler_cmdsize` bytes, zero-filled) followed by an
+    /// `LC_LOAD_DYLIB` for `dylib_path` — the shape a `sizeofcmds` well past
+    /// `MAX_SIZEOFCMDS` takes when every byte of it is real and already held
+    /// in memory (§5.2, #45 review).
+    pub(crate) fn build_thin_with_filler_then_dylib(
+        filler_cmdsize: usize,
+        dylib_path: &str,
+    ) -> Vec<u8> {
+        const FILLER_CMD: u32 = 0x7fff_0000; // not LC_SEGMENT_64/dylib/rpath/codesig
+        let mut filler = Vec::new();
+        filler.extend_from_slice(&FILLER_CMD.to_le_bytes());
+        filler.extend_from_slice(&(filler_cmdsize as u32).to_le_bytes());
+        filler.resize(filler_cmdsize, 0);
+
+        let dylib_cmd = lc_str_command(LC_LOAD_DYLIB, dylib_path);
+        let cmdsize = filler.len() + dylib_cmd.len();
+
+        let mut v = Vec::new();
+        v.extend_from_slice(&[0xCF, 0xFA, 0xED, 0xFE]); // magic -> BE 0xCFFAEDFE
+        v.extend_from_slice(&0x0100_0007u32.to_le_bytes()); // cputype x86_64
+        v.extend_from_slice(&3u32.to_le_bytes()); // cpusubtype
+        v.extend_from_slice(&2u32.to_le_bytes()); // filetype MH_EXECUTE
+        v.extend_from_slice(&2u32.to_le_bytes()); // ncmds: filler + dylib
+        v.extend_from_slice(&(cmdsize as u32).to_le_bytes());
+        v.extend_from_slice(&0u32.to_le_bytes()); // flags
+        v.extend_from_slice(&0u32.to_le_bytes()); // reserved
+        v.extend_from_slice(&filler);
+        v.extend_from_slice(&dylib_cmd);
         v
     }
 
@@ -2026,11 +2082,35 @@ mod tests {
         assert!(scan.images.is_empty());
     }
 
-    /// A slice declaring more load-command bytes than `MAX_SIZEOFCMDS` is
-    /// unwalkable by offset — it must count as skipped, not silently vanish
-    /// or take the sibling slice down with it.
+    /// A `ByteSource` wrapping `data` but reporting a caller-chosen
+    /// `held_len` instead of `data.len()` — lets a test exercise the
+    /// offset-read path (bytes genuinely past what's in memory) against a
+    /// plain in-memory buffer, which would otherwise report its whole length
+    /// as held (§5.2, #45 review).
+    struct LimitedHeldSource<'a> {
+        data: &'a [u8],
+        held: u64,
+    }
+
+    impl ByteSource for LimitedHeldSource<'_> {
+        fn source_len(&self) -> u64 {
+            self.data.source_len()
+        }
+
+        fn held_len(&self) -> u64 {
+            self.held
+        }
+
+        fn read_range(&self, off: u64, len: usize) -> Option<Vec<u8>> {
+            self.data.read_range(off, len)
+        }
+    }
+
+    /// A slice declaring more load-command bytes than `MAX_SIZEOFCMDS`, past
+    /// what's held in memory, is unwalkable by offset — it must count as
+    /// skipped, not silently vanish or take the sibling slice down with it.
     #[test]
-    fn scan_ranged_counts_an_oversized_sizeofcmds_slice_as_skipped() {
+    fn scan_ranged_counts_an_oversized_sizeofcmds_slice_as_skipped_past_the_held_bytes() {
         let (good, _, _) =
             synth_macho_64_full(b"good", &["/usr/lib/libSystem.B.dylib"], &[], false, None);
         let (mut bad, _, _) = synth_macho_64_full(b"bad", &[], &[], false, None);
@@ -2038,10 +2118,92 @@ mod tests {
         bad[20..24].copy_from_slice(&huge.to_le_bytes()); // sizeofcmds, LE u32 @ offset 20
         let fat = synth_fat(&[&good, &bad]);
 
-        let scan = scan_ranged(&fat[..]);
+        let scan = scan_ranged(&LimitedHeldSource {
+            data: &fat,
+            held: 0,
+        });
         assert!(scan.is_macho);
         assert_eq!(scan.images.len(), 1);
         assert_eq!(scan.skipped_slices, 1);
+    }
+
+    /// A thin Mach-O with a >2 MiB filler load command followed by a real
+    /// `LC_LOAD_DYLIB`, entirely inside the in-memory prefix: `MAX_SIZEOFCMDS`
+    /// must not stop this from walking to the dylib (§5.2, #45 review).
+    #[test]
+    fn scan_ranged_walks_past_an_oversized_filler_command_when_all_held() {
+        let filler_len = MAX_SIZEOFCMDS + 4096;
+        let bytes = tests_support::build_thin_with_filler_then_dylib(filler_len, "/tmp/evil.dylib");
+        assert!(bytes.len() < crate::context::MAX_CONTENT_BYTES);
+
+        let scan = scan_ranged(&bytes[..]);
+        assert!(scan.is_macho);
+        let image = scan.images.first().expect("the thin slice must be walked");
+        assert_eq!(image.dylibs, vec!["/tmp/evil.dylib".to_string()]);
+    }
+
+    /// An ≤8 MiB fat file of decoy slices, each declaring `sizeofcmds` near
+    /// `MAX_SIZEOFCMDS`, followed by one real, malicious slice: charging the
+    /// old whole-length budget for each decoy's read would exhaust it well
+    /// before reaching the real slice, but the whole file here is held in
+    /// memory, so none of it should be charged at all (§5.2, #45 review).
+    #[test]
+    fn scan_ranged_decoy_slices_within_the_held_prefix_do_not_exhaust_the_budget() {
+        const DECOY_COUNT: usize = 32;
+        const DECOY_HEADER_LEN: usize = 32; // mach_header_64
+        let (real, _, _) = synth_macho_64_full(b"evil", &["/tmp/evil.dylib"], &[], false, None);
+
+        let nfat = DECOY_COUNT + 1;
+        let header_len = 8 + 20 * nfat;
+        let decoys_start = (header_len + 15) & !15;
+        let real_off = decoys_start + DECOY_COUNT * DECOY_HEADER_LEN;
+
+        let mut fat = Vec::new();
+        fat.extend_from_slice(&FAT_MAGIC.to_be_bytes());
+        fat.extend_from_slice(&(nfat as u32).to_be_bytes());
+        for i in 0..DECOY_COUNT {
+            let off = decoys_start + i * DECOY_HEADER_LEN;
+            fat.extend_from_slice(&0x0100_0007u32.to_be_bytes()); // cputype
+            fat.extend_from_slice(&(i as u32).to_be_bytes()); // cpusubtype (distinct)
+            fat.extend_from_slice(&(off as u32).to_be_bytes()); // offset
+            fat.extend_from_slice(&(DECOY_HEADER_LEN as u32).to_be_bytes()); // size
+            fat.extend_from_slice(&0u32.to_be_bytes()); // align
+        }
+        fat.extend_from_slice(&0x0100_0007u32.to_be_bytes()); // cputype
+        fat.extend_from_slice(&(DECOY_COUNT as u32).to_be_bytes()); // cpusubtype
+        fat.extend_from_slice(&(real_off as u32).to_be_bytes()); // offset
+        fat.extend_from_slice(&(real.len() as u32).to_be_bytes()); // size
+        fat.extend_from_slice(&0u32.to_be_bytes()); // align
+
+        fat.resize(decoys_start, 0);
+        for _ in 0..DECOY_COUNT {
+            // A minimal, hollow (ncmds=0) mach_header_64 declaring a huge
+            // sizeofcmds — real bytes, no load commands to actually walk.
+            fat.extend_from_slice(&[0xCF, 0xFA, 0xED, 0xFE]); // magic
+            fat.extend_from_slice(&[0u8; 16]); // cputype, cpusubtype, filetype, ncmds=0
+            fat.extend_from_slice(&(MAX_SIZEOFCMDS as u32).to_le_bytes()); // sizeofcmds
+            fat.extend_from_slice(&[0u8; 8]); // flags, reserved
+        }
+        assert_eq!(fat.len(), real_off);
+        fat.extend_from_slice(&real);
+
+        // Pad well past every decoy's declared (header + sizeofcmds) span so
+        // the whole file — decoys included — is genuinely all held.
+        let min_len = decoys_start + DECOY_HEADER_LEN + MAX_SIZEOFCMDS + 4096;
+        fat.resize(fat.len().max(min_len), 0);
+        assert!(
+            fat.len() < 8 * 1024 * 1024,
+            "fixture must stay an <=8 MiB file"
+        );
+
+        let scan = scan_ranged(&fat[..]);
+        assert!(scan.is_macho);
+        let evil = scan
+            .images
+            .iter()
+            .find(|img| img.dylibs.contains(&"/tmp/evil.dylib".to_string()))
+            .expect("the real slice, last in the table, must still be examined");
+        assert_eq!(evil.dylibs, vec!["/tmp/evil.dylib".to_string()]);
     }
 
     /// A `ByteSource` wrapper that counts every byte actually served, so a

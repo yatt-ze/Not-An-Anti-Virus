@@ -362,6 +362,10 @@ impl crate::macho::ByteSource for ScanContext {
         self.file_len.unwrap_or(0)
     }
 
+    fn held_len(&self) -> u64 {
+        self.content.as_ref().map_or(0, |c| c.len() as u64)
+    }
+
     fn read_range(&self, off: u64, len: usize) -> Option<Vec<u8>> {
         self.read_at(off, len)
     }
