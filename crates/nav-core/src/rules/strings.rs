@@ -158,7 +158,12 @@ impl Rule for SuspiciousStringsRule {
             }
         } else {
             let content = ctx.content.as_ref().ok_or(RuleOutcome::NotApplicable)?;
-            scan_window(&String::from_utf8_lossy(content), true, &mut hits);
+            // `ctx.truncated` means `content` stops short of the real end of
+            // input (an embedded/container budget, a file past the stream
+            // cap, or no ranged-read support) — a bounded marker ending
+            // exactly at that cut is inconclusive, not a real end-of-input
+            // match (§10/§11.8).
+            scan_window(&String::from_utf8_lossy(content), !ctx.truncated, &mut hits);
         }
 
         let matched: Vec<&Marker> = MARKERS
@@ -386,6 +391,30 @@ mod tests {
         );
 
         let _ = std::fs::remove_file(&path);
+    }
+
+    /// A bounded marker ending exactly at a truncated capture's cut is
+    /// inconclusive — the byte that would decide it (`| sh` vs. `| shasum`)
+    /// was never read — so it must not match; the same bytes, known to be
+    /// the whole content, are a real end of input and do match (§10/§11.8).
+    #[test]
+    fn bounded_marker_at_a_non_streamable_truncated_cut_is_not_matched() {
+        let content = b"http://x | sh".to_vec();
+
+        let truncated = ScanContext::from_embedded_bytes("x.pkg!payload", content.clone(), true);
+        assert!(
+            SuspiciousStringsRule
+                .evaluate(&truncated)
+                .expect("rule should be applicable")
+                .is_none(),
+            "a marker ending exactly at an unstreamable truncated cut must not match"
+        );
+
+        let whole = ScanContext::from_embedded_bytes("x.pkg!payload", content, false);
+        SuspiciousStringsRule
+            .evaluate(&whole)
+            .expect("rule should be applicable")
+            .expect("the same bytes, not truncated, are a real end of input");
     }
 
     /// Embedded content has no file behind it, so it can never be streamed.
