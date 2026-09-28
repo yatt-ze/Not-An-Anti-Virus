@@ -83,8 +83,9 @@ impl Rule for HighEntropyRule {
 
         // `images` empty (whether or not `is_macho`) falls through exactly as
         // a `macho::parse` miss did — a non-Mach-O or unwalkable file.
-        if let Some(image) = ctx.macho().images.first() {
-            return self.eval_macho_text(ctx, content, image);
+        let images = &ctx.macho().images;
+        if !images.is_empty() {
+            return Ok(self.eval_macho_images(ctx, content, images));
         }
 
         if looks_like_script_or_text(content, &ctx.path) {
@@ -95,24 +96,29 @@ impl Rule for HighEntropyRule {
         Ok(None)
     }
 
-    /// Covered when there's no `__TEXT` range to miss, its EOF-clipped range
-    /// is small enough to stream and ranged reads actually work here (§5.2,
-    /// #45), and that stream didn't fail partway; a script/text file whose
-    /// content is itself unread stays uncovered.
+    /// Covered when every slice's `__TEXT` was scored: no slice was skipped
+    /// walking the Mach-O itself, each slice's EOF-clipped range fits in
+    /// their combined `MAX_STREAM_BYTES` budget with ranged reads actually
+    /// working here (§5.2, #45), and no slice's stream failed partway; a
+    /// script/text file whose content is itself unread stays uncovered.
     fn covers_truncation(&self, ctx: &ScanContext) -> bool {
-        if let Some(image) = ctx.macho().images.first() {
-            if ctx.stream_failed(self.id()) {
+        let scan = ctx.macho();
+        if !scan.images.is_empty() {
+            if ctx.stream_failed(self.id()) || scan.skipped_slices > 0 {
                 return false;
             }
-            return match &image.text_range {
-                None => true,
-                Some(range) => {
-                    let range = clip_to_file_len(ctx, range.clone());
-                    (range.end - range.start) <= MAX_STREAM_BYTES && ctx.supports_ranged_reads()
-                }
-            };
+            let total: u64 = scan
+                .images
+                .iter()
+                .filter_map(|image| image.text_range.clone())
+                .map(|range| {
+                    let range = clip_to_file_len(ctx, range);
+                    range.end - range.start
+                })
+                .sum();
+            return total <= MAX_STREAM_BYTES && (total == 0 || ctx.supports_ranged_reads());
         }
-        if ctx.macho().is_macho {
+        if scan.is_macho {
             return false;
         }
         ctx.content
@@ -122,28 +128,43 @@ impl Rule for HighEntropyRule {
 }
 
 impl HighEntropyRule {
-    /// Score a Mach-O's `__TEXT` code: streamed over its whole (EOF-clipped)
+    /// Score every image's `__TEXT` code (a fat binary can hide a packed
+    /// slice behind a clean one, §5.2) and report the single strongest —
+    /// the highest-entropy slice that clears the threshold.
+    fn eval_macho_images(
+        &self,
+        ctx: &ScanContext,
+        content: &[u8],
+        images: &[macho::MachOImage],
+    ) -> Option<MatchedSignal> {
+        images
+            .iter()
+            .filter_map(|image| self.eval_macho_text(ctx, content, image))
+            .max_by(|(a, _), (b, _)| a.total_cmp(b))
+            .map(|(_, signal)| signal)
+    }
+
+    /// Score one image's `__TEXT` code: streamed over its whole (EOF-clipped)
     /// range when that fits `MAX_STREAM_BYTES`, else only over the part
-    /// inside `content`.
+    /// inside `content`. Returns the entropy alongside the signal so the
+    /// caller can compare candidates across a fat binary's slices.
     fn eval_macho_text(
         &self,
         ctx: &ScanContext,
         content: &[u8],
         image: &macho::MachOImage,
-    ) -> Result<Option<MatchedSignal>, RuleOutcome> {
-        let Some(range) = image.text_range.clone() else {
-            return Ok(None);
-        };
+    ) -> Option<(f64, MatchedSignal)> {
+        let range = image.text_range.clone()?;
         let range = clip_to_file_len(ctx, range);
         if range.is_empty() {
-            return Ok(None);
+            return None;
         }
 
         // Whole range already resident in `content`: score it directly on
         // the slice, no streaming/windowing needed (§5.2, #45 perf follow-up,
         // PR #52 review).
         if range.end <= content.len() as u64 {
-            return Ok(self.macho_signal_from_content(content, range));
+            return self.macho_signal_from_content(content, range);
         }
 
         if range.end - range.start <= MAX_STREAM_BYTES {
@@ -156,7 +177,7 @@ impl HighEntropyRule {
                 total += window.len() as u64;
             });
             if delivered {
-                return Ok(self.macho_signal(total, entropy_from_histogram(&counts, total)));
+                return self.macho_signal(total, entropy_from_histogram(&counts, total));
             }
             // The stream failed partway — fall back to what the captured
             // prefix can still show rather than discarding a score it would
@@ -164,7 +185,7 @@ impl HighEntropyRule {
             ctx.mark_stream_failed(self.id());
         }
 
-        Ok(self.macho_signal_from_content(content, range))
+        self.macho_signal_from_content(content, range)
     }
 
     /// Score the part of `range` that lies inside `content`, clamped — used
@@ -174,7 +195,7 @@ impl HighEntropyRule {
         &self,
         content: &[u8],
         range: Range<u64>,
-    ) -> Option<MatchedSignal> {
+    ) -> Option<(f64, MatchedSignal)> {
         let start = usize::try_from(range.start)
             .ok()
             .map(|s| s.min(content.len()));
@@ -185,23 +206,27 @@ impl HighEntropyRule {
         self.macho_signal(text.len() as u64, shannon_entropy(text))
     }
 
-    /// Build the `__TEXT`-section signal if `entropy` over `len` bytes clears
-    /// [`MIN_SAMPLE_BYTES`]/[`Self::threshold`] — shared by the streamed and
-    /// content-only paths so their description format can't drift apart.
-    fn macho_signal(&self, len: u64, entropy: f64) -> Option<MatchedSignal> {
+    /// Build the `__TEXT`-section signal, and the entropy it was built from,
+    /// if `entropy` over `len` bytes clears [`MIN_SAMPLE_BYTES`]/
+    /// [`Self::threshold`] — shared by the streamed and content-only paths so
+    /// their description format can't drift apart.
+    fn macho_signal(&self, len: u64, entropy: f64) -> Option<(f64, MatchedSignal)> {
         if len < MIN_SAMPLE_BYTES as u64 || entropy < self.threshold {
             return None;
         }
-        Some(MatchedSignal {
-            id: self.id().to_string(),
-            weight: 15,
-            description: format!(
-                "high-entropy __TEXT section (entropy: {:.1} bits/byte over {} bytes) — \
-                 consistent with packed/obfuscated code",
-                entropy, len
-            ),
-            category: self.category(),
-        })
+        Some((
+            entropy,
+            MatchedSignal {
+                id: self.id().to_string(),
+                weight: 15,
+                description: format!(
+                    "high-entropy __TEXT section (entropy: {:.1} bits/byte over {} bytes) — \
+                     consistent with packed/obfuscated code",
+                    entropy, len
+                ),
+                category: self.category(),
+            },
+        ))
     }
 
     /// Score a script/text file for an embedded high-entropy payload: first
@@ -808,6 +833,63 @@ mod tests {
             .unwrap()
             .expect("the in-prefix portion should still score");
         assert!(signal.description.contains("__TEXT"));
+        assert!(!HighEntropyRule::default().covers_truncation(&ctx));
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A fat binary's first slice is small and low-entropy, entirely inside
+    /// the 8 MiB prefix; its second slice's `__TEXT` is high-entropy and
+    /// starts past it. Scoring only `images.first()` would miss the second
+    /// slice entirely (§5.2, #45).
+    #[test]
+    fn a_fat_slices_high_entropy_text_past_8mib_is_scored() {
+        let (mut first, _) = crate::macho::tests_support::synth_macho_64(&[0u8; 64]);
+        // Padding appended past the slice's own declared structure — pushes
+        // where the second slice starts in the fat file without touching the
+        // first slice's own (small, low-entropy) __TEXT range.
+        first.resize(first.len() + MAX_CONTENT_BYTES + 4096, 0);
+        let (second, _) = crate::macho::tests_support::synth_macho_64(&high_entropy_blob(4096));
+        let fat = crate::macho::tests_support::synth_fat(&[&first, &second]);
+
+        let path = write_temp_file("fat-second-text-past-8mib", &fat);
+        let ctx = ScanContext::load(&path);
+        assert!(ctx.truncated);
+
+        let signal = HighEntropyRule::default()
+            .evaluate(&ctx)
+            .unwrap()
+            .expect("the second slice's high-entropy __TEXT should be found");
+        assert!(signal.description.contains("__TEXT"));
+        assert!(HighEntropyRule::default().covers_truncation(&ctx));
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Same fixture, but the second slice's `__TEXT` stream fails partway
+    /// (the file shrinks after load): `covers_truncation` must not claim a
+    /// slice was examined that couldn't be (§10/§11.8).
+    #[test]
+    fn a_fat_slices_second_text_stream_failure_does_not_cover_truncation() {
+        let (mut first, _) = crate::macho::tests_support::synth_macho_64(&[0u8; 64]);
+        first.resize(first.len() + MAX_CONTENT_BYTES + 4096, 0);
+        let (second, _) = crate::macho::tests_support::synth_macho_64(&high_entropy_blob(4096));
+        let fat = crate::macho::tests_support::synth_fat(&[&first, &second]);
+
+        let path = write_temp_file("fat-second-text-stream-failure", &fat);
+        let ctx = ScanContext::load(&path);
+        assert!(ctx.truncated);
+
+        // Shrink the file out from under the already-loaded context: reads
+        // past the captured prefix (the second slice's __TEXT) now fail.
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_len(8)
+            .unwrap();
+
+        let _ = HighEntropyRule::default().evaluate(&ctx).unwrap();
         assert!(!HighEntropyRule::default().covers_truncation(&ctx));
 
         let _ = std::fs::remove_file(&path);
