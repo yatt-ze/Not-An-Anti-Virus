@@ -34,8 +34,10 @@ pub enum TargetKind {
 pub struct ScanBudget {
     /// Maximum number of files scored in one target scan.
     pub max_files: usize,
-    /// Maximum summed input across the target, each file counted at the bytes
-    /// actually read for it (its length clipped to the §3 per-file cap).
+    /// Maximum summed input across the target, each file counted at the most
+    /// a rule may stream from it (its length clipped to `MAX_STREAM_BYTES`,
+    /// §11.12) — not the smaller §3 in-memory prefix, since rules can stream
+    /// past it (#45).
     pub max_total_bytes: u64,
     /// Maximum directory-recursion depth below the named target.
     pub max_depth: usize,
@@ -177,8 +179,8 @@ pub fn scan_target_with_budget(
 
     // A directly named single file has nothing to traverse, so the budget
     // (which bounds *traversal* — file count, depth, aggregate size) doesn't
-    // apply; the file is already bounded by the §3 per-file read cap. Coverage
-    // is complete by construction (§11.12).
+    // apply; there's no target-level ceiling to check against a single file.
+    // Coverage is complete by construction (§11.12).
     if meta.is_file() {
         return Ok(TargetScan {
             root: path.to_path_buf(),
