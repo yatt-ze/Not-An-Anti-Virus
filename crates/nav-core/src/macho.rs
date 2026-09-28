@@ -602,10 +602,14 @@ fn scan_ranged_fat(
         _ => return not_macho_scan(),
     };
     let Some(nfat) = be_u32(head, 4).filter(|&n| n != 0 && n <= MAX_FAT_ARCHES) else {
-        // A recognized fat magic, but not even `nfat_arch` was available to
-        // read (the short in-memory retry after the full head read failed) —
-        // the table may still exist; undetermined, not clean (§10/§11.8).
-        return if head.len() < 8 {
+        // A short head is either a real, complete file too small to hold
+        // `nfat_arch` (authoritative `source_len < 8`: genuinely not a fat
+        // binary), or a head cut short by a failed/partial read or a
+        // non-authoritative length — the table may still exist there,
+        // undetermined rather than clean (§10/§11.8).
+        return if src.source_len_is_authoritative() && source_len < 8 {
+            not_macho_scan()
+        } else if head.len() < 8 {
             MachOScan {
                 is_macho: true,
                 images: Vec::new(),
@@ -2235,6 +2239,17 @@ mod tests {
         assert!(scan.images.is_empty());
         assert_eq!(scan.skipped_slices, 1);
         assert!(!scan.fully_examined());
+    }
+
+    /// A complete 4-byte file starting `CAFEBABE` is too short to be a real
+    /// fat header at all — it must not be read as an unwalkable Mach-O
+    /// (§10/§11.8: this is "checked and clean," not "couldn't check").
+    #[test]
+    fn scan_ranged_short_complete_file_with_fat_magic_is_not_macho() {
+        let data: &[u8] = &[0xCA, 0xFE, 0xBA, 0xBE];
+        let scan = scan_ranged(data);
+        assert!(!scan.is_macho);
+        assert_eq!(scan.skipped_slices, 0);
     }
 
     /// A `ByteSource` wrapping `data` but reporting a caller-chosen
