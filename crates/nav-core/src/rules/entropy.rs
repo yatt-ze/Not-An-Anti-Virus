@@ -812,6 +812,7 @@ mod tests {
             codesign_dv_cache: std::sync::OnceLock::new(),
             spctl_cache: std::sync::OnceLock::new(),
             macho_cache: std::sync::OnceLock::new(),
+            stream_failed: std::sync::atomic::AtomicBool::new(false),
         };
         assert!(HighEntropyRule::default().evaluate(&ctx).unwrap().is_none());
     }
@@ -832,6 +833,7 @@ mod tests {
             codesign_dv_cache: std::sync::OnceLock::new(),
             spctl_cache: std::sync::OnceLock::new(),
             macho_cache: std::sync::OnceLock::new(),
+            stream_failed: std::sync::atomic::AtomicBool::new(false),
         };
         let signal = HighEntropyRule::default().evaluate(&ctx).unwrap();
         assert!(signal.is_some(), "script with embedded blob should score");
@@ -853,6 +855,7 @@ mod tests {
             codesign_dv_cache: std::sync::OnceLock::new(),
             spctl_cache: std::sync::OnceLock::new(),
             macho_cache: std::sync::OnceLock::new(),
+            stream_failed: std::sync::atomic::AtomicBool::new(false),
         };
         let signal = HighEntropyRule::default().evaluate(&ctx).unwrap();
         assert!(
@@ -875,6 +878,7 @@ mod tests {
             codesign_dv_cache: std::sync::OnceLock::new(),
             spctl_cache: std::sync::OnceLock::new(),
             macho_cache: std::sync::OnceLock::new(),
+            stream_failed: std::sync::atomic::AtomicBool::new(false),
         }
     }
 

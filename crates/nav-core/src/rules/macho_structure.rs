@@ -358,6 +358,7 @@ mod tests {
             codesign_dv_cache: std::sync::OnceLock::new(),
             spctl_cache: std::sync::OnceLock::new(),
             macho_cache: std::sync::OnceLock::new(),
+            stream_failed: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -382,6 +383,7 @@ mod tests {
             codesign_dv_cache: std::sync::OnceLock::new(),
             spctl_cache: std::sync::OnceLock::new(),
             macho_cache: std::sync::OnceLock::new(),
+            stream_failed: std::sync::atomic::AtomicBool::new(false),
         };
         assert!(matches!(
             MachOStructureRule.evaluate(&c),

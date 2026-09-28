@@ -141,13 +141,18 @@ impl Rule for SuspiciousStringsRule {
     fn evaluate(&self, ctx: &ScanContext) -> Result<Option<MatchedSignal>, RuleOutcome> {
         let mut hits = vec![false; MARKERS.len()];
 
-        if ctx.truncated && self.covers_truncation(ctx) {
+        if ctx.truncated && can_stream(ctx) {
             let file_len = ctx.file_len.ok_or(RuleOutcome::NotApplicable)?;
             let ok = ctx.for_each_window(0..file_len, MAX_MARKER_LEN, |window, is_last| {
                 // Lossy-decoded: ASCII markers still match, no panic on non-UTF-8.
                 scan_window(&String::from_utf8_lossy(window), is_last, &mut hits);
             });
-            if !ok {
+            ctx.stream_failed
+                .store(!ok, std::sync::atomic::Ordering::Relaxed);
+            // A stream that failed partway still reported real hits from
+            // before the failure — keep those rather than discard them; only
+            // a failure with nothing found at all is NotApplicable.
+            if !ok && !hits.iter().any(|&hit| hit) {
                 return Err(RuleOutcome::NotApplicable);
             }
         } else {
@@ -184,11 +189,18 @@ impl Rule for SuspiciousStringsRule {
     }
 
     /// Streams the whole file through the scan's own handle (§11.7) when it's
-    /// within the streaming cap — otherwise the unread bytes past the 8 MiB
-    /// prefix may hide a marker.
+    /// within the streaming cap and the stream didn't fail partway —
+    /// otherwise unread bytes past the 8 MiB prefix may hide a marker.
     fn covers_truncation(&self, ctx: &ScanContext) -> bool {
-        ctx.is_file_backed() && ctx.file_len.is_some_and(|len| len <= MAX_STREAM_BYTES)
+        can_stream(ctx) && !ctx.stream_failed.load(std::sync::atomic::Ordering::Relaxed)
     }
+}
+
+/// Whether `evaluate` can stream `ctx` past the prefix at all: a file-backed
+/// context within the streaming cap. Separate from `covers_truncation`,
+/// which also requires that a stream actually attempted didn't fail.
+fn can_stream(ctx: &ScanContext) -> bool {
+    ctx.is_file_backed() && ctx.file_len.is_some_and(|len| len <= MAX_STREAM_BYTES)
 }
 
 #[cfg(test)]
@@ -357,6 +369,43 @@ mod tests {
                 .expect("rule should be applicable")
                 .is_none(),
             "a marker past the 8 MiB prefix must not be found when the file exceeds the stream cap"
+        );
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A stream that fails partway through must not discard the hits it
+    /// already found in the bytes it did read — and must not claim
+    /// `covers_truncation`, since it didn't finish (§10/§11.8).
+    #[test]
+    fn stream_failure_partway_keeps_hits_already_found_and_declines_coverage() {
+        let total_len = MAX_CONTENT_BYTES as u64 + 4096;
+        let path = sparse_temp_file("stream-fails-partway", total_len);
+        write_at(&path, 0, b"TCC.db");
+
+        let ctx = ScanContext::load(&path);
+        assert!(ctx.truncated);
+
+        // Shrink the file out from under the already-loaded context:
+        // `file_len` still claims the original size, so `for_each_window`
+        // reads the marker fine from `content` but then fails once it needs
+        // a chunk past the (now-real) end of the file.
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_len(8)
+            .unwrap();
+
+        let rule = SuspiciousStringsRule;
+        let sig = rule
+            .evaluate(&ctx)
+            .expect("a hit found before the failure keeps the rule applicable")
+            .expect("the marker at offset 0 must still be reported");
+        assert!(sig.description.contains("TCC permissions database"));
+        assert!(
+            !rule.covers_truncation(&ctx),
+            "a failed stream must not claim coverage"
         );
 
         let _ = std::fs::remove_file(&path);

@@ -122,6 +122,15 @@ pub struct ScanContext {
     /// about the same file. `pub(crate)` for the same reason as the caches
     /// above; use [`ScanContext::macho`] to read it.
     pub(crate) macho_cache: OnceLock<crate::macho::MachOScan>,
+    /// Set by a rule's `evaluate` when it started streaming past the prefix
+    /// (`for_each_window`) but the stream failed partway, so its
+    /// `covers_truncation` can report the gap instead of coverage it didn't
+    /// get (§10/§11.8). One flag is enough today: only
+    /// `SuspiciousStringsRule` streams and needs to report this. `AtomicBool`
+    /// rather than `Cell`, so `ScanContext` stays `Sync` like its other
+    /// caches; `Relaxed` is enough since there's no other state to order
+    /// against.
+    pub(crate) stream_failed: std::sync::atomic::AtomicBool,
 }
 
 impl ScanContext {
@@ -164,6 +173,7 @@ impl ScanContext {
             codesign_dv_cache: OnceLock::new(),
             spctl_cache: OnceLock::new(),
             macho_cache: OnceLock::new(),
+            stream_failed: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -188,6 +198,7 @@ impl ScanContext {
             codesign_dv_cache: OnceLock::new(),
             spctl_cache: OnceLock::new(),
             macho_cache: OnceLock::new(),
+            stream_failed: std::sync::atomic::AtomicBool::new(false),
         }
     }
 

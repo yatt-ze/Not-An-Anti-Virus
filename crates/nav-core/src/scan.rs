@@ -268,6 +268,7 @@ mod tests {
             codesign_dv_cache: OnceLock::new(),
             spctl_cache: OnceLock::new(),
             macho_cache: OnceLock::new(),
+            stream_failed: std::sync::atomic::AtomicBool::new(false),
         };
 
         // No rules object, so truncation is the only thing that can lower it.
@@ -310,6 +311,7 @@ mod tests {
             codesign_dv_cache: OnceLock::new(),
             spctl_cache: OnceLock::new(),
             macho_cache: OnceLock::new(),
+            stream_failed: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -433,6 +435,7 @@ mod tests {
             codesign_dv_cache: OnceLock::new(),
             spctl_cache: OnceLock::new(),
             macho_cache: OnceLock::new(),
+            stream_failed: std::sync::atomic::AtomicBool::new(false),
         };
         assert_eq!(
             scan_context(&ctx, &default_ruleset()).completeness,
