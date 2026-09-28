@@ -40,7 +40,13 @@ pub fn run(path: &Path, recursive: bool, json: bool) -> ExitCode {
 
     for result in &scan.results {
         if json {
-            println!("{}", scan_result_json(result));
+            match scan_result_json(result) {
+                Ok(line) => println!("{line}"),
+                Err(e) => {
+                    eprintln!("navd scan-once: cannot serialize result: {e}");
+                    return nav_core::exit_code(nav_core::OPERATIONAL_ERROR);
+                }
+            }
         } else {
             print_summary(result);
         }
