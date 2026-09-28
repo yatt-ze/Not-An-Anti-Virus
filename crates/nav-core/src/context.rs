@@ -366,6 +366,14 @@ impl crate::macho::ByteSource for ScanContext {
         self.content.as_ref().map_or(0, |c| c.len() as u64)
     }
 
+    fn source_len_is_authoritative(&self) -> bool {
+        // A real file's `file_len` is always the true stat'd size, even
+        // though `content` is capped. Embedded content's `file_len` is just
+        // how much was captured — the real member may be bigger — but only
+        // when extraction actually stopped short (`truncated`).
+        !(self.source == ContentSource::Embedded && self.truncated)
+    }
+
     fn read_range(&self, off: u64, len: usize) -> Option<Vec<u8>> {
         self.read_at(off, len)
     }

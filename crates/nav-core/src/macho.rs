@@ -166,6 +166,14 @@ pub trait ByteSource {
     fn held_len(&self) -> u64 {
         0
     }
+    /// Whether [`Self::source_len`] is the object's true total size. `true`
+    /// by default. `false` for a capture that stopped short of the real
+    /// object's end (an embedded/container member extracted only up to a
+    /// budget): an offset past `source_len` there may still land on real
+    /// data this source just doesn't have — see [`scan_ranged_fat`].
+    fn source_len_is_authoritative(&self) -> bool {
+        true
+    }
     /// Reads exactly `len` bytes starting at `off`, or `None` if the range
     /// doesn't fit or the read fails.
     fn read_range(&self, off: u64, len: usize) -> Option<Vec<u8>>;
@@ -515,12 +523,51 @@ pub fn scan_ranged(src: &(impl ByteSource + ?Sized)) -> MachOScan {
     }
 }
 
+/// Whether a declared fat-table offset could be confirmed to start a thin
+/// Mach-O slice — see [`classify_slice_magic`].
+enum SliceMagic {
+    /// Read (or otherwise confirmed) to be a real thin Mach-O magic.
+    Real,
+    /// Read (or ruled out via an authoritative `source_len`) and it isn't.
+    NotMacho,
+    /// Couldn't tell: the read failed (I/O error, non-unix, budget), or the
+    /// offset lies past a `source_len` that isn't authoritative — a real
+    /// slice may still exist there. Never treated as "not Mach-O" (§10/
+    /// §11.8).
+    Undetermined,
+}
+
+/// Classify what's at a declared fat-table offset without assuming a read
+/// failure or an out-of-bounds offset means "no slice here" — see
+/// [`SliceMagic`].
+fn classify_slice_magic(
+    src: &(impl ByteSource + ?Sized),
+    budget: &mut RangeBudget,
+    off: u64,
+    source_len: u64,
+) -> SliceMagic {
+    if off >= source_len {
+        return if src.source_len_is_authoritative() {
+            SliceMagic::NotMacho
+        } else {
+            SliceMagic::Undetermined
+        };
+    }
+    match read_budgeted(src, budget, off, 4) {
+        Some(bytes) if be_u32(&bytes, 0).and_then(thin_kind).is_some() => SliceMagic::Real,
+        Some(_) => SliceMagic::NotMacho,
+        None => SliceMagic::Undetermined,
+    }
+}
+
 /// Walk a fat/universal binary's arch table by offset. `is_macho` only if
-/// some declared, in-bounds offset actually holds a thin Mach-O magic — read
-/// via `read_range`, never inferred from a prefix — which keeps a Java
-/// `.class` file (#46) non-Mach-O without the old prefix path's `truncated`
-/// leniency; an offset-based read can always check the real bytes, so that
-/// leniency is no longer needed.
+/// some declared offset is confirmed to hold a thin Mach-O magic, read via
+/// `read_range` — which keeps a Java `.class` file (#46) non-Mach-O. If none
+/// is confirmed but at least one couldn't be determined (a failed read, or
+/// an offset past a non-authoritative `source_len` — e.g. a truncated
+/// embedded/container member), this still reports `is_macho: true` with
+/// those counted as skipped, rather than reading "couldn't check" as "clean"
+/// (§10/§11.8, §5.2 review).
 fn scan_ranged_fat(
     src: &(impl ByteSource + ?Sized),
     head: &[u8],
@@ -540,15 +587,32 @@ fn scan_ranged_fat(
         .map(|i| fat_arch_offset(head, is_64, i))
         .collect();
 
-    let has_real_slice = offsets.iter().flatten().any(|&off| {
-        off < source_len
-            && read_budgeted(src, budget, off, 4)
-                .and_then(|b| be_u32(&b, 0))
-                .and_then(thin_kind)
-                .is_some()
-    });
-    if !has_real_slice {
-        return not_macho_scan();
+    let magics: Vec<SliceMagic> = offsets
+        .iter()
+        .map(|off_opt| match off_opt {
+            Some(off) => classify_slice_magic(src, budget, *off, source_len),
+            // This entry's own bytes lie outside what we hold — the arch
+            // table itself may have been cut short by a non-authoritative
+            // capture.
+            None if src.source_len_is_authoritative() => SliceMagic::NotMacho,
+            None => SliceMagic::Undetermined,
+        })
+        .collect();
+
+    if !magics.iter().any(|m| matches!(m, SliceMagic::Real)) {
+        let undetermined = magics
+            .iter()
+            .filter(|m| matches!(m, SliceMagic::Undetermined))
+            .count();
+        return if undetermined == 0 {
+            not_macho_scan()
+        } else {
+            MachOScan {
+                is_macho: true,
+                images: Vec::new(),
+                skipped_slices: undetermined,
+            }
+        };
     }
 
     // Dedupe by offset exactly as `parse_fat_all` does: a duplicate of a

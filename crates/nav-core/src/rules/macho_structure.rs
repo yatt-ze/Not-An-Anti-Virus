@@ -921,6 +921,91 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
+    /// A fat header whose declared slices lie past the 8 MiB prefix, on a
+    /// file that shrank out from under the loaded context (an I/O error on
+    /// every slice-magic read): the scan must report `is_macho: true` with
+    /// both slices skipped as undetermined, never "not Mach-O" — and the
+    /// rule must not claim `covers_truncation` over a scan it couldn't
+    /// finish (§10/§11.8, §5.2 review).
+    #[test]
+    fn fat_header_whose_slices_become_unreadable_is_undetermined_not_clean() {
+        // Both slices placed well past the 8 MiB prefix (unlike `synth_fat`,
+        // which would put the first slice early enough to be read straight
+        // out of `content`, unaffected by the file shrinking below) — every
+        // slice-magic read must go through the file handle.
+        let (a, _, _) = synth_macho_64_full(b"aa", &[], &[], false, None);
+        let (b, _, _) = synth_macho_64_full(b"bb", &[], &[], false, None);
+        let a_off = MAX_CONTENT_BYTES + 4096;
+        let b_off = a_off + a.len() + 4096;
+
+        let mut fat = Vec::new();
+        fat.extend_from_slice(&[0xCA, 0xFE, 0xBA, 0xBE]); // FAT_MAGIC
+        fat.extend_from_slice(&2u32.to_be_bytes()); // nfat_arch
+        fat.extend_from_slice(&0x0100_0007u32.to_be_bytes()); // cputype
+        fat.extend_from_slice(&0u32.to_be_bytes()); // cpusubtype
+        fat.extend_from_slice(&(a_off as u32).to_be_bytes()); // offset
+        fat.extend_from_slice(&(a.len() as u32).to_be_bytes()); // size
+        fat.extend_from_slice(&0u32.to_be_bytes()); // align
+        fat.extend_from_slice(&0x0100_0007u32.to_be_bytes()); // cputype
+        fat.extend_from_slice(&1u32.to_be_bytes()); // cpusubtype
+        fat.extend_from_slice(&(b_off as u32).to_be_bytes()); // offset
+        fat.extend_from_slice(&(b.len() as u32).to_be_bytes()); // size
+        fat.extend_from_slice(&0u32.to_be_bytes()); // align
+        fat.resize(a_off, 0);
+        fat.extend_from_slice(&a);
+        fat.resize(b_off, 0);
+        fat.extend_from_slice(&b);
+
+        let path = write_temp_file("fat-slices-become-unreadable", &fat);
+        let ctx = ScanContext::load(&path);
+        assert!(ctx.truncated);
+
+        // Shrink the file out from under the already-loaded context: the fat
+        // header itself was captured in `content` and still parses, but a
+        // slice-magic read past the 8 MiB prefix now hits real EOF instead
+        // of finding the slice.
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_len(8)
+            .unwrap();
+
+        let scan = ctx.macho();
+        assert!(
+            scan.is_macho,
+            "an unreadable slice must not read as not Mach-O"
+        );
+        assert!(scan.images.is_empty());
+        assert_eq!(scan.skipped_slices, 2);
+        assert!(!MachOStructureRule.covers_truncation(&ctx));
+        assert!(matches!(
+            MachOStructureRule.evaluate(&ctx),
+            Err(RuleOutcome::NotApplicable)
+        ));
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A truncated embedded/container member (extraction stopped at a
+    /// budget) whose fat table declares a slice past the captured bytes:
+    /// unlike a real file's EOF, `source_len` here is only how much was
+    /// captured, not the member's true size, so this must read as
+    /// `NotApplicable`, not `Ok(None)` (§10/§11.8, §5.2 review).
+    #[test]
+    fn truncated_embedded_fat_header_whose_slice_lies_beyond_the_capture_is_not_applicable() {
+        let (real, _, _) = synth_macho_64_full(b"real", &[], &[], false, None);
+        let fat = synth_fat(&[&real]);
+        let header_and_table_len = 8 + 20; // fat_header + one fat_arch entry
+        let captured = fat[..header_and_table_len].to_vec();
+
+        let ctx = ScanContext::from_embedded_bytes("x.pkg!member", captured, true);
+        assert!(matches!(
+            MachOStructureRule.evaluate(&ctx),
+            Err(RuleOutcome::NotApplicable)
+        ));
+    }
+
     /// A signature whose declared `datasize` exceeds `MAX_SIGNATURE_BYTES`
     /// must not be read at all: `covers_truncation` is false, and — with no
     /// other finding — the rule reports `NotApplicable` rather than a clean
