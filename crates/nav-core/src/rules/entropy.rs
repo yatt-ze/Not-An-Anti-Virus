@@ -86,7 +86,7 @@ impl Rule for HighEntropyRule {
         // a `macho::parse` miss did — a non-Mach-O or unwalkable file.
         let images = &ctx.macho().images;
         if !images.is_empty() {
-            return Ok(self.eval_macho_images(ctx, content, images));
+            return self.eval_macho_images(ctx, content, images);
         }
 
         if looks_like_script_or_text(content, &ctx.path) {
@@ -202,19 +202,25 @@ fn budgeted_text_ranges<'a>(
 impl HighEntropyRule {
     /// Score every image's `__TEXT` code (a fat binary can hide a packed
     /// slice behind a clean one, §5.2) and report the single strongest —
-    /// the highest-entropy slice that clears the threshold.
+    /// the highest-entropy slice that clears the threshold. Returns
+    /// `NotApplicable` when nothing matched but the budget left a range
+    /// unscored (§10/§11.8); a match stands regardless.
     fn eval_macho_images(
         &self,
         ctx: &ScanContext,
         content: &[u8],
         images: &[macho::MachOImage],
-    ) -> Option<MatchedSignal> {
-        let (included, _all_scored) = budgeted_text_ranges(ctx, images);
-        included
+    ) -> Result<Option<MatchedSignal>, RuleOutcome> {
+        let (included, all_scored) = budgeted_text_ranges(ctx, images);
+        let best = included
             .into_iter()
             .filter_map(|(_, range)| self.eval_macho_text(ctx, content, range))
             .max_by(|(a, _), (b, _)| a.total_cmp(b))
-            .map(|(_, signal)| signal)
+            .map(|(_, signal)| signal);
+        match best {
+            None if !all_scored => Err(RuleOutcome::NotApplicable),
+            best => Ok(best),
+        }
     }
 
     /// Score one already-budgeted, EOF-clipped `__TEXT` range: streamed over
@@ -1016,7 +1022,10 @@ mod tests {
         let images = [image];
         let rule = HighEntropyRule::default();
         let content = ctx.content.as_ref().unwrap();
-        assert!(rule.eval_macho_images(&ctx, content, &images).is_some());
+        assert!(rule
+            .eval_macho_images(&ctx, content, &images)
+            .unwrap()
+            .is_some());
         assert!(!budgeted_text_ranges(&ctx, &images).1);
     }
 
@@ -1032,7 +1041,55 @@ mod tests {
         let images = [decoy, packed];
         let content = ctx.content.as_ref().unwrap();
         let signal = HighEntropyRule::default().eval_macho_images(&ctx, content, &images);
-        assert!(signal.is_some());
+        assert!(signal.unwrap().is_some());
+    }
+
+    /// Non-truncated ctx with `content` held, a decoy range that nearly
+    /// exhausts the budget, and a second range the budget leaves out.
+    /// `with_resident` adds a resident range scored before the decoy.
+    fn left_out_range_images(
+        content: Vec<u8>,
+        with_resident: bool,
+    ) -> (ScanContext, Vec<macho::MachOImage>) {
+        let held = content.len() as u64;
+        let (mut ctx, base) = packed_ctx(held + MAX_STREAM_BYTES);
+        ctx.content = Some(content);
+        let resident = if with_resident { held } else { 0 };
+        let mut decoy = base.clone();
+        decoy.text_range = Some(held..held + MAX_STREAM_BYTES - resident - 100);
+        let mut left_out = base.clone();
+        left_out.text_range = Some(1..held + MAX_STREAM_BYTES - 50);
+        let mut images = vec![decoy, left_out];
+        if with_resident {
+            let mut first = base;
+            first.text_range = Some(0..held);
+            images.push(first);
+        }
+        (ctx, images)
+    }
+
+    /// Non-truncated file whose decoys exhaust the budget and leave a range
+    /// out: no finding means `NotApplicable`, not clean.
+    #[test]
+    fn budget_left_out_range_without_a_match_is_not_applicable() {
+        let (ctx, images) = left_out_range_images(vec![0u8; 4096], false);
+        assert!(!budgeted_text_ranges(&ctx, &images).1);
+        let content = ctx.content.as_ref().unwrap();
+        assert!(matches!(
+            HighEntropyRule::default().eval_macho_images(&ctx, content, &images),
+            Err(RuleOutcome::NotApplicable)
+        ));
+    }
+
+    /// A finding in an included range stands even when another range was
+    /// left out by the budget.
+    #[test]
+    fn budget_left_out_range_does_not_suppress_a_match() {
+        let (ctx, images) = left_out_range_images(high_entropy_blob(4096), true);
+        assert!(!budgeted_text_ranges(&ctx, &images).1);
+        let content = ctx.content.as_ref().unwrap();
+        let signal = HighEntropyRule::default().eval_macho_images(&ctx, content, &images);
+        assert!(signal.unwrap().is_some());
     }
 
     /// Slices clipping to the same absolute range are scored once.
