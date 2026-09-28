@@ -385,19 +385,21 @@ impl ScanContext {
     /// Records that `rule_id`'s [`Self::for_each_window`] stream failed
     /// partway this scan.
     pub fn mark_stream_failed(&self, rule_id: &'static str) {
-        if let Ok(mut failures) = self.stream_failures.lock() {
-            if !failures.contains(&rule_id) {
-                failures.push(rule_id);
-            }
+        let mut failures = self
+            .stream_failures
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !failures.contains(&rule_id) {
+            failures.push(rule_id);
         }
     }
 
     /// Whether `rule_id`'s stream failed partway this scan.
     pub fn stream_failed(&self, rule_id: &'static str) -> bool {
-        match self.stream_failures.lock() {
-            Ok(failures) => failures.contains(&rule_id),
-            Err(_) => false,
-        }
+        self.stream_failures
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .contains(&rule_id)
     }
 }
 
@@ -481,6 +483,20 @@ mod tests {
 
     /// A real, opened file supports ranged reads; embedded content (no file
     /// at all) never does, on any platform (§5.2, #45).
+    /// A poisoned failure list still records and reports failures.
+    #[test]
+    fn stream_failures_survive_a_poisoned_lock() {
+        let ctx = ScanContext::from_embedded_bytes("x", vec![1], false);
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = ctx.stream_failures.lock().unwrap();
+            panic!("poison the lock");
+        }));
+        assert!(ctx.stream_failures.is_poisoned());
+        assert!(!ctx.stream_failed("a"));
+        ctx.mark_stream_failed("a");
+        assert!(ctx.stream_failed("a"));
+    }
+
     #[test]
     fn supports_ranged_reads_requires_an_actual_file_handle() {
         let path = write_temp_file("supports-ranged-reads", b"hello world");
