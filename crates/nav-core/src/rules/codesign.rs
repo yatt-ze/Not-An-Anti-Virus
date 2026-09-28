@@ -140,13 +140,15 @@ impl Rule for UnsignedBinaryRule {
         if !ctx.is_file_backed() {
             return Err(RuleOutcome::NotApplicable);
         }
-        let content = ctx.content.as_ref().ok_or(RuleOutcome::NotApplicable)?;
+        if ctx.content.is_none() {
+            return Err(RuleOutcome::NotApplicable);
+        }
 
         // `codesign -dv` says "not signed at all" for anything it doesn't
         // recognize (text, tarball, `.pkg` — whose xar signature it can't
-        // read), so gate on Mach-O magic first or the rule calls a README an
-        // unsigned binary (§10/§11.8).
-        if !crate::macho::is_macho_magic(content, ctx.truncated) {
+        // read), so gate on `ctx.macho()` first or the rule calls a README
+        // an unsigned binary (§10/§11.8).
+        if !ctx.macho().is_macho {
             return Ok(None);
         }
 
@@ -160,6 +162,12 @@ impl Rule for UnsignedBinaryRule {
         } else {
             Ok(None) // signed (ad-hoc or real) — other rules' concern
         }
+    }
+
+    /// `ctx.macho()` is only consulted for the Mach-O gate; the verdict
+    /// itself comes from `codesign` run on the whole file.
+    fn covers_truncation(&self, _ctx: &ScanContext) -> bool {
+        true
     }
 }
 
@@ -191,8 +199,10 @@ impl Rule for AdHocSignedRule {
         if !ctx.is_file_backed() {
             return Err(RuleOutcome::NotApplicable);
         }
-        let content = ctx.content.as_ref().ok_or(RuleOutcome::NotApplicable)?;
-        if !crate::macho::is_macho_magic(content, ctx.truncated) {
+        if ctx.content.is_none() {
+            return Err(RuleOutcome::NotApplicable);
+        }
+        if !ctx.macho().is_macho {
             return Ok(None);
         }
 
@@ -207,6 +217,11 @@ impl Rule for AdHocSignedRule {
         } else {
             Ok(None)
         }
+    }
+
+    /// Same as `UnsignedBinaryRule`: `ctx.macho()` only gates.
+    fn covers_truncation(&self, _ctx: &ScanContext) -> bool {
+        true
     }
 }
 
@@ -247,8 +262,10 @@ impl Rule for RevokedSignatureRule {
         if !ctx.is_file_backed() {
             return Err(RuleOutcome::NotApplicable);
         }
-        let content = ctx.content.as_ref().ok_or(RuleOutcome::NotApplicable)?;
-        if !crate::macho::is_macho_magic(content, ctx.truncated) {
+        if ctx.content.is_none() {
+            return Err(RuleOutcome::NotApplicable);
+        }
+        if !ctx.macho().is_macho {
             return Ok(None);
         }
 
@@ -268,6 +285,11 @@ impl Rule for RevokedSignatureRule {
         } else {
             Ok(None)
         }
+    }
+
+    /// Same as `UnsignedBinaryRule`: `ctx.macho()` only gates.
+    fn covers_truncation(&self, _ctx: &ScanContext) -> bool {
+        true
     }
 }
 
@@ -366,8 +388,10 @@ impl Rule for UnnotarizedSignedRule {
         if !ctx.is_file_backed() {
             return Err(RuleOutcome::NotApplicable);
         }
-        let content = ctx.content.as_ref().ok_or(RuleOutcome::NotApplicable)?;
-        if !crate::macho::is_macho_magic(content, ctx.truncated) {
+        if ctx.content.is_none() {
+            return Err(RuleOutcome::NotApplicable);
+        }
+        if !ctx.macho().is_macho {
             return Ok(None);
         }
         // Notarization presupposes a real identity to submit for notarization.
@@ -386,6 +410,11 @@ impl Rule for UnnotarizedSignedRule {
             }
             _ => Ok(None),
         }
+    }
+
+    /// Same as `UnsignedBinaryRule`: `ctx.macho()` only gates.
+    fn covers_truncation(&self, _ctx: &ScanContext) -> bool {
+        true
     }
 }
 
@@ -413,8 +442,10 @@ impl Rule for NotarizedRule {
         if !ctx.is_file_backed() {
             return Err(RuleOutcome::NotApplicable);
         }
-        let content = ctx.content.as_ref().ok_or(RuleOutcome::NotApplicable)?;
-        if !crate::macho::is_macho_magic(content, ctx.truncated) {
+        if ctx.content.is_none() {
+            return Err(RuleOutcome::NotApplicable);
+        }
+        if !ctx.macho().is_macho {
             return Ok(None);
         }
         if run_codesign_dv(ctx)? != DvStatus::Signed {
@@ -432,6 +463,11 @@ impl Rule for NotarizedRule {
             }
             _ => Ok(None),
         }
+    }
+
+    /// Same as `UnsignedBinaryRule`: `ctx.macho()` only gates.
+    fn covers_truncation(&self, _ctx: &ScanContext) -> bool {
+        true
     }
 }
 
@@ -545,9 +581,31 @@ mod tests {
             file_len: Some(body.len() as u64),
             identity: None,
             source: ContentSource::File,
+            file: None,
             codesign_dv_cache: std::sync::OnceLock::new(),
             spctl_cache: std::sync::OnceLock::new(),
+            macho_cache: std::sync::OnceLock::new(),
+            stream_failures: std::sync::Mutex::new(Vec::new()),
         }
+    }
+
+    fn truncated_ctx(name: &str, body: &[u8]) -> ScanContext {
+        ScanContext {
+            truncated: true,
+            ..ctx(name, body)
+        }
+    }
+
+    /// All five rules' verdicts come from `codesign`/`spctl` on the whole
+    /// file, not the truncated prefix — see the module-level doc comments.
+    #[test]
+    fn all_codesign_rules_cover_truncation_on_a_truncated_macho_context() {
+        let c = truncated_ctx("app", b"\xfe\xed\xfa\xcf");
+        assert!(UnsignedBinaryRule.covers_truncation(&c));
+        assert!(AdHocSignedRule.covers_truncation(&c));
+        assert!(RevokedSignatureRule.covers_truncation(&c));
+        assert!(UnnotarizedSignedRule.covers_truncation(&c));
+        assert!(NotarizedRule.covers_truncation(&c));
     }
 
     /// Without the Mach-O gate this rule fired on every non-binary file
@@ -567,6 +625,47 @@ mod tests {
                 "{name} is not a code object and must not be reported as an unsigned binary"
             );
         }
+    }
+
+    /// A >8 MiB file with a `CAFEBABE` header whose sole arch-table entry
+    /// points past the 8 MiB prefix at bytes that aren't a thin Mach-O
+    /// magic: `ctx.macho()` reads the real offset and correctly says this
+    /// isn't Mach-O, so none of the five rules should even ask `codesign`
+    /// (§5.2, #45).
+    #[test]
+    fn codesign_rules_do_not_treat_an_out_of_bounds_fat_offset_as_macho() {
+        use crate::context::MAX_CONTENT_BYTES;
+        use crate::test_support::{sparse_temp_file, write_at};
+
+        let total_len = MAX_CONTENT_BYTES as u64 + 4096;
+        let path = sparse_temp_file("codesign-oob-fat-offset", total_len);
+
+        let bogus_offset = (MAX_CONTENT_BYTES + 2048) as u32;
+        let mut header = Vec::new();
+        header.extend_from_slice(&0xCAFE_BABEu32.to_be_bytes());
+        header.extend_from_slice(&1u32.to_be_bytes()); // nfat_arch = 1
+        header.extend_from_slice(&0x0100_0007u32.to_be_bytes()); // cputype
+        header.extend_from_slice(&0u32.to_be_bytes()); // cpusubtype
+        header.extend_from_slice(&bogus_offset.to_be_bytes()); // offset
+        header.extend_from_slice(&4096u32.to_be_bytes()); // size
+        header.extend_from_slice(&0u32.to_be_bytes()); // align
+        write_at(&path, 0, &header);
+        write_at(&path, bogus_offset as u64, b"not a mach-o slice at all");
+
+        let ctx = ScanContext::load(&path);
+        assert!(ctx.truncated);
+        assert!(
+            !ctx.macho().is_macho,
+            "the arch table's offset, read for real, doesn't point at a thin magic"
+        );
+
+        assert!(matches!(UnsignedBinaryRule.evaluate(&ctx), Ok(None)));
+        assert!(matches!(AdHocSignedRule.evaluate(&ctx), Ok(None)));
+        assert!(matches!(RevokedSignatureRule.evaluate(&ctx), Ok(None)));
+        assert!(matches!(UnnotarizedSignedRule.evaluate(&ctx), Ok(None)));
+        assert!(matches!(NotarizedRule.evaluate(&ctx), Ok(None)));
+
+        let _ = std::fs::remove_file(&path);
     }
 
     /// Content lifted out of a container has no file to ask about.

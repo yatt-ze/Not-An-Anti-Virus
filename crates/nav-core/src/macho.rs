@@ -9,7 +9,15 @@
 //! general Mach-O reader: it walks the load command table and a signature
 //! SuperBlob it can bound, and returns `None`/empty for anything it can't
 //! recognize or bound.
+//!
+//! [`parse`]/[`parse_all`]/[`parse_all_slices`] work over an in-memory
+//! buffer (typically a capped prefix) and so lose slices/signatures past its
+//! end. [`scan_ranged`] instead reads exactly the regions it needs — headers,
+//! load commands, code signatures — from their real offsets via
+//! [`ByteSource`], so a file bigger than any in-memory capture is still fully
+//! examined (§5.2, #45).
 
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::ops::Range;
 
@@ -79,6 +87,37 @@ const MAX_ENTITLEMENTS_BYTES: usize = 256 * 1024;
 // alongside the real slice, #46) — don't lower it to exclude other formats,
 // an arch-count cap can hide a runnable binary.
 const MAX_FAT_ARCHES: u32 = 1024;
+/// A slice declaring more load-command bytes than this is unwalkable by
+/// offset once its load commands extend past what [`ByteSource::held_len`]
+/// already holds — [`scan_ranged`] skips the slice rather than read that much
+/// by offset. Doesn't bound a slice whose load commands are already in
+/// memory; there's no I/O to cap.
+const MAX_SIZEOFCMDS: usize = 2 * 1024 * 1024;
+/// Largest `LC_CODE_SIGNATURE` region [`scan_ranged`] will read by offset.
+pub(crate) const MAX_SIGNATURE_BYTES: usize = 16 * 1024 * 1024;
+/// Total bytes one [`scan_ranged`] call may read across every slice and
+/// signature; once exhausted, remaining slices count as skipped.
+const MAX_RANGED_BYTES: u64 = 64 * 1024 * 1024;
+
+/// Whether a slice's `LC_CODE_SIGNATURE` region was examined.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SignatureRegion {
+    /// The whole region was read; the signature facts are determined.
+    Read,
+    /// The region lies past an authoritative end of the object: there is
+    /// nothing to read, so "no readable signature" is a determined fact.
+    PastEof,
+    /// Not read (truncated prefix, size cap, budget, non-authoritative
+    /// length, read failure): whatever it holds is unknown (§10/§11.8).
+    Unread,
+}
+
+impl SignatureRegion {
+    /// True when the region's contents (or absence) are determined.
+    pub fn is_determined(self) -> bool {
+        !matches!(self, SignatureRegion::Unread)
+    }
+}
 
 /// A recognized Mach-O image: `__TEXT,__text`'s file range plus the loader
 /// facts (`dylibs`/`rpaths`/`has_code_signature`/`entitlements`) the
@@ -122,6 +161,61 @@ pub struct MachOImage {
     /// has none. Only meaningful when `code_directory_flags` is `Some` —
     /// otherwise the signature region couldn't be read at all.
     pub has_cms_signature: bool,
+    /// How much is known about the `LC_CODE_SIGNATURE` region
+    /// (`dataoff..dataoff+datasize`, slice-relative). [`SignatureRegion::Unread`]
+    /// also when there's no signature at all.
+    pub signature_region: SignatureRegion,
+    /// Slice-relative `LC_CODE_SIGNATURE` `(dataoff, datasize)`, so
+    /// [`scan_ranged`] can find and re-read the region by absolute offset.
+    /// `None` if there's no `LC_CODE_SIGNATURE` load command.
+    pub code_signature: Option<(u32, u32)>,
+}
+
+/// Uniform access to file-like bytes for offset-based parsing
+/// ([`scan_ranged`]): shared by `[u8]` (a whole in-memory buffer — tests, the
+/// fuzz target) and [`crate::context::ScanContext`] (reads through the
+/// scan's own file handle past its in-memory prefix).
+pub trait ByteSource {
+    /// Total length of the underlying object.
+    fn source_len(&self) -> u64;
+    /// Leading bytes already resident in memory — readable at no I/O cost.
+    /// `0` by default. `[u8]` overrides this to its whole length (it's all
+    /// memory already); [`crate::context::ScanContext`] to `content`'s
+    /// length. [`read_budgeted`] only charges a read for the part of its
+    /// range beyond this.
+    fn held_len(&self) -> u64 {
+        0
+    }
+    /// Whether [`Self::source_len`] is the object's true total size. `true`
+    /// by default. `false` for a capture that stopped short of the real
+    /// object's end (an embedded/container member extracted only up to a
+    /// budget): an offset past `source_len` there may still land on real
+    /// data this source just doesn't have — see [`scan_ranged_fat`].
+    fn source_len_is_authoritative(&self) -> bool {
+        true
+    }
+    /// Reads exactly `len` bytes starting at `off`, or `None` if the range
+    /// doesn't fit or the read fails. Borrows straight from memory already
+    /// held when the whole range lies inside it, rather than copying — a
+    /// single slice's header/signature reads can number in the thousands on
+    /// hostile input (§5.2).
+    fn read_range(&self, off: u64, len: usize) -> Option<Cow<'_, [u8]>>;
+}
+
+impl ByteSource for [u8] {
+    fn source_len(&self) -> u64 {
+        self.len() as u64
+    }
+
+    fn held_len(&self) -> u64 {
+        self.len() as u64
+    }
+
+    fn read_range(&self, off: u64, len: usize) -> Option<Cow<'_, [u8]>> {
+        let start = usize::try_from(off).ok()?;
+        let end = start.checked_add(len)?;
+        self.get(start..end).map(Cow::Borrowed)
+    }
 }
 
 /// Parse `data` as a single Mach-O image: the thin image, or the **first**
@@ -337,6 +431,390 @@ fn parse_fat_slice_at(data: &[u8], obj_off: u64) -> Option<MachOImage> {
     parse_thin(data, base, is_64_thin, be, true)
 }
 
+/// Result of an offset-based scan ([`scan_ranged`]): every slice this parser
+/// could walk by reading exactly the regions it needed from anywhere in the
+/// source, not just an in-memory prefix.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MachOScan {
+    /// Whether the source begins with, or (for a fat file) references, a
+    /// Mach-O image at all.
+    pub is_macho: bool,
+    /// Every slice this parser could walk, in fat-table order (or the single
+    /// thin image).
+    pub images: Vec<MachOImage>,
+    /// Declared fat-table arches that couldn't be walked at all, or read
+    /// failures hit while walking one (bad offset, unwalkable header, budget
+    /// exhaustion) — never silently treated as clean.
+    pub skipped_slices: usize,
+}
+
+impl MachOScan {
+    /// True only if every slice was walkable and every slice's held code
+    /// signature was read in full — nothing was skipped, and no
+    /// `LC_CODE_SIGNATURE` region went unread.
+    pub fn fully_examined(&self) -> bool {
+        self.is_macho
+            && !self.images.is_empty()
+            && self.skipped_slices == 0
+            && self
+                .images
+                .iter()
+                .all(|i| !i.has_code_signature || i.signature_region.is_determined())
+    }
+}
+
+fn not_macho_scan() -> MachOScan {
+    MachOScan {
+        is_macho: false,
+        images: Vec::new(),
+        skipped_slices: 0,
+    }
+}
+
+/// Bytes one [`scan_ranged`] call may still read, charged across every slice
+/// and signature it reads — bounds total work on a hostile fat table, not
+/// just a single slice.
+struct RangeBudget {
+    remaining: u64,
+}
+
+impl RangeBudget {
+    fn take(&mut self, want: u64) -> bool {
+        match self.remaining.checked_sub(want) {
+            Some(rest) => {
+                self.remaining = rest;
+                true
+            }
+            None => false,
+        }
+    }
+}
+
+/// Reads `len` bytes at `off` through `src`, charging `budget` only for the
+/// part of `[off, off+len)` beyond `src.held_len()` — bytes already resident
+/// in memory cost nothing to re-read. Refuses the read up front if the
+/// chargeable part alone would exceed the remaining budget.
+fn read_budgeted<'a>(
+    src: &'a (impl ByteSource + ?Sized),
+    budget: &mut RangeBudget,
+    off: u64,
+    len: usize,
+) -> Option<Cow<'a, [u8]>> {
+    let end = off.checked_add(len as u64)?;
+    let held = src.held_len();
+    let chargeable = end.saturating_sub(held.max(off));
+    if !budget.take(chargeable) {
+        return None;
+    }
+    src.read_range(off, len)
+}
+
+/// Parse every Mach-O image in `src` by reading exactly the bytes needed from
+/// their real, absolute offsets — the header and load commands of each
+/// slice, and each slice's code signature (typically near EOF) — rather than
+/// [`parse_all_slices`]'s in-memory prefix, which loses both for a file
+/// bigger than the capture (§5.2, #45).
+pub fn scan_ranged(src: &(impl ByteSource + ?Sized)) -> MachOScan {
+    let source_len = src.source_len();
+    let mut budget = RangeBudget {
+        remaining: MAX_RANGED_BYTES,
+    };
+
+    let head_len = (8u64.saturating_add(MAX_FAT_ARCHES as u64 * 32)).min(source_len) as usize;
+    let head = match read_budgeted(src, &mut budget, 0, head_len) {
+        Some(head) => head,
+        // The full head couldn't be read — e.g. `source_len` is stale (the
+        // real object shrank after it was captured) and there's no handle to
+        // serve the rest. Fall back to whatever's already held in memory
+        // rather than reading a read failure as "not Mach-O" (§10/§11.8).
+        None => match read_budgeted(
+            src,
+            &mut budget,
+            0,
+            src.held_len().min(head_len as u64) as usize,
+        ) {
+            Some(head) if head.len() >= 4 => head,
+            _ => return not_macho_scan(),
+        },
+    };
+
+    match be_u32(&head, 0) {
+        Some(FAT_MAGIC) | Some(FAT_MAGIC_64) => {
+            scan_ranged_fat(src, &head, head.len() < head_len, source_len, &mut budget)
+        }
+        Some(magic) => match thin_kind(magic) {
+            Some(_) => match scan_ranged_slice(src, 0, false, source_len, &mut budget) {
+                Some(image) => MachOScan {
+                    is_macho: true,
+                    images: vec![image],
+                    skipped_slices: 0,
+                },
+                // Recognized magic, but the structure itself couldn't be
+                // walked (the same short-head situation, or a genuinely
+                // malformed slice) — still Mach-O, not clean.
+                None => MachOScan {
+                    is_macho: true,
+                    images: Vec::new(),
+                    skipped_slices: 1,
+                },
+            },
+            None => not_macho_scan(),
+        },
+        None => not_macho_scan(),
+    }
+}
+
+/// Whether a declared fat-table offset could be confirmed to start a thin
+/// Mach-O slice — see [`classify_slice_magic`].
+enum SliceMagic {
+    /// Read (or otherwise confirmed) to be a real thin Mach-O magic.
+    Real,
+    /// Read (or ruled out via an authoritative `source_len`) and it isn't.
+    NotMacho,
+    /// Couldn't tell: the read failed (I/O error, non-unix, budget), or the
+    /// offset lies past a `source_len` that isn't authoritative — a real
+    /// slice may still exist there. Never treated as "not Mach-O" (§10/
+    /// §11.8).
+    Undetermined,
+}
+
+/// Classify what's at a declared fat-table offset without assuming a read
+/// failure or an out-of-bounds offset means "no slice here" — see
+/// [`SliceMagic`].
+fn classify_slice_magic(
+    src: &(impl ByteSource + ?Sized),
+    budget: &mut RangeBudget,
+    off: u64,
+    source_len: u64,
+) -> SliceMagic {
+    if off >= source_len {
+        return if src.source_len_is_authoritative() {
+            SliceMagic::NotMacho
+        } else {
+            SliceMagic::Undetermined
+        };
+    }
+    // Fewer than 4 bytes remain before a true EOF: no magic can be there.
+    if source_len - off < 4 && src.source_len_is_authoritative() {
+        return SliceMagic::NotMacho;
+    }
+    match read_budgeted(src, budget, off, 4) {
+        Some(bytes) if be_u32(&bytes, 0).and_then(thin_kind).is_some() => SliceMagic::Real,
+        Some(_) => SliceMagic::NotMacho,
+        None => SliceMagic::Undetermined,
+    }
+}
+
+/// Walk a fat/universal binary's arch table by offset. `is_macho` only if
+/// some declared offset is confirmed to hold a thin Mach-O magic, read via
+/// `read_range` — which keeps a Java `.class` file (#46) non-Mach-O. If none
+/// is confirmed but at least one couldn't be determined (a failed read, or
+/// an offset past a non-authoritative `source_len` — e.g. a truncated
+/// embedded/container member), this still reports `is_macho: true` with
+/// those counted as skipped, rather than reading "couldn't check" as "clean"
+/// (§10/§11.8, §5.2). `head_is_short` marks a head cut short by a failed
+/// read: arch entries beyond it are undetermined, not absent.
+fn scan_ranged_fat(
+    src: &(impl ByteSource + ?Sized),
+    head: &[u8],
+    head_is_short: bool,
+    source_len: u64,
+    budget: &mut RangeBudget,
+) -> MachOScan {
+    let is_64 = match be_u32(head, 0) {
+        Some(FAT_MAGIC) => false,
+        Some(FAT_MAGIC_64) => true,
+        _ => return not_macho_scan(),
+    };
+    let Some(nfat) = be_u32(head, 4).filter(|&n| n != 0 && n <= MAX_FAT_ARCHES) else {
+        // A short head is either a real, complete file too small to hold
+        // `nfat_arch` (authoritative `source_len < 8`: genuinely not a fat
+        // binary), or a head cut short by a failed/partial read or a
+        // non-authoritative length — the table may still exist there,
+        // undetermined rather than clean (§10/§11.8).
+        return if src.source_len_is_authoritative() && source_len < 8 {
+            not_macho_scan()
+        } else if head.len() < 8 {
+            MachOScan {
+                is_macho: true,
+                images: Vec::new(),
+                skipped_slices: 1,
+            }
+        } else {
+            not_macho_scan()
+        };
+    };
+
+    let offsets: Vec<Option<u64>> = (0..nfat as usize)
+        .map(|i| fat_arch_offset(head, is_64, i))
+        .collect();
+
+    let magics: Vec<SliceMagic> = offsets
+        .iter()
+        .map(|off_opt| match off_opt {
+            Some(off) => classify_slice_magic(src, budget, *off, source_len),
+            // This entry's own bytes lie outside the head: real only if the
+            // head is the full table region of an authoritative source.
+            None if src.source_len_is_authoritative() && !head_is_short => SliceMagic::NotMacho,
+            None => SliceMagic::Undetermined,
+        })
+        .collect();
+
+    if !magics.iter().any(|m| matches!(m, SliceMagic::Real)) {
+        let undetermined = magics
+            .iter()
+            .filter(|m| matches!(m, SliceMagic::Undetermined))
+            .count();
+        return if undetermined == 0 {
+            not_macho_scan()
+        } else {
+            MachOScan {
+                is_macho: true,
+                images: Vec::new(),
+                skipped_slices: undetermined,
+            }
+        };
+    }
+
+    // Dedupe by offset exactly as `parse_fat_all` does: a duplicate of a
+    // walkable slice is one slice, not re-walked or counted as skipped; a
+    // duplicate of an offset that failed to walk counts again.
+    let mut images = Vec::new();
+    let mut skipped = 0usize;
+    let mut seen: HashMap<u64, bool> = HashMap::new();
+    for off_opt in &offsets {
+        let Some(off) = *off_opt else {
+            skipped += 1; // this entry's own bytes lie outside what we hold
+            continue;
+        };
+        match seen.get(&off) {
+            Some(true) => {}
+            Some(false) => skipped += 1,
+            None => match scan_ranged_slice(src, off, true, source_len, budget) {
+                Some(img) => {
+                    seen.insert(off, true);
+                    images.push(img);
+                }
+                None => {
+                    seen.insert(off, false);
+                    skipped += 1;
+                }
+            },
+        }
+    }
+
+    MachOScan {
+        is_macho: true,
+        images,
+        skipped_slices: skipped,
+    }
+}
+
+/// Parse the slice at absolute offset `off`: read its header and load
+/// commands by offset, capped to `source_len` (a declared `sizeofcmds` can
+/// overrun the object itself) and, beyond what's already held, to
+/// `MAX_SIZEOFCMDS`; then its code signature by offset if one is declared
+/// and fits within `MAX_SIGNATURE_BYTES`/`source_len`/the remaining budget.
+/// `None` if the offset is out of bounds, the header/magic doesn't check
+/// out, the declared load commands run past a non-authoritative
+/// `source_len` (a truncated capture), or `sizeofcmds` is unwalkable — the
+/// caller counts that as skipped.
+fn scan_ranged_slice(
+    src: &(impl ByteSource + ?Sized),
+    off: u64,
+    is_fat: bool,
+    source_len: u64,
+    budget: &mut RangeBudget,
+) -> Option<MachOImage> {
+    if off >= source_len {
+        return None;
+    }
+    let probe_len = 32u64.min(source_len - off) as usize;
+    let probe = read_budgeted(src, budget, off, probe_len)?;
+    let (is_64, be) = be_u32(&probe, 0).and_then(thin_kind)?;
+    let header_size: usize = if is_64 { 32 } else { 28 };
+    if probe.len() < header_size {
+        return None; // header itself truncated at EOF
+    }
+    let sizeofcmds = Reader { data: &probe, be }.u32(20)? as usize;
+    let cmds_end = off
+        .checked_add(header_size as u64)?
+        .checked_add(sizeofcmds as u64)?;
+    if cmds_end > source_len && !src.source_len_is_authoritative() {
+        // Declared load commands run past a capture that stopped short of
+        // the real object's end (a truncated embedded/container member) —
+        // what's cut off could hold anything; skip rather than silently
+        // treat it as absent (§10/§11.8).
+        return None;
+    }
+    // Cap `cmds_end` to what the source actually has before comparing
+    // against `held_len`: a slice on a complete file can declare far more
+    // load-command bytes than the file itself has left, and none of that
+    // excess is real I/O to bound — there's simply nothing there to read.
+    let walk_end = cmds_end.min(source_len);
+    if walk_end > src.held_len() && sizeofcmds > MAX_SIZEOFCMDS {
+        // Far more load-command bytes than any real image declares, and at
+        // least some of them require real I/O past what's already in
+        // memory.
+        return None;
+    }
+
+    let want = (walk_end - off) as usize;
+    let buf = read_budgeted(src, budget, off, want)?;
+    let mut image = parse_thin(&buf, 0, is_64, be, is_fat)?;
+
+    image.text_range = image.text_range.and_then(|range| {
+        let start = off.checked_add(range.start)?;
+        let end = off.checked_add(range.end)?;
+        Some(start..end)
+    });
+
+    if let Some((dataoff, datasize)) = image.code_signature {
+        read_signature_ranged(src, off, dataoff, datasize, source_len, budget, &mut image);
+    }
+
+    Some(image)
+}
+
+/// Read a slice's `LC_CODE_SIGNATURE` region by its real, absolute offset and
+/// fill in `image`'s signature facts — the part an in-memory prefix parse
+/// can't do once the region lies past what's held. A region ending past an
+/// authoritative `source_len` sets [`SignatureRegion::PastEof`]; one that is
+/// too big or that the budget can't cover leaves `image` unchanged.
+fn read_signature_ranged(
+    src: &(impl ByteSource + ?Sized),
+    slice_off: u64,
+    dataoff: u32,
+    datasize: u32,
+    source_len: u64,
+    budget: &mut RangeBudget,
+    image: &mut MachOImage,
+) {
+    if datasize as usize > MAX_SIGNATURE_BYTES {
+        return;
+    }
+    let Some(sig_off) = slice_off.checked_add(dataoff as u64) else {
+        return;
+    };
+    let Some(sig_end) = sig_off.checked_add(datasize as u64) else {
+        return;
+    };
+    if sig_end > source_len {
+        if src.source_len_is_authoritative() {
+            image.signature_region = SignatureRegion::PastEof;
+        }
+        return;
+    }
+    let Some(sig_bytes) = read_budgeted(src, budget, sig_off, datasize as usize) else {
+        return;
+    };
+    let facts = extract_signature_facts_checked(&sig_bytes, 0, 0, datasize).unwrap_or_default();
+    image.entitlements = facts.entitlements;
+    image.code_directory_flags = facts.code_directory_flags;
+    image.has_cms_signature = facts.has_cms_signature;
+    image.signature_region = SignatureRegion::Read;
+}
+
 fn parse_thin(data: &[u8], base: usize, is_64: bool, be: bool, is_fat: bool) -> Option<MachOImage> {
     let r = Reader { data, be };
 
@@ -361,6 +839,8 @@ fn parse_thin(data: &[u8], base: usize, is_64: bool, be: bool, is_fat: bool) -> 
     let mut entitlements = None;
     let mut code_directory_flags = None;
     let mut has_cms_signature = false;
+    let mut code_signature = None;
+    let mut signature_region = SignatureRegion::Unread;
 
     let mut off = cmds_start;
     for _ in 0..ncmds {
@@ -405,10 +885,20 @@ fn parse_thin(data: &[u8], base: usize, is_64: bool, be: bool, is_fat: bool) -> 
             if let (Some(dataoff), Some(datasize)) =
                 (r.u32(off.checked_add(8)?), r.u32(off.checked_add(12)?))
             {
+                code_signature = Some((dataoff, datasize));
                 let facts = extract_signature_facts(data, base, dataoff, datasize);
                 entitlements = facts.entitlements;
                 code_directory_flags = facts.code_directory_flags;
                 has_cms_signature = facts.has_cms_signature;
+                let held = base
+                    .checked_add(dataoff as usize)
+                    .and_then(|s| s.checked_add(datasize as usize))
+                    .is_some_and(|end| end <= data.len());
+                signature_region = if held {
+                    SignatureRegion::Read
+                } else {
+                    SignatureRegion::Unread
+                };
             }
         }
 
@@ -425,6 +915,8 @@ fn parse_thin(data: &[u8], base: usize, is_64: bool, be: bool, is_fat: bool) -> 
         entitlements,
         code_directory_flags,
         has_cms_signature,
+        signature_region,
+        code_signature,
     })
 }
 
@@ -866,6 +1358,38 @@ pub(crate) mod tests_support {
         v.extend_from_slice(str_bytes);
         v.resize(v.len() + (padded - content_len) + 1, 0); // NUL + padding
         assert_eq!(v.len(), cmdsize);
+        v
+    }
+
+    /// A thin 64-bit Mach-O whose first load command is an oversized, unknown
+    /// command (`filler_cmdsize` bytes, zero-filled) followed by an
+    /// `LC_LOAD_DYLIB` for `dylib_path` — the shape a `sizeofcmds` well past
+    /// `MAX_SIZEOFCMDS` takes when every byte of it is real and already held
+    /// in memory (§5.2, #45).
+    pub(crate) fn build_thin_with_filler_then_dylib(
+        filler_cmdsize: usize,
+        dylib_path: &str,
+    ) -> Vec<u8> {
+        const FILLER_CMD: u32 = 0x7fff_0000; // not LC_SEGMENT_64/dylib/rpath/codesig
+        let mut filler = Vec::new();
+        filler.extend_from_slice(&FILLER_CMD.to_le_bytes());
+        filler.extend_from_slice(&(filler_cmdsize as u32).to_le_bytes());
+        filler.resize(filler_cmdsize, 0);
+
+        let dylib_cmd = lc_str_command(LC_LOAD_DYLIB, dylib_path);
+        let cmdsize = filler.len() + dylib_cmd.len();
+
+        let mut v = Vec::new();
+        v.extend_from_slice(&[0xCF, 0xFA, 0xED, 0xFE]); // magic -> BE 0xCFFAEDFE
+        v.extend_from_slice(&0x0100_0007u32.to_le_bytes()); // cputype x86_64
+        v.extend_from_slice(&3u32.to_le_bytes()); // cpusubtype
+        v.extend_from_slice(&2u32.to_le_bytes()); // filetype MH_EXECUTE
+        v.extend_from_slice(&2u32.to_le_bytes()); // ncmds: filler + dylib
+        v.extend_from_slice(&(cmdsize as u32).to_le_bytes());
+        v.extend_from_slice(&0u32.to_le_bytes()); // flags
+        v.extend_from_slice(&0u32.to_le_bytes()); // reserved
+        v.extend_from_slice(&filler);
+        v.extend_from_slice(&dylib_cmd);
         v
     }
 
@@ -1351,6 +1875,18 @@ mod tests {
     }
 
     #[test]
+    fn complete_class_file_with_arch_offset_in_the_last_bytes_is_not_macho() {
+        // An offset 2 bytes before a true EOF can't hold a 4-byte magic.
+        let mut v = vec![0xCA, 0xFE, 0xBA, 0xBE];
+        v.extend_from_slice(&0x0000_0034u32.to_be_bytes());
+        v.extend_from_slice(&[0u8; 64]);
+        let near_eof = v.len() as u32 - 2;
+        v[16..20].copy_from_slice(&near_eof.to_be_bytes());
+        assert!(!is_macho_magic(&v, false));
+        assert!(parse_all(&v).is_empty());
+    }
+
+    #[test]
     fn a_real_fat_header_with_a_handful_of_arches_is_still_macho() {
         let (a, _, _) = synth_macho_64_full(b"aaaa", &[], &[], false, None);
         let (b, _, _) = synth_macho_64_full(b"bbbb", &[], &[], false, None);
@@ -1645,5 +2181,402 @@ mod tests {
         let (images, skipped) = parse_all_slices(&fat, false);
         assert_eq!(images.len(), 1);
         assert_eq!(skipped, 1);
+    }
+
+    /// Strips the two fields that legitimately differ between a whole-buffer
+    /// prefix parse and an offset-based one (the latter actually reads the
+    /// signature by offset) so the rest of `MachOImage` can be compared.
+    fn strip_ranged_only_fields(img: &MachOImage) -> MachOImage {
+        let mut img = img.clone();
+        img.signature_region = SignatureRegion::Unread;
+        img.code_signature = None;
+        img
+    }
+
+    fn assert_scan_ranged_agrees(data: &[u8]) {
+        let (prefix_images, prefix_skipped) = parse_all_slices(data, false);
+        let ranged = scan_ranged(data);
+        assert_eq!(ranged.images.len(), prefix_images.len());
+        assert_eq!(ranged.skipped_slices, prefix_skipped);
+        let ranged_stripped: Vec<_> = ranged.images.iter().map(strip_ranged_only_fields).collect();
+        let prefix_stripped: Vec<_> = prefix_images.iter().map(strip_ranged_only_fields).collect();
+        assert_eq!(ranged_stripped, prefix_stripped);
+    }
+
+    /// `scan_ranged` must find the same slices, in the same shape, as the
+    /// existing in-memory prefix parse on every buffer small enough that the
+    /// two have nothing to disagree about (§5.2, #45).
+    #[test]
+    fn scan_ranged_agrees_with_parse_all_slices_on_existing_synthetic_images() {
+        let (thin, _) = synth_macho_64(b"code");
+        assert_scan_ranged_agrees(&thin);
+
+        let (a, _, _) = synth_macho_64_full(b"aaaa", &["/usr/lib/a.dylib"], &[], true, None);
+        let (b, _, _) = synth_macho_64_full(b"bbbb", &["/tmp/b.dylib"], &[], false, None);
+        assert_scan_ranged_agrees(&synth_fat(&[&a, &b]));
+
+        let (real, _, _) = synth_macho_64_full(
+            b"real slice",
+            &["/usr/lib/libSystem.B.dylib"],
+            &[],
+            false,
+            None,
+        );
+        assert_scan_ranged_agrees(&synth_fat_with_bogus_arches(&real, 24));
+
+        let garbage: &[u8] = &[0xDE, 0xAD, 0xBE, 0xEF, 0, 0, 0, 0];
+        assert_scan_ranged_agrees(&synth_fat(&[&real, garbage]));
+    }
+
+    /// A Java `.class`-shaped, complete (non-truncated) header must not be
+    /// read as Mach-O by the offset-based path either (#46).
+    #[test]
+    fn scan_ranged_java_class_like_fat_header_is_not_macho() {
+        let mut v = vec![0xCA, 0xFE, 0xBA, 0xBE];
+        v.extend_from_slice(&0x0000_0034u32.to_be_bytes()); // minor=0, major=52
+        v.extend_from_slice(&[0u8; 64]);
+        let scan = scan_ranged(&v[..]);
+        assert!(!scan.is_macho);
+        assert!(scan.images.is_empty());
+    }
+
+    /// A `ByteSource` that reports a `source_len` bigger than the bytes it
+    /// can actually serve — the shape a stale, larger `file_len` takes after
+    /// the real object shrank underneath a loaded `ScanContext` with no
+    /// handle left to serve the difference (§10/§11.8).
+    struct StaleLenSource<'a> {
+        data: &'a [u8],
+        claimed_len: u64,
+    }
+
+    impl ByteSource for StaleLenSource<'_> {
+        fn source_len(&self) -> u64 {
+            self.claimed_len
+        }
+
+        fn held_len(&self) -> u64 {
+            self.data.len() as u64
+        }
+
+        fn read_range(&self, off: u64, len: usize) -> Option<Cow<'_, [u8]>> {
+            self.data.read_range(off, len)
+        }
+    }
+
+    /// A stale `source_len` far bigger than what's actually held must not
+    /// make `scan_ranged` read a real magic as "not Mach-O": the full head
+    /// read fails (nothing to serve past the held bytes), but the magic
+    /// itself is still recognized from what is held, so the result stays
+    /// `is_macho: true` with the unwalkable slice counted as skipped — never
+    /// a clean bill of health (§10/§11.8).
+    #[test]
+    fn scan_ranged_recognizes_a_thin_magic_when_the_full_head_read_fails() {
+        let src = StaleLenSource {
+            data: &[0xFE, 0xED, 0xFA, 0xCF], // MH_MAGIC_64
+            claimed_len: u64::MAX,
+        };
+        let scan = scan_ranged(&src);
+        assert!(scan.is_macho, "a real magic must not read as not Mach-O");
+        assert!(scan.images.is_empty());
+        assert_eq!(scan.skipped_slices, 1);
+        assert!(!scan.fully_examined());
+    }
+
+    /// Same shape with a fat magic: the retry only recovers the magic
+    /// itself, not even `nfat_arch` — still undetermined, not clean.
+    #[test]
+    fn scan_ranged_recognizes_a_fat_magic_when_the_full_head_read_fails_before_nfat() {
+        let src = StaleLenSource {
+            data: &[0xCA, 0xFE, 0xBA, 0xBE], // FAT_MAGIC, nfat_arch unreadable
+            claimed_len: u64::MAX,
+        };
+        let scan = scan_ranged(&src);
+        assert!(
+            scan.is_macho,
+            "a real fat magic must not read as not Mach-O"
+        );
+        assert!(scan.images.is_empty());
+        assert_eq!(scan.skipped_slices, 1);
+        assert!(!scan.fully_examined());
+    }
+
+    /// The head read fell back to a short held prefix: an arch entry lying
+    /// beyond it is undetermined, so the file stays Mach-O with a skip.
+    #[test]
+    fn scan_ranged_short_fallback_head_leaves_later_arch_entries_undetermined() {
+        let mut data = vec![0xCA, 0xFE, 0xBA, 0xBE];
+        data.extend_from_slice(&2u32.to_be_bytes()); // nfat_arch = 2
+        data.extend_from_slice(&[0u8; 8]); // cputype, cpusubtype
+        data.extend_from_slice(&28u32.to_be_bytes()); // first offset: held zeros
+        data.extend_from_slice(&[0u8; 8]); // size, align
+        data.extend_from_slice(&[0u8; 4]); // bytes at offset 28: not a magic
+        assert_eq!(data.len(), 32); // second entry (bytes 28..48) not held
+        let src = StaleLenSource {
+            data: &data,
+            claimed_len: u64::MAX,
+        };
+        let scan = scan_ranged(&src);
+        assert!(scan.is_macho);
+        assert!(scan.skipped_slices >= 1);
+        assert!(!scan.fully_examined());
+    }
+
+    /// A complete 4-byte file starting `CAFEBABE` is too short to be a real
+    /// fat header at all — it must not be read as an unwalkable Mach-O
+    /// (§10/§11.8: this is "checked and clean," not "couldn't check").
+    #[test]
+    fn scan_ranged_short_complete_file_with_fat_magic_is_not_macho() {
+        let data: &[u8] = &[0xCA, 0xFE, 0xBA, 0xBE];
+        let scan = scan_ranged(data);
+        assert!(!scan.is_macho);
+        assert_eq!(scan.skipped_slices, 0);
+    }
+
+    /// A `ByteSource` wrapping `data` but reporting a caller-chosen
+    /// `held_len` instead of `data.len()` — lets a test exercise the
+    /// offset-read path (bytes genuinely past what's in memory) against a
+    /// plain in-memory buffer, which would otherwise report its whole length
+    /// as held (§5.2, #45).
+    struct LimitedHeldSource<'a> {
+        data: &'a [u8],
+        held: u64,
+    }
+
+    impl ByteSource for LimitedHeldSource<'_> {
+        fn source_len(&self) -> u64 {
+            self.data.source_len()
+        }
+
+        fn held_len(&self) -> u64 {
+            self.held
+        }
+
+        fn read_range(&self, off: u64, len: usize) -> Option<Cow<'_, [u8]>> {
+            self.data.read_range(off, len)
+        }
+    }
+
+    /// A slice declaring more load-command bytes than `MAX_SIZEOFCMDS`, past
+    /// what's held in memory, is unwalkable by offset — it must count as
+    /// skipped, not silently vanish or take the sibling slice down with it.
+    #[test]
+    fn scan_ranged_counts_an_oversized_sizeofcmds_slice_as_skipped_past_the_held_bytes() {
+        let (good, _, _) =
+            synth_macho_64_full(b"good", &["/usr/lib/libSystem.B.dylib"], &[], false, None);
+        let (mut bad, _, _) = synth_macho_64_full(b"bad", &[], &[], false, None);
+        let huge = (MAX_SIZEOFCMDS as u32) + 1;
+        bad[20..24].copy_from_slice(&huge.to_le_bytes()); // sizeofcmds, LE u32 @ offset 20
+        let fat = synth_fat(&[&good, &bad]);
+
+        let scan = scan_ranged(&LimitedHeldSource {
+            data: &fat,
+            held: 0,
+        });
+        assert!(scan.is_macho);
+        assert_eq!(scan.images.len(), 1);
+        assert_eq!(scan.skipped_slices, 1);
+    }
+
+    /// A thin Mach-O with a >2 MiB filler load command followed by a real
+    /// `LC_LOAD_DYLIB`, entirely inside the in-memory prefix: `MAX_SIZEOFCMDS`
+    /// must not stop this from walking to the dylib (§5.2, #45).
+    #[test]
+    fn scan_ranged_walks_past_an_oversized_filler_command_when_all_held() {
+        let filler_len = MAX_SIZEOFCMDS + 4096;
+        let bytes = tests_support::build_thin_with_filler_then_dylib(filler_len, "/tmp/evil.dylib");
+        assert!(bytes.len() < crate::context::MAX_CONTENT_BYTES);
+
+        let scan = scan_ranged(&bytes[..]);
+        assert!(scan.is_macho);
+        let image = scan.images.first().expect("the thin slice must be walked");
+        assert_eq!(image.dylibs, vec!["/tmp/evil.dylib".to_string()]);
+    }
+
+    /// A thin Mach-O whose declared `sizeofcmds` overruns the whole (complete,
+    /// non-truncated) file, not just `MAX_SIZEOFCMDS`: none of that excess is
+    /// real I/O to bound, so the slice must still be walked up to EOF rather
+    /// than skipped outright (§5.2, #45).
+    #[test]
+    fn scan_ranged_walks_a_thin_slice_whose_sizeofcmds_overruns_the_whole_file() {
+        let (mut bytes, _, _) =
+            synth_macho_64_full(b"evil", &["/tmp/evil.dylib"], &[], false, None);
+        let huge = 0x1000_0000u32; // far beyond both MAX_SIZEOFCMDS and the file itself
+        bytes[20..24].copy_from_slice(&huge.to_le_bytes()); // sizeofcmds, LE u32 @ offset 20
+
+        let scan = scan_ranged(&bytes[..]);
+        assert!(scan.is_macho);
+        assert_eq!(scan.skipped_slices, 0);
+        let image = scan
+            .images
+            .first()
+            .expect("the thin slice must still be walked");
+        assert_eq!(image.dylibs, vec!["/tmp/evil.dylib".to_string()]);
+    }
+
+    /// An ≤8 MiB fat file of decoy slices, each declaring `sizeofcmds` near
+    /// `MAX_SIZEOFCMDS`, followed by one real, malicious slice: the whole
+    /// file is held in memory, so none of it should be charged against the
+    /// ranged budget, leaving it for the real slice (§5.2, #45).
+    #[test]
+    fn scan_ranged_decoy_slices_within_the_held_prefix_do_not_exhaust_the_budget() {
+        const DECOY_COUNT: usize = 32;
+        const DECOY_HEADER_LEN: usize = 32; // mach_header_64
+        let (real, _, _) = synth_macho_64_full(b"evil", &["/tmp/evil.dylib"], &[], false, None);
+
+        let nfat = DECOY_COUNT + 1;
+        let header_len = 8 + 20 * nfat;
+        let decoys_start = (header_len + 15) & !15;
+        let real_off = decoys_start + DECOY_COUNT * DECOY_HEADER_LEN;
+
+        let mut fat = Vec::new();
+        fat.extend_from_slice(&FAT_MAGIC.to_be_bytes());
+        fat.extend_from_slice(&(nfat as u32).to_be_bytes());
+        for i in 0..DECOY_COUNT {
+            let off = decoys_start + i * DECOY_HEADER_LEN;
+            fat.extend_from_slice(&0x0100_0007u32.to_be_bytes()); // cputype
+            fat.extend_from_slice(&(i as u32).to_be_bytes()); // cpusubtype (distinct)
+            fat.extend_from_slice(&(off as u32).to_be_bytes()); // offset
+            fat.extend_from_slice(&(DECOY_HEADER_LEN as u32).to_be_bytes()); // size
+            fat.extend_from_slice(&0u32.to_be_bytes()); // align
+        }
+        fat.extend_from_slice(&0x0100_0007u32.to_be_bytes()); // cputype
+        fat.extend_from_slice(&(DECOY_COUNT as u32).to_be_bytes()); // cpusubtype
+        fat.extend_from_slice(&(real_off as u32).to_be_bytes()); // offset
+        fat.extend_from_slice(&(real.len() as u32).to_be_bytes()); // size
+        fat.extend_from_slice(&0u32.to_be_bytes()); // align
+
+        fat.resize(decoys_start, 0);
+        for _ in 0..DECOY_COUNT {
+            // A minimal, hollow (ncmds=0) mach_header_64 declaring a huge
+            // sizeofcmds — real bytes, no load commands to actually walk.
+            fat.extend_from_slice(&[0xCF, 0xFA, 0xED, 0xFE]); // magic
+            fat.extend_from_slice(&[0u8; 16]); // cputype, cpusubtype, filetype, ncmds=0
+            fat.extend_from_slice(&(MAX_SIZEOFCMDS as u32).to_le_bytes()); // sizeofcmds
+            fat.extend_from_slice(&[0u8; 8]); // flags, reserved
+        }
+        assert_eq!(fat.len(), real_off);
+        fat.extend_from_slice(&real);
+
+        // Pad well past every decoy's declared (header + sizeofcmds) span so
+        // the whole file — decoys included — is genuinely all held.
+        let min_len = decoys_start + DECOY_HEADER_LEN + MAX_SIZEOFCMDS + 4096;
+        fat.resize(fat.len().max(min_len), 0);
+        assert!(
+            fat.len() < 8 * 1024 * 1024,
+            "fixture must stay an <=8 MiB file"
+        );
+
+        let scan = scan_ranged(&fat[..]);
+        assert!(scan.is_macho);
+        let evil = scan
+            .images
+            .iter()
+            .find(|img| img.dylibs.contains(&"/tmp/evil.dylib".to_string()))
+            .expect("the real slice, last in the table, must still be examined");
+        assert_eq!(evil.dylibs, vec!["/tmp/evil.dylib".to_string()]);
+    }
+
+    /// A `ByteSource` wrapper that counts every byte actually served, so a
+    /// test can confirm `scan_ranged` never reads past its own budget.
+    struct CountingSource<'a> {
+        data: &'a [u8],
+        served: std::cell::Cell<u64>,
+    }
+
+    impl ByteSource for CountingSource<'_> {
+        fn source_len(&self) -> u64 {
+            self.data.source_len()
+        }
+
+        fn read_range(&self, off: u64, len: usize) -> Option<Cow<'_, [u8]>> {
+            let bytes = self.data.read_range(off, len)?;
+            self.served.set(self.served.get() + bytes.len() as u64);
+            Some(bytes)
+        }
+    }
+
+    /// A hostile fat table of `MAX_FAT_ARCHES` distinct offsets, each
+    /// pointing at its own big-ish (but otherwise ordinary) valid slice, must
+    /// stop reading once `MAX_RANGED_BYTES` is exhausted rather than walk
+    /// every declared arch — and must never read more than that budget while
+    /// doing it (#45; the fat-table analogue of #46's bogus-arch flood).
+    #[test]
+    fn scan_ranged_hostile_fat_table_stops_at_the_ranged_budget() {
+        // One real slice with a single, deliberately huge LC_RPATH so each
+        // copy of it is "big-ish" (~80 KiB) without needing thousands of
+        // load commands.
+        let huge_rpath = format!("/{}", "a".repeat(79_800));
+        let (slice, _, _) = synth_macho_64_full(b"code", &[], &[&huge_rpath], false, None);
+
+        let count = MAX_FAT_ARCHES as usize;
+        let header_len = 8 + 20 * count;
+        let stride = (slice.len() + 15) & !15; // 16-byte aligned, as `synth_fat` does
+        let mut offsets = Vec::with_capacity(count);
+        let mut cursor = (header_len + 15) & !15;
+        for _ in 0..count {
+            offsets.push(cursor);
+            cursor += stride;
+        }
+
+        let total_slice_bytes = count as u64 * stride as u64;
+        assert!(
+            total_slice_bytes > MAX_RANGED_BYTES,
+            "the fixture must actually exceed the budget to exercise it"
+        );
+
+        let mut fat = Vec::new();
+        fat.extend_from_slice(&FAT_MAGIC.to_be_bytes());
+        fat.extend_from_slice(&(count as u32).to_be_bytes());
+        for (i, &off) in offsets.iter().enumerate() {
+            fat.extend_from_slice(&0x0100_0007u32.to_be_bytes()); // cputype
+            fat.extend_from_slice(&(i as u32).to_be_bytes()); // cpusubtype (distinct)
+            fat.extend_from_slice(&(off as u32).to_be_bytes()); // offset
+            fat.extend_from_slice(&(slice.len() as u32).to_be_bytes()); // size
+            fat.extend_from_slice(&0u32.to_be_bytes()); // align
+        }
+        for &off in &offsets {
+            fat.resize(off, 0);
+            fat.extend_from_slice(&slice);
+        }
+
+        let counting = CountingSource {
+            data: &fat,
+            served: std::cell::Cell::new(0),
+        };
+        let scan = scan_ranged(&counting);
+
+        assert!(scan.is_macho);
+        assert!(
+            scan.images.len() < count,
+            "the budget must leave some declared arches unread"
+        );
+        assert_eq!(scan.images.len() + scan.skipped_slices, count);
+        assert!(
+            counting.served.get() <= MAX_RANGED_BYTES,
+            "read {} bytes against a {MAX_RANGED_BYTES}-byte budget",
+            counting.served.get()
+        );
+    }
+
+    /// A signature region whose `dataoff + datasize` runs past an
+    /// authoritative source length is never read and is `PastEof`;
+    /// `has_code_signature` stays true (the load command itself is intact).
+    #[test]
+    fn scan_ranged_signature_past_source_len_is_past_eof() {
+        let (mut image, _, sig_off) = synth_macho_64_full(b"code", &[], &[], true, None);
+        let lc_off = image
+            .windows(4)
+            .position(|w| w == LC_CODE_SIGNATURE.to_le_bytes())
+            .expect("LC_CODE_SIGNATURE present");
+        let real_len = (image.len() - sig_off) as u32;
+        let huge = real_len + 1000; // runs 1000 bytes past the end of the file
+        image[lc_off + 12..lc_off + 16].copy_from_slice(&huge.to_le_bytes());
+
+        let scan = scan_ranged(&image[..]);
+        assert!(scan.is_macho);
+        let img = scan.images.first().expect("thin slice should still parse");
+        assert!(img.has_code_signature);
+        assert_eq!(img.signature_region, SignatureRegion::PastEof);
+        assert!(scan.fully_examined());
     }
 }

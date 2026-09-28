@@ -48,15 +48,22 @@ pub fn scan_context(ctx: &ScanContext, rules: &[Box<dyn Rule>]) -> ScanResult {
     let mut signals: Vec<MatchedSignal> = Vec::new();
     let mut not_applicable_count = 0usize;
     let mut evaluated_count = 0usize;
+    let mut truncation_uncovered = false;
 
     for rule in rules {
         match rule.evaluate(ctx) {
             Ok(Some(signal)) => {
                 evaluated_count += 1;
                 signals.push(signal);
+                if ctx.truncated && !rule.covers_truncation(ctx) {
+                    truncation_uncovered = true;
+                }
             }
             Ok(None) => {
                 evaluated_count += 1;
+                if ctx.truncated && !rule.covers_truncation(ctx) {
+                    truncation_uncovered = true;
+                }
             }
             Err(RuleOutcome::NotApplicable) => {
                 not_applicable_count += 1;
@@ -64,17 +71,22 @@ pub fn scan_context(ctx: &ScanContext, rules: &[Box<dyn Rule>]) -> ScanResult {
             Err(RuleOutcome::Evaluated(_)) => {
                 // Rules never return this from `evaluate`; handle defensively.
                 evaluated_count += 1;
+                if ctx.truncated && !rule.covers_truncation(ctx) {
+                    truncation_uncovered = true;
+                }
             }
         }
     }
 
-    // Truncation is a global completeness fact, not something individual rules
-    // track: a file read only up to the §-content cap (or a container member
-    // whose extraction stopped at a §6.2 limit) was not fully examined, so it
-    // can never be `Complete` even when every rule that ran found nothing.
+    // Truncation degrades completeness unless every rule that ran covers it
+    // (§5.5) — a rule that didn't opt in via `covers_truncation` may have
+    // missed something in the unread bytes.
     let completeness = if !ctx.readable() {
         ScanCompleteness::Indeterminate
-    } else if ctx.truncated || not_applicable_count > 0 {
+    } else if not_applicable_count > 0
+        || truncation_uncovered
+        || (ctx.truncated && evaluated_count == 0)
+    {
         ScanCompleteness::Partial
     } else {
         ScanCompleteness::Complete
@@ -252,8 +264,11 @@ mod tests {
             file_len: Some(u64::MAX),
             identity: None,
             source: ContentSource::File,
+            file: None,
             codesign_dv_cache: OnceLock::new(),
             spctl_cache: OnceLock::new(),
+            macho_cache: OnceLock::new(),
+            stream_failures: std::sync::Mutex::new(Vec::new()),
         };
 
         // No rules object, so truncation is the only thing that can lower it.
@@ -279,5 +294,154 @@ mod tests {
             &default_ruleset(),
         );
         assert_ne!(r.completeness, ScanCompleteness::Complete);
+    }
+
+    fn ctx(truncated: bool) -> ScanContext {
+        use crate::context::ContentSource;
+        use std::sync::OnceLock;
+
+        ScanContext {
+            path: "big.bin".into(),
+            content: Some(b"benign".to_vec()),
+            truncated,
+            file_len: Some(u64::MAX),
+            identity: None,
+            source: ContentSource::File,
+            file: None,
+            codesign_dv_cache: OnceLock::new(),
+            spctl_cache: OnceLock::new(),
+            macho_cache: OnceLock::new(),
+            stream_failures: std::sync::Mutex::new(Vec::new()),
+        }
+    }
+
+    /// Runs clean and reports whatever `covers_truncation` it was built with.
+    struct StubRule {
+        covers: bool,
+    }
+
+    impl Rule for StubRule {
+        fn id(&self) -> &'static str {
+            "stub-rule"
+        }
+        fn category(&self) -> SignalCategory {
+            SignalCategory::Informational
+        }
+        fn evaluate(&self, _ctx: &ScanContext) -> Result<Option<MatchedSignal>, RuleOutcome> {
+            Ok(None)
+        }
+        fn covers_truncation(&self, _ctx: &ScanContext) -> bool {
+            self.covers
+        }
+    }
+
+    /// Can't run at all here, but claims to cover truncation — NotApplicable
+    /// must still degrade completeness regardless of that claim.
+    struct NotApplicableCoveringStub;
+
+    impl Rule for NotApplicableCoveringStub {
+        fn id(&self) -> &'static str {
+            "stub-not-applicable"
+        }
+        fn category(&self) -> SignalCategory {
+            SignalCategory::Informational
+        }
+        fn evaluate(&self, _ctx: &ScanContext) -> Result<Option<MatchedSignal>, RuleOutcome> {
+            Err(RuleOutcome::NotApplicable)
+        }
+        fn covers_truncation(&self, _ctx: &ScanContext) -> bool {
+            true
+        }
+    }
+
+    /// Truncated context stays Complete when every rule that ran covers it.
+    #[test]
+    fn truncation_covered_by_every_rule_stays_complete() {
+        let rules: Vec<Box<dyn Rule>> = vec![
+            Box::new(StubRule { covers: true }),
+            Box::new(StubRule { covers: true }),
+        ];
+        assert_eq!(
+            scan_context(&ctx(true), &rules).completeness,
+            ScanCompleteness::Complete
+        );
+    }
+
+    /// One rule not covering truncation is enough to make the scan Partial.
+    #[test]
+    fn truncation_uncovered_by_one_rule_is_partial() {
+        let rules: Vec<Box<dyn Rule>> = vec![
+            Box::new(StubRule { covers: true }),
+            Box::new(StubRule { covers: false }),
+        ];
+        assert_eq!(
+            scan_context(&ctx(true), &rules).completeness,
+            ScanCompleteness::Partial
+        );
+    }
+
+    /// A rule that claims to cover truncation but couldn't run is still Partial.
+    #[test]
+    fn a_covering_rule_that_could_not_run_is_still_partial() {
+        let rules: Vec<Box<dyn Rule>> = vec![Box::new(NotApplicableCoveringStub)];
+        assert_eq!(
+            scan_context(&ctx(true), &rules).completeness,
+            ScanCompleteness::Partial
+        );
+    }
+
+    /// `covers_truncation` is never consulted on an untruncated context.
+    #[test]
+    fn covers_truncation_is_irrelevant_when_not_truncated() {
+        let rules: Vec<Box<dyn Rule>> = vec![Box::new(StubRule { covers: false })];
+        assert_eq!(
+            scan_context(&ctx(false), &rules).completeness,
+            ScanCompleteness::Complete
+        );
+    }
+
+    /// An empty ruleset can't cover truncation, so it stays Partial.
+    #[test]
+    fn truncation_with_no_rules_is_partial() {
+        let rules: [Box<dyn Rule>; 0] = [];
+        assert_eq!(
+            scan_context(&ctx(true), &rules).completeness,
+            ScanCompleteness::Partial
+        );
+    }
+
+    /// The codesign rules are NotApplicable — `codesign` can't run against a
+    /// path ("app") that doesn't exist — and persistence/package are covered
+    /// for content that doesn't look like their own format (true here).
+    /// `ctx.macho()` recognizes this fixture's magic as Mach-O (§10/§11.8,
+    /// #45): `MachOStructureRule` is NotApplicable (magic recognized,
+    /// nothing walkable), and `HighEntropyRule` doesn't cover truncation
+    /// either, since the content is recognized as Mach-O rather than ruled
+    /// out. `SuspiciousStringsRule` never covers here regardless: it opts in
+    /// only for a file-backed context within the streaming cap, which this
+    /// fixture's `u64::MAX` length exceeds — so a truncated real ruleset
+    /// here still stays `Partial`.
+    #[test]
+    fn default_ruleset_on_truncated_macho_content_is_still_partial() {
+        use crate::context::ContentSource;
+        use std::sync::OnceLock;
+
+        let ctx = ScanContext {
+            path: "app".into(),
+            content: Some(b"\xfe\xed\xfa\xcf".to_vec()),
+            truncated: true,
+            file_len: Some(u64::MAX),
+            identity: None,
+            source: ContentSource::File,
+            file: None,
+            codesign_dv_cache: OnceLock::new(),
+            spctl_cache: OnceLock::new(),
+            macho_cache: OnceLock::new(),
+            stream_failures: std::sync::Mutex::new(Vec::new()),
+        };
+        assert_eq!(
+            scan_context(&ctx, &default_ruleset()).completeness,
+            ScanCompleteness::Partial
+        );
     }
 }

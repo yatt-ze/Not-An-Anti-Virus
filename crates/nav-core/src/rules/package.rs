@@ -114,6 +114,14 @@ impl Rule for InstallerScriptRule {
             category: self.category(),
         }))
     }
+
+    /// A truncated prefix that isn't even a xar archive has no scripts this
+    /// rule could have missed past the cap.
+    fn covers_truncation(&self, ctx: &ScanContext) -> bool {
+        ctx.content
+            .as_deref()
+            .is_some_and(|c| !xar::has_xar_magic(c))
+    }
 }
 
 /// Notes an installer package that carries no signature.
@@ -150,6 +158,13 @@ impl Rule for UnsignedPackageRule {
             category: self.category(),
         }))
     }
+
+    /// Same as `InstallerScriptRule`: nothing to miss if it isn't a xar archive.
+    fn covers_truncation(&self, ctx: &ScanContext) -> bool {
+        ctx.content
+            .as_deref()
+            .is_some_and(|c| !xar::has_xar_magic(c))
+    }
 }
 
 #[cfg(test)]
@@ -172,8 +187,11 @@ mod tests {
             file_len: Some(body.len() as u64),
             identity: None,
             source: ContentSource::File,
+            file: None,
             codesign_dv_cache: std::sync::OnceLock::new(),
             spctl_cache: std::sync::OnceLock::new(),
+            macho_cache: std::sync::OnceLock::new(),
+            stream_failures: std::sync::Mutex::new(Vec::new()),
         }
     }
 
@@ -270,6 +288,31 @@ mod tests {
         assert_eq!(signal.id, "unsigned-installer-package");
         assert_eq!(signal.category, SignalCategory::ProvenanceConcern);
         assert!(signal.weight < 15, "must not alert on its own");
+    }
+
+    fn truncated_ctx(name: &str, body: &[u8]) -> ScanContext {
+        ScanContext {
+            truncated: true,
+            ..ctx(name, body)
+        }
+    }
+
+    /// Content starting with the xar magic might hide the deciding bytes
+    /// (TOC, scripts, signature) past the cap — not covered.
+    #[test]
+    fn covers_truncation_false_for_xar_magic() {
+        let c = truncated_ctx("x.pkg", b"xar!\x00\x1c\x00\x01");
+        assert!(!InstallerScriptRule.covers_truncation(&c));
+        assert!(!UnsignedPackageRule.covers_truncation(&c));
+    }
+
+    /// Content that plainly isn't a xar archive has nothing this rule could
+    /// have missed past the cap.
+    #[test]
+    fn covers_truncation_true_for_non_xar_content() {
+        let c = truncated_ctx("app", b"\xfe\xed\xfa\xcf");
+        assert!(InstallerScriptRule.covers_truncation(&c));
+        assert!(UnsignedPackageRule.covers_truncation(&c));
     }
 
     /// Different categories on purpose — see module docs.

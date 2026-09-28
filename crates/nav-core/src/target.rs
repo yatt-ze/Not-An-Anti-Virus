@@ -10,7 +10,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 use crate::bundle::{self, BundleLayout};
-use crate::context::MAX_CONTENT_BYTES;
+use crate::context::MAX_STREAM_BYTES;
 use crate::model::{Recommendation, ScanCompleteness, ScanResult};
 use crate::scan::scan_file;
 
@@ -34,8 +34,10 @@ pub enum TargetKind {
 pub struct ScanBudget {
     /// Maximum number of files scored in one target scan.
     pub max_files: usize,
-    /// Maximum summed input across the target, each file counted at the bytes
-    /// actually read for it (its length clipped to the §3 per-file cap).
+    /// Maximum summed input across the target, each file counted at the most
+    /// a rule may stream from it (its length clipped to `MAX_STREAM_BYTES`,
+    /// §11.12) — not the smaller §3 in-memory prefix, since rules can stream
+    /// past it (#45).
     pub max_total_bytes: u64,
     /// Maximum directory-recursion depth below the named target.
     pub max_depth: usize,
@@ -177,8 +179,8 @@ pub fn scan_target_with_budget(
 
     // A directly named single file has nothing to traverse, so the budget
     // (which bounds *traversal* — file count, depth, aggregate size) doesn't
-    // apply; the file is already bounded by the §3 per-file read cap. Coverage
-    // is complete by construction (§11.12).
+    // apply; there's no target-level ceiling to check against a single file.
+    // Coverage is complete by construction (§11.12).
     if meta.is_file() {
         return Ok(TargetScan {
             root: path.to_path_buf(),
@@ -233,7 +235,8 @@ fn outcome(collect_limit: Option<BudgetLimit>, byte_limit: Option<BudgetLimit>) 
 }
 
 /// Scan `files` in order until the summed read (each file's length clipped to
-/// the §3 per-file cap) would exceed `max_total_bytes`. Returns the results
+/// `MAX_STREAM_BYTES`, the most a rule streams from one file) would exceed
+/// `max_total_bytes`. Returns the results
 /// scored and `Some(TotalBytes)` if the cap stopped it short.
 fn scan_within_bytes(
     files: &[PathBuf],
@@ -243,7 +246,7 @@ fn scan_within_bytes(
     let mut used: u64 = 0;
     for f in files {
         let read_len = std::fs::metadata(f)
-            .map(|m| m.len().min(MAX_CONTENT_BYTES as u64))
+            .map(|m| m.len().min(MAX_STREAM_BYTES))
             .unwrap_or(0);
         // Always allow the first file through, so one large file still scans.
         if !results.is_empty() && used.saturating_add(read_len) > budget.max_total_bytes {
