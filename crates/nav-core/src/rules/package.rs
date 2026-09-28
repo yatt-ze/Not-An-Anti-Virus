@@ -145,9 +145,10 @@ impl Rule for UnsignedPackageRule {
         if !archive.is_complete() {
             return Err(RuleOutcome::NotApplicable);
         }
-        if archive.signature.is_some() {
+        let source_len = ctx.file_len.unwrap_or(content.len() as u64);
+        if archive.has_plausible_signature(source_len) {
             // Present but not verified — validity is a Security.framework
-            // question (§5.2), beyond what this parser establishes.
+            // question (§5.2). A bogus claim counts as unsigned.
             return Ok(None);
         }
 
@@ -313,6 +314,63 @@ mod tests {
         let c = truncated_ctx("app", b"\xfe\xed\xfa\xcf");
         assert!(InstallerScriptRule.covers_truncation(&c));
         assert!(UnsignedPackageRule.covers_truncation(&c));
+    }
+
+    fn signed_toc_ctx(toc_body: &str, tail: usize) -> ScanContext {
+        let mut bytes = crate::xar::toc_xar_bytes(toc_body);
+        bytes.extend(std::iter::repeat(0u8).take(tail));
+        ctx("p.pkg", &bytes)
+    }
+
+    fn fires_unsigned(c: &ScanContext) -> bool {
+        matches!(UnsignedPackageRule.evaluate(c), Ok(Some(_)))
+    }
+
+    #[test]
+    fn a_bare_top_level_signature_does_not_count_as_signed() {
+        assert!(fires_unsigned(&signed_toc_ctx(
+            r#"<signature style="RSA"/>"#,
+            64
+        )));
+    }
+
+    #[test]
+    fn a_nested_only_signature_does_not_count_as_signed() {
+        let body = r#"<file id="1"><name>x</name><signature style="RSA"><offset>0</offset><size>8</size></signature></file>"#;
+        assert!(fires_unsigned(&signed_toc_ctx(body, 64)));
+    }
+
+    #[test]
+    fn a_signature_range_past_the_archive_end_does_not_count_as_signed() {
+        let body = r#"<signature style="RSA"><offset>0</offset><size>1000</size></signature>"#;
+        assert!(fires_unsigned(&signed_toc_ctx(body, 64)));
+        let body = r#"<signature style="RSA"><offset>1000</offset><size>8</size></signature>"#;
+        assert!(fires_unsigned(&signed_toc_ctx(body, 64)));
+    }
+
+    #[test]
+    fn an_in_range_top_level_signature_counts_as_signed() {
+        let body = r#"<signature style="RSA"><offset>0</offset><size>64</size></signature>"#;
+        assert!(matches!(
+            UnsignedPackageRule.evaluate(&signed_toc_ctx(body, 64)),
+            Ok(None)
+        ));
+    }
+
+    /// The range is checked against the true file length, not the held
+    /// prefix, so a signature past a truncated capture still counts.
+    #[test]
+    fn a_signature_past_the_held_prefix_but_within_the_file_counts_as_signed() {
+        let body = r#"<signature style="RSA"><offset>0</offset><size>64</size></signature>"#;
+        let full = signed_toc_ctx(body, 64);
+        let held = full.content.as_ref().unwrap().len() - 64;
+        let c = ScanContext {
+            content: Some(full.content.as_ref().unwrap()[..held].to_vec()),
+            truncated: true,
+            file_len: full.file_len,
+            ..full
+        };
+        assert!(matches!(UnsignedPackageRule.evaluate(&c), Ok(None)));
     }
 
     /// Different categories on purpose — see module docs.
