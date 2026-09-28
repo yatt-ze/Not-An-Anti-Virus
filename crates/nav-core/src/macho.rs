@@ -575,6 +575,10 @@ fn classify_slice_magic(
             SliceMagic::Undetermined
         };
     }
+    // Fewer than 4 bytes remain before a true EOF: no magic can be there.
+    if source_len - off < 4 && src.source_len_is_authoritative() {
+        return SliceMagic::NotMacho;
+    }
     match read_budgeted(src, budget, off, 4) {
         Some(bytes) if be_u32(&bytes, 0).and_then(thin_kind).is_some() => SliceMagic::Real,
         Some(_) => SliceMagic::NotMacho,
@@ -1840,6 +1844,18 @@ mod tests {
             "complete read finds no evidence"
         );
         assert!(is_macho_magic(&v, true), "truncated read stays lenient");
+    }
+
+    #[test]
+    fn complete_class_file_with_arch_offset_in_the_last_bytes_is_not_macho() {
+        // An offset 2 bytes before a true EOF can't hold a 4-byte magic.
+        let mut v = vec![0xCA, 0xFE, 0xBA, 0xBE];
+        v.extend_from_slice(&0x0000_0034u32.to_be_bytes());
+        v.extend_from_slice(&[0u8; 64]);
+        let near_eof = v.len() as u32 - 2;
+        v[16..20].copy_from_slice(&near_eof.to_be_bytes());
+        assert!(!is_macho_magic(&v, false));
+        assert!(parse_all(&v).is_empty());
     }
 
     #[test]
