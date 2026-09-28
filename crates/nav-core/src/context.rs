@@ -207,6 +207,16 @@ impl ScanContext {
         self.source == ContentSource::File
     }
 
+    /// True when [`Self::read_at`]/[`Self::for_each_window`] can actually
+    /// reach bytes past `content`: a real, opened file, on a platform with
+    /// an fd-based `read_at` ([`Self::read_at_file`] is unix-only). A rule
+    /// deciding whether it can stream/range-read past the prefix should
+    /// check this, not [`Self::is_file_backed`] alone — on a non-unix
+    /// platform the latter is true but every such read still fails.
+    pub fn supports_ranged_reads(&self) -> bool {
+        cfg!(unix) && self.file.is_some()
+    }
+
     pub fn readable(&self) -> bool {
         self.content.is_some()
     }
@@ -480,6 +490,20 @@ mod tests {
         assert_eq!(id.size, ctx.content.as_ref().unwrap().len() as u64);
         assert!(!ctx.truncated);
         let _ = std::fs::remove_file(&path);
+    }
+
+    /// A real, opened file supports ranged reads; embedded content (no file
+    /// at all) never does, on any platform (§5.2, #45 review).
+    #[test]
+    fn supports_ranged_reads_requires_an_actual_file_handle() {
+        let path = temp_file("supports-ranged-reads", b"hello world");
+        let ctx = ScanContext::load(&path);
+        assert!(ctx.file.is_some());
+        assert_eq!(ctx.supports_ranged_reads(), cfg!(unix));
+        let _ = std::fs::remove_file(&path);
+
+        let embedded = ScanContext::from_embedded_bytes("x.pkg!member", vec![1, 2, 3], false);
+        assert!(!embedded.supports_ranged_reads());
     }
 
     /// Embedded content has no file identity, so the stability check never

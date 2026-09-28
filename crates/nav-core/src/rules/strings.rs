@@ -196,11 +196,12 @@ impl Rule for SuspiciousStringsRule {
     }
 }
 
-/// Whether `evaluate` can stream `ctx` past the prefix at all: a file-backed
-/// context within the streaming cap. Separate from `covers_truncation`,
-/// which also requires that a stream actually attempted didn't fail.
+/// Whether `evaluate` can stream `ctx` past the prefix at all: ranged reads
+/// are actually possible, and the file is within the streaming cap.
+/// Separate from `covers_truncation`, which also requires that a stream
+/// actually attempted didn't fail.
 fn can_stream(ctx: &ScanContext) -> bool {
-    ctx.is_file_backed() && ctx.file_len.is_some_and(|len| len <= MAX_STREAM_BYTES)
+    ctx.supports_ranged_reads() && ctx.file_len.is_some_and(|len| len <= MAX_STREAM_BYTES)
 }
 
 #[cfg(test)]
@@ -415,6 +416,29 @@ mod tests {
     #[test]
     fn embedded_truncated_content_does_not_cover_truncation() {
         let ctx = ScanContext::from_embedded_bytes("x.pkg!Scripts/preinstall", vec![1, 2, 3], true);
+        assert!(!SuspiciousStringsRule.covers_truncation(&ctx));
+    }
+
+    /// A context that looks file-backed but has no actual file handle (the
+    /// shape a non-unix platform's `read_at_file` always leaves, since it
+    /// never serves a real read either way) must not claim coverage — every
+    /// streamed byte past `content` would in fact be unreachable (§5.2, #45
+    /// review).
+    #[test]
+    fn file_backed_without_a_handle_does_not_cover_truncation() {
+        let ctx = crate::context::ScanContext {
+            path: "app".into(),
+            content: Some(b"benign".to_vec()),
+            truncated: true,
+            file_len: Some(6),
+            identity: None,
+            source: crate::context::ContentSource::File,
+            file: None,
+            codesign_dv_cache: std::sync::OnceLock::new(),
+            spctl_cache: std::sync::OnceLock::new(),
+            macho_cache: std::sync::OnceLock::new(),
+            stream_failed: std::sync::atomic::AtomicBool::new(false),
+        };
         assert!(!SuspiciousStringsRule.covers_truncation(&ctx));
     }
 }

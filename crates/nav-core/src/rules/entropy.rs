@@ -96,15 +96,16 @@ impl Rule for HighEntropyRule {
     }
 
     /// Covered when there's no `__TEXT` range to miss, or its EOF-clipped
-    /// range is small enough to stream and file-backed (§5.2, #45); a
-    /// script/text file whose content is itself unread stays uncovered.
+    /// range is small enough to stream and ranged reads actually work here
+    /// (§5.2, #45); a script/text file whose content is itself unread stays
+    /// uncovered.
     fn covers_truncation(&self, ctx: &ScanContext) -> bool {
         if let Some(image) = ctx.macho().images.first() {
             return match &image.text_range {
                 None => true,
                 Some(range) => {
                     let range = clip_to_file_len(ctx, range.clone());
-                    (range.end - range.start) <= MAX_STREAM_BYTES && ctx.is_file_backed()
+                    (range.end - range.start) <= MAX_STREAM_BYTES && ctx.supports_ranged_reads()
                 }
             };
         }
