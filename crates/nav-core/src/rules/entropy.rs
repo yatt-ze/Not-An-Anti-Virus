@@ -161,8 +161,7 @@ impl HighEntropyRule {
         }
 
         // Whole range already resident in `content`: score it directly on
-        // the slice, no streaming/windowing needed (§5.2, #45 perf follow-up,
-        // PR #52 review).
+        // the slice, no streaming/windowing needed (§5.2).
         if range.end <= content.len() as u64 {
             return self.macho_signal_from_content(content, range);
         }
@@ -797,8 +796,7 @@ mod tests {
     /// A stream failure partway through `__TEXT` (the file shrinks after
     /// `ScanContext::load`, so reads past the captured prefix start failing)
     /// must not discard the score the content-only path would have found in
-    /// that prefix, and must not claim `covers_truncation` (§10/§11.8,
-    /// PR #52 review).
+    /// that prefix, and must not claim `covers_truncation` (§10/§11.8).
     #[test]
     fn stream_failure_falls_back_to_the_content_only_score() {
         const TOTAL_LEN: usize = MAX_CONTENT_BYTES + 1024 * 1024;

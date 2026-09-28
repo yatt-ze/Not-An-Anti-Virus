@@ -179,7 +179,7 @@ pub trait ByteSource {
     /// doesn't fit or the read fails. Borrows straight from memory already
     /// held when the whole range lies inside it, rather than copying — a
     /// single slice's header/signature reads can number in the thousands on
-    /// hostile input (§5.2, #45 perf follow-up, PR #52 review).
+    /// hostile input (§5.2).
     fn read_range(&self, off: u64, len: usize) -> Option<Cow<'_, [u8]>>;
 }
 
@@ -2199,7 +2199,7 @@ mod tests {
     /// A `ByteSource` that reports a `source_len` bigger than the bytes it
     /// can actually serve — the shape a stale, larger `file_len` takes after
     /// the real object shrank underneath a loaded `ScanContext` with no
-    /// handle left to serve the difference (§10/§11.8, PR #52 review).
+    /// handle left to serve the difference (§10/§11.8).
     struct StaleLenSource<'a> {
         data: &'a [u8],
         claimed_len: u64,
@@ -2224,7 +2224,7 @@ mod tests {
     /// read fails (nothing to serve past the held bytes), but the magic
     /// itself is still recognized from what is held, so the result stays
     /// `is_macho: true` with the unwalkable slice counted as skipped — never
-    /// a clean bill of health (§10/§11.8, PR #52 review).
+    /// a clean bill of health (§10/§11.8).
     #[test]
     fn scan_ranged_recognizes_a_thin_magic_when_the_full_head_read_fails() {
         let src = StaleLenSource {

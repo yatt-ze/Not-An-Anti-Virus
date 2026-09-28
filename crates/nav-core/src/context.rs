@@ -233,8 +233,7 @@ impl ScanContext {
     /// Core of [`Self::read_at`] and [`ByteSource::read_range`]: borrows
     /// straight from `content` when the whole range is already held there,
     /// so a caller making many small ranged reads (`macho::scan_ranged`)
-    /// doesn't copy on every one of them (§5.2, #45 perf follow-up, PR #52
-    /// review).
+    /// doesn't copy on every one of them (§5.2).
     fn read_range_cow(&self, offset: u64, len: usize) -> Option<Cow<'_, [u8]>> {
         if len > MAX_RANGE_READ {
             return None;
@@ -513,7 +512,7 @@ mod tests {
 
     /// A `ByteSource::read_range` call fully inside `content` borrows from it
     /// rather than copying — the hot path for `macho::scan_ranged`'s many
-    /// small header/signature reads (§5.2, #45 perf follow-up, PR #52 review).
+    /// small header/signature reads (§5.2).
     #[test]
     fn read_range_inside_content_borrows_without_copying() {
         use crate::macho::ByteSource;

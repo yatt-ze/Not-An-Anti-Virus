@@ -627,13 +627,11 @@ mod tests {
         }
     }
 
-    /// A >8 MiB file shaped like the #45 review regression: a `CAFEBABE`
-    /// header whose sole arch-table entry points past the 8 MiB prefix at
-    /// bytes that aren't a thin Mach-O magic. The old prefix-only
-    /// `is_macho_magic` gate read a truncated capture with an out-of-bounds
-    /// offset as "possibly Mach-O" and let `unsigned-binary` call this a
-    /// binary at all — `ctx.macho()` reads the real offset and correctly
-    /// says it isn't, so none of the five rules should even ask `codesign`.
+    /// A >8 MiB file with a `CAFEBABE` header whose sole arch-table entry
+    /// points past the 8 MiB prefix at bytes that aren't a thin Mach-O
+    /// magic: `ctx.macho()` reads the real offset and correctly says this
+    /// isn't Mach-O, so none of the five rules should even ask `codesign`
+    /// (§5.2, #45).
     #[test]
     fn codesign_rules_do_not_treat_an_out_of_bounds_fat_offset_as_macho() {
         use crate::context::MAX_CONTENT_BYTES;

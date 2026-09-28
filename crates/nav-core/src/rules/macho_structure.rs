@@ -396,8 +396,7 @@ mod tests {
     /// past `content` (the shape a real object shrinking after load takes)
     /// must not make `ctx.macho()` read a real magic in `content` as "not
     /// Mach-O": it's still recognized, just unwalkable, so `covers_truncation`
-    /// must not claim coverage over a scan that couldn't finish (§10/§11.8,
-    /// PR #52 review).
+    /// must not claim coverage over a scan that couldn't finish (§10/§11.8).
     #[test]
     fn stale_file_len_with_no_handle_is_undetermined_not_covered() {
         let c = ScanContext {
