@@ -8,13 +8,14 @@
 //!   entropy and is deliberately not this rule's signal (issue #35).
 //! - **any other opaque binary**: not scored — expected to be high-entropy.
 
+use std::collections::HashSet;
 use std::ops::Range;
 use std::path::Path;
 
 use super::{Rule, RuleOutcome};
 use crate::base64;
 use crate::context::{ScanContext, MAX_STREAM_BYTES};
-use crate::macho;
+use crate::macho::{self, ByteSource};
 use crate::model::{MatchedSignal, SignalCategory};
 
 /// Above this (out of 8.0 bits/byte, the max for byte-oriented Shannon
@@ -97,26 +98,30 @@ impl Rule for HighEntropyRule {
     }
 
     /// Covered when every slice's `__TEXT` was scored: no slice was skipped
-    /// walking the Mach-O itself, each slice's EOF-clipped range fits in
-    /// their combined `MAX_STREAM_BYTES` budget with ranged reads actually
-    /// working here (§5.2, #45), and no slice's stream failed partway; a
-    /// script/text file whose content is itself unread stays uncovered.
+    /// walking the Mach-O itself, no slice's declared range needs bytes past
+    /// a non-authoritative capture (§10/§11.8), the combined EOF-clipped
+    /// ranges fit `MAX_STREAM_BYTES` with none left out by that cap, ranged
+    /// reads actually work here when streaming was needed (§5.2, #45), and
+    /// no slice's stream failed partway; a script/text file whose content is
+    /// itself unread stays uncovered.
     fn covers_truncation(&self, ctx: &ScanContext) -> bool {
         let scan = ctx.macho();
         if !scan.images.is_empty() {
             if ctx.stream_failed(self.id()) || scan.skipped_slices > 0 {
                 return false;
             }
-            let total: u64 = scan
-                .images
+            if declares_text_past_a_non_authoritative_capture(ctx, &scan.images) {
+                return false;
+            }
+            let (included, all_scored) = budgeted_text_ranges(ctx, &scan.images);
+            if !all_scored {
+                return false;
+            }
+            let total: u64 = included
                 .iter()
-                .filter_map(|image| image.text_range.clone())
-                .map(|range| {
-                    let range = clip_to_file_len(ctx, range);
-                    range.end - range.start
-                })
+                .map(|(_, range)| range.end - range.start)
                 .sum();
-            return total <= MAX_STREAM_BYTES && (total == 0 || ctx.supports_ranged_reads());
+            return total == 0 || ctx.supports_ranged_reads();
         }
         if scan.is_macho {
             return false;
@@ -125,6 +130,73 @@ impl Rule for HighEntropyRule {
             .as_ref()
             .is_some_and(|content| !looks_like_script_or_text(content, &ctx.path))
     }
+}
+
+/// True if any image's declared, *unclipped* `__TEXT` range reaches past
+/// `ctx.file_len` on a source whose length isn't authoritative (a truncated
+/// embedded/container capture, §10/§11.8): real bytes past what this
+/// capture holds could still hold the section, so [`clip_to_file_len`]
+/// shrinking or emptying the range must not be read as "nothing to score."
+fn declares_text_past_a_non_authoritative_capture(
+    ctx: &ScanContext,
+    images: &[macho::MachOImage],
+) -> bool {
+    !ctx.source_len_is_authoritative()
+        && images.iter().any(|image| {
+            image
+                .text_range
+                .as_ref()
+                .is_some_and(|range| range.end > ctx.file_len.unwrap_or(0))
+        })
+}
+
+/// Decide which `__TEXT` ranges get scored under one `MAX_STREAM_BYTES`
+/// budget for the whole file (§5.2): images are deduped by EOF-clipped
+/// absolute range and resident ranges are considered first. A range that
+/// fits the remaining budget is included whole, else only its resident part
+/// (inside `ctx`'s held content) if that fits, else it is skipped. Returns
+/// the included `(image, range)` pairs and whether every non-empty range was
+/// included whole. Shared by evaluate and `covers_truncation` so they can't
+/// disagree.
+fn budgeted_text_ranges<'a>(
+    ctx: &ScanContext,
+    images: &'a [macho::MachOImage],
+) -> (Vec<(&'a macho::MachOImage, Range<u64>)>, bool) {
+    let held = ctx.content.as_ref().map_or(0, |c| c.len() as u64);
+    let mut seen = HashSet::new();
+    let mut candidates = Vec::new();
+    for image in images {
+        let Some(range) = image.text_range.clone() else {
+            continue;
+        };
+        let range = clip_to_file_len(ctx, range);
+        if !range.is_empty() && seen.insert((range.start, range.end)) {
+            candidates.push((image, range));
+        }
+    }
+    // Fully resident ranges first, so a decoy that spends the whole budget
+    // on streamed bytes can't crowd them out.
+    candidates.sort_by_key(|(_, range)| range.end > held);
+    let mut included = Vec::new();
+    let mut total = 0u64;
+    let mut all_scored = true;
+    for (image, range) in candidates {
+        let remaining = MAX_STREAM_BYTES - total;
+        let mut chosen = range.clone();
+        if chosen.end - chosen.start > remaining {
+            all_scored = false;
+            chosen = range.start.min(held)..range.end.min(held);
+            if chosen.is_empty()
+                || chosen.end - chosen.start > remaining
+                || (chosen != range && !seen.insert((chosen.start, chosen.end)))
+            {
+                continue;
+            }
+        }
+        total += chosen.end - chosen.start;
+        included.push((image, chosen));
+    }
+    (included, all_scored)
 }
 
 impl HighEntropyRule {
@@ -137,29 +209,24 @@ impl HighEntropyRule {
         content: &[u8],
         images: &[macho::MachOImage],
     ) -> Option<MatchedSignal> {
-        images
-            .iter()
-            .filter_map(|image| self.eval_macho_text(ctx, content, image))
+        let (included, _all_scored) = budgeted_text_ranges(ctx, images);
+        included
+            .into_iter()
+            .filter_map(|(_, range)| self.eval_macho_text(ctx, content, range))
             .max_by(|(a, _), (b, _)| a.total_cmp(b))
             .map(|(_, signal)| signal)
     }
 
-    /// Score one image's `__TEXT` code: streamed over its whole (EOF-clipped)
-    /// range when that fits `MAX_STREAM_BYTES`, else only over the part
-    /// inside `content`. Returns the entropy alongside the signal so the
-    /// caller can compare candidates across a fat binary's slices.
+    /// Score one already-budgeted, EOF-clipped `__TEXT` range: streamed over
+    /// the whole range when that fits `MAX_STREAM_BYTES`, else only over the
+    /// part inside `content`. Returns the entropy alongside the signal so
+    /// the caller can compare candidates across a fat binary's slices.
     fn eval_macho_text(
         &self,
         ctx: &ScanContext,
         content: &[u8],
-        image: &macho::MachOImage,
+        range: Range<u64>,
     ) -> Option<(f64, MatchedSignal)> {
-        let range = image.text_range.clone()?;
-        let range = clip_to_file_len(ctx, range);
-        if range.is_empty() {
-            return None;
-        }
-
         // Whole range already resident in `content`: score it directly on
         // the slice, no streaming/windowing needed (§5.2).
         if range.end <= content.len() as u64 {
@@ -891,6 +958,104 @@ mod tests {
         assert!(!HighEntropyRule::default().covers_truncation(&ctx));
 
         let _ = std::fs::remove_file(&path);
+    }
+
+    /// Images cloned from one synthetic Mach-O with `count` distinct-offset
+    /// `__TEXT` ranges, each `len` bytes long, plus a context whose declared
+    /// file length is `file_len`.
+    fn many_images_ctx(
+        count: u64,
+        len: u64,
+        file_len: u64,
+    ) -> (ScanContext, Vec<macho::MachOImage>) {
+        let (bytes, _) = crate::macho::tests_support::synth_macho_64(&[0u8; 64]);
+        let mut ctx = make_ctx("fat", bytes);
+        let base = ctx.macho().images[0].clone();
+        ctx.file_len = Some(file_len);
+        let images = (0..count)
+            .map(|i| {
+                let mut image = base.clone();
+                image.text_range = Some(i * 4096..i * 4096 + len);
+                image
+            })
+            .collect();
+        (ctx, images)
+    }
+
+    /// Hostile fat file: 1024 distinct-offset slices each declaring a huge
+    /// `__TEXT` clipped to EOF. The scored set stays within the total
+    /// budget and the rest are reported as left out.
+    #[test]
+    fn many_overlapping_slice_texts_are_bounded_by_the_total_budget() {
+        let file_len = MAX_STREAM_BYTES / 4;
+        let (ctx, images) = many_images_ctx(1024, u64::MAX / 2, file_len);
+        let (included, all_scored) = budgeted_text_ranges(&ctx, &images);
+        let total: u64 = included.iter().map(|(_, r)| r.end - r.start).sum();
+        assert!(total <= MAX_STREAM_BYTES);
+        assert!(included.len() < images.len());
+        assert!(!all_scored);
+    }
+
+    /// Context holding `content` (high-entropy) with a declared file length
+    /// of `file_len`, plus a base image to clone `__TEXT` ranges onto.
+    fn packed_ctx(file_len: u64) -> (ScanContext, macho::MachOImage) {
+        let (bytes, _) = crate::macho::tests_support::synth_macho_64(&[0u8; 64]);
+        let base = make_ctx("m", bytes).macho().images[0].clone();
+        let mut ctx = make_ctx("fat", high_entropy_blob(4096));
+        ctx.file_len = Some(file_len);
+        (ctx, base)
+    }
+
+    /// One `__TEXT` declared larger than the whole budget: its resident
+    /// packed prefix is still scored, and coverage is not claimed.
+    #[test]
+    fn oversized_text_still_scores_its_resident_prefix() {
+        let (ctx, base) = packed_ctx(MAX_STREAM_BYTES + 4096);
+        let mut image = base;
+        image.text_range = Some(0..MAX_STREAM_BYTES + 4096);
+        let images = [image];
+        let rule = HighEntropyRule::default();
+        let content = ctx.content.as_ref().unwrap();
+        assert!(rule.eval_macho_images(&ctx, content, &images).is_some());
+        assert!(!budgeted_text_ranges(&ctx, &images).1);
+    }
+
+    /// A decoy first slice declaring a huge `__TEXT` doesn't hide a later,
+    /// fully resident packed slice.
+    #[test]
+    fn decoy_huge_first_slice_does_not_hide_a_resident_packed_slice() {
+        let (ctx, base) = packed_ctx(MAX_STREAM_BYTES + 4096);
+        let mut decoy = base.clone();
+        decoy.text_range = Some(4096..MAX_STREAM_BYTES + 4096);
+        let mut packed = base;
+        packed.text_range = Some(0..4096);
+        let images = [decoy, packed];
+        let content = ctx.content.as_ref().unwrap();
+        let signal = HighEntropyRule::default().eval_macho_images(&ctx, content, &images);
+        assert!(signal.is_some());
+    }
+
+    /// Slices clipping to the same absolute range are scored once.
+    #[test]
+    fn identical_clipped_ranges_are_deduped() {
+        let (ctx, mut images) = many_images_ctx(3, 100, 4096 * 4);
+        for image in &mut images {
+            image.text_range = Some(0..100);
+        }
+        let (included, all_scored) = budgeted_text_ranges(&ctx, &images);
+        assert_eq!(included.len(), 1);
+        assert!(all_scored);
+    }
+
+    /// A truncated embedded member whose `__TEXT` lies past the capture
+    /// can't be claimed as covered, even though the clipped range is empty.
+    #[test]
+    fn truncated_embedded_text_past_the_capture_does_not_cover_truncation() {
+        let (bytes, range) = crate::macho::tests_support::synth_macho_64(&high_entropy_blob(4096));
+        let cut = bytes[..range.start as usize].to_vec();
+        let ctx = ScanContext::from_embedded_bytes("x.pkg!member", cut, true);
+        assert!(!ctx.macho().images.is_empty());
+        assert!(!HighEntropyRule::default().covers_truncation(&ctx));
     }
 
     /// A truncated file with no Mach-O magic and no text-like structure is
