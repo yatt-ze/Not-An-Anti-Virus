@@ -63,10 +63,11 @@ pub trait Rule: Send + Sync {
 
     /// True only when this rule's result for `ctx` doesn't depend on bytes
     /// past `ctx.content` — it doesn't read content, or it read what it
-    /// needed itself (`read_at`/`for_each_window`) and returns
-    /// `NotApplicable` when it couldn't. Only consulted when `ctx` is
-    /// truncated; the default keeps "truncated ⇒ Partial" for any rule
-    /// that hasn't been checked.
+    /// needed itself (`read_at`/`for_each_window`). A failed read must
+    /// return `NotApplicable` or be recorded with
+    /// `ScanContext::mark_stream_failed` so this returns `false`; it is
+    /// called after `evaluate`. Only consulted when `ctx` is truncated; the
+    /// default keeps "truncated ⇒ Partial" (§5.5).
     fn covers_truncation(&self, _ctx: &ScanContext) -> bool {
         false
     }
