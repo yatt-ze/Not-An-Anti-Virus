@@ -95,12 +95,15 @@ impl Rule for HighEntropyRule {
         Ok(None)
     }
 
-    /// Covered when there's no `__TEXT` range to miss, or its EOF-clipped
-    /// range is small enough to stream and ranged reads actually work here
-    /// (§5.2, #45); a script/text file whose content is itself unread stays
-    /// uncovered.
+    /// Covered when there's no `__TEXT` range to miss, its EOF-clipped range
+    /// is small enough to stream and ranged reads actually work here (§5.2,
+    /// #45), and that stream didn't fail partway; a script/text file whose
+    /// content is itself unread stays uncovered.
     fn covers_truncation(&self, ctx: &ScanContext) -> bool {
         if let Some(image) = ctx.macho().images.first() {
+            if ctx.stream_failed(self.id()) {
+                return false;
+            }
             return match &image.text_range {
                 None => true,
                 Some(range) => {
@@ -146,16 +149,19 @@ impl HighEntropyRule {
         if range.end - range.start <= MAX_STREAM_BYTES {
             let mut counts = [0u64; 256];
             let mut total = 0u64;
-            let delivered = ctx.for_each_window(range, 0, |window, _is_last| {
+            let delivered = ctx.for_each_window(range.clone(), 0, |window, _is_last| {
                 for &b in window {
                     counts[b as usize] += 1;
                 }
                 total += window.len() as u64;
             });
-            if !delivered {
-                return Err(RuleOutcome::NotApplicable);
+            if delivered {
+                return Ok(self.macho_signal(total, entropy_from_histogram(&counts, total)));
             }
-            return Ok(self.macho_signal(total, entropy_from_histogram(&counts, total)));
+            // The stream failed partway — fall back to what the captured
+            // prefix can still show rather than discarding a score it would
+            // have found there (§10/§11.8).
+            ctx.mark_stream_failed(self.id());
         }
 
         Ok(self.macho_signal_from_content(content, range))
@@ -763,6 +769,50 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
+    /// A stream failure partway through `__TEXT` (the file shrinks after
+    /// `ScanContext::load`, so reads past the captured prefix start failing)
+    /// must not discard the score the content-only path would have found in
+    /// that prefix, and must not claim `covers_truncation` (§10/§11.8,
+    /// PR #52 review).
+    #[test]
+    fn stream_failure_falls_back_to_the_content_only_score() {
+        const TOTAL_LEN: usize = MAX_CONTENT_BYTES + 1024 * 1024;
+        let payload = high_entropy_blob(TOTAL_LEN);
+        let (image_bytes, range) = crate::macho::tests_support::synth_macho_64(&payload);
+        assert!(
+            (range.end - range.start) as usize > MAX_CONTENT_BYTES,
+            "the __TEXT range must extend past the prefix to exercise streaming"
+        );
+
+        let path = write_temp_file("entropy-stream-failure", &image_bytes);
+        let ctx = ScanContext::load(&path);
+        assert!(ctx.truncated);
+
+        // Confirm the premise: the in-content portion alone clears the
+        // threshold, so the fallback (not the streamed read) is what finds it.
+        let content = ctx.content.as_ref().unwrap();
+        let start = usize::try_from(range.start).unwrap();
+        assert!(shannon_entropy(&content[start..]) >= ENTROPY_THRESHOLD);
+
+        // Shrink the file out from under the already-loaded context: reads
+        // past the captured prefix now fail.
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_len(8)
+            .unwrap();
+
+        let signal = HighEntropyRule::default()
+            .evaluate(&ctx)
+            .unwrap()
+            .expect("the in-prefix portion should still score");
+        assert!(signal.description.contains("__TEXT"));
+        assert!(!HighEntropyRule::default().covers_truncation(&ctx));
+
+        let _ = std::fs::remove_file(&path);
+    }
+
     /// A truncated file with no Mach-O magic and no text-like structure is
     /// opaque-binary territory: never scored, and unread bytes past 8 MiB
     /// can't change that, so the rule covers the truncation.
@@ -813,7 +863,7 @@ mod tests {
             codesign_dv_cache: std::sync::OnceLock::new(),
             spctl_cache: std::sync::OnceLock::new(),
             macho_cache: std::sync::OnceLock::new(),
-            stream_failed: std::sync::atomic::AtomicBool::new(false),
+            stream_failures: std::sync::Mutex::new(Vec::new()),
         };
         assert!(HighEntropyRule::default().evaluate(&ctx).unwrap().is_none());
     }
@@ -834,7 +884,7 @@ mod tests {
             codesign_dv_cache: std::sync::OnceLock::new(),
             spctl_cache: std::sync::OnceLock::new(),
             macho_cache: std::sync::OnceLock::new(),
-            stream_failed: std::sync::atomic::AtomicBool::new(false),
+            stream_failures: std::sync::Mutex::new(Vec::new()),
         };
         let signal = HighEntropyRule::default().evaluate(&ctx).unwrap();
         assert!(signal.is_some(), "script with embedded blob should score");
@@ -856,7 +906,7 @@ mod tests {
             codesign_dv_cache: std::sync::OnceLock::new(),
             spctl_cache: std::sync::OnceLock::new(),
             macho_cache: std::sync::OnceLock::new(),
-            stream_failed: std::sync::atomic::AtomicBool::new(false),
+            stream_failures: std::sync::Mutex::new(Vec::new()),
         };
         let signal = HighEntropyRule::default().evaluate(&ctx).unwrap();
         assert!(
@@ -879,7 +929,7 @@ mod tests {
             codesign_dv_cache: std::sync::OnceLock::new(),
             spctl_cache: std::sync::OnceLock::new(),
             macho_cache: std::sync::OnceLock::new(),
-            stream_failed: std::sync::atomic::AtomicBool::new(false),
+            stream_failures: std::sync::Mutex::new(Vec::new()),
         }
     }
 

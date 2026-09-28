@@ -123,15 +123,11 @@ pub struct ScanContext {
     /// about the same file. `pub(crate)` for the same reason as the caches
     /// above; use [`ScanContext::macho`] to read it.
     pub(crate) macho_cache: OnceLock<crate::macho::MachOScan>,
-    /// Set by a rule's `evaluate` when it started streaming past the prefix
-    /// (`for_each_window`) but the stream failed partway, so its
-    /// `covers_truncation` can report the gap instead of coverage it didn't
-    /// get (§10/§11.8). One flag is enough today: only
-    /// `SuspiciousStringsRule` streams and needs to report this. `AtomicBool`
-    /// rather than `Cell`, so `ScanContext` stays `Sync` like its other
-    /// caches; `Relaxed` is enough since there's no other state to order
-    /// against.
-    pub(crate) stream_failed: std::sync::atomic::AtomicBool,
+    /// Ids of rules whose `for_each_window` stream failed partway this scan,
+    /// so their `covers_truncation` can report the gap instead of coverage
+    /// they didn't get (§10/§11.8). Keyed per rule so one streaming rule's
+    /// failure can't clobber another's.
+    pub(crate) stream_failures: std::sync::Mutex<Vec<&'static str>>,
 }
 
 impl ScanContext {
@@ -174,7 +170,7 @@ impl ScanContext {
             codesign_dv_cache: OnceLock::new(),
             spctl_cache: OnceLock::new(),
             macho_cache: OnceLock::new(),
-            stream_failed: std::sync::atomic::AtomicBool::new(false),
+            stream_failures: std::sync::Mutex::new(Vec::new()),
         }
     }
 
@@ -199,7 +195,7 @@ impl ScanContext {
             codesign_dv_cache: OnceLock::new(),
             spctl_cache: OnceLock::new(),
             macho_cache: OnceLock::new(),
-            stream_failed: std::sync::atomic::AtomicBool::new(false),
+            stream_failures: std::sync::Mutex::new(Vec::new()),
         }
     }
 
@@ -385,6 +381,24 @@ impl ScanContext {
     pub fn macho(&self) -> &crate::macho::MachOScan {
         self.macho_cache
             .get_or_init(|| crate::macho::scan_ranged(self))
+    }
+
+    /// Records that `rule_id`'s [`Self::for_each_window`] stream failed
+    /// partway this scan.
+    pub fn mark_stream_failed(&self, rule_id: &'static str) {
+        if let Ok(mut failures) = self.stream_failures.lock() {
+            if !failures.contains(&rule_id) {
+                failures.push(rule_id);
+            }
+        }
+    }
+
+    /// Whether `rule_id`'s stream failed partway this scan.
+    pub fn stream_failed(&self, rule_id: &'static str) -> bool {
+        match self.stream_failures.lock() {
+            Ok(failures) => failures.contains(&rule_id),
+            Err(_) => false,
+        }
     }
 }
 

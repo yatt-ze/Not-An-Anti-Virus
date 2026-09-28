@@ -147,8 +147,9 @@ impl Rule for SuspiciousStringsRule {
                 // Lossy-decoded: ASCII markers still match, no panic on non-UTF-8.
                 scan_window(&String::from_utf8_lossy(window), is_last, &mut hits);
             });
-            ctx.stream_failed
-                .store(!ok, std::sync::atomic::Ordering::Relaxed);
+            if !ok {
+                ctx.mark_stream_failed(self.id());
+            }
             // A stream that failed partway still reported real hits from
             // before the failure — keep those rather than discard them; only
             // a failure with nothing found at all is NotApplicable.
@@ -192,7 +193,7 @@ impl Rule for SuspiciousStringsRule {
     /// within the streaming cap and the stream didn't fail partway —
     /// otherwise unread bytes past the 8 MiB prefix may hide a marker.
     fn covers_truncation(&self, ctx: &ScanContext) -> bool {
-        can_stream(ctx) && !ctx.stream_failed.load(std::sync::atomic::Ordering::Relaxed)
+        can_stream(ctx) && !ctx.stream_failed(self.id())
     }
 }
 
@@ -412,7 +413,7 @@ mod tests {
             codesign_dv_cache: std::sync::OnceLock::new(),
             spctl_cache: std::sync::OnceLock::new(),
             macho_cache: std::sync::OnceLock::new(),
-            stream_failed: std::sync::atomic::AtomicBool::new(false),
+            stream_failures: std::sync::Mutex::new(Vec::new()),
         };
         assert!(!SuspiciousStringsRule.covers_truncation(&ctx));
     }
