@@ -136,6 +136,13 @@ impl HighEntropyRule {
             return Ok(None);
         }
 
+        // Whole range already resident in `content`: score it directly on
+        // the slice, no streaming/windowing needed (§5.2, #45 perf follow-up,
+        // PR #52 review).
+        if range.end <= content.len() as u64 {
+            return Ok(self.macho_signal_from_content(content, range));
+        }
+
         if range.end - range.start <= MAX_STREAM_BYTES {
             let mut counts = [0u64; 256];
             let mut total = 0u64;
@@ -151,16 +158,25 @@ impl HighEntropyRule {
             return Ok(self.macho_signal(total, entropy_from_histogram(&counts, total)));
         }
 
+        Ok(self.macho_signal_from_content(content, range))
+    }
+
+    /// Score the part of `range` that lies inside `content`, clamped — used
+    /// both when the whole range is already held and as the fallback when it
+    /// can't be streamed (too large, or the stream failed partway).
+    fn macho_signal_from_content(
+        &self,
+        content: &[u8],
+        range: Range<u64>,
+    ) -> Option<MatchedSignal> {
         let start = usize::try_from(range.start)
             .ok()
             .map(|s| s.min(content.len()));
         let end = usize::try_from(range.end)
             .ok()
             .map(|e| e.min(content.len()));
-        let Some(text) = start.zip(end).and_then(|(s, e)| content.get(s..e)) else {
-            return Ok(None);
-        };
-        Ok(self.macho_signal(text.len() as u64, shannon_entropy(text)))
+        let text = start.zip(end).and_then(|(s, e)| content.get(s..e))?;
+        self.macho_signal(text.len() as u64, shannon_entropy(text))
     }
 
     /// Build the `__TEXT`-section signal if `entropy` over `len` bytes clears

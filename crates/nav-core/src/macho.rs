@@ -17,6 +17,7 @@
 //! [`ByteSource`], so a file bigger than any in-memory capture is still fully
 //! examined (§5.2, #45).
 
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::ops::Range;
 
@@ -175,8 +176,11 @@ pub trait ByteSource {
         true
     }
     /// Reads exactly `len` bytes starting at `off`, or `None` if the range
-    /// doesn't fit or the read fails.
-    fn read_range(&self, off: u64, len: usize) -> Option<Vec<u8>>;
+    /// doesn't fit or the read fails. Borrows straight from memory already
+    /// held when the whole range lies inside it, rather than copying — a
+    /// single slice's header/signature reads can number in the thousands on
+    /// hostile input (§5.2, #45 perf follow-up, PR #52 review).
+    fn read_range(&self, off: u64, len: usize) -> Option<Cow<'_, [u8]>>;
 }
 
 impl ByteSource for [u8] {
@@ -188,10 +192,10 @@ impl ByteSource for [u8] {
         self.len() as u64
     }
 
-    fn read_range(&self, off: u64, len: usize) -> Option<Vec<u8>> {
+    fn read_range(&self, off: u64, len: usize) -> Option<Cow<'_, [u8]>> {
         let start = usize::try_from(off).ok()?;
         let end = start.checked_add(len)?;
-        self.get(start..end).map(<[u8]>::to_vec)
+        self.get(start..end).map(Cow::Borrowed)
     }
 }
 
@@ -471,12 +475,12 @@ impl RangeBudget {
 /// part of `[off, off+len)` beyond `src.held_len()` — bytes already resident
 /// in memory cost nothing to re-read. Refuses the read up front if the
 /// chargeable part alone would exceed the remaining budget.
-fn read_budgeted(
-    src: &(impl ByteSource + ?Sized),
+fn read_budgeted<'a>(
+    src: &'a (impl ByteSource + ?Sized),
     budget: &mut RangeBudget,
     off: u64,
     len: usize,
-) -> Option<Vec<u8>> {
+) -> Option<Cow<'a, [u8]>> {
     let end = off.checked_add(len as u64)?;
     let held = src.held_len();
     let chargeable = end.saturating_sub(held.max(off));
@@ -2163,7 +2167,7 @@ mod tests {
             self.held
         }
 
-        fn read_range(&self, off: u64, len: usize) -> Option<Vec<u8>> {
+        fn read_range(&self, off: u64, len: usize) -> Option<Cow<'_, [u8]>> {
             self.data.read_range(off, len)
         }
     }
@@ -2279,7 +2283,7 @@ mod tests {
             self.data.source_len()
         }
 
-        fn read_range(&self, off: u64, len: usize) -> Option<Vec<u8>> {
+        fn read_range(&self, off: u64, len: usize) -> Option<Cow<'_, [u8]>> {
             let bytes = self.data.read_range(off, len)?;
             self.served.set(self.served.get() + bytes.len() as u64);
             Some(bytes)

@@ -4,6 +4,7 @@
 //! Reads past that prefix ([`ScanContext::read_at`], [`ScanContext::for_each_window`])
 //! go through the context's own file handle, never a fresh open by path (§11.7).
 
+use std::borrow::Cow;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
@@ -230,6 +231,15 @@ impl ScanContext {
     /// (embedded content, or a platform with no `read_at`-style syscall) once
     /// the range extends past `content`.
     pub fn read_at(&self, offset: u64, len: usize) -> Option<Vec<u8>> {
+        self.read_range_cow(offset, len).map(Cow::into_owned)
+    }
+
+    /// Core of [`Self::read_at`] and [`ByteSource::read_range`]: borrows
+    /// straight from `content` when the whole range is already held there,
+    /// so a caller making many small ranged reads (`macho::scan_ranged`)
+    /// doesn't copy on every one of them (§5.2, #45 perf follow-up, PR #52
+    /// review).
+    fn read_range_cow(&self, offset: u64, len: usize) -> Option<Cow<'_, [u8]>> {
         if len > MAX_RANGE_READ {
             return None;
         }
@@ -242,11 +252,11 @@ impl ScanContext {
         if let Some(content) = &self.content {
             if end <= content.len() as u64 {
                 let start = offset as usize;
-                return Some(content[start..start + len].to_vec());
+                return Some(Cow::Borrowed(&content[start..start + len]));
             }
         }
 
-        self.read_at_file(offset, len)
+        self.read_at_file(offset, len).map(Cow::Owned)
     }
 
     #[cfg(unix)]
@@ -395,8 +405,8 @@ impl crate::macho::ByteSource for ScanContext {
         !(self.source == ContentSource::Embedded && self.truncated)
     }
 
-    fn read_range(&self, off: u64, len: usize) -> Option<Vec<u8>> {
-        self.read_at(off, len)
+    fn read_range(&self, off: u64, len: usize) -> Option<Cow<'_, [u8]>> {
+        self.read_range_cow(off, len)
     }
 }
 
@@ -485,6 +495,41 @@ mod tests {
             ctx.run_object_bound(|| Some("ok".to_string())),
             Some("ok".to_string())
         );
+    }
+
+    /// A `ByteSource::read_range` call fully inside `content` borrows from it
+    /// rather than copying — the hot path for `macho::scan_ranged`'s many
+    /// small header/signature reads (§5.2, #45 perf follow-up, PR #52 review).
+    #[test]
+    fn read_range_inside_content_borrows_without_copying() {
+        use crate::macho::ByteSource;
+
+        let path = write_temp_file("read-range-borrowed", b"hello world");
+        let ctx = ScanContext::load(&path);
+        let cow = ctx.read_range(0, 5).expect("in-range read");
+        assert!(matches!(cow, std::borrow::Cow::Borrowed(_)));
+        assert_eq!(&*cow, b"hello");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A range past `content` has to be read for real, so it comes back owned.
+    #[test]
+    fn read_range_past_content_is_owned() {
+        use crate::macho::ByteSource;
+
+        let total_len = MAX_CONTENT_BYTES as u64 + 4096;
+        let path = sparse_temp_file("read-range-owned", total_len);
+        let marker = b"MARKER-PAST-CONTENT";
+        let marker_offset = MAX_CONTENT_BYTES as u64 + 100;
+        write_at(&path, marker_offset, marker);
+
+        let ctx = ScanContext::load(&path);
+        let cow = ctx
+            .read_range(marker_offset, marker.len())
+            .expect("past-content read");
+        assert!(matches!(cow, std::borrow::Cow::Owned(_)));
+        assert_eq!(&*cow, marker);
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
