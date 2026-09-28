@@ -521,7 +521,7 @@ pub fn scan_ranged(src: &(impl ByteSource + ?Sized)) -> MachOScan {
 
     match be_u32(&head, 0) {
         Some(FAT_MAGIC) | Some(FAT_MAGIC_64) => {
-            scan_ranged_fat(src, &head, source_len, &mut budget)
+            scan_ranged_fat(src, &head, head.len() < head_len, source_len, &mut budget)
         }
         Some(magic) => match thin_kind(magic) {
             Some(_) => match scan_ranged_slice(src, 0, false, source_len, &mut budget) {
@@ -593,10 +593,12 @@ fn classify_slice_magic(
 /// an offset past a non-authoritative `source_len` — e.g. a truncated
 /// embedded/container member), this still reports `is_macho: true` with
 /// those counted as skipped, rather than reading "couldn't check" as "clean"
-/// (§10/§11.8, §5.2).
+/// (§10/§11.8, §5.2). `head_is_short` marks a head cut short by a failed
+/// read: arch entries beyond it are undetermined, not absent.
 fn scan_ranged_fat(
     src: &(impl ByteSource + ?Sized),
     head: &[u8],
+    head_is_short: bool,
     source_len: u64,
     budget: &mut RangeBudget,
 ) -> MachOScan {
@@ -632,10 +634,9 @@ fn scan_ranged_fat(
         .iter()
         .map(|off_opt| match off_opt {
             Some(off) => classify_slice_magic(src, budget, *off, source_len),
-            // This entry's own bytes lie outside what we hold — the arch
-            // table itself may have been cut short by a non-authoritative
-            // capture.
-            None if src.source_len_is_authoritative() => SliceMagic::NotMacho,
+            // This entry's own bytes lie outside the head: real only if the
+            // head is the full table region of an authoritative source.
+            None if src.source_len_is_authoritative() && !head_is_short => SliceMagic::NotMacho,
             None => SliceMagic::Undetermined,
         })
         .collect();
@@ -2269,6 +2270,27 @@ mod tests {
         );
         assert!(scan.images.is_empty());
         assert_eq!(scan.skipped_slices, 1);
+        assert!(!scan.fully_examined());
+    }
+
+    /// The head read fell back to a short held prefix: an arch entry lying
+    /// beyond it is undetermined, so the file stays Mach-O with a skip.
+    #[test]
+    fn scan_ranged_short_fallback_head_leaves_later_arch_entries_undetermined() {
+        let mut data = vec![0xCA, 0xFE, 0xBA, 0xBE];
+        data.extend_from_slice(&2u32.to_be_bytes()); // nfat_arch = 2
+        data.extend_from_slice(&[0u8; 8]); // cputype, cpusubtype
+        data.extend_from_slice(&28u32.to_be_bytes()); // first offset: held zeros
+        data.extend_from_slice(&[0u8; 8]); // size, align
+        data.extend_from_slice(&[0u8; 4]); // bytes at offset 28: not a magic
+        assert_eq!(data.len(), 32); // second entry (bytes 28..48) not held
+        let src = StaleLenSource {
+            data: &data,
+            claimed_len: u64::MAX,
+        };
+        let scan = scan_ranged(&src);
+        assert!(scan.is_macho);
+        assert!(scan.skipped_slices >= 1);
         assert!(!scan.fully_examined());
     }
 
