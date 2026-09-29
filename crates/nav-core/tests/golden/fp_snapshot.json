@@ -153,6 +153,15 @@
     ],
     "completeness": "complete"
   },
+  "benign/macho_identity_jvm_entitlements": {
+    "score": 14,
+    "recommendation": "no-action",
+    "rule_ids": [
+      "macho-loader-anomaly",
+      "unsigned-binary"
+    ],
+    "completeness": "complete"
+  },
   "benign/macho_like_but_incomplete": {
     "score": 4,
     "recommendation": "no-action",

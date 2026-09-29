@@ -33,6 +33,10 @@ const ENTITLEMENT_WEIGHT_SIGNED: i32 = 10;
 /// under a real identity (README's "suspicious entitlements on unsigned
 /// binaries").
 const ENTITLEMENT_WEIGHT_ADHOC: i32 = 18;
+/// Ceiling on the combined contribution of all entitlements weighted at
+/// `ENTITLEMENT_WEIGHT_SIGNED`: under a real identity they only corroborate
+/// (§5.2). Ad-hoc-weighted entitlements are not capped by it.
+const SIGNED_ENTITLEMENTS_CAP: i32 = ENTITLEMENT_WEIGHT_SIGNED;
 /// Ceiling on this rule's single signal — comfortably in `Notify` range,
 /// never near the §5.1 high-severity threshold on its own.
 const MAX_WEIGHT: i32 = 30;
@@ -175,7 +179,15 @@ impl Rule for MachOStructureRule {
                 .map(|ent| ent.key)
                 .filter(|key| entitlement_weights.contains_key(key))
                 .collect();
-            let weight: i32 = entitlement_weights.values().sum();
+            let (adhoc_sum, signed_sum) =
+                entitlement_weights.values().fold((0, 0), |(a, s), &w| {
+                    if w == ENTITLEMENT_WEIGHT_ADHOC {
+                        (a + w, s)
+                    } else {
+                        (a, s + w)
+                    }
+                });
+            let weight = adhoc_sum + signed_sum.min(SIGNED_ENTITLEMENTS_CAP);
             let any_adhoc = entitlement_weights
                 .values()
                 .any(|&w| w == ENTITLEMENT_WEIGHT_ADHOC);
@@ -551,6 +563,97 @@ mod tests {
         assert_eq!(
             unknown_sig.weight, ENTITLEMENT_WEIGHT_SIGNED,
             "an unrecoverable CodeDirectory must not assume the worse case"
+        );
+    }
+
+    const THREE_ENTITLEMENTS: &[u8] = br#"<?xml version="1.0"?><plist version="1.0"><dict>
+        <key>com.apple.security.cs.disable-library-validation</key><true/>
+        <key>com.apple.security.cs.allow-dyld-environment-variables</key><true/>
+        <key>com.apple.security.cs.disable-executable-page-protection</key><true/>
+    </dict></plist>"#;
+
+    #[test]
+    fn real_identity_entitlements_are_capped_in_total() {
+        let (image, _, _) = synth_macho_64_full_with_cds_and_cms(
+            b"code",
+            &[],
+            &[],
+            true,
+            Some(THREE_ENTITLEMENTS),
+            &[(0, 0)],
+            Some(4),
+        );
+        let sig = MachOStructureRule
+            .evaluate(&ctx_for(image))
+            .unwrap()
+            .expect("should fire");
+        assert_eq!(sig.weight, SIGNED_ENTITLEMENTS_CAP);
+        assert!(sig.description.contains("disable-library-validation"));
+        assert!(sig.description.contains("allow-dyld-environment-variables"));
+        assert!(sig
+            .description
+            .contains("disable-executable-page-protection"));
+
+        // Unknown flags fall back to the real-identity weight, so the cap too.
+        let (unknown, _, _) =
+            synth_macho_64_full(b"code", &[], &[], true, Some(THREE_ENTITLEMENTS));
+        let sig = MachOStructureRule
+            .evaluate(&ctx_for(unknown))
+            .unwrap()
+            .expect("should fire");
+        assert_eq!(sig.weight, SIGNED_ENTITLEMENTS_CAP);
+    }
+
+    #[test]
+    fn adhoc_entitlements_are_not_subject_to_the_signed_cap() {
+        let xml = br#"<?xml version="1.0"?><plist version="1.0"><dict>
+            <key>com.apple.security.cs.disable-library-validation</key><true/>
+            <key>com.apple.security.cs.allow-dyld-environment-variables</key><true/>
+        </dict></plist>"#;
+        let (image, _, _) =
+            synth_macho_64_full_with_cd_flags(b"code", &[], &[], true, Some(xml), Some(CS_ADHOC));
+        let sig = MachOStructureRule
+            .evaluate(&ctx_for(image))
+            .unwrap()
+            .expect("should fire");
+        // 2 x 18 = 36, clamped by the rule-wide MAX_WEIGHT.
+        assert_eq!(sig.weight, MAX_WEIGHT);
+    }
+
+    #[test]
+    fn mixed_fat_binary_caps_only_the_signed_weighted_keys() {
+        let adhoc_xml = br#"<?xml version="1.0"?><plist version="1.0"><dict>
+            <key>com.apple.security.cs.disable-library-validation</key><true/>
+        </dict></plist>"#;
+        let signed_xml = br#"<?xml version="1.0"?><plist version="1.0"><dict>
+            <key>com.apple.security.cs.allow-dyld-environment-variables</key><true/>
+            <key>com.apple.security.cs.disable-executable-page-protection</key><true/>
+        </dict></plist>"#;
+        let (adhoc, _, _) = synth_macho_64_full_with_cd_flags(
+            b"aaaa",
+            &[],
+            &[],
+            true,
+            Some(adhoc_xml),
+            Some(CS_ADHOC),
+        );
+        let (signed, _, _) = synth_macho_64_full_with_cds_and_cms(
+            b"bbbb",
+            &[],
+            &[],
+            true,
+            Some(signed_xml),
+            &[(0, 0)],
+            Some(4),
+        );
+        let fat = synth_fat(&[&adhoc, &signed]);
+        let sig = MachOStructureRule
+            .evaluate(&ctx_for(fat))
+            .unwrap()
+            .expect("should fire");
+        assert_eq!(
+            sig.weight,
+            ENTITLEMENT_WEIGHT_ADHOC + SIGNED_ENTITLEMENTS_CAP
         );
     }
 
@@ -1350,5 +1453,26 @@ mod fixture_gen {
             identity_claim,
         )
         .unwrap();
+
+        // Benign: a real-identity-looking signature (non-empty CMS blob, no
+        // CS_ADHOC) with the JVM-style entitlement set. Under a real identity
+        // these only corroborate (§5.2).
+        let jvm_entitlements = br#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+    <key>com.apple.security.cs.disable-library-validation</key><true/>
+    <key>com.apple.security.cs.allow-dyld-environment-variables</key><true/>
+    <key>com.apple.security.cs.allow-jit</key><true/>
+</dict></plist>"#;
+        let (jvm, _, _) = synth_macho_64_full_with_cds_and_cms(
+            b"\x55\x48\x89\xe5\x90jvm-like machine code padding to look real",
+            &["/usr/lib/libSystem.B.dylib"],
+            &[],
+            true,
+            Some(jvm_entitlements),
+            &[(0, 0)],
+            Some(4),
+        );
+        std::fs::write(root.join("benign/macho_identity_jvm_entitlements"), jvm).unwrap();
     }
 }
