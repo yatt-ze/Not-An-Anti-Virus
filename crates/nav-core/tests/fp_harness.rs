@@ -63,6 +63,25 @@ fn scan(path: &Path) -> TargetScan {
         .unwrap_or_else(|e| panic!("failed to scan fixture {}: {e}", path.display()))
 }
 
+/// Whether every scanned member was examined in full (§11.8).
+fn is_complete(scan: &TargetScan) -> bool {
+    scan.coverage_complete()
+        && !scan
+            .worst()
+            .is_some_and(|r| r.completeness != ScanCompleteness::Complete)
+}
+
+fn has_signal(scan: &TargetScan) -> bool {
+    scan.results.iter().any(|r| !r.signals.is_empty())
+}
+
+/// A suspicious fixture the scanner did not silently miss: it has a signal or,
+/// off macOS (where the codesign rules are `NotApplicable`), it is at least
+/// incomplete — "couldn't check", not "checked and clean" (§10/§11.8).
+fn is_noticed(scan: &TargetScan) -> bool {
+    has_signal(scan) || (!cfg!(target_os = "macos") && !is_complete(scan))
+}
+
 /// Sorted, deduplicated union of rule ids fired anywhere in a target scan —
 /// for a single-file target this is just that file's signals; for a
 /// directory/`.app` target it's the union across every scanned member.
@@ -101,7 +120,8 @@ fn benign_fixtures_never_alert() {
 
 /// Suspicious fixtures allowed to stay below Notify, keyed by
 /// [`fixture_key`] with the reason. Every other suspicious fixture must reach
-/// Notify (§11.1).
+/// Notify (§11.1). Each must still be noticed: a signal, or off macOS at
+/// least an incomplete scan.
 const SUB_THRESHOLD_ALLOWLIST: &[(&str, &str)] = &[
     (
         "suspicious/macho_duplicate_code_signature",
@@ -149,9 +169,9 @@ fn suspicious_fixtures_reach_notify_unless_allowlisted() {
                     result.recommendation(),
                 );
                 assert!(
-                    result.results.iter().any(|r| !r.signals.is_empty()),
-                    "allowlisted fixture {key} produced no signals at all — the scanner \
-                     failed to notice content that was deliberately constructed to be \
+                    is_noticed(&result),
+                    "allowlisted fixture {key} produced no signals and scanned Complete — the \
+                     scanner failed to notice content that was deliberately constructed to be \
                      suspicious.",
                 );
             }
@@ -266,8 +286,9 @@ fn report_fixture_metrics() {
 /// percentiles) alongside it. Two things are asserted, both corpus-size
 /// independent:
 ///   * benign false-positive rate is exactly 0 — no known-good fixture alerts;
-///   * suspicious signal coverage is 100% — every deliberately-suspicious
-///     fixture produces at least one signal (a silent miss is a gate failure).
+///   * suspicious coverage is 100% — every deliberately-suspicious fixture
+///     produces at least one signal (a silent miss is a gate failure); off
+///     macOS, an incomplete scan also counts (see `is_noticed`).
 ///     Reaching Notify is gated separately by
 ///     `suspicious_fixtures_reach_notify_unless_allowlisted`.
 ///
@@ -280,6 +301,7 @@ fn false_positive_gate_and_corpus_metrics() {
     let mut benign_alerts = 0usize;
     let mut suspicious_total = 0usize;
     let mut suspicious_with_signal = 0usize;
+    let mut suspicious_noticed = 0usize;
     let mut high_risk = 0usize;
     let mut notify = 0usize;
     let mut incomplete = 0usize;
@@ -292,14 +314,10 @@ fn false_positive_gate_and_corpus_metrics() {
             runtimes.push(start.elapsed());
 
             let alerted = result.recommendation() != Recommendation::NoAction;
-            let has_signal = result.results.iter().any(|r| !r.signals.is_empty());
+            let noticed = is_noticed(&result);
             // "Couldn't fully examine it" is tracked separately from the verdict
             // (§11.8): the worst member's completeness, or budget coverage.
-            let complete = result.coverage_complete()
-                && result
-                    .worst()
-                    .is_none_or(|r| r.completeness == ScanCompleteness::Complete);
-            if !complete {
+            if !is_complete(&result) {
                 incomplete += 1;
             }
 
@@ -312,8 +330,11 @@ fn false_positive_gate_and_corpus_metrics() {
                 }
                 _ => {
                     suspicious_total += 1;
-                    if has_signal {
+                    if has_signal(&result) {
                         suspicious_with_signal += 1;
+                    }
+                    if noticed {
+                        suspicious_noticed += 1;
                     }
                     match result.recommendation() {
                         Recommendation::NotifyAndSuggestQuarantine => high_risk += 1,
@@ -326,7 +347,7 @@ fn false_positive_gate_and_corpus_metrics() {
     }
 
     let fp_rate = benign_alerts as f64 / benign_total.max(1) as f64;
-    let coverage = suspicious_with_signal as f64 / suspicious_total.max(1) as f64;
+    let coverage = suspicious_noticed as f64 / suspicious_total.max(1) as f64;
     let (p50, p95) = runtime_percentiles(&mut runtimes);
 
     println!();
@@ -340,8 +361,14 @@ fn false_positive_gate_and_corpus_metrics() {
         fp_rate * 100.0
     );
     println!("suspicious fixtures:    {suspicious_total}");
+    println!("  with >=1 signal:      {suspicious_with_signal}");
+    if !cfg!(target_os = "macos") {
+        println!(
+            "  signal or incomplete: {suspicious_noticed}  (off macOS, codesign rules are N/A)"
+        );
+    }
     println!(
-        "  with >=1 signal:      {suspicious_with_signal}  ({:.1}% coverage, gate: 100%)",
+        "  coverage:             {:.1}%   (gate: 100%)",
         coverage * 100.0
     );
     println!("  high-risk (quarant.): {high_risk}");
@@ -368,9 +395,10 @@ fn false_positive_gate_and_corpus_metrics() {
         fp_rate * 100.0
     );
     assert_eq!(
-        suspicious_with_signal, suspicious_total,
-        "coverage gate: only {suspicious_with_signal} of {suspicious_total} suspicious fixtures \
-         produced a signal — a deliberately-suspicious sample was scored silently clean."
+        suspicious_noticed, suspicious_total,
+        "coverage gate: only {suspicious_noticed} of {suspicious_total} suspicious fixtures \
+         produced a signal or an incomplete scan — a deliberately-suspicious sample was \
+         scored silently clean."
     );
 }
 
