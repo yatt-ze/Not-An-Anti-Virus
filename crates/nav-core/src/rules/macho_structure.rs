@@ -45,6 +45,23 @@ const SIGNED_ENTITLEMENTS_CAP: i32 = ENTITLEMENT_WEIGHT_SIGNED;
 /// never near the §5.1 high-severity threshold on its own.
 const MAX_WEIGHT: i32 = 30;
 
+/// Which weight a requested entitlement carries. `AdHoc` outranks `Signed`
+/// when slices of a fat binary disagree.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum EntitlementBucket {
+    Signed,
+    AdHoc,
+}
+
+impl EntitlementBucket {
+    fn weight(self) -> i32 {
+        match self {
+            Self::Signed => ENTITLEMENT_WEIGHT_SIGNED,
+            Self::AdHoc => ENTITLEMENT_WEIGHT_ADHOC,
+        }
+    }
+}
+
 /// When a suspicious entitlement contributes to the score.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum EntitlementPolicy {
@@ -135,7 +152,7 @@ impl Rule for MachOStructureRule {
         // back clean.
         let mut bad_paths: Vec<&str> = Vec::new();
         let mut path_weight = 0;
-        let mut entitlement_weights: HashMap<&'static str, i32> = HashMap::new();
+        let mut entitlement_buckets: HashMap<&'static str, EntitlementBucket> = HashMap::new();
         let mut entitlements_gap = false;
 
         for image in images {
@@ -154,11 +171,11 @@ impl Rule for MachOStructureRule {
             }
             match entitlements_finding(image) {
                 Ok(Some(contributing)) => {
-                    for (key, weight) in contributing {
-                        entitlement_weights
+                    for (key, bucket) in contributing {
+                        entitlement_buckets
                             .entry(key)
-                            .and_modify(|w| *w = (*w).max(weight))
-                            .or_insert(weight);
+                            .and_modify(|b| *b = (*b).max(bucket))
+                            .or_insert(bucket);
                     }
                 }
                 Ok(None) => {}
@@ -179,26 +196,18 @@ impl Rule for MachOStructureRule {
                 ),
             ));
         }
-        if !entitlement_weights.is_empty() {
+        if !entitlement_buckets.is_empty() {
             // List in SUSPICIOUS_ENTITLEMENTS's fixed order for a deterministic
             // description regardless of slice/HashMap iteration order.
             let keys: Vec<&'static str> = SUSPICIOUS_ENTITLEMENTS
                 .iter()
                 .map(|ent| ent.key)
-                .filter(|key| entitlement_weights.contains_key(key))
+                .filter(|key| entitlement_buckets.contains_key(key))
                 .collect();
-            let (adhoc_sum, signed_sum) =
-                entitlement_weights.values().fold((0, 0), |(a, s), &w| {
-                    if w == ENTITLEMENT_WEIGHT_ADHOC {
-                        (a + w, s)
-                    } else {
-                        (a, s + w)
-                    }
-                });
-            let weight = adhoc_sum + signed_sum.min(SIGNED_ENTITLEMENTS_CAP);
-            let any_adhoc = entitlement_weights
+            let weight = entitlements_weight(entitlement_buckets.values().copied());
+            let any_adhoc = entitlement_buckets
                 .values()
-                .any(|&w| w == ENTITLEMENT_WEIGHT_ADHOC);
+                .any(|&b| b == EntitlementBucket::AdHoc);
             let description = if any_adhoc {
                 format!(
                     "requests suspicious entitlement(s) on an ad-hoc-signed binary: {}",
@@ -246,6 +255,16 @@ impl Rule for MachOStructureRule {
     }
 }
 
+/// Combined weight of the requested entitlements: ad-hoc ones count in full,
+/// the rest are capped at `SIGNED_ENTITLEMENTS_CAP` in total (§5.2).
+fn entitlements_weight(buckets: impl Iterator<Item = EntitlementBucket>) -> i32 {
+    let (adhoc, signed) = buckets.fold((0, 0), |(a, s), b| match b {
+        EntitlementBucket::AdHoc => (a + b.weight(), s),
+        EntitlementBucket::Signed => (a, s + b.weight()),
+    });
+    adhoc + signed.min(SIGNED_ENTITLEMENTS_CAP)
+}
+
 /// Score this slice's entitlements, if any were recovered — the suspicious
 /// keys it requests, each with its own ad-hoc/identity weight; the caller
 /// unions these across a fat binary's slices rather than scoring each slice
@@ -260,7 +279,7 @@ impl Rule for MachOStructureRule {
 /// determined: no entitlements.
 fn entitlements_finding(
     image: &MachOImage,
-) -> Result<Option<Vec<(&'static str, i32)>>, RuleOutcome> {
+) -> Result<Option<Vec<(&'static str, EntitlementBucket)>>, RuleOutcome> {
     let Some(xml) = &image.entitlements else {
         return if image.has_code_signature && !image.signature_region.is_determined() {
             Err(RuleOutcome::NotApplicable)
@@ -284,24 +303,24 @@ fn entitlements_finding(
         .map(|flags| flags & CS_ADHOC != 0 || !image.has_cms_signature);
     let is_adhoc = is_adhoc_known.unwrap_or(false); // unknown falls back to the real-identity weight
 
-    let mut contributing: Vec<(&'static str, i32)> = Vec::new();
+    let mut contributing: Vec<(&'static str, EntitlementBucket)> = Vec::new();
     for ent in SUSPICIOUS_ENTITLEMENTS {
         if parsed.get(ent.key).and_then(PlistValue::as_bool) != Some(true) {
             continue;
         }
         match ent.policy {
             EntitlementPolicy::WeightedByIdentity => {
-                let weight = if is_adhoc {
-                    ENTITLEMENT_WEIGHT_ADHOC
+                let bucket = if is_adhoc {
+                    EntitlementBucket::AdHoc
                 } else {
-                    ENTITLEMENT_WEIGHT_SIGNED
+                    EntitlementBucket::Signed
                 };
-                contributing.push((ent.key, weight));
+                contributing.push((ent.key, bucket));
             }
             // Ad-hoc or unknown flags: not identity-confirmed, so this
             // entitlement contributes nothing and isn't listed.
             EntitlementPolicy::IdentityOnly if is_adhoc_known == Some(false) => {
-                contributing.push((ent.key, ENTITLEMENT_WEIGHT_SIGNED));
+                contributing.push((ent.key, EntitlementBucket::Signed));
             }
             EntitlementPolicy::IdentityOnly => {}
         }
