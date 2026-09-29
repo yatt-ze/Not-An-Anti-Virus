@@ -55,6 +55,14 @@ const MIN_FREEFORM_LINE_LEN: usize = 48;
 /// carry more weight alone.
 const BASE64_PAYLOAD_WEIGHT: i32 = 8;
 
+/// Whole-content entropy in a fallback-classified file whose prefix shows
+/// binary-container evidence (§5.2). Corroboration-only: media and PDFs
+/// look like this, and a spoofed header must only lower a dropper's score.
+const CONTAINER_BLOB_WEIGHT: i32 = 5;
+
+/// Weight of a raw high-entropy blob in a script/text file (§5.1).
+const EMBEDDED_BLOB_WEIGHT: i32 = 15;
+
 pub struct HighEntropyRule {
     threshold: f64,
 }
@@ -89,8 +97,8 @@ impl Rule for HighEntropyRule {
             return self.eval_macho_images(ctx, content, images);
         }
 
-        if looks_like_script_or_text(content, &ctx.path) {
-            return Ok(self.eval_embedded_payload(content));
+        if let TextClass::Text { container_evidence } = classify_text(content, &ctx.path) {
+            return Ok(self.eval_embedded_payload(content, container_evidence));
         }
 
         // Opaque non-Mach-O binary: high entropy is expected, so no suspicion.
@@ -128,7 +136,7 @@ impl Rule for HighEntropyRule {
         }
         ctx.content
             .as_ref()
-            .is_some_and(|content| !looks_like_script_or_text(content, &ctx.path))
+            .is_some_and(|content| classify_text(content, &ctx.path) == TextClass::NotText)
     }
 }
 
@@ -306,16 +314,30 @@ impl HighEntropyRule {
     /// base64-encoded run's *decoded* bytes (module docs above). Neither
     /// path fires on base64 of ordinary text — decoding that yields low
     /// entropy, which is the point.
-    fn eval_embedded_payload(&self, content: &[u8]) -> Option<MatchedSignal> {
+    fn eval_embedded_payload(
+        &self,
+        content: &[u8],
+        container_evidence: bool,
+    ) -> Option<MatchedSignal> {
         if content.len() >= MIN_SAMPLE_BYTES {
             let entropy = shannon_entropy(content);
             if entropy >= self.threshold {
+                let (weight, what) = if container_evidence {
+                    (
+                        CONTAINER_BLOB_WEIGHT,
+                        "high-entropy data in a text-headed binary container",
+                    )
+                } else {
+                    (
+                        EMBEDDED_BLOB_WEIGHT,
+                        "binary data embedded in a script/text file",
+                    )
+                };
                 return Some(MatchedSignal {
                     id: self.id().to_string(),
-                    weight: 15,
+                    weight,
                     description: format!(
-                        "binary data embedded in a script/text file \
-                         (entropy: {:.1} bits/byte over {} bytes)",
+                        "{what} (entropy: {:.1} bits/byte over {} bytes)",
                         entropy,
                         content.len()
                     ),
@@ -704,13 +726,28 @@ fn data_uri_magic(mime: &[u8]) -> Option<&'static [u8]> {
         .map(|&(_, magic)| magic)
 }
 
-/// Whether `content`/`path` looks like a script or text file (which could
-/// carry an obfuscated payload), vs. an opaque binary blob.
-fn looks_like_script_or_text(content: &[u8], path: &Path) -> bool {
-    if content.starts_with(b"#!") {
-        return true;
-    }
+/// How [`classify_text`] read a file.
+#[derive(Debug, PartialEq, Eq)]
+enum TextClass {
+    /// Opaque binary blob.
+    NotText,
+    /// Script or text. `container_evidence` is set only for the
+    /// printable-prefix fallback, when the prefix has a NUL or a known
+    /// binary magic; shebang and script-extension files never carry it.
+    Text { container_evidence: bool },
+}
 
+/// True if `prefix` starts like a known binary container.
+fn starts_with_binary_magic(prefix: &[u8]) -> bool {
+    BINARY_MAGICS.iter().any(|(_, m)| prefix.starts_with(m))
+        || prefix.starts_with(b"II*\0")
+        || prefix.starts_with(b"MM\0*")
+        || prefix.get(4..8) == Some(b"ftyp")
+}
+
+/// Classify `content`/`path` as script/text (which could carry an obfuscated
+/// payload) or an opaque binary blob (§5.2).
+fn classify_text(content: &[u8], path: &Path) -> TextClass {
     const SCRIPT_EXTS: &[&str] = &[
         "sh",
         "bash",
@@ -726,29 +763,33 @@ fn looks_like_script_or_text(content: &[u8], path: &Path) -> bool {
         "php",
         "ps1",
     ];
-    if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
-        if SCRIPT_EXTS.iter().any(|e| e.eq_ignore_ascii_case(ext)) {
-            return true;
-        }
+    let strong = content.starts_with(b"#!")
+        || path
+            .extension()
+            .and_then(|e| e.to_str())
+            .is_some_and(|ext| SCRIPT_EXTS.iter().any(|e| e.eq_ignore_ascii_case(ext)));
+    if strong {
+        return TextClass::Text {
+            container_evidence: false,
+        };
     }
 
     // Extensionless but overwhelmingly printable leading bytes: a text file
-    // with a binary blob spliced in. Real text has no NUL, and PDF is a text
-    // header over binary streams (#61).
+    // with a binary blob spliced in.
     let prefix = &content[..content.len().min(512)];
-    if prefix.len() < MIN_SAMPLE_BYTES || prefix.starts_with(b"%PDF") {
-        return false;
+    if prefix.len() < MIN_SAMPLE_BYTES {
+        return TextClass::NotText;
     }
-    let mut printable = 0;
-    for &b in prefix {
-        if b == 0 {
-            return false;
-        }
-        if b == b'\n' || b == b'\t' || b == b'\r' || (0x20..=0x7e).contains(&b) {
-            printable += 1;
-        }
+    let printable = prefix
+        .iter()
+        .filter(|&&b| b == b'\n' || b == b'\t' || b == b'\r' || (0x20..=0x7e).contains(&b))
+        .count();
+    if printable * 100 / prefix.len() < 85 {
+        return TextClass::NotText;
     }
-    printable * 100 / prefix.len() >= 85
+    TextClass::Text {
+        container_evidence: prefix.contains(&0) || starts_with_binary_magic(prefix),
+    }
 }
 
 /// Clip `range`'s end to `ctx`'s real length — tolerates a section size
@@ -1228,21 +1269,36 @@ mod tests {
         c
     }
 
-    #[test]
-    fn png_with_text_metadata_is_not_a_script() {
-        let content = png_with_text_and_noise();
-        let printable = content[..512]
-            .iter()
-            .filter(|&&b| b == b'\n' || (0x20..=0x7e).contains(&b))
-            .count();
-        assert!(printable * 100 / 512 >= 85, "fixture must be mostly text");
-        assert!(!looks_like_script_or_text(&content, Path::new("a.png")));
-        let ctx = make_ctx("a.png", content);
-        assert!(HighEntropyRule::default().evaluate(&ctx).unwrap().is_none());
+    fn text_with_blob() -> Vec<u8> {
+        let mut c = "plain notes about nothing in particular\n"
+            .repeat(20)
+            .into_bytes();
+        c.extend_from_slice(&high_entropy_blob(4096));
+        c
+    }
+
+    fn weight_of(path: &str, content: Vec<u8>) -> Option<i32> {
+        let ctx = make_ctx(path, content);
+        HighEntropyRule::default()
+            .evaluate(&ctx)
+            .unwrap()
+            .map(|s| s.weight)
     }
 
     #[test]
-    fn pdf_with_binary_stream_is_not_a_script() {
+    fn png_with_text_metadata_is_demoted() {
+        let content = png_with_text_and_noise();
+        assert_eq!(
+            classify_text(&content, Path::new("a.png")),
+            TextClass::Text {
+                container_evidence: true
+            }
+        );
+        assert_eq!(weight_of("a.png", content), Some(CONTAINER_BLOB_WEIGHT));
+    }
+
+    #[test]
+    fn pdf_with_binary_stream_is_demoted() {
         let mut content = b"%PDF-1.7\n".to_vec();
         content.extend_from_slice(
             "1 0 obj << /Type /Catalog /Pages 2 0 R >> endobj\n"
@@ -1252,38 +1308,105 @@ mod tests {
         content.extend_from_slice(b"stream\n");
         content.extend_from_slice(&high_entropy_blob(4096));
         content.extend_from_slice(b"\nendstream\n");
-        assert!(!looks_like_script_or_text(&content, Path::new("a.pdf")));
-        let ctx = make_ctx("a.pdf", content);
-        assert!(HighEntropyRule::default().evaluate(&ctx).unwrap().is_none());
+        assert_eq!(weight_of("a.pdf", content), Some(CONTAINER_BLOB_WEIGHT));
     }
 
-    fn text_with_blob() -> Vec<u8> {
-        let mut c = "plain notes about nothing in particular\n"
+    #[test]
+    fn extensionless_text_with_blob_keeps_full_weight() {
+        assert_eq!(
+            weight_of("notes", text_with_blob()),
+            Some(EMBEDDED_BLOB_WEIGHT)
+        );
+    }
+
+    #[test]
+    fn txt_with_blob_keeps_full_weight() {
+        assert_eq!(
+            weight_of("notes.txt", text_with_blob()),
+            Some(EMBEDDED_BLOB_WEIGHT)
+        );
+    }
+
+    #[test]
+    fn shebang_script_with_nul_is_never_demoted() {
+        let mut content = b"#!/bin/sh\n\0".to_vec();
+        content.extend_from_slice(&high_entropy_blob(4096));
+        assert_eq!(weight_of("x", content), Some(EMBEDDED_BLOB_WEIGHT));
+    }
+
+    #[test]
+    fn script_extension_with_nul_is_never_demoted() {
+        let mut content = b"echo hi\n\0".to_vec();
+        content.extend_from_slice(&high_entropy_blob(4096));
+        assert_eq!(weight_of("x.sh", content), Some(EMBEDDED_BLOB_WEIGHT));
+    }
+
+    #[test]
+    fn nul_past_the_prefix_is_not_evidence() {
+        let mut content = "plain notes about nothing in particular\n"
             .repeat(20)
             .into_bytes();
+        assert!(content.len() > 512);
+        content.push(0);
+        content.extend_from_slice(&high_entropy_blob(4096));
+        assert_eq!(weight_of("notes", content), Some(EMBEDDED_BLOB_WEIGHT));
+    }
+
+    #[test]
+    fn truncated_text_headed_file_with_nul_does_not_cover_truncation() {
+        let mut content = b"header\0 of a text-looking file\n".to_vec();
+        while content.len() <= MAX_CONTENT_BYTES {
+            content.extend_from_slice(b"padding line to keep this file large.\n");
+        }
+        let path = write_temp_file("nul-text-past-8mib", &content);
+        let ctx = ScanContext::load(&path);
+        assert!(ctx.truncated);
+        assert!(!HighEntropyRule::default().covers_truncation(&ctx));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    fn scan_default(path: &str, content: Vec<u8>) -> crate::model::ScanResult {
+        let ctx = make_ctx(path, content);
+        crate::scan::scan_context(&ctx, &crate::rules::default_ruleset())
+    }
+
+    fn polyglot(first: &[u8], second: &[u8]) -> Vec<u8> {
+        let mut c = first.to_vec();
+        c.extend_from_slice(b"tail -c +600 \"$0\" | base64 -D | sh; exit\n");
+        c.extend_from_slice(second);
+        c.extend_from_slice(b"\n");
+        c.extend_from_slice(
+            "# padding so the header stays mostly text\n"
+                .repeat(14)
+                .as_bytes(),
+        );
         c.extend_from_slice(&high_entropy_blob(4096));
         c
     }
 
     #[test]
-    fn extensionless_text_with_blob_is_still_scored() {
-        let content = text_with_blob();
-        assert!(looks_like_script_or_text(&content, Path::new("notes")));
-        let ctx = make_ctx("notes", content);
-        assert!(HighEntropyRule::default().evaluate(&ctx).unwrap().is_some());
+    fn polyglot_dropper_with_nul_on_line_two_still_notifies() {
+        let r = scan_default("dropper", polyglot(b"", b"\0"));
+        let hec = r.signals.iter().find(|s| s.id == "high-entropy-content");
+        assert_eq!(hec.map(|s| s.weight), Some(CONTAINER_BLOB_WEIGHT));
+        assert!(r.signals.iter().any(|s| s.id == "suspicious-strings"));
+        assert!(matches!(
+            r.recommendation,
+            crate::model::Recommendation::Notify
+                | crate::model::Recommendation::NotifyAndSuggestQuarantine
+        ));
     }
 
     #[test]
-    fn txt_with_blob_is_still_scored() {
-        let ctx = make_ctx("notes.txt", text_with_blob());
-        assert!(HighEntropyRule::default().evaluate(&ctx).unwrap().is_some());
-    }
-
-    #[test]
-    fn shebang_wins_over_nul_in_prefix() {
-        let mut content = b"#!/bin/sh\n\0".to_vec();
-        content.extend_from_slice(&high_entropy_blob(4096));
-        assert!(looks_like_script_or_text(&content, Path::new("x")));
+    fn polyglot_dropper_with_png_header_line_still_notifies() {
+        let r = scan_default("dropper", polyglot(b"\x89PNG\r\n\x1a\n", b"# x"));
+        let hec = r.signals.iter().find(|s| s.id == "high-entropy-content");
+        assert_eq!(hec.map(|s| s.weight), Some(CONTAINER_BLOB_WEIGHT));
+        assert!(matches!(
+            r.recommendation,
+            crate::model::Recommendation::Notify
+                | crate::model::Recommendation::NotifyAndSuggestQuarantine
+        ));
     }
 
     #[test]
