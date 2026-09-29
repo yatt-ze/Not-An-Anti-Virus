@@ -18,9 +18,9 @@ use crate::macho::{self, ByteSource};
 use crate::model::{MatchedSignal, SignalCategory};
 use crate::textclass::{classify_text, TextClass, BINARY_MAGICS, MIN_SAMPLE_BYTES};
 
-/// Above this (out of 8.0 bits/byte, the max for byte-oriented Shannon
-/// entropy) content reads as packed/encrypted/compressed rather than typical
-/// machine code or text.
+/// Entry gate (bits/byte, max 8.0) for the script/text and base64 paths and
+/// for the elevated `__TEXT` tier; packed `__TEXT` needs
+/// [`TEXT_PACKED_THRESHOLD`].
 const ENTROPY_THRESHOLD: f64 = 7.0;
 
 /// `__TEXT` entropy at or above this is treated as packed/encrypted code
@@ -58,9 +58,8 @@ const MIN_FREEFORM_LINE_LEN: usize = 48;
 /// Corroboration-only (§5.1): a script embedding a compressed/encoded
 /// payload as base64 is common in benign software (installers, bundlers),
 /// so this alone must not reach Notify — it needs a second signal. Lower
-/// than the whole-content/`__TEXT` weight, which stays narrowly scoped
-/// enough (raw binary spliced into a script, or packed Mach-O code) to
-/// carry more weight alone.
+/// than [`EMBEDDED_BLOB_WEIGHT`] and [`TEXT_PACKED_WEIGHT`], which are narrow
+/// enough (raw binary in a script, packed Mach-O code) to carry more alone.
 const BASE64_PAYLOAD_WEIGHT: i32 = 8;
 
 /// Whole-content entropy in a fallback-classified file whose prefix shows
