@@ -888,26 +888,31 @@ mod tests {
         let (elevated, _) =
             crate::macho::tests_support::synth_macho_64(&uniform_over(147, 147 * 40));
         let (packed, _) = crate::macho::tests_support::synth_macho_64(&high_entropy_blob(65536));
-        let fat = crate::macho::tests_support::synth_fat(&[&elevated, &packed]);
-        let path = write_temp_file("entropy-tier-fat", &fat);
-        let ctx = ScanContext::load(&path);
-        let signal = HighEntropyRule.evaluate(&ctx).unwrap().unwrap();
-        assert_eq!(signal.weight, TEXT_PACKED_WEIGHT);
-        let _ = std::fs::remove_file(&path);
+        for (tag, slices) in [
+            ("elevated-first", [&elevated[..], &packed[..]]),
+            ("packed-first", [&packed[..], &elevated[..]]),
+        ] {
+            let fat = crate::macho::tests_support::synth_fat(&slices);
+            let path = write_temp_file(&format!("entropy-tier-fat-{tag}"), &fat);
+            let ctx = ScanContext::load(&path);
+            let signal = HighEntropyRule.evaluate(&ctx).unwrap().unwrap();
+            assert_eq!(signal.weight, TEXT_PACKED_WEIGHT, "{tag}");
+            let _ = std::fs::remove_file(&path);
+        }
     }
 
     /// A `__TEXT` section whose 8 MiB-clipped prefix is pure low-entropy but
-    /// whose full range (low prefix + a high-entropy tail past 8 MiB) clears
-    /// the threshold overall: streaming the whole section, not just the
+    /// whose full range (low prefix + a high-entropy tail past 8 MiB) reaches
+    /// the elevated tier overall: streaming the whole section, not just the
     /// captured prefix, is what makes this fire (§5.2, #45).
     #[test]
     fn macho_text_past_8mib_is_scored_on_the_whole_section() {
         // LOW_LEN fills the entire captured prefix with zero bytes; HIGH_LEN
         // (divisible by 256) cycles every byte value equally past it, giving
-        // an exact combined histogram: ~7.61 bits/byte overall (clears the
-        // 7.5 packed tier) while the zero-only clipped prefix reads as 0.0.
+        // an exact combined histogram: 7.293 bits/byte overall (elevated tier)
+        // while the zero-only clipped prefix reads as 0.0.
         const LOW_LEN: usize = MAX_CONTENT_BYTES;
-        const HIGH_LEN: usize = 64 * 1024 * 1024;
+        const HIGH_LEN: usize = 40 * 1024 * 1024;
         let mut payload = vec![0u8; LOW_LEN];
         payload.extend((0..HIGH_LEN as u32).map(|i| (i % 256) as u8));
         let full_len = payload.len() as u64;
@@ -922,13 +927,13 @@ mod tests {
         let content = ctx.content.as_ref().unwrap();
         let prefix_start = usize::try_from(range.start).unwrap();
         assert!(shannon_entropy(&content[prefix_start..]) < ENTROPY_THRESHOLD);
-        assert!(shannon_entropy(&payload) >= TEXT_PACKED_THRESHOLD);
+        assert!(shannon_entropy(&payload) >= ENTROPY_THRESHOLD);
 
         let signal = HighEntropyRule
             .evaluate(&ctx)
             .unwrap()
             .expect("the whole __TEXT section should clear the threshold");
-        assert_eq!(signal.weight, TEXT_PACKED_WEIGHT);
+        assert_eq!(signal.weight, TEXT_ELEVATED_WEIGHT);
         assert!(signal
             .description
             .contains(&format!("over {full_len} bytes")));
