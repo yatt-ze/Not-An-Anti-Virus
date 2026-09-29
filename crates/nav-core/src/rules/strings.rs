@@ -221,6 +221,9 @@ fn at_command_position(line: &[u8], mut s: usize, cut_start: bool) -> bool {
         if j == 0 {
             return !cut_start;
         }
+        if matches!(line[j - 1], b';' | b'|' | b'(' | b'&') && is_escaped(line, j - 1) {
+            return false;
+        }
         match line[j - 1] {
             b';' | b'|' | b'`' | b'(' | b'"' | b'\'' => return true,
             b'&' => return is_background_or_and(line, j - 1),
@@ -278,10 +281,38 @@ fn command_start(line: &[u8], s: usize, e: usize, cut_start: bool) -> Option<usi
     at_command_position(line, start, cut_start).then_some(start)
 }
 
+/// Whether the byte at `i` is escaped by an odd run of backslashes before it.
+fn is_escaped(line: &[u8], i: usize) -> bool {
+    line[..i].iter().rev().take_while(|&&b| b == b'\\').count() % 2 == 1
+}
+
+/// Whether the `|` at `pipe` separates regex alternatives — `(bash|sh|zsh)`:
+/// blank-free words chained by `|` back to an opening `(` that is not a
+/// `$(`/`<(` substitution. Only walks back `MAX_WALK_BACK` bytes.
+fn is_alternation(line: &[u8], pipe: usize) -> bool {
+    let floor = pipe.saturating_sub(MAX_WALK_BACK);
+    let mut i = pipe;
+    loop {
+        let end = i;
+        while i > floor && is_word(line[i - 1]) {
+            i -= 1;
+        }
+        if i == end || i == 0 {
+            return false;
+        }
+        match line[i - 1] {
+            b'|' if i - 1 > floor => i -= 1,
+            b'(' => return i < 2 || !matches!(line[i - 2], b'$' | b'<' | b'>'),
+            _ => return false,
+        }
+    }
+}
+
 /// Whether the token at `s` sits directly inside `<(` or `$(`.
 fn directly_in_substitution(line: &[u8], s: usize) -> bool {
     let j = trimmed_before(line, s);
-    line[..j].ends_with(b"<(") || line[..j].ends_with(b"$(")
+    (line[..j].ends_with(b"<(") || line[..j].ends_with(b"$("))
+        && (j < 2 || !is_escaped(line, j - 2))
 }
 
 /// `sudo` options that take a separate argument.
@@ -442,10 +473,12 @@ fn scan_line(line: &[u8], cut_start: bool, cut_end: bool, hits: &mut [bool; PATT
         let unquoted = !single && !double;
         match b {
             b'\\' if !single => {
-                let escapes = line
+                // An escaped metacharacter (or backslash) is literal; a
+                // backslash before a word is the `\curl` form.
+                let literal = line
                     .get(i + 1)
-                    .is_some_and(|c| matches!(c, b'\'' | b'"' | b';' | b'&' | b'|'));
-                i += if escapes { 2 } else { 1 };
+                    .is_some_and(|&c| !is_word(c) && !is_blank(c));
+                i += if literal { 2 } else { 1 };
                 continue;
             }
             b'\'' if !double => {
@@ -466,7 +499,8 @@ fn scan_line(line: &[u8], cut_start: bool, cut_end: bool, hits: &mut [bool; PATT
             _ => {}
         }
         if line[i] == b'|' {
-            if let Some(end) = pipe_to_shell(line, i, cut_end) {
+            if let Some(end) = pipe_to_shell(line, i, cut_end).filter(|_| !is_alternation(line, i))
+            {
                 if st.downloader.is_some_and(|d| within_span(d, end)) {
                     hits[DOWNLOAD_TO_SHELL] = true;
                 }
@@ -1012,6 +1046,37 @@ mod tests {
         scan_patterns("x\\", true, false, &mut hits);
         scan_patterns("\\\r", false, true, &mut hits);
         scan_patterns("\\\n", false, true, &mut hits);
+    }
+
+    #[test]
+    fn backslash_escaped_metacharacters_are_literal() {
+        for t in [
+            r"/^curl -s\b.+?\| (bash|sh|zsh)\b|^\/bin\/(bash|sh|zsh) -c\b.+?\bcurl/",
+            r"bash <<<|curl -kfsSL) \$\(echo .+? base64 -d\b",
+            r"curl x \| sh",
+            r"echo \$(curl x)",
+            r"curl x \; sh",
+            r"echo \(curl x | sh",
+        ] {
+            assert!(!fires(t, DOWNLOAD_TO_SHELL), "{t}");
+        }
+        assert!(none_fire(r"echo x \| base64 -d \| sh"));
+        assert!(fires("curl x | sh", DOWNLOAD_TO_SHELL));
+        assert!(fires("bash -c \"$(curl x)\"", DOWNLOAD_TO_SHELL));
+        assert!(fires("echo P | base64 -d | sh", DECODE_TO_SHELL));
+        assert!(fires(r"\curl x | sh", DOWNLOAD_TO_SHELL));
+        assert!(fires(r"echo \\; curl x | sh", DOWNLOAD_TO_SHELL));
+    }
+
+    #[test]
+    fn regex_alternation_is_not_a_pipe() {
+        assert!(none_fire(
+            r"|^(bash <<<|curl -kfsSL) x|openssl base64 -d|^curl -s\b.+?\| (bash|sh|zsh)\b|y"
+        ));
+        assert!(fires("curl x|sh", DOWNLOAD_TO_SHELL));
+        assert!(fires("$(curl x|sh)", DOWNLOAD_TO_SHELL));
+        assert!(fires("curl x|gunzip|sh", DOWNLOAD_TO_SHELL));
+        assert!(fires("( curl x | sh )", DOWNLOAD_TO_SHELL));
     }
 
     #[test]
