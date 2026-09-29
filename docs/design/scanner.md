@@ -79,7 +79,7 @@ A scan is `Complete` only when the whole object was actually examined. Reading t
 
 `--json` output mirrors this structure (score, matched signals with id/weight/description, recommendation) rather than being a separate schema, plus a top-level `schema_version` (currently `1`, NAV-008) so scripts can detect a future breaking change before it surfaces as a parse error — since §8 promises `--json` everywhere and this is the command most likely to get scripted against.
 
-JSON paths are strings, with any non-UTF-8 bytes replaced by U+FFFD (lossy). There is no schema bump: such output previously panicked. A serialization failure exits `4` with a stderr message (#44).
+JSON paths are strings, with any non-UTF-8 bytes replaced by U+FFFD (lossy). There is no schema bump: such output previously panicked. Two distinct non-UTF-8 names (or a real U+FFFD in a name) can serialize to the same string, so JSON `path` isn't a reliable key on such filesystems; macOS APFS names are always UTF-8. A serialization failure exits `4` with a stderr message (#44).
 
 `Recommendation` is only action-safe when `Scan completeness` reads `Complete` — a `Partial`/`Indeterminate` result must not be acted on as if it were, so a caller reading a `ScanResult` gates on `ScanResult::is_actionable()` rather than `recommendation` alone (NAV-005). The §8 exit code is a report, not an action: a partial result that reached `Notify` or higher still exits `1`/`2`, and `is_actionable()` still gates anything automatic.
 
