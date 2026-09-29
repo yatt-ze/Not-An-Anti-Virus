@@ -1711,15 +1711,7 @@ mod fixture_gen {
         std::fs::write(root.join("benign/macho_dense_simd_text"), dense_simd).unwrap();
 
         // Suspicious: pseudo-random `__text` (~8.0 bits/byte), packed tier.
-        let mut state: u32 = 0x1234_5678;
-        let packed: Vec<u8> = (0..8192)
-            .map(|_| {
-                state ^= state << 13;
-                state ^= state >> 17;
-                state ^= state << 5;
-                (state & 0xff) as u8
-            })
-            .collect();
+        let packed = crate::test_support::xorshift_bytes(8192);
         let (packed_text, _) = synth_macho_64(&packed);
         std::fs::write(root.join("suspicious/macho_packed_text"), packed_text).unwrap();
     }

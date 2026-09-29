@@ -44,3 +44,17 @@ pub(crate) fn write_at(path: &Path, offset: u64, bytes: &[u8]) {
     f.seek(SeekFrom::Start(offset)).unwrap();
     f.write_all(bytes).unwrap();
 }
+
+/// Deterministic xorshift32 pseudo-random bytes (seed `0x1234_5678`), for
+/// tests and fixture generation.
+pub(crate) fn xorshift_bytes(len: usize) -> Vec<u8> {
+    let mut state: u32 = 0x1234_5678;
+    (0..len)
+        .map(|_| {
+            state ^= state << 13;
+            state ^= state >> 17;
+            state ^= state << 5;
+            (state & 0xff) as u8
+        })
+        .collect()
+}
