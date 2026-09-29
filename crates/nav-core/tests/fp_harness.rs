@@ -119,18 +119,6 @@ const SUB_THRESHOLD_ALLOWLIST: &[(&str, &str)] = &[
         "suspicious/adhoc_named_flags=0x20000",
         "exercises a parser edge case, not a complete malicious sample",
     ),
-    (
-        "suspicious/dropper_curl_pipe_bash.sh",
-        "below Notify until suspicious-strings intent patterns land (#35)",
-    ),
-    (
-        "suspicious/dropper_base64_exec.sh",
-        "below Notify until suspicious-strings intent patterns land (#35)",
-    ),
-    (
-        "suspicious/dropper_osascript_fetch.sh",
-        "below Notify until suspicious-strings intent patterns land (#35)",
-    ),
 ];
 
 fn sub_threshold_reason(key: &str) -> Option<&'static str> {

