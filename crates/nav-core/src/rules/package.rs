@@ -13,6 +13,7 @@
 
 use super::{embedded_content_ruleset, Rule, RuleOutcome};
 use crate::context::ScanContext;
+use crate::macho::ByteSource;
 use crate::model::{MatchedSignal, SignalCategory};
 use crate::scan::scan_embedded_bytes;
 use crate::{cpio, xar};
@@ -150,6 +151,13 @@ impl Rule for UnsignedPackageRule {
             // Present but not verified — validity is a Security.framework
             // question (§5.2). A bogus claim counts as unsigned.
             return Ok(None);
+        }
+        // With a truncated embedded capture `source_len` is only what was
+        // captured, so a range past it may still be real (§10/§11.8).
+        if !ctx.source_len_is_authoritative()
+            && archive.signature_end().is_some_and(|end| end > source_len)
+        {
+            return Err(RuleOutcome::NotApplicable);
         }
 
         Ok(Some(MatchedSignal {
@@ -371,6 +379,23 @@ mod tests {
             ..full
         };
         assert!(matches!(UnsignedPackageRule.evaluate(&c), Ok(None)));
+    }
+
+    /// On a truncated embedded capture the length is only what was captured,
+    /// so a signature range past it is undetermined, not bogus.
+    #[test]
+    fn a_signature_past_a_truncated_embedded_capture_is_not_applicable() {
+        let body = r#"<signature style="RSA"><offset>0</offset><size>1000</size></signature>"#;
+        let full = signed_toc_ctx(body, 64);
+        let c = ScanContext {
+            source: ContentSource::Embedded,
+            truncated: true,
+            ..full
+        };
+        assert!(matches!(
+            UnsignedPackageRule.evaluate(&c),
+            Err(RuleOutcome::NotApplicable)
+        ));
     }
 
     /// Different categories on purpose — see module docs.

@@ -158,24 +158,22 @@ impl XarArchive {
         self.halted.is_none()
     }
 
-    /// True when the TOC has a top-level `<signature>` with an `offset` and a
-    /// non-zero `size` whose heap range lies within `source_len`, the whole
-    /// archive's length. Presence only: validity is not checked (§5.2).
+    /// End of the recorded signature's heap range (absolute), or `None` if it
+    /// lacks an `offset`, has no non-zero `size`, or the range overflows.
+    pub fn signature_end(&self) -> Option<u64> {
+        let sig = self.signature.as_ref()?;
+        let (offset, size) = (sig.offset?, sig.size?);
+        if size == 0 {
+            return None;
+        }
+        self.heap_start.checked_add(offset)?.checked_add(size)
+    }
+
+    /// True when the root `<toc>`'s signature has an `offset` and a non-zero
+    /// `size` whose heap range lies within `source_len`, the whole archive's
+    /// length. Presence only: validity is not checked (§5.2).
     pub fn has_plausible_signature(&self, source_len: u64) -> bool {
-        let Some(XarSignature {
-            offset: Some(offset),
-            size: Some(size),
-            ..
-        }) = &self.signature
-        else {
-            return false;
-        };
-        *size > 0
-            && self
-                .heap_start
-                .checked_add(*offset)
-                .and_then(|s| s.checked_add(*size))
-                .is_some_and(|end| end <= source_len)
+        self.signature_end().is_some_and(|end| end <= source_len)
     }
 
     /// The entries Phase 0a is allowed to read back — see
