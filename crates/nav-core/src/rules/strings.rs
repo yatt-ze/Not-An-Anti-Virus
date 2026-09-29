@@ -317,12 +317,45 @@ fn upload_flag(line: &[u8], word: &[u8], end: usize, curl_start: usize) -> bool 
     }
 }
 
+/// Whether the `&` at `i` ends a command (`&&`, background `&`) rather than
+/// belonging to a redirection (`2>&1`, `&>`) or a `|&` pipe.
+fn is_background_or_and(line: &[u8], i: usize) -> bool {
+    let prev = i.checked_sub(1).map(|p| line[p]);
+    !matches!(prev, Some(b'>' | b'<' | b'|')) && line.get(i + 1) != Some(&b'>')
+}
+
 /// Matches the line-scoped patterns in one line, setting `hits`. `cut_start`
 /// / `cut_end` mark a line edge that is a window edge, not a real delimiter.
 fn scan_line(line: &[u8], cut_start: bool, cut_end: bool, hits: &mut [bool; PATTERNS.len()]) {
     let mut st = LineState::default();
+    let (mut single, mut double) = (false, false);
     let mut i = 0;
     while i < line.len() {
+        let b = line[i];
+        let unquoted = !single && !double;
+        match b {
+            b'\\' if !single => {
+                let escapes = line
+                    .get(i + 1)
+                    .is_some_and(|c| matches!(c, b'\'' | b'"' | b';' | b'&' | b'|'));
+                i += if escapes { 2 } else { 1 };
+                continue;
+            }
+            b'\'' if !double => {
+                single = !single;
+                i += 1;
+                continue;
+            }
+            b'"' if !single => {
+                double = !double;
+                i += 1;
+                continue;
+            }
+            b';' if unquoted => st = LineState::default(),
+            b'&' if unquoted && is_background_or_and(line, i) => st = LineState::default(),
+            b'|' if unquoted && line.get(i + 1) == Some(&b'|') => st = LineState::default(),
+            _ => {}
+        }
         if line[i] == b'|' {
             if let Some(end) = pipe_to_shell(line, i, cut_end) {
                 if st.downloader.is_some_and(|d| within_span(d, end)) {
@@ -688,6 +721,36 @@ mod tests {
         ] {
             assert!(none_fire(t), "{t}");
         }
+    }
+
+    #[test]
+    fn state_is_scoped_to_one_command() {
+        for t in [
+            "eval \"$(brew shellenv)\"; LATEST=$(curl -fsSL https://api.github.com/x)",
+            "osascript -e 'do shell script \"launchctl kickstart x\"' && curl -fsSLO https://v/u.zip",
+            "curl -LO url && ssh -T git@host",
+            "base64 f > o; tr -d x < y | sh",
+            "curl -s x 2>&1 > f; sh f | sh",
+        ] {
+            assert!(none_fire(t), "{t}");
+        }
+    }
+
+    #[test]
+    fn pipes_and_quoted_separators_do_not_reset_state() {
+        assert!(fires("curl x 2>&1 | sh", DOWNLOAD_TO_SHELL));
+        assert!(fires("curl x | tee f | sh", DOWNLOAD_TO_SHELL));
+        assert!(fires("echo x | base64 -d | gunzip | sh", DECODE_TO_SHELL));
+        assert!(fires(
+            "osascript -e 'do shell script \"curl x && sh y\"'",
+            OSASCRIPT_DOWNLOAD
+        ));
+        assert!(fires("sh -c \"$(curl -fsSL x)\"", DOWNLOAD_TO_SHELL));
+        assert!(fires("bash <(curl -fsSL x)", DOWNLOAD_TO_SHELL));
+        assert!(fires(
+            "sudo sh -c \"$(curl -fsSL x)\"; true",
+            DOWNLOAD_TO_SHELL
+        ));
     }
 
     #[test]
