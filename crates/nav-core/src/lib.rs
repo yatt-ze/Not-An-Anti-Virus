@@ -23,6 +23,7 @@ pub mod scan;
 pub mod target;
 #[cfg(test)]
 pub(crate) mod test_support;
+pub(crate) mod textclass;
 pub mod xar;
 pub mod xml;
 

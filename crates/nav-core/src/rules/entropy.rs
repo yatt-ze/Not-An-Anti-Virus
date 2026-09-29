@@ -10,21 +10,18 @@
 
 use std::collections::HashSet;
 use std::ops::Range;
-use std::path::Path;
 
 use super::{Rule, RuleOutcome};
 use crate::base64;
 use crate::context::{ScanContext, MAX_STREAM_BYTES};
 use crate::macho::{self, ByteSource};
 use crate::model::{MatchedSignal, SignalCategory};
+use crate::textclass::{classify_text, TextClass, BINARY_MAGICS, MIN_SAMPLE_BYTES};
 
 /// Above this (out of 8.0 bits/byte, the max for byte-oriented Shannon
 /// entropy) content reads as packed/encrypted/compressed rather than typical
 /// machine code or text.
 const ENTROPY_THRESHOLD: f64 = 7.0;
-
-/// Below this many bytes an entropy figure is too noisy to act on.
-const MIN_SAMPLE_BYTES: usize = 256;
 
 /// A base64 run shorter than this (alphabet characters, `=` and line breaks
 /// not counted) is too small to be a meaningful embedded payload rather than
@@ -703,20 +700,6 @@ fn find_data_uri_mime(content: &[u8], run_start: usize) -> Option<&[u8]> {
     Some(&content[search_start + data_pos + 5..mime_end])
 }
 
-/// Known binary formats: the mime types a data URI may carry them under, and
-/// the magic bytes their content starts with.
-const BINARY_MAGICS: &[(&[&[u8]], &[u8])] = &[
-    (&[b"image/png"], b"\x89PNG"),
-    (&[b"image/jpeg"], b"\xFF\xD8\xFF"),
-    (&[b"image/gif"], b"GIF8"),
-    (&[b"image/webp"], b"RIFF"),
-    (&[b"font/woff", b"application/font-woff"], b"wOFF"),
-    (&[b"font/woff2"], b"wOF2"),
-    (&[b"application/pdf"], b"%PDF"),
-    (&[b"application/zip"], b"PK\x03\x04"),
-    (&[b"application/gzip", b"application/x-gzip"], b"\x1f\x8b"),
-];
-
 /// Expected magic bytes for a known mime type carried as a data URI, or
 /// `None` for one this rule doesn't recognize.
 fn data_uri_magic(mime: &[u8]) -> Option<&'static [u8]> {
@@ -724,72 +707,6 @@ fn data_uri_magic(mime: &[u8]) -> Option<&'static [u8]> {
         .iter()
         .find(|(mimes, _)| mimes.contains(&mime))
         .map(|&(_, magic)| magic)
-}
-
-/// How [`classify_text`] read a file.
-#[derive(Debug, PartialEq, Eq)]
-enum TextClass {
-    /// Opaque binary blob.
-    NotText,
-    /// Script or text. `container_evidence` is set only for the
-    /// printable-prefix fallback, when the prefix has a NUL or a known
-    /// binary magic; shebang and script-extension files never carry it.
-    Text { container_evidence: bool },
-}
-
-/// True if `prefix` starts like a known binary container.
-fn starts_with_binary_magic(prefix: &[u8]) -> bool {
-    BINARY_MAGICS.iter().any(|(_, m)| prefix.starts_with(m))
-        || prefix.starts_with(b"II*\0")
-        || prefix.starts_with(b"MM\0*")
-        || prefix.get(4..8) == Some(b"ftyp")
-}
-
-/// Classify `content`/`path` as script/text (which could carry an obfuscated
-/// payload) or an opaque binary blob (§5.2).
-fn classify_text(content: &[u8], path: &Path) -> TextClass {
-    const SCRIPT_EXTS: &[&str] = &[
-        "sh",
-        "bash",
-        "zsh",
-        "command",
-        "scpt",
-        "applescript",
-        "js",
-        "jxa",
-        "py",
-        "rb",
-        "pl",
-        "php",
-        "ps1",
-    ];
-    let strong = content.starts_with(b"#!")
-        || path
-            .extension()
-            .and_then(|e| e.to_str())
-            .is_some_and(|ext| SCRIPT_EXTS.iter().any(|e| e.eq_ignore_ascii_case(ext)));
-    if strong {
-        return TextClass::Text {
-            container_evidence: false,
-        };
-    }
-
-    // Extensionless but overwhelmingly printable leading bytes: a text file
-    // with a binary blob spliced in.
-    let prefix = &content[..content.len().min(512)];
-    if prefix.len() < MIN_SAMPLE_BYTES {
-        return TextClass::NotText;
-    }
-    let printable = prefix
-        .iter()
-        .filter(|&&b| b == b'\n' || b == b'\t' || b == b'\r' || (0x20..=0x7e).contains(&b))
-        .count();
-    if printable * 100 / prefix.len() < 85 {
-        return TextClass::NotText;
-    }
-    TextClass::Text {
-        container_evidence: prefix.contains(&0) || starts_with_binary_magic(prefix),
-    }
 }
 
 /// Clip `range`'s end to `ctx`'s real length — tolerates a section size
@@ -831,7 +748,7 @@ mod tests {
     use super::*;
     use crate::context::MAX_CONTENT_BYTES;
     use crate::test_support::write_temp_file;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
 
     /// `total_len` high-entropy bytes, starting with `magic` — for building
     /// a payload that a content-validated carrier check should recognize.
