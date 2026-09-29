@@ -175,14 +175,6 @@ fn skip_blanks(line: &[u8], mut i: usize) -> usize {
     i
 }
 
-/// End of the run of path-word bytes (`is_word` plus `/`) starting at `i`.
-fn path_word_end(line: &[u8], mut i: usize) -> usize {
-    while i < line.len() && (is_word(line[i]) || line[i] == b'/') {
-        i += 1;
-    }
-    i
-}
-
 /// Whether the words after byte `from` are exactly `words`, blank-separated.
 fn words_follow(line: &[u8], mut from: usize, words: &[&[u8]]) -> bool {
     for w in words {
@@ -292,32 +284,82 @@ fn directly_in_substitution(line: &[u8], s: usize) -> bool {
     line[..j].ends_with(b"<(") || line[..j].ends_with(b"$(")
 }
 
-/// If the `|` at `pipe` feeds a shell (`sh`/`bash`/`zsh`, optionally behind
-/// `sudo`, `/bin/`, `/usr/bin/` or `/usr/bin/env`), the index just past the
-/// shell name. `None` when the name touches a cut line end.
+/// `sudo` options that take a separate argument.
+const SUDO_ARG_FLAGS: &[&[u8]] = &[b"-u", b"-g", b"-h", b"-p", b"-C", b"-r", b"-t", b"-U"];
+
+/// `env` options that take a separate argument.
+const ENV_ARG_FLAGS: &[&[u8]] = &[b"-u", b"-C", b"-S"];
+
+/// Most wrapper words and options skipped between a pipe and its shell.
+const MAX_PIPE_TOKENS: usize = 64;
+
+/// The shell-word token at `i`: an optional opening quote, then a run of
+/// bytes up to a blank, separator or quote. Returns the token and the index
+/// just past it; `None` when empty.
+fn shell_token(line: &[u8], i: usize) -> Option<(&[u8], usize)> {
+    let start = i + usize::from(matches!(line.get(i), Some(b'"' | b'\'')));
+    let mut end = start;
+    while end < line.len()
+        && !is_blank(line[end])
+        && !matches!(
+            line[end],
+            b';' | b'|' | b'&' | b'(' | b')' | b'<' | b'>' | b'"' | b'\'' | b'`'
+        )
+    {
+        end += 1;
+    }
+    (end > start).then(|| (&line[start..end], end))
+}
+
+fn basename(token: &[u8]) -> &[u8] {
+    token.rsplit(|&b| b == b'/').next().unwrap_or(token)
+}
+
+/// If the `|` (or `|&`) at `pipe` feeds a shell (`sh`/`bash`/`zsh` under any
+/// directory, optionally quoted, behind `sudo` and its options, `env`,
+/// `exec` or `command`), the index just past the shell name. `None` when the
+/// name touches a cut line end.
 fn pipe_to_shell(line: &[u8], pipe: usize, cut_end: bool) -> Option<usize> {
     if line.get(pipe + 1) == Some(&b'|') || (pipe > 0 && line[pipe - 1] == b'|') {
         return None;
     }
-    let mut s = skip_blanks(line, pipe + 1);
-    let mut e = path_word_end(line, s);
-    if &line[s..e] == b"sudo" {
-        s = skip_blanks(line, e);
-        e = path_word_end(line, s);
+    let after = pipe + 1 + usize::from(line.get(pipe + 1) == Some(&b'&'));
+    let mut i = skip_blanks(line, after);
+    for _ in 0..MAX_PIPE_TOKENS {
+        let (token, end) = shell_token(line, i)?;
+        i = skip_blanks(line, end);
+        match basename(token) {
+            b"sh" | b"bash" | b"zsh" if !token.ends_with(b"/") => {
+                return (!(end == line.len() && cut_end)).then_some(end);
+            }
+            b"exec" | b"command" => {}
+            b"sudo" => i = skip_options(line, i, SUDO_ARG_FLAGS, false),
+            b"env" => i = skip_options(line, i, ENV_ARG_FLAGS, true),
+            _ => return None,
+        }
     }
-    if &line[s..e] == b"/usr/bin/env" {
-        s = skip_blanks(line, e);
-        e = path_word_end(line, s);
+    None
+}
+
+/// Skips option words (and their arguments, and `NAME=value` words when
+/// `assignments`) starting at `i`; returns the index of the next word.
+fn skip_options(line: &[u8], mut i: usize, arg_flags: &[&[u8]], assignments: bool) -> usize {
+    for _ in 0..MAX_PIPE_TOKENS {
+        let Some((token, end)) = shell_token(line, i) else {
+            break;
+        };
+        if token.starts_with(b"-") {
+            i = skip_blanks(line, end);
+            if arg_flags.contains(&token) {
+                i = shell_token(line, i).map_or(i, |(_, e)| skip_blanks(line, e));
+            }
+        } else if assignments && token.contains(&b'=') {
+            i = skip_blanks(line, end);
+        } else {
+            break;
+        }
     }
-    let name = &line[s..e];
-    let name = name
-        .strip_prefix(b"/usr/bin/")
-        .or_else(|| name.strip_prefix(b"/bin/"))
-        .unwrap_or(name);
-    if !matches!(name, b"sh" | b"bash" | b"zsh") || (e == line.len() && cut_end) {
-        return None;
-    }
-    Some(e)
+    i
 }
 
 /// A decoder invocation waiting for its flags.
@@ -890,6 +932,36 @@ mod tests {
                 start.elapsed() < std::time::Duration::from_secs(5),
                 "{unit}"
             );
+        }
+    }
+
+    #[test]
+    fn common_pipe_targets_are_shells() {
+        for t in [
+            "curl x | sudo -E bash -",
+            "curl x | sudo -u root -H sh",
+            "curl x | /opt/homebrew/bin/bash",
+            "curl x | env sh",
+            "curl x | env -i FOO=1 bash",
+            "curl x | exec bash",
+            "curl x | command sh",
+            "curl x | \"sh\"",
+            "curl x | 'bash' -s",
+            "curl x |& sh",
+            "curl x | /usr/bin/env zsh",
+            "curl x | sudo /bin/sh",
+        ] {
+            assert!(fires(t, DOWNLOAD_TO_SHELL), "{t}");
+        }
+        for t in [
+            "curl x | sudo -u root tee f",
+            "curl x | env FOO=1",
+            "curl x | sudo",
+            "curl x | dash",
+            "curl x | /bin/sh/",
+            "curl x | \"shasum\"",
+        ] {
+            assert!(!fires(t, DOWNLOAD_TO_SHELL), "{t}");
         }
     }
 
