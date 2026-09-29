@@ -123,6 +123,26 @@ impl Rule for MachOStructureRule {
     }
 
     fn evaluate(&self, ctx: &ScanContext) -> Result<Option<MatchedSignal>, RuleOutcome> {
+        self.evaluate_with(ctx, || super::codesign::verifies_apple_anchor(ctx))
+    }
+
+    /// Covered when the content is determined not to be Mach-O at all (a
+    /// header-level fact, never past the prefix), or when every slice and
+    /// every held code signature was read by offset (§5.2, #45).
+    fn covers_truncation(&self, ctx: &ScanContext) -> bool {
+        let scan = ctx.macho();
+        !scan.is_macho || scan.fully_examined()
+    }
+}
+
+impl MachOStructureRule {
+    /// `evaluate` with the Apple-anchor check injected. `anchored` runs at most
+    /// once, and only when two or more entitlements sit at the signed weight.
+    fn evaluate_with(
+        &self,
+        ctx: &ScanContext,
+        anchored: impl FnOnce() -> bool,
+    ) -> Result<Option<MatchedSignal>, RuleOutcome> {
         if ctx.content.is_none() {
             return Err(RuleOutcome::NotApplicable);
         }
@@ -204,7 +224,12 @@ impl Rule for MachOStructureRule {
                 .map(|ent| ent.key)
                 .filter(|key| entitlement_buckets.contains_key(key))
                 .collect();
-            let weight = entitlements_weight(entitlement_buckets.values().copied());
+            let signed_keys = entitlement_buckets
+                .values()
+                .filter(|&&b| b == EntitlementBucket::Signed)
+                .count();
+            let cap_signed = signed_keys >= 2 && anchored();
+            let weight = entitlements_weight(entitlement_buckets.values().copied(), cap_signed);
             let any_adhoc = entitlement_buckets
                 .values()
                 .any(|&b| b == EntitlementBucket::AdHoc);
@@ -245,24 +270,22 @@ impl Rule for MachOStructureRule {
             category: self.category(),
         }))
     }
-
-    /// Covered when the content is determined not to be Mach-O at all (a
-    /// header-level fact, never past the prefix), or when every slice and
-    /// every held code signature was read by offset (§5.2, #45).
-    fn covers_truncation(&self, ctx: &ScanContext) -> bool {
-        let scan = ctx.macho();
-        !scan.is_macho || scan.fully_examined()
-    }
 }
 
-/// Combined weight of the requested entitlements: ad-hoc ones count in full,
-/// the rest are capped at `SIGNED_ENTITLEMENTS_CAP` in total (§5.2).
-fn entitlements_weight(buckets: impl Iterator<Item = EntitlementBucket>) -> i32 {
+/// Combined weight of the requested entitlements: ad-hoc ones count in full;
+/// signed ones sum, capped at `SIGNED_ENTITLEMENTS_CAP` in total only when
+/// `cap_signed` (the signature verified to an Apple anchor, §5.2).
+fn entitlements_weight(buckets: impl Iterator<Item = EntitlementBucket>, cap_signed: bool) -> i32 {
     let (adhoc, signed) = buckets.fold((0, 0), |(a, s), b| match b {
         EntitlementBucket::AdHoc => (a + b.weight(), s),
         EntitlementBucket::Signed => (a, s + b.weight()),
     });
-    adhoc + signed.min(SIGNED_ENTITLEMENTS_CAP)
+    adhoc
+        + if cap_signed {
+            signed.min(SIGNED_ENTITLEMENTS_CAP)
+        } else {
+            signed
+        }
 }
 
 /// Score this slice's entitlements, if any were recovered — the suspicious
@@ -674,7 +697,7 @@ mod tests {
     </dict></plist>"#;
 
     #[test]
-    fn real_identity_entitlements_are_capped_in_total() {
+    fn anchored_real_identity_entitlements_are_capped_in_total() {
         let (image, _, _) = synth_macho_64_full_with_cds_and_cms(
             b"code",
             &[],
@@ -685,7 +708,7 @@ mod tests {
             Some(4),
         );
         let sig = MachOStructureRule
-            .evaluate(&ctx_for(image))
+            .evaluate_with(&ctx_for(image), || true)
             .unwrap()
             .expect("should fire");
         assert_eq!(sig.weight, SIGNED_ENTITLEMENTS_CAP);
@@ -694,15 +717,46 @@ mod tests {
         assert!(sig
             .description
             .contains("disable-executable-page-protection"));
+    }
 
-        // Unknown flags fall back to the real-identity weight, so the cap too.
+    #[test]
+    fn unanchored_or_unknown_identity_entitlements_are_not_capped() {
+        // A CMS blob that doesn't verify to an Apple anchor (e.g. self-signed).
+        let (cms, _, _) = synth_macho_64_full_with_cds_and_cms(
+            b"code",
+            &[],
+            &[],
+            true,
+            Some(THREE_ENTITLEMENTS),
+            &[(0, 0)],
+            Some(4),
+        );
+        let sig = MachOStructureRule
+            .evaluate_with(&ctx_for(cms), || false)
+            .unwrap()
+            .expect("should fire");
+        assert_eq!(sig.weight, 3 * ENTITLEMENT_WEIGHT_SIGNED);
+
+        // Unknown CodeDirectory flags and no CMS: uncapped through the real
+        // check too (no verifiable file here, so it can't say "anchored").
         let (unknown, _, _) =
             synth_macho_64_full(b"code", &[], &[], true, Some(THREE_ENTITLEMENTS));
         let sig = MachOStructureRule
             .evaluate(&ctx_for(unknown))
             .unwrap()
             .expect("should fire");
-        assert_eq!(sig.weight, SIGNED_ENTITLEMENTS_CAP);
+        assert_eq!(sig.weight, 3 * ENTITLEMENT_WEIGHT_SIGNED);
+    }
+
+    #[test]
+    fn anchor_check_runs_only_when_the_cap_could_matter() {
+        let one = br#"<?xml version="1.0"?><plist version="1.0"><dict>
+            <key>com.apple.security.cs.disable-library-validation</key><true/>
+        </dict></plist>"#;
+        let (image, _, _) = synth_macho_64_full(b"code", &[], &[], true, Some(one));
+        let _ = MachOStructureRule.evaluate_with(&ctx_for(image), || {
+            panic!("a single signed entitlement must not trigger the anchor check")
+        });
     }
 
     #[test]
@@ -749,7 +803,7 @@ mod tests {
         );
         let fat = synth_fat(&[&adhoc, &signed]);
         let sig = MachOStructureRule
-            .evaluate(&ctx_for(fat))
+            .evaluate_with(&ctx_for(fat), || true)
             .unwrap()
             .expect("should fire");
         assert_eq!(
@@ -1555,9 +1609,10 @@ mod fixture_gen {
         )
         .unwrap();
 
-        // Benign: a real-identity-looking signature (non-empty CMS blob, no
-        // CS_ADHOC) with the JVM-style entitlement set. Under a real identity
-        // these only corroborate (§5.2).
+        // Suspicious: an identity-looking signature (non-empty CMS blob, no
+        // CS_ADHOC) that doesn't verify to an Apple anchor, with JVM-style
+        // entitlements. A self-signed certificate looks like this; only an
+        // Apple-anchored identity earns the cap (§5.2).
         let jvm_entitlements = br#"<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0"><dict>
@@ -1574,7 +1629,11 @@ mod fixture_gen {
             &[(0, 0)],
             Some(4),
         );
-        std::fs::write(root.join("benign/macho_identity_jvm_entitlements"), jvm).unwrap();
+        std::fs::write(
+            root.join("suspicious/macho_unanchored_identity_jvm_entitlements"),
+            jvm,
+        )
+        .unwrap();
 
         // Benign: unsigned, with LC_RPATHs into a leaked build directory under
         // another user's home (Steam's libavif shape). Corroboration-only (§5.2).
