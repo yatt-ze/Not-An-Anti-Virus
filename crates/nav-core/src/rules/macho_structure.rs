@@ -356,71 +356,72 @@ fn entitlements_finding(
     }
 }
 
-/// Weight of a flagged load path, `None` if it isn't flagged. A path under
-/// `/Users/<name>/` (`<name>` not `Shared`, case-insensitive) with no hidden
-/// component scores `USER_HOME_PATH_WEIGHT`; everything else flagged scores
-/// `TRANSIENT_LOCATION_WEIGHT` (§5.2).
+/// Weight of a flagged load path, `None` if it isn't flagged: an absolute
+/// path into a transient/user-writable location, or one with a hidden
+/// directory component. `@executable_path`/`@loader_path`/`@rpath` forms,
+/// relative paths and Apple system locations are never flagged. The path is
+/// judged after `normalize_load_path`; only a plain-ASCII, non-`Shared`
+/// `/Users/<name>/…` path with no hidden component and no `..` in its
+/// original form scores `USER_HOME_PATH_WEIGHT`, everything else flagged
+/// scores `TRANSIENT_LOCATION_WEIGHT` (§5.2). The `..` check stays because
+/// dyld resolves `..` after symlinks, which lexical normalization can't see.
 fn load_path_weight(path: &str) -> Option<i32> {
-    if !is_writable_or_transient(path) {
+    if !path.starts_with('/') {
+        return None; // `@…` forms and relative paths aren't judged
+    }
+    let n = normalize_load_path(path);
+
+    const SYSTEM_PREFIXES: &[&str] = &["/system/", "/usr/lib/", "/library/"];
+    if SYSTEM_PREFIXES.iter().any(|p| n.starts_with(p)) {
         return None;
     }
-    let other_user_home = path.strip_prefix("/Users/").is_some_and(|rest| {
-        let mut parts = rest.split('/');
-        let user = parts.next().unwrap_or("");
-        !user.eq_ignore_ascii_case("Shared")
-            && !has_hidden_component(path)
-            && !has_parent_component(path)
+    let hidden = n.split('/').any(|c| c.len() > 1 && c.starts_with('.'));
+    let transient = super::TRANSIENT_PREFIXES.iter().any(|p| {
+        n.as_bytes()
+            .get(..p.len())
+            .is_some_and(|head| head.eq_ignore_ascii_case(p.as_bytes()))
     });
-    Some(if other_user_home && !is_transient_prefix(path) {
+    let home = n.strip_prefix("/users/");
+    if !(transient || hidden || home.is_some()) {
+        return None;
+    }
+    let plain_other_user = home.is_some_and(|rest| {
+        let user = rest.split('/').next().unwrap_or("");
+        user != "shared"
+            && !user.is_empty()
+            && user
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+    });
+    let demotable =
+        plain_other_user && !transient && !hidden && !path.split('/').any(|c| c == "..");
+    Some(if demotable {
         USER_HOME_PATH_WEIGHT
     } else {
         TRANSIENT_LOCATION_WEIGHT
     })
 }
 
-fn is_transient_prefix(path: &str) -> bool {
-    super::TRANSIENT_PREFIXES
-        .iter()
-        .any(|p| path.starts_with(p))
-}
-
-/// True if `path` has a `..` component; dyld resolves it, so the path can
-/// leave the home directory.
-fn has_parent_component(path: &str) -> bool {
-    path.split('/').any(|c| c == "..")
-}
-
-fn has_hidden_component(path: &str) -> bool {
-    path.split('/')
-        .any(|c| c.len() > 1 && c.starts_with('.') && c != "..")
-}
-
-/// True if `path` is a load path worth flagging: an absolute path into a
-/// transient/user-writable location, or one with a hidden directory
-/// component. The `@executable_path`/`@loader_path`/`@rpath` relative forms
-/// (the normal way an app references its own bundled libraries) and Apple
-/// system locations are never flagged.
-fn is_writable_or_transient(path: &str) -> bool {
-    if path.starts_with("@executable_path")
-        || path.starts_with("@loader_path")
-        || path.starts_with("@rpath")
-    {
-        return false;
+/// Lexical form of an absolute path for location checks: repeated `/`
+/// collapsed, `.` dropped, `..` resolved (clamped at the root), a leading
+/// `/System/Volumes/Data` (the firmlinked data volume) removed, and ASCII
+/// lowercased (APFS is case-insensitive by default). Scoped to this rule;
+/// the original string is kept for messages.
+fn normalize_load_path(path: &str) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    for c in path.split('/') {
+        match c {
+            "" | "." => {}
+            ".." => {
+                parts.pop();
+            }
+            _ => parts.push(c.to_ascii_lowercase()),
+        }
     }
-    if !path.starts_with('/') {
-        return false; // not an absolute path this heuristic can judge
+    if parts.len() > 3 && parts[..3] == ["system", "volumes", "data"] {
+        parts.drain(..3);
     }
-
-    const SYSTEM_PREFIXES: &[&str] = &["/System/", "/usr/lib/", "/Library/"];
-    if SYSTEM_PREFIXES.iter().any(|p| path.starts_with(p)) {
-        return false;
-    }
-
-    if is_transient_prefix(path) || path.starts_with("/Users/") {
-        return true;
-    }
-
-    has_hidden_component(path)
+    format!("/{}", parts.join("/"))
 }
 
 #[cfg(test)]
@@ -434,6 +435,10 @@ mod tests {
     use crate::macho::MAX_SIGNATURE_BYTES;
     use crate::test_support::write_temp_file;
     use std::path::PathBuf;
+
+    fn flagged(path: &str) -> bool {
+        load_path_weight(path).is_some()
+    }
 
     fn ctx_for(content: Vec<u8>) -> ScanContext {
         ctx_for_truncated(content, false)
@@ -583,7 +588,25 @@ mod tests {
             Some(TRANSIENT_LOCATION_WEIGHT)
         );
         assert_eq!(w("/Users/x/../../tmp/e"), Some(TRANSIENT_LOCATION_WEIGHT));
-        assert_eq!(USER_HOME_PATH_WEIGHT, 5);
+        for bypass in [
+            "/Users//Shared/libevil.dylib",
+            "/Users/./Shared/libevil.dylib",
+            "/USERS/SHARED/x",
+            "/TMP/x",
+            "//tmp/x",
+            "/private//tmp/x",
+            "/System/Volumes/Data/Users/Shared/evil.dylib",
+            "/Library/../tmp/evil.dylib",
+            "/System/../private/tmp/e.dylib",
+            "/Users/\u{17f}hared/x",
+            "/Users/b\u{fc}ilder/x",
+        ] {
+            assert_eq!(w(bypass), Some(TRANSIENT_LOCATION_WEIGHT), "{bypass}");
+        }
+        assert_eq!(w("/Users//builder/./proj"), Some(USER_HOME_PATH_WEIGHT));
+        assert_eq!(w("/usr/lib/x"), None);
+        assert_eq!(w("/System/Library/x"), None);
+        assert_eq!(w("/System/Volumes/Data/Library/x"), None);
     }
 
     #[test]
@@ -978,27 +1001,23 @@ mod tests {
     }
 
     #[test]
-    fn is_writable_or_transient_examples() {
-        assert!(is_writable_or_transient("/tmp/evil"));
-        assert!(is_writable_or_transient("/private/tmp/evil"));
-        assert!(is_writable_or_transient("/var/tmp/evil"));
-        assert!(is_writable_or_transient("/Users/Shared/evil"));
-        assert!(is_writable_or_transient("/Users/alice/evil"));
-        assert!(is_writable_or_transient("/opt/app/.hidden/lib"));
-        assert!(is_writable_or_transient(
-            "/private/var/folders/xy/abc/T/libevil.dylib"
-        ));
-        assert!(is_writable_or_transient(
-            "/var/folders/xy/abc/T/libevil.dylib"
-        ));
+    fn flagged_examples() {
+        assert!(flagged("/tmp/evil"));
+        assert!(flagged("/private/tmp/evil"));
+        assert!(flagged("/var/tmp/evil"));
+        assert!(flagged("/Users/Shared/evil"));
+        assert!(flagged("/Users/alice/evil"));
+        assert!(flagged("/opt/app/.hidden/lib"));
+        assert!(flagged("/private/var/folders/xy/abc/T/libevil.dylib"));
+        assert!(flagged("/var/folders/xy/abc/T/libevil.dylib"));
 
-        assert!(!is_writable_or_transient("@executable_path/../Frameworks"));
-        assert!(!is_writable_or_transient("@loader_path/lib.dylib"));
-        assert!(!is_writable_or_transient("@rpath/lib.dylib"));
-        assert!(!is_writable_or_transient("/System/Library/x"));
-        assert!(!is_writable_or_transient("/usr/lib/libSystem.B.dylib"));
-        assert!(!is_writable_or_transient("/Library/Frameworks/x"));
-        assert!(!is_writable_or_transient("libFoo.dylib")); // relative, not judged
+        assert!(!flagged("@executable_path/../Frameworks"));
+        assert!(!flagged("@loader_path/lib.dylib"));
+        assert!(!flagged("@rpath/lib.dylib"));
+        assert!(!flagged("/System/Library/x"));
+        assert!(!flagged("/usr/lib/libSystem.B.dylib"));
+        assert!(!flagged("/Library/Frameworks/x"));
+        assert!(!flagged("libFoo.dylib")); // relative, not judged
     }
 
     #[test]
