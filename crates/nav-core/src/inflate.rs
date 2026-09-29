@@ -544,7 +544,7 @@ fn crc32(data: &[u8]) -> u32 {
 
 /// Adler-32 (RFC 1950 §9). Chunked at 5552 bytes — the longest run before the
 /// accumulators can overflow 32 bits.
-fn adler32(data: &[u8]) -> u32 {
+pub(crate) fn adler32(data: &[u8]) -> u32 {
     const MOD: u32 = 65521;
     const NMAX: usize = 5552;
     let mut a: u32 = 1;

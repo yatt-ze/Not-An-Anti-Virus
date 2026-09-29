@@ -587,17 +587,12 @@ fn be_u64(d: &[u8], off: usize) -> Option<u64> {
 /// stored block (test TOCs are far below 64 KiB).
 pub(crate) fn toc_xar_bytes(toc_body: &str) -> Vec<u8> {
     let toc = format!("<?xml version=\"1.0\"?><xar><toc>{toc_body}</toc></xar>");
-    let (mut a, mut b) = (1u32, 0u32);
-    for &x in toc.as_bytes() {
-        a = (a + x as u32) % 65521;
-        b = (b + a) % 65521;
-    }
     let len = toc.len() as u16;
     let mut z = vec![0x78, 0x01, 0x01];
     z.extend_from_slice(&len.to_le_bytes());
     z.extend_from_slice(&(!len).to_le_bytes());
     z.extend_from_slice(toc.as_bytes());
-    z.extend_from_slice(&((b << 16) | a).to_be_bytes());
+    z.extend_from_slice(&inflate::adler32(toc.as_bytes()).to_be_bytes());
     let mut v = Vec::new();
     v.extend_from_slice(b"xar!");
     v.extend_from_slice(&28u16.to_be_bytes());
