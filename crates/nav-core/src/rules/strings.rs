@@ -6,10 +6,18 @@
 use super::{Rule, RuleOutcome};
 use crate::context::{ScanContext, MAX_STREAM_BYTES};
 use crate::model::{MatchedSignal, SignalCategory};
+use crate::textclass::{classify_text, TextClass};
 
+/// Score per matched name marker in a script/text file.
+const NAME_WEIGHT: i32 = 2;
+
+/// Cap on the combined name-marker score: names corroborate, and cannot reach
+/// Notify alone (§5.2).
+const NAME_FLOOR_CAP: i32 = 5;
+
+/// A bare name that only corroborates intent patterns.
 struct Marker {
     needle: &'static str,
-    weight: i32,
     note: &'static str,
     /// Require a non-word byte (or end of input) after the needle — see
     /// `contains_token`. Used for markers that would otherwise match as a
@@ -20,43 +28,36 @@ struct Marker {
 const MARKERS: &[Marker] = &[
     Marker {
         needle: "NSAppleScript",
-        weight: 6,
         note: "references NSAppleScript (AppleScript execution API)",
         bounded: false,
     },
     Marker {
         needle: "osascript",
-        weight: 6,
         note: "references osascript (AppleScript/JXA interpreter)",
         bounded: false,
     },
     Marker {
         needle: "dlopen",
-        weight: 4,
         note: "references dlopen (dynamic library loading)",
         bounded: false,
     },
     Marker {
         needle: "SecKeychain",
-        weight: 8,
         note: "references Keychain Services APIs",
         bounded: false,
     },
     Marker {
         needle: "curl ",
-        weight: 3,
         note: "references curl invocation",
         bounded: false,
     },
     Marker {
         needle: "| sh",
-        weight: 10,
         note: "curl/download-pipe-to-shell pattern",
         bounded: true,
     },
     Marker {
         needle: "| bash",
-        weight: 10,
         note: "curl/download-pipe-to-shell pattern",
         bounded: true,
     },
@@ -539,15 +540,22 @@ impl Rule for SuspiciousStringsRule {
             weight += p.weight;
             notes.push(p.note);
         }
-        for (m, _) in MARKERS
-            .iter()
-            .zip(hits.markers.iter())
-            .filter(|(_, &hit)| hit)
-        {
-            weight += m.weight;
-            notes.push(m.note);
+        // Binaries name APIs legitimately; only script/text counts names.
+        let names_count = hits.markers.iter().any(|&h| h)
+            && ctx.content.as_deref().is_some_and(|content| {
+                matches!(classify_text(content, &ctx.path), TextClass::Text { .. })
+            });
+        if names_count {
+            let names: Vec<&str> = MARKERS
+                .iter()
+                .zip(hits.markers.iter())
+                .filter(|(_, &hit)| hit)
+                .map(|(m, _)| m.note)
+                .collect();
+            weight += (names.len() as i32 * NAME_WEIGHT).min(NAME_FLOOR_CAP);
+            notes.extend(names);
         }
-        if notes.is_empty() {
+        if weight == 0 {
             return Ok(None);
         }
 
@@ -778,7 +786,56 @@ mod tests {
         assert!(sig
             .description
             .starts_with("matched 3 indicator(s): download piped to a shell"));
-        assert_eq!(sig.weight, 15 + 3 + 10);
+        assert_eq!(sig.weight, 15 + 2 * NAME_WEIGHT);
+    }
+
+    fn weight_of(name: &str, content: &[u8]) -> Option<i32> {
+        let ctx = ScanContext::from_embedded_bytes(name, content.to_vec(), false);
+        SuspiciousStringsRule
+            .evaluate(&ctx)
+            .expect("rule should be applicable")
+            .map(|s| s.weight)
+    }
+
+    fn binary_with(tail: &[u8]) -> Vec<u8> {
+        let mut c = vec![0x9Du8; 600];
+        c.extend_from_slice(tail);
+        c
+    }
+
+    #[test]
+    fn names_alone_in_a_script_score_two_each_up_to_the_cap() {
+        assert_eq!(weight_of("x.sh", b"#!/bin/sh\ndlopen\n"), Some(NAME_WEIGHT));
+        assert_eq!(
+            weight_of("x.sh", b"#!/bin/sh\ndlopen NSAppleScript\n"),
+            Some(2 * NAME_WEIGHT)
+        );
+        assert_eq!(
+            weight_of(
+                "x.sh",
+                b"#!/bin/sh\ndlopen NSAppleScript osascript SecKeychain\n"
+            ),
+            Some(NAME_FLOOR_CAP)
+        );
+    }
+
+    #[test]
+    fn names_alone_in_a_binary_score_nothing() {
+        let bin = binary_with(b"\0dlopen\0NSAppleScript\0osascript\0SecKeychain\0");
+        assert_eq!(weight_of("x.bin", &bin), None);
+    }
+
+    #[test]
+    fn patterns_still_score_in_a_binary() {
+        let bin = binary_with(b"\0curl -s http://x | sh\0dlopen\0");
+        assert_eq!(weight_of("x.bin", &bin), Some(15));
+    }
+
+    #[test]
+    fn a_pattern_plus_names_in_a_script_adds_the_capped_names() {
+        let s = b"#!/bin/sh\ncurl -s http://x | sh\ndlopen NSAppleScript osascript\n";
+        // Names: `curl `, `| sh`, dlopen, NSAppleScript, osascript = 10, capped.
+        assert_eq!(weight_of("x.sh", s), Some(15 + NAME_FLOOR_CAP));
     }
 
     /// A pattern straddling a `STREAM_CHUNK` boundary lands whole, with its
@@ -850,6 +907,7 @@ mod tests {
         let total_len = 10 * STREAM_CHUNK as u64;
         let path = sparse_temp_file("boundary-not-matched", total_len);
         let boundary = 9 * STREAM_CHUNK as u64; // past the 8 MiB prefix
+        write_at(&path, 0, b"#!/bin/sh\n");
         write_at(&path, boundary - 4, b"| shasum");
 
         let ctx = ScanContext::load(&path);
@@ -873,6 +931,7 @@ mod tests {
     fn bounded_marker_at_the_true_end_of_the_file_is_matched() {
         let total_len = 10 * STREAM_CHUNK as u64;
         let path = sparse_temp_file("end-of-file-matched", total_len);
+        write_at(&path, 0, b"#!/bin/sh\n");
         write_at(&path, total_len - 4, b"| sh");
 
         let ctx = ScanContext::load(&path);
@@ -953,7 +1012,7 @@ mod tests {
     /// the whole content, are a real end of input and do match (§10/§11.8).
     #[test]
     fn bounded_marker_at_a_non_streamable_truncated_cut_is_not_matched() {
-        let content = b"http://x | sh".to_vec();
+        let content = b"#!/bin/sh\nhttp://x | sh".to_vec();
 
         let truncated = ScanContext::from_embedded_bytes("x.pkg!payload", content.clone(), true);
         assert!(
