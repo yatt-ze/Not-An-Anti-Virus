@@ -25,6 +25,10 @@ use std::collections::HashMap;
 /// location. Flat, not per-path — the anomaly is "loads from somewhere an
 /// attacker can write," not "N such paths is N times worse."
 const TRANSIENT_LOCATION_WEIGHT: i32 = 15;
+/// Weight when every flagged path is an absolute path into another user's
+/// home (`/Users/<name>/…`, not `Shared`, no hidden component): almost always
+/// a leaked build directory, and not writable by an arbitrary attacker (§5.2).
+const USER_HOME_PATH_WEIGHT: i32 = 5;
 /// Per-entitlement weight for a real (non-ad-hoc) signing identity, and the
 /// safe default when the CodeDirectory's flags couldn't be determined.
 const ENTITLEMENT_WEIGHT_SIGNED: i32 = 10;
@@ -130,6 +134,7 @@ impl Rule for MachOStructureRule {
         // deliberately malformed slice must not hide behind the rest coming
         // back clean.
         let mut bad_paths: Vec<&str> = Vec::new();
+        let mut path_weight = 0;
         let mut entitlement_weights: HashMap<&'static str, i32> = HashMap::new();
         let mut entitlements_gap = false;
 
@@ -140,8 +145,11 @@ impl Rule for MachOStructureRule {
                 .chain(image.rpaths.iter())
                 .map(String::as_str)
             {
-                if is_writable_or_transient(p) && !bad_paths.contains(&p) {
-                    bad_paths.push(p);
+                if let Some(w) = load_path_weight(p) {
+                    path_weight = path_weight.max(w);
+                    if !bad_paths.contains(&p) {
+                        bad_paths.push(p);
+                    }
                 }
             }
             match entitlements_finding(image) {
@@ -164,7 +172,7 @@ impl Rule for MachOStructureRule {
         let mut findings: Vec<(i32, String)> = Vec::new();
         if !bad_paths.is_empty() {
             findings.push((
-                TRANSIENT_LOCATION_WEIGHT,
+                path_weight,
                 format!(
                     "loads from a writable/transient location: {}",
                     bad_paths.join(", ")
@@ -306,6 +314,37 @@ fn entitlements_finding(
     }
 }
 
+/// Weight of a flagged load path, `None` if it isn't flagged. A path under
+/// `/Users/<name>/` (`<name>` not `Shared`, case-insensitive) with no hidden
+/// component scores `USER_HOME_PATH_WEIGHT`; everything else flagged scores
+/// `TRANSIENT_LOCATION_WEIGHT` (§5.2).
+fn load_path_weight(path: &str) -> Option<i32> {
+    if !is_writable_or_transient(path) {
+        return None;
+    }
+    let other_user_home = path.strip_prefix("/Users/").is_some_and(|rest| {
+        let mut parts = rest.split('/');
+        let user = parts.next().unwrap_or("");
+        !user.eq_ignore_ascii_case("Shared") && !has_hidden_component(path)
+    });
+    Some(if other_user_home && !is_transient_prefix(path) {
+        USER_HOME_PATH_WEIGHT
+    } else {
+        TRANSIENT_LOCATION_WEIGHT
+    })
+}
+
+fn is_transient_prefix(path: &str) -> bool {
+    super::TRANSIENT_PREFIXES
+        .iter()
+        .any(|p| path.starts_with(p))
+}
+
+fn has_hidden_component(path: &str) -> bool {
+    path.split('/')
+        .any(|c| c.len() > 1 && c.starts_with('.') && c != "..")
+}
+
 /// True if `path` is a load path worth flagging: an absolute path into a
 /// transient/user-writable location, or one with a hidden directory
 /// component. The `@executable_path`/`@loader_path`/`@rpath` relative forms
@@ -327,16 +366,11 @@ fn is_writable_or_transient(path: &str) -> bool {
         return false;
     }
 
-    if super::TRANSIENT_PREFIXES
-        .iter()
-        .any(|p| path.starts_with(p))
-        || path.starts_with("/Users/")
-    {
+    if is_transient_prefix(path) || path.starts_with("/Users/") {
         return true;
     }
 
-    path.split('/')
-        .any(|c| c.len() > 1 && c.starts_with('.') && c != "..")
+    has_hidden_component(path)
 }
 
 #[cfg(test)]
@@ -476,6 +510,41 @@ mod tests {
             .evaluate(&ctx_for(image))
             .unwrap()
             .is_some());
+    }
+
+    #[test]
+    fn load_path_weights_by_location() {
+        let w = |p: &str| {
+            let (image, _, _) = synth_macho_64_full(b"code", &[], &[p], false, None);
+            MachOStructureRule
+                .evaluate(&ctx_for(image))
+                .unwrap()
+                .map(|s| s.weight)
+        };
+        assert_eq!(w("/Users/builder/proj/lib"), Some(USER_HOME_PATH_WEIGHT));
+        assert_eq!(w("/Users/Shared/x"), Some(TRANSIENT_LOCATION_WEIGHT));
+        assert_eq!(w("/Users/shared/x"), Some(TRANSIENT_LOCATION_WEIGHT));
+        assert_eq!(w("/Users/x/.hidden/lib"), Some(TRANSIENT_LOCATION_WEIGHT));
+        assert_eq!(w("/tmp/x"), Some(TRANSIENT_LOCATION_WEIGHT));
+        assert_eq!(w("/var/folders/zz/T/x"), Some(TRANSIENT_LOCATION_WEIGHT));
+        assert_eq!(w("/opt/app/.cache/lib"), Some(TRANSIENT_LOCATION_WEIGHT));
+        assert_eq!(USER_HOME_PATH_WEIGHT, 5);
+    }
+
+    #[test]
+    fn a_tmp_path_alongside_a_home_path_keeps_the_higher_weight() {
+        let (image, _, _) = synth_macho_64_full(
+            b"code",
+            &["/Users/builder/lib.dylib"],
+            &["/tmp/x"],
+            false,
+            None,
+        );
+        let sig = MachOStructureRule
+            .evaluate(&ctx_for(image))
+            .unwrap()
+            .expect("should fire");
+        assert_eq!(sig.weight, TRANSIENT_LOCATION_WEIGHT);
     }
 
     #[test]
@@ -1474,5 +1543,16 @@ mod fixture_gen {
             Some(4),
         );
         std::fs::write(root.join("benign/macho_identity_jvm_entitlements"), jvm).unwrap();
+
+        // Benign: unsigned, with LC_RPATHs into a leaked build directory under
+        // another user's home (Steam's libavif shape). Corroboration-only (§5.2).
+        let (leaked, _, _) = synth_macho_64_full(
+            b"\x55\x48\x89\xe5\x90leaked build rpath machine code padding to look real",
+            &["/usr/lib/libSystem.B.dylib"],
+            &["/Users/builder/work/build/lib"],
+            false,
+            None,
+        );
+        std::fs::write(root.join("benign/macho_leaked_build_rpath"), leaked).unwrap();
     }
 }
