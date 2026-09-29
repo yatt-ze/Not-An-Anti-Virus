@@ -153,6 +153,15 @@
     ],
     "completeness": "complete"
   },
+  "benign/macho_leaked_build_rpath": {
+    "score": 9,
+    "recommendation": "no-action",
+    "rule_ids": [
+      "macho-loader-anomaly",
+      "unsigned-binary"
+    ],
+    "completeness": "complete"
+  },
   "benign/macho_like_but_incomplete": {
     "score": 4,
     "recommendation": "no-action",
@@ -415,6 +424,15 @@
   },
   "suspicious/macho_tmpdir_dylib": {
     "score": 19,
+    "recommendation": "notify",
+    "rule_ids": [
+      "macho-loader-anomaly",
+      "unsigned-binary"
+    ],
+    "completeness": "complete"
+  },
+  "suspicious/macho_unanchored_identity_jvm_entitlements": {
+    "score": 24,
     "recommendation": "notify",
     "rule_ids": [
       "macho-loader-anomaly",

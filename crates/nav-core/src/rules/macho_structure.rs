@@ -25,6 +25,10 @@ use std::collections::HashMap;
 /// location. Flat, not per-path — the anomaly is "loads from somewhere an
 /// attacker can write," not "N such paths is N times worse."
 const TRANSIENT_LOCATION_WEIGHT: i32 = 15;
+/// Weight when every flagged path is an absolute path into another user's
+/// home (`/Users/<name>/…`, not `Shared`, no hidden component): almost always
+/// a leaked build directory, and not writable by an arbitrary attacker (§5.2).
+const USER_HOME_PATH_WEIGHT: i32 = 5;
 /// Per-entitlement weight for a real (non-ad-hoc) signing identity, and the
 /// safe default when the CodeDirectory's flags couldn't be determined.
 const ENTITLEMENT_WEIGHT_SIGNED: i32 = 10;
@@ -33,9 +37,30 @@ const ENTITLEMENT_WEIGHT_SIGNED: i32 = 10;
 /// under a real identity (README's "suspicious entitlements on unsigned
 /// binaries").
 const ENTITLEMENT_WEIGHT_ADHOC: i32 = 18;
+/// Ceiling on the combined contribution of all entitlements weighted at
+/// `ENTITLEMENT_WEIGHT_SIGNED`: under a real identity they only corroborate
+/// (§5.2). Ad-hoc-weighted entitlements are not capped by it.
+const SIGNED_ENTITLEMENTS_CAP: i32 = ENTITLEMENT_WEIGHT_SIGNED;
 /// Ceiling on this rule's single signal — comfortably in `Notify` range,
 /// never near the §5.1 high-severity threshold on its own.
 const MAX_WEIGHT: i32 = 30;
+
+/// Which weight a requested entitlement carries. `AdHoc` outranks `Signed`
+/// when slices of a fat binary disagree.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum EntitlementBucket {
+    Signed,
+    AdHoc,
+}
+
+impl EntitlementBucket {
+    fn weight(self) -> i32 {
+        match self {
+            Self::Signed => ENTITLEMENT_WEIGHT_SIGNED,
+            Self::AdHoc => ENTITLEMENT_WEIGHT_ADHOC,
+        }
+    }
+}
 
 /// When a suspicious entitlement contributes to the score.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -98,6 +123,26 @@ impl Rule for MachOStructureRule {
     }
 
     fn evaluate(&self, ctx: &ScanContext) -> Result<Option<MatchedSignal>, RuleOutcome> {
+        self.evaluate_with(ctx, || super::codesign::verifies_apple_anchor(ctx))
+    }
+
+    /// Covered when the content is determined not to be Mach-O at all (a
+    /// header-level fact, never past the prefix), or when every slice and
+    /// every held code signature was read by offset (§5.2, #45).
+    fn covers_truncation(&self, ctx: &ScanContext) -> bool {
+        let scan = ctx.macho();
+        !scan.is_macho || scan.fully_examined()
+    }
+}
+
+impl MachOStructureRule {
+    /// `evaluate` with the Apple-anchor check injected. `anchored` runs at most
+    /// once, and only when two or more entitlements sit at the signed weight.
+    fn evaluate_with(
+        &self,
+        ctx: &ScanContext,
+        anchored: impl FnOnce() -> bool,
+    ) -> Result<Option<MatchedSignal>, RuleOutcome> {
         if ctx.content.is_none() {
             return Err(RuleOutcome::NotApplicable);
         }
@@ -126,7 +171,9 @@ impl Rule for MachOStructureRule {
         // deliberately malformed slice must not hide behind the rest coming
         // back clean.
         let mut bad_paths: Vec<&str> = Vec::new();
-        let mut entitlement_weights: HashMap<&'static str, i32> = HashMap::new();
+        let mut home_paths: Vec<&str> = Vec::new();
+        let mut path_weight = 0;
+        let mut entitlement_buckets: HashMap<&'static str, EntitlementBucket> = HashMap::new();
         let mut entitlements_gap = false;
 
         for image in images {
@@ -136,17 +183,25 @@ impl Rule for MachOStructureRule {
                 .chain(image.rpaths.iter())
                 .map(String::as_str)
             {
-                if is_writable_or_transient(p) && !bad_paths.contains(&p) {
-                    bad_paths.push(p);
+                if let Some(w) = load_path_weight(p) {
+                    path_weight = path_weight.max(w);
+                    let list = if w == USER_HOME_PATH_WEIGHT {
+                        &mut home_paths
+                    } else {
+                        &mut bad_paths
+                    };
+                    if !list.contains(&p) {
+                        list.push(p);
+                    }
                 }
             }
             match entitlements_finding(image) {
                 Ok(Some(contributing)) => {
-                    for (key, weight) in contributing {
-                        entitlement_weights
+                    for (key, bucket) in contributing {
+                        entitlement_buckets
                             .entry(key)
-                            .and_modify(|w| *w = (*w).max(weight))
-                            .or_insert(weight);
+                            .and_modify(|b| *b = (*b).max(bucket))
+                            .or_insert(bucket);
                     }
                 }
                 Ok(None) => {}
@@ -158,27 +213,39 @@ impl Rule for MachOStructureRule {
         }
 
         let mut findings: Vec<(i32, String)> = Vec::new();
-        if !bad_paths.is_empty() {
-            findings.push((
-                TRANSIENT_LOCATION_WEIGHT,
-                format!(
+        if !bad_paths.is_empty() || !home_paths.is_empty() {
+            let mut parts = Vec::new();
+            if !bad_paths.is_empty() {
+                parts.push(format!(
                     "loads from a writable/transient location: {}",
                     bad_paths.join(", ")
-                ),
-            ));
+                ));
+            }
+            if !home_paths.is_empty() {
+                parts.push(format!(
+                    "loads from another user's home directory (likely a leaked build path): {}",
+                    home_paths.join(", ")
+                ));
+            }
+            findings.push((path_weight, parts.join("; ")));
         }
-        if !entitlement_weights.is_empty() {
+        if !entitlement_buckets.is_empty() {
             // List in SUSPICIOUS_ENTITLEMENTS's fixed order for a deterministic
             // description regardless of slice/HashMap iteration order.
             let keys: Vec<&'static str> = SUSPICIOUS_ENTITLEMENTS
                 .iter()
                 .map(|ent| ent.key)
-                .filter(|key| entitlement_weights.contains_key(key))
+                .filter(|key| entitlement_buckets.contains_key(key))
                 .collect();
-            let weight: i32 = entitlement_weights.values().sum();
-            let any_adhoc = entitlement_weights
+            let signed_keys = entitlement_buckets
                 .values()
-                .any(|&w| w == ENTITLEMENT_WEIGHT_ADHOC);
+                .filter(|&&b| b == EntitlementBucket::Signed)
+                .count();
+            let cap_signed = signed_keys >= 2 && anchored();
+            let weight = entitlements_weight(entitlement_buckets.values().copied(), cap_signed);
+            let any_adhoc = entitlement_buckets
+                .values()
+                .any(|&b| b == EntitlementBucket::AdHoc);
             let description = if any_adhoc {
                 format!(
                     "requests suspicious entitlement(s) on an ad-hoc-signed binary: {}",
@@ -216,14 +283,22 @@ impl Rule for MachOStructureRule {
             category: self.category(),
         }))
     }
+}
 
-    /// Covered when the content is determined not to be Mach-O at all (a
-    /// header-level fact, never past the prefix), or when every slice and
-    /// every held code signature was read by offset (§5.2, #45).
-    fn covers_truncation(&self, ctx: &ScanContext) -> bool {
-        let scan = ctx.macho();
-        !scan.is_macho || scan.fully_examined()
-    }
+/// Combined weight of the requested entitlements: ad-hoc ones count in full;
+/// signed ones sum, capped at `SIGNED_ENTITLEMENTS_CAP` in total only when
+/// `cap_signed` (the signature verified to an Apple anchor, §5.2).
+fn entitlements_weight(buckets: impl Iterator<Item = EntitlementBucket>, cap_signed: bool) -> i32 {
+    let (adhoc, signed) = buckets.fold((0, 0), |(a, s), b| match b {
+        EntitlementBucket::AdHoc => (a + b.weight(), s),
+        EntitlementBucket::Signed => (a, s + b.weight()),
+    });
+    adhoc
+        + if cap_signed {
+            signed.min(SIGNED_ENTITLEMENTS_CAP)
+        } else {
+            signed
+        }
 }
 
 /// Score this slice's entitlements, if any were recovered — the suspicious
@@ -240,7 +315,7 @@ impl Rule for MachOStructureRule {
 /// determined: no entitlements.
 fn entitlements_finding(
     image: &MachOImage,
-) -> Result<Option<Vec<(&'static str, i32)>>, RuleOutcome> {
+) -> Result<Option<Vec<(&'static str, EntitlementBucket)>>, RuleOutcome> {
     let Some(xml) = &image.entitlements else {
         return if image.has_code_signature && !image.signature_region.is_determined() {
             Err(RuleOutcome::NotApplicable)
@@ -264,24 +339,24 @@ fn entitlements_finding(
         .map(|flags| flags & CS_ADHOC != 0 || !image.has_cms_signature);
     let is_adhoc = is_adhoc_known.unwrap_or(false); // unknown falls back to the real-identity weight
 
-    let mut contributing: Vec<(&'static str, i32)> = Vec::new();
+    let mut contributing: Vec<(&'static str, EntitlementBucket)> = Vec::new();
     for ent in SUSPICIOUS_ENTITLEMENTS {
         if parsed.get(ent.key).and_then(PlistValue::as_bool) != Some(true) {
             continue;
         }
         match ent.policy {
             EntitlementPolicy::WeightedByIdentity => {
-                let weight = if is_adhoc {
-                    ENTITLEMENT_WEIGHT_ADHOC
+                let bucket = if is_adhoc {
+                    EntitlementBucket::AdHoc
                 } else {
-                    ENTITLEMENT_WEIGHT_SIGNED
+                    EntitlementBucket::Signed
                 };
-                contributing.push((ent.key, weight));
+                contributing.push((ent.key, bucket));
             }
             // Ad-hoc or unknown flags: not identity-confirmed, so this
             // entitlement contributes nothing and isn't listed.
             EntitlementPolicy::IdentityOnly if is_adhoc_known == Some(false) => {
-                contributing.push((ent.key, ENTITLEMENT_WEIGHT_SIGNED));
+                contributing.push((ent.key, EntitlementBucket::Signed));
             }
             EntitlementPolicy::IdentityOnly => {}
         }
@@ -294,37 +369,72 @@ fn entitlements_finding(
     }
 }
 
-/// True if `path` is a load path worth flagging: an absolute path into a
-/// transient/user-writable location, or one with a hidden directory
-/// component. The `@executable_path`/`@loader_path`/`@rpath` relative forms
-/// (the normal way an app references its own bundled libraries) and Apple
-/// system locations are never flagged.
-fn is_writable_or_transient(path: &str) -> bool {
-    if path.starts_with("@executable_path")
-        || path.starts_with("@loader_path")
-        || path.starts_with("@rpath")
-    {
-        return false;
-    }
+/// Weight of a flagged load path, `None` if it isn't flagged: an absolute
+/// path into a transient/user-writable location, or one with a hidden
+/// directory component. `@executable_path`/`@loader_path`/`@rpath` forms,
+/// relative paths and Apple system locations are never flagged. The path is
+/// judged after `normalize_load_path`; only a plain-ASCII, non-`Shared`
+/// `/Users/<name>/…` path with no hidden component and no `..` in its
+/// original form scores `USER_HOME_PATH_WEIGHT`, everything else flagged
+/// scores `TRANSIENT_LOCATION_WEIGHT` (§5.2). The `..` check stays because
+/// dyld resolves `..` after symlinks, which lexical normalization can't see.
+fn load_path_weight(path: &str) -> Option<i32> {
     if !path.starts_with('/') {
-        return false; // not an absolute path this heuristic can judge
+        return None; // `@…` forms and relative paths aren't judged
     }
+    let n = normalize_load_path(path);
 
-    const SYSTEM_PREFIXES: &[&str] = &["/System/", "/usr/lib/", "/Library/"];
-    if SYSTEM_PREFIXES.iter().any(|p| path.starts_with(p)) {
-        return false;
+    const SYSTEM_PREFIXES: &[&str] = &["/system/", "/usr/lib/", "/library/"];
+    if SYSTEM_PREFIXES.iter().any(|p| n.starts_with(p)) {
+        return None;
     }
-
-    if super::TRANSIENT_PREFIXES
-        .iter()
-        .any(|p| path.starts_with(p))
-        || path.starts_with("/Users/")
-    {
-        return true;
+    let hidden = n.split('/').any(|c| c.len() > 1 && c.starts_with('.'));
+    let transient = super::TRANSIENT_PREFIXES.iter().any(|p| {
+        n.as_bytes()
+            .get(..p.len())
+            .is_some_and(|head| head.eq_ignore_ascii_case(p.as_bytes()))
+    });
+    let home = n.strip_prefix("/users/");
+    if !(transient || hidden || home.is_some()) {
+        return None;
     }
+    let plain_other_user = home.is_some_and(|rest| {
+        let user = rest.split('/').next().unwrap_or("");
+        user != "shared"
+            && !user.is_empty()
+            && user
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+    });
+    let demotable =
+        plain_other_user && !transient && !hidden && !path.split('/').any(|c| c == "..");
+    Some(if demotable {
+        USER_HOME_PATH_WEIGHT
+    } else {
+        TRANSIENT_LOCATION_WEIGHT
+    })
+}
 
-    path.split('/')
-        .any(|c| c.len() > 1 && c.starts_with('.') && c != "..")
+/// Lexical form of an absolute path for location checks: repeated `/`
+/// collapsed, `.` dropped, `..` resolved (clamped at the root), a leading
+/// `/System/Volumes/Data` (the firmlinked data volume) removed, and ASCII
+/// lowercased (APFS is case-insensitive by default). Scoped to this rule;
+/// the original string is kept for messages.
+fn normalize_load_path(path: &str) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    for c in path.split('/') {
+        match c {
+            "" | "." => {}
+            ".." => {
+                parts.pop();
+            }
+            _ => parts.push(c.to_ascii_lowercase()),
+        }
+    }
+    if parts.len() > 3 && parts[..3] == ["system", "volumes", "data"] {
+        parts.drain(..3);
+    }
+    format!("/{}", parts.join("/"))
 }
 
 #[cfg(test)]
@@ -338,6 +448,10 @@ mod tests {
     use crate::macho::MAX_SIGNATURE_BYTES;
     use crate::test_support::write_temp_file;
     use std::path::PathBuf;
+
+    fn flagged(path: &str) -> bool {
+        load_path_weight(path).is_some()
+    }
 
     fn ctx_for(content: Vec<u8>) -> ScanContext {
         ctx_for_truncated(content, false)
@@ -467,6 +581,90 @@ mod tests {
     }
 
     #[test]
+    fn load_path_weights_by_location() {
+        let w = |p: &str| {
+            let (image, _, _) = synth_macho_64_full(b"code", &[], &[p], false, None);
+            MachOStructureRule
+                .evaluate(&ctx_for(image))
+                .unwrap()
+                .map(|s| s.weight)
+        };
+        assert_eq!(w("/Users/builder/proj/lib"), Some(USER_HOME_PATH_WEIGHT));
+        assert_eq!(w("/Users/Shared/x"), Some(TRANSIENT_LOCATION_WEIGHT));
+        assert_eq!(w("/Users/shared/x"), Some(TRANSIENT_LOCATION_WEIGHT));
+        assert_eq!(w("/Users/x/.hidden/lib"), Some(TRANSIENT_LOCATION_WEIGHT));
+        assert_eq!(w("/tmp/x"), Some(TRANSIENT_LOCATION_WEIGHT));
+        assert_eq!(w("/var/folders/zz/T/x"), Some(TRANSIENT_LOCATION_WEIGHT));
+        assert_eq!(w("/opt/app/.cache/lib"), Some(TRANSIENT_LOCATION_WEIGHT));
+        assert_eq!(
+            w("/Users/x/../Shared/evil.dylib"),
+            Some(TRANSIENT_LOCATION_WEIGHT)
+        );
+        assert_eq!(w("/Users/x/../../tmp/e"), Some(TRANSIENT_LOCATION_WEIGHT));
+        for bypass in [
+            "/Users//Shared/libevil.dylib",
+            "/Users/./Shared/libevil.dylib",
+            "/USERS/SHARED/x",
+            "/TMP/x",
+            "//tmp/x",
+            "/private//tmp/x",
+            "/System/Volumes/Data/Users/Shared/evil.dylib",
+            "/Library/../tmp/evil.dylib",
+            "/System/../private/tmp/e.dylib",
+            "/Users/\u{17f}hared/x",
+            "/Users/b\u{fc}ilder/x",
+        ] {
+            assert_eq!(w(bypass), Some(TRANSIENT_LOCATION_WEIGHT), "{bypass}");
+        }
+        assert_eq!(w("/Users//builder/./proj"), Some(USER_HOME_PATH_WEIGHT));
+        assert_eq!(w("/usr/lib/x"), None);
+        assert_eq!(w("/System/Library/x"), None);
+        assert_eq!(w("/System/Volumes/Data/Library/x"), None);
+    }
+
+    #[test]
+    fn description_names_the_kind_of_path() {
+        let desc = |dylibs: &[&str], rpaths: &[&str]| {
+            let (image, _, _) = synth_macho_64_full(b"code", dylibs, rpaths, false, None);
+            MachOStructureRule
+                .evaluate(&ctx_for(image))
+                .unwrap()
+                .expect("should fire")
+                .description
+        };
+        let home = desc(&[], &["/Users/builder/work/lib"]);
+        assert!(home.contains("another user's home directory (likely a leaked build path)"));
+        assert!(home.contains("/Users/builder/work/lib"));
+        assert!(!home.contains("writable/transient"));
+
+        let tmp = desc(&[], &["/tmp/x"]);
+        assert!(tmp.contains("writable/transient location: /tmp/x"));
+        assert!(!tmp.contains("another user's home"));
+
+        let mixed = desc(&["/Users/builder/l.dylib"], &["/tmp/x"]);
+        assert!(mixed.contains("writable/transient location: /tmp/x"));
+        assert!(mixed.contains(
+            "another user's home directory (likely a leaked build path): /Users/builder/l.dylib"
+        ));
+    }
+
+    #[test]
+    fn a_tmp_path_alongside_a_home_path_keeps_the_higher_weight() {
+        let (image, _, _) = synth_macho_64_full(
+            b"code",
+            &["/Users/builder/lib.dylib"],
+            &["/tmp/x"],
+            false,
+            None,
+        );
+        let sig = MachOStructureRule
+            .evaluate(&ctx_for(image))
+            .unwrap()
+            .expect("should fire");
+        assert_eq!(sig.weight, TRANSIENT_LOCATION_WEIGHT);
+    }
+
+    #[test]
     fn hidden_directory_component_is_flagged() {
         let (image, _, _) =
             synth_macho_64_full(b"code", &[], &["/opt/app/.cache/lib"], false, None);
@@ -551,6 +749,128 @@ mod tests {
         assert_eq!(
             unknown_sig.weight, ENTITLEMENT_WEIGHT_SIGNED,
             "an unrecoverable CodeDirectory must not assume the worse case"
+        );
+    }
+
+    const THREE_ENTITLEMENTS: &[u8] = br#"<?xml version="1.0"?><plist version="1.0"><dict>
+        <key>com.apple.security.cs.disable-library-validation</key><true/>
+        <key>com.apple.security.cs.allow-dyld-environment-variables</key><true/>
+        <key>com.apple.security.cs.disable-executable-page-protection</key><true/>
+    </dict></plist>"#;
+
+    #[test]
+    fn anchored_real_identity_entitlements_are_capped_in_total() {
+        let (image, _, _) = synth_macho_64_full_with_cds_and_cms(
+            b"code",
+            &[],
+            &[],
+            true,
+            Some(THREE_ENTITLEMENTS),
+            &[(0, 0)],
+            Some(4),
+        );
+        let sig = MachOStructureRule
+            .evaluate_with(&ctx_for(image), || true)
+            .unwrap()
+            .expect("should fire");
+        assert_eq!(sig.weight, SIGNED_ENTITLEMENTS_CAP);
+        assert!(sig.description.contains("disable-library-validation"));
+        assert!(sig.description.contains("allow-dyld-environment-variables"));
+        assert!(sig
+            .description
+            .contains("disable-executable-page-protection"));
+    }
+
+    #[test]
+    fn unanchored_or_unknown_identity_entitlements_are_not_capped() {
+        // A CMS blob that doesn't verify to an Apple anchor (e.g. self-signed).
+        let (cms, _, _) = synth_macho_64_full_with_cds_and_cms(
+            b"code",
+            &[],
+            &[],
+            true,
+            Some(THREE_ENTITLEMENTS),
+            &[(0, 0)],
+            Some(4),
+        );
+        let sig = MachOStructureRule
+            .evaluate_with(&ctx_for(cms), || false)
+            .unwrap()
+            .expect("should fire");
+        assert_eq!(sig.weight, 3 * ENTITLEMENT_WEIGHT_SIGNED);
+
+        // Unknown CodeDirectory flags and no CMS: uncapped through the real
+        // check too (no verifiable file here, so it can't say "anchored").
+        let (unknown, _, _) =
+            synth_macho_64_full(b"code", &[], &[], true, Some(THREE_ENTITLEMENTS));
+        let sig = MachOStructureRule
+            .evaluate(&ctx_for(unknown))
+            .unwrap()
+            .expect("should fire");
+        assert_eq!(sig.weight, 3 * ENTITLEMENT_WEIGHT_SIGNED);
+    }
+
+    #[test]
+    fn anchor_check_runs_only_when_the_cap_could_matter() {
+        let one = br#"<?xml version="1.0"?><plist version="1.0"><dict>
+            <key>com.apple.security.cs.disable-library-validation</key><true/>
+        </dict></plist>"#;
+        let (image, _, _) = synth_macho_64_full(b"code", &[], &[], true, Some(one));
+        let _ = MachOStructureRule.evaluate_with(&ctx_for(image), || {
+            panic!("a single signed entitlement must not trigger the anchor check")
+        });
+    }
+
+    #[test]
+    fn adhoc_entitlements_are_not_subject_to_the_signed_cap() {
+        let xml = br#"<?xml version="1.0"?><plist version="1.0"><dict>
+            <key>com.apple.security.cs.disable-library-validation</key><true/>
+            <key>com.apple.security.cs.allow-dyld-environment-variables</key><true/>
+        </dict></plist>"#;
+        let (image, _, _) =
+            synth_macho_64_full_with_cd_flags(b"code", &[], &[], true, Some(xml), Some(CS_ADHOC));
+        let sig = MachOStructureRule
+            .evaluate(&ctx_for(image))
+            .unwrap()
+            .expect("should fire");
+        // 2 x 18 = 36, clamped by the rule-wide MAX_WEIGHT.
+        assert_eq!(sig.weight, MAX_WEIGHT);
+    }
+
+    #[test]
+    fn mixed_fat_binary_caps_only_the_signed_weighted_keys() {
+        let adhoc_xml = br#"<?xml version="1.0"?><plist version="1.0"><dict>
+            <key>com.apple.security.cs.disable-library-validation</key><true/>
+        </dict></plist>"#;
+        let signed_xml = br#"<?xml version="1.0"?><plist version="1.0"><dict>
+            <key>com.apple.security.cs.allow-dyld-environment-variables</key><true/>
+            <key>com.apple.security.cs.disable-executable-page-protection</key><true/>
+        </dict></plist>"#;
+        let (adhoc, _, _) = synth_macho_64_full_with_cd_flags(
+            b"aaaa",
+            &[],
+            &[],
+            true,
+            Some(adhoc_xml),
+            Some(CS_ADHOC),
+        );
+        let (signed, _, _) = synth_macho_64_full_with_cds_and_cms(
+            b"bbbb",
+            &[],
+            &[],
+            true,
+            Some(signed_xml),
+            &[(0, 0)],
+            Some(4),
+        );
+        let fat = synth_fat(&[&adhoc, &signed]);
+        let sig = MachOStructureRule
+            .evaluate_with(&ctx_for(fat), || true)
+            .unwrap()
+            .expect("should fire");
+        assert_eq!(
+            sig.weight,
+            ENTITLEMENT_WEIGHT_ADHOC + SIGNED_ENTITLEMENTS_CAP
         );
     }
 
@@ -720,27 +1040,23 @@ mod tests {
     }
 
     #[test]
-    fn is_writable_or_transient_examples() {
-        assert!(is_writable_or_transient("/tmp/evil"));
-        assert!(is_writable_or_transient("/private/tmp/evil"));
-        assert!(is_writable_or_transient("/var/tmp/evil"));
-        assert!(is_writable_or_transient("/Users/Shared/evil"));
-        assert!(is_writable_or_transient("/Users/alice/evil"));
-        assert!(is_writable_or_transient("/opt/app/.hidden/lib"));
-        assert!(is_writable_or_transient(
-            "/private/var/folders/xy/abc/T/libevil.dylib"
-        ));
-        assert!(is_writable_or_transient(
-            "/var/folders/xy/abc/T/libevil.dylib"
-        ));
+    fn flagged_examples() {
+        assert!(flagged("/tmp/evil"));
+        assert!(flagged("/private/tmp/evil"));
+        assert!(flagged("/var/tmp/evil"));
+        assert!(flagged("/Users/Shared/evil"));
+        assert!(flagged("/Users/alice/evil"));
+        assert!(flagged("/opt/app/.hidden/lib"));
+        assert!(flagged("/private/var/folders/xy/abc/T/libevil.dylib"));
+        assert!(flagged("/var/folders/xy/abc/T/libevil.dylib"));
 
-        assert!(!is_writable_or_transient("@executable_path/../Frameworks"));
-        assert!(!is_writable_or_transient("@loader_path/lib.dylib"));
-        assert!(!is_writable_or_transient("@rpath/lib.dylib"));
-        assert!(!is_writable_or_transient("/System/Library/x"));
-        assert!(!is_writable_or_transient("/usr/lib/libSystem.B.dylib"));
-        assert!(!is_writable_or_transient("/Library/Frameworks/x"));
-        assert!(!is_writable_or_transient("libFoo.dylib")); // relative, not judged
+        assert!(!flagged("@executable_path/../Frameworks"));
+        assert!(!flagged("@loader_path/lib.dylib"));
+        assert!(!flagged("@rpath/lib.dylib"));
+        assert!(!flagged("/System/Library/x"));
+        assert!(!flagged("/usr/lib/libSystem.B.dylib"));
+        assert!(!flagged("/Library/Frameworks/x"));
+        assert!(!flagged("libFoo.dylib")); // relative, not judged
     }
 
     #[test]
@@ -1350,5 +1666,42 @@ mod fixture_gen {
             identity_claim,
         )
         .unwrap();
+
+        // Suspicious: an identity-looking signature (non-empty CMS blob, no
+        // CS_ADHOC) that doesn't verify to an Apple anchor, with JVM-style
+        // entitlements. A self-signed certificate looks like this; only an
+        // Apple-anchored identity earns the cap (§5.2).
+        let jvm_entitlements = br#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+    <key>com.apple.security.cs.disable-library-validation</key><true/>
+    <key>com.apple.security.cs.allow-dyld-environment-variables</key><true/>
+    <key>com.apple.security.cs.allow-jit</key><true/>
+</dict></plist>"#;
+        let (jvm, _, _) = synth_macho_64_full_with_cds_and_cms(
+            b"\x55\x48\x89\xe5\x90jvm-like machine code padding to look real",
+            &["/usr/lib/libSystem.B.dylib"],
+            &[],
+            true,
+            Some(jvm_entitlements),
+            &[(0, 0)],
+            Some(4),
+        );
+        std::fs::write(
+            root.join("suspicious/macho_unanchored_identity_jvm_entitlements"),
+            jvm,
+        )
+        .unwrap();
+
+        // Benign: unsigned, with LC_RPATHs into a leaked build directory under
+        // another user's home (Steam's libavif shape). Corroboration-only (§5.2).
+        let (leaked, _, _) = synth_macho_64_full(
+            b"\x55\x48\x89\xe5\x90leaked build rpath machine code padding to look real",
+            &["/usr/lib/libSystem.B.dylib"],
+            &["/Users/builder/work/build/lib"],
+            false,
+            None,
+        );
+        std::fs::write(root.join("benign/macho_leaked_build_rpath"), leaked).unwrap();
     }
 }

@@ -355,6 +355,37 @@ fn spawn_codesign_verify(_path: &std::path::Path) -> Result<String, RuleOutcome>
     Err(RuleOutcome::NotApplicable)
 }
 
+/// True only if `codesign --verify --strict -R="anchor apple generic"` accepts
+/// the scanned file: the signature is intact and chains to an Apple anchor
+/// (Developer ID, Apple's own, App Store). False for embedded content, off
+/// macOS, a swapped object, a spawn failure, or any verification failure —
+/// callers treat that as "not verified," never as an error (§5.2).
+pub(super) fn verifies_apple_anchor(ctx: &ScanContext) -> bool {
+    ctx.source == crate::context::ContentSource::File
+        && ctx
+            .run_object_bound(|| spawn_verify_apple_anchor(&ctx.path))
+            .unwrap_or(false)
+}
+
+#[cfg(target_os = "macos")]
+fn spawn_verify_apple_anchor(path: &std::path::Path) -> Option<bool> {
+    let status = std::process::Command::new("codesign")
+        .arg("--verify")
+        .arg("--strict")
+        .arg("-R=anchor apple generic")
+        .arg(path)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .ok()?;
+    Some(status.success())
+}
+
+#[cfg(not(target_os = "macos"))]
+fn spawn_verify_apple_anchor(_path: &std::path::Path) -> Option<bool> {
+    None
+}
+
 /// Weight for a real-identity-signed binary that hasn't been notarized.
 /// Small — plenty of legitimate CLI tools and direct-distribution software
 /// (most of the Homebrew/Rust/Go corpus §12 tests against) never goes
