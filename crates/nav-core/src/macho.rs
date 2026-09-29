@@ -107,6 +107,9 @@ pub enum SignatureRegion {
     /// The region lies past an authoritative end of the object: there is
     /// nothing to read, so "no readable signature" is a determined fact.
     PastEof,
+    /// The region was read but its SuperBlob could not be parsed (bad magic,
+    /// too many blobs, truncated index): its facts are unknown, not "unsigned".
+    Malformed,
     /// Not read (truncated prefix, size cap, budget, non-authoritative
     /// length, read failure): whatever it holds is unknown (§10/§11.8).
     Unread,
@@ -115,7 +118,7 @@ pub enum SignatureRegion {
 impl SignatureRegion {
     /// True when the region's contents (or absence) are determined.
     pub fn is_determined(self) -> bool {
-        !matches!(self, SignatureRegion::Unread)
+        !matches!(self, SignatureRegion::Unread | SignatureRegion::Malformed)
     }
 }
 
@@ -808,11 +811,15 @@ fn read_signature_ranged(
     let Some(sig_bytes) = read_budgeted(src, budget, sig_off, datasize as usize) else {
         return;
     };
-    let facts = extract_signature_facts_checked(&sig_bytes, 0, 0, datasize).unwrap_or_default();
-    image.entitlements = facts.entitlements;
-    image.code_directory_flags = facts.code_directory_flags;
-    image.has_cms_signature = facts.has_cms_signature;
-    image.signature_region = SignatureRegion::Read;
+    match extract_signature_facts_checked(&sig_bytes, 0, 0, datasize) {
+        Some(facts) => {
+            image.entitlements = facts.entitlements;
+            image.code_directory_flags = facts.code_directory_flags;
+            image.has_cms_signature = facts.has_cms_signature;
+            image.signature_region = SignatureRegion::Read;
+        }
+        None => image.signature_region = SignatureRegion::Malformed,
+    }
 }
 
 fn parse_thin(data: &[u8], base: usize, is_64: bool, be: bool, is_fat: bool) -> Option<MachOImage> {
@@ -886,18 +893,21 @@ fn parse_thin(data: &[u8], base: usize, is_64: bool, be: bool, is_fat: bool) -> 
                 (r.u32(off.checked_add(8)?), r.u32(off.checked_add(12)?))
             {
                 code_signature = Some((dataoff, datasize));
-                let facts = extract_signature_facts(data, base, dataoff, datasize);
-                entitlements = facts.entitlements;
-                code_directory_flags = facts.code_directory_flags;
-                has_cms_signature = facts.has_cms_signature;
                 let held = base
                     .checked_add(dataoff as usize)
                     .and_then(|s| s.checked_add(datasize as usize))
                     .is_some_and(|end| end <= data.len());
-                signature_region = if held {
+                signature_region = if !held {
+                    SignatureRegion::Unread
+                } else if let Some(facts) =
+                    extract_signature_facts_checked(data, base, dataoff, datasize)
+                {
+                    entitlements = facts.entitlements;
+                    code_directory_flags = facts.code_directory_flags;
+                    has_cms_signature = facts.has_cms_signature;
                     SignatureRegion::Read
                 } else {
-                    SignatureRegion::Unread
+                    SignatureRegion::Malformed
                 };
             }
         }
@@ -951,30 +961,12 @@ fn read_lc_str(r: &Reader, cmd_off: usize, cmd_end: usize, max_len: usize) -> Op
 }
 
 /// Facts recovered from a Mach-O's embedded code-signature SuperBlob in one
-/// bounded walk — see [`extract_signature_facts`].
+/// bounded walk — see [`extract_signature_facts_checked`].
 #[derive(Default)]
 struct SignatureFacts {
     entitlements: Option<Vec<u8>>,
     code_directory_flags: Option<u32>,
     has_cms_signature: bool,
-}
-
-/// Recover the entitlements, the OR of every CodeDirectory's `flags`, and
-/// whether a non-empty CMS blob wrapper is present, from a Mach-O's embedded
-/// code-signature SuperBlob, in one bounded walk of its blob index.
-/// `dataoff`/`datasize` are the `LC_CODE_SIGNATURE` fields (Mach-O
-/// endianness); the SuperBlob itself is always big-endian. `base` is where
-/// this image begins in `data`. `entitlements`/`code_directory_flags` are
-/// `None` if their blob is absent or the SuperBlob is malformed; every field
-/// stays at its default if the signature region lies past the bytes held (a
-/// truncated capture) — the caller must not read that as a determined fact.
-fn extract_signature_facts(
-    data: &[u8],
-    base: usize,
-    dataoff: u32,
-    datasize: u32,
-) -> SignatureFacts {
-    extract_signature_facts_checked(data, base, dataoff, datasize).unwrap_or_default()
 }
 
 /// True for the primary CodeDirectory slot (0) or any of the 5 alternate
@@ -987,6 +979,12 @@ fn is_codedirectory_slot(slot_type: u32) -> bool {
             .contains(&slot_type)
 }
 
+/// Recover the entitlements, the OR of every CodeDirectory's `flags`, and
+/// whether a non-empty CMS blob wrapper is present, in one bounded walk of the
+/// SuperBlob's blob index. `dataoff`/`datasize` are the `LC_CODE_SIGNATURE`
+/// fields; `base` is where the image begins in `data`. `None` if the region
+/// isn't fully held or the SuperBlob is malformed; individual fields are
+/// `None`/false when their blob is absent.
 fn extract_signature_facts_checked(
     data: &[u8],
     base: usize,
@@ -998,12 +996,15 @@ fn extract_signature_facts_checked(
     if sig_end > data.len() {
         return None; // signature region past the bytes we hold
     }
+    if datasize < 12 {
+        return None; // the SuperBlob header doesn't fit
+    }
     if be_u32(data, sig_off)? != CSMAGIC_EMBEDDED_SIGNATURE {
         return None;
     }
     let count = be_u32(data, sig_off.checked_add(8)?)?;
-    if count > MAX_CS_BLOBS {
-        return None;
+    if count > MAX_CS_BLOBS || 12 + count as usize * 8 > datasize as usize {
+        return None; // too many blobs, or the index doesn't fit the region
     }
 
     let mut facts = SignatureFacts::default();
@@ -1011,14 +1012,11 @@ fn extract_signature_facts_checked(
     for i in 0..count as usize {
         // CS_BlobIndex: type(4), offset(4) — offset relative to `sig_off`.
         let entry_off = sig_off.checked_add(12)?.checked_add(i.checked_mul(8)?)?;
-        if entry_off.checked_add(8)? > sig_end {
-            break;
-        }
         let slot_type = be_u32(data, entry_off)?;
         let rel_off = be_u32(data, entry_off.checked_add(4)?)?;
         let blob_off = sig_off.checked_add(rel_off as usize)?;
         if blob_off.checked_add(8)? > sig_end {
-            continue;
+            return None; // index entry points outside the region
         }
         let magic = be_u32(data, blob_off)?;
 
@@ -1198,6 +1196,50 @@ pub(crate) mod tests_support {
         CSSLOT_SIGNATURESLOT, FAT_MAGIC, LC_CODE_SIGNATURE, LC_LOAD_DYLIB, LC_RPATH, LC_SEGMENT_64,
     };
     use std::ops::Range;
+
+    /// Ways a complete signed Mach-O's SuperBlob can be made unwalkable.
+    #[derive(Clone, Copy, Debug)]
+    pub(crate) enum SuperBlobFault {
+        BadMagic,
+        TooManyBlobs,
+        /// `LC_CODE_SIGNATURE.datasize` too small for the SuperBlob header.
+        ShortRegion,
+        /// Declared blob count whose index doesn't fit the region.
+        IndexPastRegion,
+        /// An index entry whose blob offset lies outside the region.
+        BlobOffsetOutside,
+    }
+
+    /// A complete thin 64-bit Mach-O with one entitlements blob whose
+    /// SuperBlob is broken as `fault` says.
+    pub(crate) fn synth_macho_64_bad_superblob(fault: SuperBlobFault) -> Vec<u8> {
+        let (mut image, _, sig_off) = synth_macho_64_full(
+            b"code",
+            &[],
+            &[],
+            true,
+            Some(b"<plist version=\"1.0\"><dict/></plist>"),
+        );
+        let put = |image: &mut Vec<u8>, at: usize, v: u32| {
+            image[at..at + 4].copy_from_slice(&v.to_be_bytes());
+        };
+        match fault {
+            SuperBlobFault::BadMagic => put(&mut image, sig_off, 0),
+            SuperBlobFault::TooManyBlobs => {
+                put(&mut image, sig_off + 8, super::MAX_CS_BLOBS + 1);
+            }
+            SuperBlobFault::IndexPastRegion => put(&mut image, sig_off + 8, 200),
+            SuperBlobFault::BlobOffsetOutside => put(&mut image, sig_off + 16, 0x00ff_ffff),
+            SuperBlobFault::ShortRegion => {
+                let lc = image
+                    .windows(4)
+                    .position(|w| w == LC_CODE_SIGNATURE.to_le_bytes())
+                    .expect("LC_CODE_SIGNATURE present");
+                image[lc + 12..lc + 16].copy_from_slice(&8u32.to_le_bytes());
+            }
+        }
+        image
+    }
 
     /// Wrap already-built thin images as the slices of a 32-bit fat/universal
     /// binary (`fat_arch` table + payloads). Offsets are 16-byte aligned, as a
@@ -2577,6 +2619,50 @@ mod tests {
         let img = scan.images.first().expect("thin slice should still parse");
         assert!(img.has_code_signature);
         assert_eq!(img.signature_region, SignatureRegion::PastEof);
+        assert!(scan.fully_examined());
+    }
+
+    /// A read signature region whose SuperBlob can't be walked is `Malformed`
+    /// on both parse paths, and not fully examined.
+    #[test]
+    fn unwalkable_superblob_is_malformed_on_both_parse_paths() {
+        use super::tests_support::{synth_macho_64_bad_superblob, SuperBlobFault};
+        for fault in [
+            SuperBlobFault::BadMagic,
+            SuperBlobFault::TooManyBlobs,
+            SuperBlobFault::ShortRegion,
+            SuperBlobFault::IndexPastRegion,
+            SuperBlobFault::BlobOffsetOutside,
+        ] {
+            let image = synth_macho_64_bad_superblob(fault);
+            let parsed = parse(&image).expect("parses");
+            assert_eq!(
+                parsed.signature_region,
+                SignatureRegion::Malformed,
+                "{fault:?}"
+            );
+            assert!(!parsed.signature_region.is_determined());
+            let scan = scan_ranged(&image[..]);
+            let img = scan.images.first().expect("thin slice");
+            assert_eq!(
+                img.signature_region,
+                SignatureRegion::Malformed,
+                "{fault:?}"
+            );
+            assert!(!scan.fully_examined());
+        }
+    }
+
+    /// A valid SuperBlob stays `Read` on both parse paths.
+    #[test]
+    fn valid_superblob_stays_read_on_both_parse_paths() {
+        let (image, _, _) = synth_macho_64_full(b"code", &[], &[], true, None);
+        assert_eq!(
+            parse(&image).unwrap().signature_region,
+            SignatureRegion::Read
+        );
+        let scan = scan_ranged(&image[..]);
+        assert_eq!(scan.images[0].signature_region, SignatureRegion::Read);
         assert!(scan.fully_examined());
     }
 }

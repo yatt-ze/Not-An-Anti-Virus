@@ -289,6 +289,15 @@
     ],
     "completeness": "complete"
   },
+  "suspicious/installer_spoofed_signature.pkg": {
+    "score": 15,
+    "recommendation": "notify",
+    "rule_ids": [
+      "installer-script-suspicious",
+      "unsigned-installer-package"
+    ],
+    "completeness": "complete"
+  },
   "suspicious/macho_adhoc_disable_lib_validation": {
     "score": 22,
     "recommendation": "notify",

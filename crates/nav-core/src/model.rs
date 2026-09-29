@@ -72,6 +72,7 @@ pub enum Recommendation {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ScanResult {
+    #[serde(serialize_with = "lossy_path::serialize")]
     pub path: PathBuf,
     pub score: i32,
     pub confidence: EvidenceConfidence,
@@ -95,6 +96,22 @@ impl ScanResult {
     /// instead of reading `recommendation` alone — NAV-005.
     pub fn is_actionable(&self) -> bool {
         matches!(self.completeness, ScanCompleteness::Complete)
+    }
+}
+
+/// JSON form of a path: a string, with non-UTF-8 bytes replaced by U+FFFD
+/// (`serde_json` refuses to serialize such a path at all) (§8, #44).
+pub mod lossy_path {
+    use serde::Serializer;
+    use std::path::Path;
+
+    pub fn serialize<S: Serializer>(p: &impl AsRef<Path>, s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_str(&p.as_ref().to_string_lossy())
+    }
+
+    /// `p` as a JSON string value, lossily.
+    pub fn to_value(p: &impl AsRef<Path>) -> serde_json::Value {
+        serde_json::Value::String(p.as_ref().to_string_lossy().into_owned())
     }
 }
 

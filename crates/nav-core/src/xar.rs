@@ -106,7 +106,7 @@ impl XarFile {
     }
 }
 
-/// A `<signature>` block in the TOC.
+/// The TOC's own `<signature>` (a direct child of `<toc>`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct XarSignature {
     /// e.g. `RSA`, or `CMS` for a notarized package.
@@ -156,6 +156,24 @@ pub struct XarArchive {
 impl XarArchive {
     pub fn is_complete(&self) -> bool {
         self.halted.is_none()
+    }
+
+    /// End of the recorded signature's heap range (absolute), or `None` if it
+    /// lacks an `offset`, has no non-zero `size`, or the range overflows.
+    pub fn signature_end(&self) -> Option<u64> {
+        let sig = self.signature.as_ref()?;
+        let (offset, size) = (sig.offset?, sig.size?);
+        if size == 0 {
+            return None;
+        }
+        self.heap_start.checked_add(offset)?.checked_add(size)
+    }
+
+    /// True when the root `<toc>`'s signature has an `offset` and a non-zero
+    /// `size` whose heap range lies within `source_len`, the whole archive's
+    /// length. Presence only: validity is not checked (§5.2).
+    pub fn has_plausible_signature(&self, source_len: u64) -> bool {
+        self.signature_end().is_some_and(|end| end <= source_len)
     }
 
     /// The entries Phase 0a is allowed to read back — see
@@ -336,6 +354,8 @@ fn walk_toc(toc: &[u8], limits: &XarLimits, archive: &mut XarArchive) {
     let mut open_files: Vec<usize> = Vec::new();
     let mut nodes: Vec<Node> = Vec::new();
     let mut sig: Option<XarSignature> = None;
+    // True while the recorded root-level `<signature>` is the open element.
+    let mut in_sig = false;
     // A TOC with no `<toc>` element must halt, not come back "complete, zero
     // files" (which reads as "package contains nothing").
     let mut saw_toc = false;
@@ -392,12 +412,13 @@ fn walk_toc(toc: &[u8], limits: &XarLimits, archive: &mut XarArchive) {
                             }
                         }
                     }
-                    "signature" if sig.is_none() => {
+                    "signature" if sig.is_none() && elems.as_slice() == ["xar", "toc"] => {
                         sig = Some(XarSignature {
                             style: xml::attr(attrs, "style").unwrap_or_default(),
                             offset: None,
                             size: None,
                         });
+                        in_sig = !self_closing;
                     }
                     "checksum" if archive.checksum_style.is_none() => {
                         archive.checksum_style = xml::attr(attrs, "style");
@@ -414,6 +435,9 @@ fn walk_toc(toc: &[u8], limits: &XarLimits, archive: &mut XarArchive) {
                 if name == "file" {
                     open_files.pop();
                 }
+                if name == "signature" && elems.len() == 3 {
+                    in_sig = false;
+                }
                 // Tolerate a stray close — entries collected so far are evidence.
                 if elems.last() == Some(&name) {
                     elems.pop();
@@ -427,9 +451,10 @@ fn walk_toc(toc: &[u8], limits: &XarLimits, archive: &mut XarArchive) {
                     .and_then(|i| elems.get(i))
                     .copied();
 
-                // Signature offset/size, which sit under <signature>.
+                // Offset/size of the recorded signature only; any other
+                // <signature> never fills it in.
                 if parent == Some("signature") {
-                    if let Some(s) = sig.as_mut() {
+                    if let (Some(s), true) = (sig.as_mut(), in_sig && elems.len() == 4) {
                         match elem {
                             "offset" => s.offset = parse_u64(raw),
                             "size" => s.size = parse_u64(raw),
@@ -468,6 +493,7 @@ fn walk_toc(toc: &[u8], limits: &XarLimits, archive: &mut XarArchive) {
         archive.halted = Some(XarHalt::TocMalformed);
     }
 
+    archive.signature = sig;
     archive.files = resolve_paths(&nodes, limits);
 }
 
@@ -554,6 +580,28 @@ fn be_u64(d: &[u8], off: usize) -> Option<u64> {
     Some(u64::from_be_bytes(
         d.get(off..off.checked_add(8)?)?.try_into().ok()?,
     ))
+}
+
+#[cfg(test)]
+/// A xar whose TOC is `toc_body` inside `<xar><toc>`, zlib-wrapped as one
+/// stored block (test TOCs are far below 64 KiB).
+pub(crate) fn toc_xar_bytes(toc_body: &str) -> Vec<u8> {
+    let toc = format!("<?xml version=\"1.0\"?><xar><toc>{toc_body}</toc></xar>");
+    let len = toc.len() as u16;
+    let mut z = vec![0x78, 0x01, 0x01];
+    z.extend_from_slice(&len.to_le_bytes());
+    z.extend_from_slice(&(!len).to_le_bytes());
+    z.extend_from_slice(toc.as_bytes());
+    z.extend_from_slice(&inflate::adler32(toc.as_bytes()).to_be_bytes());
+    let mut v = Vec::new();
+    v.extend_from_slice(b"xar!");
+    v.extend_from_slice(&28u16.to_be_bytes());
+    v.extend_from_slice(&1u16.to_be_bytes());
+    v.extend_from_slice(&(z.len() as u64).to_be_bytes());
+    v.extend_from_slice(&(toc.len() as u64).to_be_bytes());
+    v.extend_from_slice(&1u32.to_be_bytes());
+    v.extend_from_slice(&z);
+    v
 }
 
 #[cfg(test)]
@@ -907,5 +955,70 @@ mod tests {
         assert_eq!(parse_u64(b"12a"), None);
         assert_eq!(parse_u64(b"-1"), None);
         assert_eq!(parse_u64(b"99999999999999999999999"), None);
+    }
+
+    use super::toc_xar_bytes;
+
+    fn toc_archive(toc_body: &str) -> XarArchive {
+        parse(&toc_xar_bytes(toc_body), &XarLimits::default()).expect("xar")
+    }
+
+    /// Only a `<toc>`-level `<signature>` is recorded, with its own
+    /// offset/size; a nested one is ignored and never fills them in.
+    #[test]
+    fn only_a_top_level_signature_is_recorded() {
+        let nested = toc_archive(
+            r#"<file id="1"><name>x</name><signature style="RSA"><offset>1</offset><size>2</size></signature></file>"#,
+        );
+        assert!(nested.is_complete());
+        assert!(nested.signature.is_none());
+
+        let top =
+            toc_archive(r#"<signature style="RSA"><offset>0</offset><size>256</size></signature>"#);
+        let sig = top.signature.expect("top-level signature");
+        assert_eq!((sig.offset, sig.size), (Some(0), Some(256)));
+
+        let both = toc_archive(
+            r#"<signature style="RSA"><offset>5</offset><size>6</size></signature><file id="1"><name>x</name><signature style="RSA"><offset>1</offset><size>2</size></signature></file>"#,
+        );
+        let sig = both.signature.expect("top-level signature");
+        assert_eq!((sig.offset, sig.size), (Some(5), Some(6)));
+    }
+
+    /// Recording is by depth (`<xar><toc>`), not by parent name, and a later
+    /// `<signature>` never overwrites the first one's fields.
+    #[test]
+    fn only_the_root_tocs_first_signature_is_recorded() {
+        let nested_toc = toc_archive(
+            r#"<file id="1"><toc><signature style="RSA"><offset>0</offset><size>8</size></signature></toc></file>"#,
+        );
+        assert!(nested_toc.signature.is_none());
+
+        let bare_then_valid = toc_archive(
+            r#"<signature style="RSA"/><signature style="RSA"><offset>0</offset><size>8</size></signature>"#,
+        );
+        let sig = bare_then_valid.signature.as_ref().expect("first signature");
+        assert_eq!((sig.offset, sig.size), (None, None));
+        assert!(!bare_then_valid.has_plausible_signature(u64::MAX));
+    }
+
+    #[test]
+    fn plausible_signature_needs_offset_size_and_range() {
+        let a =
+            toc_archive(r#"<signature style="RSA"><offset>0</offset><size>10</size></signature>"#);
+        let end = a.heap_start + 10;
+        assert!(a.has_plausible_signature(end));
+        assert!(!a.has_plausible_signature(end - 1));
+        for body in [
+            r#"<signature style="RSA"/>"#,
+            r#"<signature style="RSA"><offset>0</offset></signature>"#,
+            r#"<signature style="RSA"><offset>0</offset><size>0</size></signature>"#,
+            r#"<signature style="RSA"><offset>18446744073709551615</offset><size>2</size></signature>"#,
+        ] {
+            assert!(
+                !toc_archive(body).has_plausible_signature(u64::MAX),
+                "{body}"
+            );
+        }
     }
 }

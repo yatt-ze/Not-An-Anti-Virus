@@ -7,7 +7,9 @@
 //! `scan` prints one terse line per file;
 //! `rules test` prints the worst file's full breakdown plus a roll-up.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
+
+use nav_core::model::lossy_path;
 use std::process::ExitCode;
 
 use nav_core::{
@@ -36,7 +38,10 @@ pub fn run_scan(path: &Path, recursive: bool, json: bool) -> ExitCode {
 
     for result in &scan.results {
         if json {
-            println!("{}", with_schema_version(result));
+            match with_schema_version(result) {
+                Ok(v) => println!("{v}"),
+                Err(e) => return json_error(&e),
+            }
         } else {
             print_scan_summary(result);
         }
@@ -75,10 +80,10 @@ pub fn run_rules_test(path: &Path, recursive: bool, json: bool) -> ExitCode {
     if scan.kind == TargetKind::File {
         let result = &scan.results[0];
         if json {
-            println!(
-                "{}",
-                serde_json::to_string_pretty(&with_schema_version(result)).unwrap()
-            );
+            match with_schema_version(result).and_then(|v| serde_json::to_string_pretty(&v)) {
+                Ok(s) => println!("{s}"),
+                Err(e) => return json_error(&e),
+            }
         } else {
             print_rules_test(result);
         }
@@ -96,11 +101,10 @@ pub fn run_rules_test(path: &Path, recursive: bool, json: bool) -> ExitCode {
             // usable here: it expects a non-empty `results` to pick a worst
             // file from.
             if json {
-                println!(
-                    "{}",
-                    serde_json::to_string_pretty(&multi_json(&scan)).unwrap()
-                );
-                return exit::code(exit::INDETERMINATE);
+                return match print_multi_json(&scan) {
+                    Ok(()) => exit::code(exit::INDETERMINATE),
+                    Err(e) => json_error(&e),
+                };
             }
         }
         eprintln!("navctl: no files to scan under {}", path.display());
@@ -108,10 +112,9 @@ pub fn run_rules_test(path: &Path, recursive: bool, json: bool) -> ExitCode {
     }
 
     if json {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&multi_json(&scan)).unwrap()
-        );
+        if let Err(e) = print_multi_json(&scan) {
+            return json_error(&e);
+        }
     } else {
         print_rules_test_multi(&scan);
     }
@@ -240,23 +243,35 @@ fn print_rules_test_multi(scan: &TargetScan) {
     );
 }
 
-fn multi_json(scan: &TargetScan) -> serde_json::Value {
+/// Report a JSON serialization failure as an operational error (§8).
+fn json_error(e: &serde_json::Error) -> ExitCode {
+    eprintln!("navctl: cannot serialize JSON output: {e}");
+    exit::code(exit::OPERATIONAL_ERROR)
+}
+
+fn print_multi_json(scan: &TargetScan) -> Result<(), serde_json::Error> {
+    println!("{}", serde_json::to_string_pretty(&multi_json(scan)?)?);
+    Ok(())
+}
+
+fn multi_json(scan: &TargetScan) -> Result<serde_json::Value, serde_json::Error> {
     let kind = match scan.kind {
         TargetKind::Bundle => "bundle",
         _ => "directory",
     };
-    serde_json::json!({
+    let paths = |ps: &[PathBuf]| ps.iter().map(lossy_path::to_value).collect::<Vec<_>>();
+    Ok(serde_json::json!({
         "schema_version": SCAN_JSON_SCHEMA_VERSION,
-        "target": scan.root,
+        "target": lossy_path::to_value(&scan.root),
         "kind": kind,
-        "primary": scan.primary,
-        "skipped_resources": scan.skipped,
+        "primary": scan.primary.as_ref().map(lossy_path::to_value),
+        "skipped_resources": paths(&scan.skipped),
         "coverage_complete": scan.coverage_complete(),
         "budget_limit": budget_limit_str(scan),
-        "unreadable": scan.unreadable,
-        "recommendation": scan.recommendation(),
-        "results": scan.results,
-    })
+        "unreadable": paths(&scan.unreadable),
+        "recommendation": serde_json::to_value(scan.recommendation())?,
+        "results": serde_json::to_value(&scan.results)?,
+    }))
 }
 
 /// A human-readable warning when a scan budget cut the target short, or `None`
@@ -397,7 +412,7 @@ mod tests {
 
     #[test]
     fn with_schema_version_adds_field_alongside_existing_ones() {
-        let value = with_schema_version(&sample_result());
+        let value = with_schema_version(&sample_result()).unwrap();
         assert_eq!(value["schema_version"], SCAN_JSON_SCHEMA_VERSION);
         // Original fields still present — schema_version is additive.
         assert_eq!(value["score"], 0);
@@ -414,7 +429,7 @@ mod tests {
             results: vec![sample_result()],
             budget: nav_core::BudgetOutcome::Within,
         };
-        let value = multi_json(&scan);
+        let value = multi_json(&scan).unwrap();
         assert_eq!(value["schema_version"], SCAN_JSON_SCHEMA_VERSION);
     }
 
@@ -480,9 +495,42 @@ mod tests {
     #[test]
     fn multi_json_on_empty_results_reports_incomplete_coverage() {
         let scan = empty_scan(vec![PathBuf::from("/tmp/locked")]);
-        let value = multi_json(&scan);
+        let value = multi_json(&scan).unwrap();
         assert_eq!(value["results"], serde_json::json!([]));
         assert_eq!(value["coverage_complete"], false);
         assert_eq!(value["unreadable"], serde_json::json!(["/tmp/locked"]));
+    }
+
+    /// Non-UTF-8 paths in every path-bearing field give valid JSON.
+    #[cfg(unix)]
+    #[test]
+    fn multi_json_serializes_non_utf8_paths_lossily() {
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt;
+        let bad = |s: &[u8]| PathBuf::from(OsStr::from_bytes(s));
+        let mut result = sample_result();
+        result.path = bad(b"/tmp/r\xff");
+        let scan = TargetScan {
+            root: bad(b"/tmp/root\xff"),
+            kind: TargetKind::Bundle,
+            primary: Some(bad(b"/tmp/root\xff/p\xfe")),
+            skipped: vec![bad(b"/tmp/s\xfe")],
+            unreadable: vec![bad(b"/tmp/u\xff\xfe")],
+            results: vec![result],
+            budget: nav_core::BudgetOutcome::Within,
+        };
+        let text = serde_json::to_string_pretty(&multi_json(&scan).expect("serializes")).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(v["target"], "/tmp/root\u{FFFD}");
+        assert_eq!(v["primary"], "/tmp/root\u{FFFD}/p\u{FFFD}");
+        assert_eq!(
+            v["skipped_resources"],
+            serde_json::json!(["/tmp/s\u{FFFD}"])
+        );
+        assert_eq!(
+            v["unreadable"],
+            serde_json::json!(["/tmp/u\u{FFFD}\u{FFFD}"])
+        );
+        assert_eq!(v["results"][0]["path"], "/tmp/r\u{FFFD}");
     }
 }

@@ -15,19 +15,22 @@ pub const SCAN_JSON_SCHEMA_VERSION: u32 = 1;
 
 /// Serializes `value` to a JSON object with `schema_version` merged in.
 /// `value` must serialize to a JSON object (every current caller does).
-pub fn with_schema_version<T: Serialize>(value: &T) -> serde_json::Value {
-    let mut v = serde_json::to_value(value).expect("scan JSON output always serializes");
+/// Errors only if `value`'s own `Serialize` impl fails.
+pub fn with_schema_version<T: Serialize>(
+    value: &T,
+) -> Result<serde_json::Value, serde_json::Error> {
+    let mut v = serde_json::to_value(value)?;
     if let serde_json::Value::Object(map) = &mut v {
         map.insert("schema_version".into(), SCAN_JSON_SCHEMA_VERSION.into());
     }
-    v
+    Ok(v)
 }
 
 /// `result` as a single-line JSON string carrying `schema_version` — the
 /// entry point for a caller (`navd`) that must not take its own
 /// `serde_json` dependency just to print a verdict.
-pub fn scan_result_json(result: &ScanResult) -> String {
-    with_schema_version(result).to_string()
+pub fn scan_result_json(result: &ScanResult) -> Result<String, serde_json::Error> {
+    Ok(with_schema_version(result)?.to_string())
 }
 
 pub const CLEAN: u8 = 0;
@@ -161,7 +164,7 @@ mod tests {
 
     #[test]
     fn with_schema_version_adds_field_alongside_existing_ones() {
-        let value = with_schema_version(&sample_result());
+        let value = with_schema_version(&sample_result()).unwrap();
         assert_eq!(value["schema_version"], SCAN_JSON_SCHEMA_VERSION);
         // Original fields still present — schema_version is additive.
         assert_eq!(value["score"], 0);
@@ -169,7 +172,7 @@ mod tests {
 
     #[test]
     fn scan_result_json_parses_and_carries_schema_version() {
-        let json = scan_result_json(&sample_result());
+        let json = scan_result_json(&sample_result()).unwrap();
         let value: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(value["schema_version"], SCAN_JSON_SCHEMA_VERSION);
         assert_eq!(value["score"], 0);
@@ -326,5 +329,25 @@ mod tests {
         };
         assert!(!scan.coverage_complete());
         assert_eq!(for_target(&scan), SUSPICIOUS);
+    }
+
+    /// A non-UTF-8 path serializes lossily instead of failing; a UTF-8 path
+    /// is emitted unchanged.
+    #[cfg(unix)]
+    #[test]
+    fn non_utf8_path_serializes_lossily() {
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt;
+        let mut r = sample_result();
+        r.path = PathBuf::from(OsStr::from_bytes(b"/tmp/\xff\xfe"));
+        let value = with_schema_version(&r).expect("serializes");
+        let text = serde_json::to_string(&value).unwrap();
+        let back: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(back["path"], "/tmp/\u{FFFD}\u{FFFD}");
+        assert!(scan_result_json(&r).is_ok());
+        assert_eq!(
+            with_schema_version(&sample_result()).unwrap()["path"],
+            "/tmp/sample"
+        );
     }
 }

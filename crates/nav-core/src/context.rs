@@ -481,8 +481,6 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
-    /// A real, opened file supports ranged reads; embedded content (no file
-    /// at all) never does, on any platform (§5.2, #45).
     /// A poisoned failure list still records and reports failures.
     #[test]
     fn stream_failures_survive_a_poisoned_lock() {
@@ -497,6 +495,8 @@ mod tests {
         assert!(ctx.stream_failed("a"));
     }
 
+    /// A real, opened file supports ranged reads; embedded content (no file
+    /// at all) never does, on any platform (§5.2, #45).
     #[test]
     fn supports_ranged_reads_requires_an_actual_file_handle() {
         let path = write_temp_file("supports-ranged-reads", b"hello world");

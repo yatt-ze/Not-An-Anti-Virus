@@ -234,10 +234,10 @@ impl Rule for MachOStructureRule {
 /// and we held the whole file but found no entitlements blob" (a determined
 /// fact), and "signed, entitlements present, none of them suspicious."
 /// `Err(NotApplicable)` only when the slice is signed and its
-/// `LC_CODE_SIGNATURE` region is undetermined (unread, §5.2, #45): that
-/// can't be told apart from "unread past a real entitlements blob"
-/// (§10/§11.8). A region past an authoritative EOF is determined: no
-/// entitlements.
+/// `LC_CODE_SIGNATURE` region is undetermined (unread, or read but
+/// unparseable, §5.2, #45, #55): that can't be told apart from a real
+/// entitlements blob (§10/§11.8). A region past an authoritative EOF is
+/// determined: no entitlements.
 fn entitlements_finding(
     image: &MachOImage,
 ) -> Result<Option<Vec<(&'static str, i32)>>, RuleOutcome> {
@@ -1062,6 +1062,39 @@ mod tests {
         let ctx = ctx_for(signature_past_eof_bytes());
         assert!(MachOStructureRule.covers_truncation(&ctx));
         assert!(matches!(MachOStructureRule.evaluate(&ctx), Ok(None)));
+    }
+
+    /// A complete Mach-O whose signature region is read but whose SuperBlob
+    /// can't be walked is undetermined, not clean.
+    #[test]
+    fn unwalkable_signature_superblob_is_not_applicable() {
+        use crate::macho::tests_support::{synth_macho_64_bad_superblob, SuperBlobFault};
+        for fault in [
+            SuperBlobFault::BadMagic,
+            SuperBlobFault::TooManyBlobs,
+            SuperBlobFault::ShortRegion,
+            SuperBlobFault::IndexPastRegion,
+            SuperBlobFault::BlobOffsetOutside,
+        ] {
+            let ctx = ctx_for(synth_macho_64_bad_superblob(fault));
+            assert!(
+                matches!(
+                    MachOStructureRule.evaluate(&ctx),
+                    Err(RuleOutcome::NotApplicable)
+                ),
+                "{fault:?}"
+            );
+        }
+    }
+
+    /// A valid signed Mach-O with no entitlements is still clean.
+    #[test]
+    fn valid_signature_without_entitlements_is_clean() {
+        let (bytes, _, _) = synth_macho_64_full(b"code", &[], &[], true, None);
+        assert!(matches!(
+            MachOStructureRule.evaluate(&ctx_for(bytes)),
+            Ok(None)
+        ));
     }
 
     /// The same bytes as a truncated embedded member: the true length is

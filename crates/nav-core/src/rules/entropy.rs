@@ -223,10 +223,12 @@ impl HighEntropyRule {
         }
     }
 
-    /// Score one already-budgeted, EOF-clipped `__TEXT` range: streamed over
-    /// the whole range when that fits `MAX_STREAM_BYTES`, else only over the
-    /// part inside `content`. Returns the entropy alongside the signal so
-    /// the caller can compare candidates across a fat binary's slices.
+    /// Score one `__TEXT` range from [`budgeted_text_ranges`] (EOF-clipped,
+    /// at most `MAX_STREAM_BYTES`): read from `content` when resident, else
+    /// streamed; if the stream fails, only the part inside `content` is
+    /// scored and the failure is recorded. Returns the entropy alongside the
+    /// signal so the caller can compare candidates across a fat binary's
+    /// slices.
     fn eval_macho_text(
         &self,
         ctx: &ScanContext,
@@ -239,30 +241,28 @@ impl HighEntropyRule {
             return self.macho_signal_from_content(content, range);
         }
 
-        if range.end - range.start <= MAX_STREAM_BYTES {
-            let mut counts = [0u64; 256];
-            let mut total = 0u64;
-            let delivered = ctx.for_each_window(range.clone(), 0, |window, _is_last| {
-                for &b in window {
-                    counts[b as usize] += 1;
-                }
-                total += window.len() as u64;
-            });
-            if delivered {
-                return self.macho_signal(total, entropy_from_histogram(&counts, total));
+        let mut counts = [0u64; 256];
+        let mut total = 0u64;
+        let delivered = ctx.for_each_window(range.clone(), 0, |window, _is_last| {
+            for &b in window {
+                counts[b as usize] += 1;
             }
-            // The stream failed partway — fall back to what the captured
-            // prefix can still show rather than discarding a score it would
-            // have found there (§10/§11.8).
-            ctx.mark_stream_failed(self.id());
+            total += window.len() as u64;
+        });
+        if delivered {
+            return self.macho_signal(total, entropy_from_histogram(&counts, total));
         }
+        // The stream failed (or ranged reads are unavailable) — fall back to
+        // what the captured prefix can still show rather than discarding a
+        // score it would have found there (§10/§11.8).
+        ctx.mark_stream_failed(self.id());
 
         self.macho_signal_from_content(content, range)
     }
 
     /// Score the part of `range` that lies inside `content`, clamped — used
-    /// both when the whole range is already held and as the fallback when it
-    /// can't be streamed (too large, or the stream failed partway).
+    /// both when the whole range is already held and as the fallback after a
+    /// failed stream.
     fn macho_signal_from_content(
         &self,
         content: &[u8],
@@ -334,7 +334,6 @@ impl HighEntropyRule {
     fn eval_base64_payload(&self, content: &[u8]) -> Option<MatchedSignal> {
         let mut pos = 0;
         while let Some((run_start, run_end, resume)) = next_base64_run(content, pos) {
-            let carrier = Carrier::detect(content, run_start);
             let mut carrier_confirmed = None;
             let mut seg_start = run_start;
             while seg_start < run_end {
@@ -343,7 +342,7 @@ impl HighEntropyRule {
                     content,
                     seg_start,
                     seg_end,
-                    &carrier,
+                    run_start,
                     &mut carrier_confirmed,
                 ) {
                     return Some(signal);
@@ -357,13 +356,14 @@ impl HighEntropyRule {
 
     /// Evaluate one candidate byte range as a possible base64 payload.
     /// `carrier_confirmed` is settled by the first candidate long enough to
-    /// decode meaningfully, then applied to the rest of the run (§5.2).
+    /// decode meaningfully — the only point [`Carrier::detect`] runs, on the
+    /// text before `run_start` — then applied to the rest of the run (§5.2).
     fn try_base64_candidate(
         &self,
         content: &[u8],
         start: usize,
         end: usize,
-        carrier: &Carrier,
+        run_start: usize,
         carrier_confirmed: &mut Option<bool>,
     ) -> Option<MatchedSignal> {
         let run = &content[start..end];
@@ -374,6 +374,7 @@ impl HighEntropyRule {
         }
 
         let confirmed = *carrier_confirmed.get_or_insert_with(|| {
+            let carrier = Carrier::detect(content, run_start);
             !matches!(carrier, Carrier::None)
                 && carrier.matches(&decoded[..decoded.len().min(CARRIER_MAGIC_PREFIX_BYTES)])
         });
@@ -525,6 +526,10 @@ fn next_base64_run(content: &[u8], from: usize) -> Option<(usize, usize, usize)>
 /// (header lines and a blank separator) to find a `-----BEGIN ` line.
 const PEM_LOOKBACK_LINES: usize = 8;
 
+/// Longest line [`find_pem_carrier`] will consider: PEM armor and header
+/// lines are short, so a longer one is neither.
+const MAX_PEM_LINE_BYTES: usize = 1024;
+
 /// Bytes to search backward from a `;base64,` suffix for a `data:` prefix —
 /// mime types are short, so this is generous.
 const MAX_MIME_LOOKBACK: usize = 64;
@@ -596,7 +601,8 @@ impl PemArmor {
 /// through the text lines ending there (independent of run boundaries — a
 /// run can start mid-line, since a header value's last word is itself a run
 /// byte). Up to [`PEM_LOOKBACK_LINES`] blank/`Key: value`-header lines are
-/// tolerated before a `-----BEGIN ` line; anything else means no carrier.
+/// tolerated before a `-----BEGIN ` line; anything else, including a line
+/// longer than [`MAX_PEM_LINE_BYTES`], means no carrier.
 fn find_pem_carrier(content: &[u8], run_start: usize) -> Option<PemArmor> {
     let mut end = run_start;
     let mut is_legacy_encrypted = false;
@@ -605,11 +611,12 @@ fn find_pem_carrier(content: &[u8], run_start: usize) -> Option<PemArmor> {
         if end == 0 {
             return None;
         }
-        let start = content[..end]
-            .iter()
-            .rposition(|&b| b == b'\n')
-            .map(|p| p + 1)
-            .unwrap_or(0);
+        let floor = end.saturating_sub(MAX_PEM_LINE_BYTES + 1); // +1: the '\n' before a line of exactly the cap
+        let start = match content[floor..end].iter().rposition(|&b| b == b'\n') {
+            Some(p) => floor + p + 1,
+            None if floor == 0 => 0,
+            None => return None, // line longer than the cap
+        };
         let line_end = if end > start && content[end - 1] == b'\r' {
             end - 1
         } else {
@@ -1388,6 +1395,46 @@ mod tests {
         );
         let ctx = make_ctx("key.pem", content.into_bytes());
         assert!(HighEntropyRule::default().evaluate(&ctx).unwrap().is_none());
+    }
+
+    /// A long single line holding many qualifying base64-alphabet runs must
+    /// not make carrier detection quadratic (#59): every run reaches
+    /// `Carrier::detect`, which used to search back to the line start.
+    #[test]
+    fn long_single_line_of_many_qualifying_runs_evaluates_quickly() {
+        let content = format!("{};", "A".repeat(1100)).repeat(3800).into_bytes();
+        assert!(content.len() > 4_000_000 && !content.contains(&b'\n'));
+        let ctx = make_ctx("bundle.min.js", content);
+        let start = std::time::Instant::now();
+        assert!(HighEntropyRule::default().evaluate(&ctx).unwrap().is_none());
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(10),
+            "took {:?}",
+            start.elapsed()
+        );
+    }
+
+    /// A PEM header line of exactly the cap is armor (the block behind it is
+    /// a carrier); one byte longer is not (the block is scored).
+    #[test]
+    fn a_pem_header_line_at_and_over_the_cap() {
+        let payload = magic_prefixed_blob(&[0x30, 0x82, 0x00, 0x00], 1536);
+        let encoded = wrap(&base64_encode(&payload), 64);
+        let mk = |header_len: usize| {
+            let header = format!("Comment:{}", " ".repeat(header_len - "Comment:".len()));
+            let content = format!(
+                "#!/bin/sh\n-----BEGIN CERTIFICATE-----\n{header}\n\n{encoded}\n\
+                 -----END CERTIFICATE-----\n"
+            );
+            make_ctx("x.sh", content.into_bytes())
+        };
+        let rule = HighEntropyRule::default();
+        assert!(rule.evaluate(&mk(20)).unwrap().is_none());
+        assert!(rule.evaluate(&mk(MAX_PEM_LINE_BYTES)).unwrap().is_none());
+        assert!(rule
+            .evaluate(&mk(MAX_PEM_LINE_BYTES + 1))
+            .unwrap()
+            .is_some());
     }
 
     #[test]
