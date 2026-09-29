@@ -1064,22 +1064,26 @@ mod tests {
         assert!(matches!(MachOStructureRule.evaluate(&ctx), Ok(None)));
     }
 
-    /// A complete Mach-O whose signature region is read but has a bad
-    /// SuperBlob magic or an oversized blob count is undetermined, not clean.
+    /// A complete Mach-O whose signature region is read but whose SuperBlob
+    /// can't be walked is undetermined, not clean.
     #[test]
-    fn unparseable_signature_superblob_is_not_applicable() {
-        for bad_magic in [true, false] {
-            let (mut bytes, _, sig_off) = synth_macho_64_full(b"code", &[], &[], true, None);
-            if bad_magic {
-                bytes[sig_off..sig_off + 4].copy_from_slice(&[0; 4]);
-            } else {
-                bytes[sig_off + 8..sig_off + 12].copy_from_slice(&100_000u32.to_be_bytes());
-            }
-            let ctx = ctx_for(bytes);
-            assert!(matches!(
-                MachOStructureRule.evaluate(&ctx),
-                Err(RuleOutcome::NotApplicable)
-            ));
+    fn unwalkable_signature_superblob_is_not_applicable() {
+        use crate::macho::tests_support::{synth_macho_64_bad_superblob, SuperBlobFault};
+        for fault in [
+            SuperBlobFault::BadMagic,
+            SuperBlobFault::TooManyBlobs,
+            SuperBlobFault::ShortRegion,
+            SuperBlobFault::IndexPastRegion,
+            SuperBlobFault::BlobOffsetOutside,
+        ] {
+            let ctx = ctx_for(synth_macho_64_bad_superblob(fault));
+            assert!(
+                matches!(
+                    MachOStructureRule.evaluate(&ctx),
+                    Err(RuleOutcome::NotApplicable)
+                ),
+                "{fault:?}"
+            );
         }
     }
 

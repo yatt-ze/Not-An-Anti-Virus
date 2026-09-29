@@ -996,12 +996,15 @@ fn extract_signature_facts_checked(
     if sig_end > data.len() {
         return None; // signature region past the bytes we hold
     }
+    if datasize < 12 {
+        return None; // the SuperBlob header doesn't fit
+    }
     if be_u32(data, sig_off)? != CSMAGIC_EMBEDDED_SIGNATURE {
         return None;
     }
     let count = be_u32(data, sig_off.checked_add(8)?)?;
-    if count > MAX_CS_BLOBS {
-        return None;
+    if count > MAX_CS_BLOBS || 12 + count as usize * 8 > datasize as usize {
+        return None; // too many blobs, or the index doesn't fit the region
     }
 
     let mut facts = SignatureFacts::default();
@@ -1009,14 +1012,11 @@ fn extract_signature_facts_checked(
     for i in 0..count as usize {
         // CS_BlobIndex: type(4), offset(4) — offset relative to `sig_off`.
         let entry_off = sig_off.checked_add(12)?.checked_add(i.checked_mul(8)?)?;
-        if entry_off.checked_add(8)? > sig_end {
-            break;
-        }
         let slot_type = be_u32(data, entry_off)?;
         let rel_off = be_u32(data, entry_off.checked_add(4)?)?;
         let blob_off = sig_off.checked_add(rel_off as usize)?;
         if blob_off.checked_add(8)? > sig_end {
-            continue;
+            return None; // index entry points outside the region
         }
         let magic = be_u32(data, blob_off)?;
 
@@ -1196,6 +1196,50 @@ pub(crate) mod tests_support {
         CSSLOT_SIGNATURESLOT, FAT_MAGIC, LC_CODE_SIGNATURE, LC_LOAD_DYLIB, LC_RPATH, LC_SEGMENT_64,
     };
     use std::ops::Range;
+
+    /// Ways a complete signed Mach-O's SuperBlob can be made unwalkable.
+    #[derive(Clone, Copy, Debug)]
+    pub(crate) enum SuperBlobFault {
+        BadMagic,
+        TooManyBlobs,
+        /// `LC_CODE_SIGNATURE.datasize` too small for the SuperBlob header.
+        ShortRegion,
+        /// Declared blob count whose index doesn't fit the region.
+        IndexPastRegion,
+        /// An index entry whose blob offset lies outside the region.
+        BlobOffsetOutside,
+    }
+
+    /// A complete thin 64-bit Mach-O with one entitlements blob whose
+    /// SuperBlob is broken as `fault` says.
+    pub(crate) fn synth_macho_64_bad_superblob(fault: SuperBlobFault) -> Vec<u8> {
+        let (mut image, _, sig_off) = synth_macho_64_full(
+            b"code",
+            &[],
+            &[],
+            true,
+            Some(b"<plist version=\"1.0\"><dict/></plist>"),
+        );
+        let put = |image: &mut Vec<u8>, at: usize, v: u32| {
+            image[at..at + 4].copy_from_slice(&v.to_be_bytes());
+        };
+        match fault {
+            SuperBlobFault::BadMagic => put(&mut image, sig_off, 0),
+            SuperBlobFault::TooManyBlobs => {
+                put(&mut image, sig_off + 8, super::MAX_CS_BLOBS + 1);
+            }
+            SuperBlobFault::IndexPastRegion => put(&mut image, sig_off + 8, 200),
+            SuperBlobFault::BlobOffsetOutside => put(&mut image, sig_off + 16, 0x00ff_ffff),
+            SuperBlobFault::ShortRegion => {
+                let lc = image
+                    .windows(4)
+                    .position(|w| w == LC_CODE_SIGNATURE.to_le_bytes())
+                    .expect("LC_CODE_SIGNATURE present");
+                image[lc + 12..lc + 16].copy_from_slice(&8u32.to_le_bytes());
+            }
+        }
+        image
+    }
 
     /// Wrap already-built thin images as the slices of a 32-bit fat/universal
     /// binary (`fat_arch` table + payloads). Offsets are 16-byte aligned, as a
@@ -2578,29 +2622,33 @@ mod tests {
         assert!(scan.fully_examined());
     }
 
-    fn with_bad_superblob(bad_magic: bool) -> Vec<u8> {
-        let (mut image, _, sig_off) = synth_macho_64_full(b"code", &[], &[], true, None);
-        if bad_magic {
-            image[sig_off..sig_off + 4].copy_from_slice(&[0, 0, 0, 0]);
-        } else {
-            let n = (MAX_CS_BLOBS + 1).to_be_bytes();
-            image[sig_off + 8..sig_off + 12].copy_from_slice(&n);
-        }
-        image
-    }
-
-    /// A read signature region with a bad SuperBlob magic or an oversized
-    /// blob count is `Malformed` on both parse paths, and not fully examined.
+    /// A read signature region whose SuperBlob can't be walked is `Malformed`
+    /// on both parse paths, and not fully examined.
     #[test]
-    fn unparseable_superblob_is_malformed_on_both_parse_paths() {
-        for bad_magic in [true, false] {
-            let image = with_bad_superblob(bad_magic);
+    fn unwalkable_superblob_is_malformed_on_both_parse_paths() {
+        use super::tests_support::{synth_macho_64_bad_superblob, SuperBlobFault};
+        for fault in [
+            SuperBlobFault::BadMagic,
+            SuperBlobFault::TooManyBlobs,
+            SuperBlobFault::ShortRegion,
+            SuperBlobFault::IndexPastRegion,
+            SuperBlobFault::BlobOffsetOutside,
+        ] {
+            let image = synth_macho_64_bad_superblob(fault);
             let parsed = parse(&image).expect("parses");
-            assert_eq!(parsed.signature_region, SignatureRegion::Malformed);
+            assert_eq!(
+                parsed.signature_region,
+                SignatureRegion::Malformed,
+                "{fault:?}"
+            );
             assert!(!parsed.signature_region.is_determined());
             let scan = scan_ranged(&image[..]);
             let img = scan.images.first().expect("thin slice");
-            assert_eq!(img.signature_region, SignatureRegion::Malformed);
+            assert_eq!(
+                img.signature_region,
+                SignatureRegion::Malformed,
+                "{fault:?}"
+            );
             assert!(!scan.fully_examined());
         }
     }
