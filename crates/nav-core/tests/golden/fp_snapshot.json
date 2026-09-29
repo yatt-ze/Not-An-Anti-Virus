@@ -161,6 +161,12 @@
     ],
     "completeness": "complete"
   },
+  "benign/pdf_with_binary_stream.pdf": {
+    "score": 0,
+    "recommendation": "no-action",
+    "rule_ids": [],
+    "completeness": "complete"
+  },
   "benign/pem_bundle.sh": {
     "score": 0,
     "recommendation": "no-action",
@@ -168,6 +174,12 @@
     "completeness": "complete"
   },
   "benign/pipe_to_checksum.sh": {
+    "score": 0,
+    "recommendation": "no-action",
+    "rule_ids": [],
+    "completeness": "complete"
+  },
+  "benign/png_with_text_metadata.png": {
     "score": 0,
     "recommendation": "no-action",
     "rule_ids": [],
