@@ -161,6 +161,14 @@
     ],
     "completeness": "complete"
   },
+  "benign/pdf_with_binary_stream.pdf": {
+    "score": 5,
+    "recommendation": "no-action",
+    "rule_ids": [
+      "high-entropy-content"
+    ],
+    "completeness": "complete"
+  },
   "benign/pem_bundle.sh": {
     "score": 0,
     "recommendation": "no-action",
@@ -171,6 +179,14 @@
     "score": 0,
     "recommendation": "no-action",
     "rule_ids": [],
+    "completeness": "complete"
+  },
+  "benign/png_with_text_metadata.png": {
+    "score": 5,
+    "recommendation": "no-action",
+    "rule_ids": [
+      "high-entropy-content"
+    ],
     "completeness": "complete"
   },
   "benign/readme.txt": {
@@ -258,6 +274,15 @@
     "score": 9,
     "recommendation": "no-action",
     "rule_ids": [
+      "suspicious-strings"
+    ],
+    "completeness": "complete"
+  },
+  "suspicious/dropper_polyglot_nul": {
+    "score": 15,
+    "recommendation": "notify",
+    "rule_ids": [
+      "high-entropy-content",
       "suspicious-strings"
     ],
     "completeness": "complete"
