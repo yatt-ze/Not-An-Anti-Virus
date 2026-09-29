@@ -1463,9 +1463,9 @@ mod tests {
 #[cfg(test)]
 mod fixture_gen {
     use crate::macho::tests_support::{
-        synth_fat, synth_fat_with_bogus_arches_aligned, synth_macho_64_duplicate_code_signature,
-        synth_macho_64_full, synth_macho_64_full_with_cd_flags,
-        synth_macho_64_full_with_cds_and_cms,
+        synth_fat, synth_fat_with_bogus_arches_aligned, synth_macho_64,
+        synth_macho_64_duplicate_code_signature, synth_macho_64_full,
+        synth_macho_64_full_with_cd_flags, synth_macho_64_full_with_cds_and_cms,
     };
     use crate::macho::CS_ADHOC;
     use std::path::Path;
@@ -1703,5 +1703,24 @@ mod fixture_gen {
             None,
         );
         std::fs::write(root.join("benign/macho_leaked_build_rpath"), leaked).unwrap();
+
+        // Benign: `__text` uniform over 147 byte values (7.20 bits/byte, the
+        // dense-SIMD range): elevated tier, corroboration-only (§5.2, #62).
+        let dense: Vec<u8> = (0..147 * 40).map(|i| (i % 147) as u8).collect();
+        let (dense_simd, _) = synth_macho_64(&dense);
+        std::fs::write(root.join("benign/macho_dense_simd_text"), dense_simd).unwrap();
+
+        // Suspicious: pseudo-random `__text` (~8.0 bits/byte), packed tier.
+        let mut state: u32 = 0x1234_5678;
+        let packed: Vec<u8> = (0..8192)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 17;
+                state ^= state << 5;
+                (state & 0xff) as u8
+            })
+            .collect();
+        let (packed_text, _) = synth_macho_64(&packed);
+        std::fs::write(root.join("suspicious/macho_packed_text"), packed_text).unwrap();
     }
 }

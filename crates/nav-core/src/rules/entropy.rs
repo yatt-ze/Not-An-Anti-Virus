@@ -23,6 +23,18 @@ use crate::textclass::{classify_text, TextClass, BINARY_MAGICS, MIN_SAMPLE_BYTES
 /// machine code or text.
 const ENTROPY_THRESHOLD: f64 = 7.0;
 
+/// `__TEXT` entropy at or above this is treated as packed/encrypted code
+/// (full weight). Corpus: benign max 7.24, p99 7.13; compressed/random
+/// references 7.82-8.00 (§5.2).
+const TEXT_PACKED_THRESHOLD: f64 = 7.5;
+
+/// `__TEXT` entropy from [`ENTROPY_THRESHOLD`] up to [`TEXT_PACKED_THRESHOLD`]
+/// (dense SIMD code or partial packing): corroboration-only weight (§5.2).
+const TEXT_ELEVATED_WEIGHT: i32 = 4;
+
+/// Weight of a `__TEXT` section at or above [`TEXT_PACKED_THRESHOLD`].
+const TEXT_PACKED_WEIGHT: i32 = 15;
+
 /// A base64 run shorter than this (alphabet characters, `=` and line breaks
 /// not counted) is too small to be a meaningful embedded payload rather than
 /// an incidental alnum-only token.
@@ -283,24 +295,30 @@ impl HighEntropyRule {
         self.macho_signal(text.len() as u64, shannon_entropy(text))
     }
 
-    /// Build the `__TEXT`-section signal, and the entropy it was built from,
-    /// if `entropy` over `len` bytes clears [`MIN_SAMPLE_BYTES`]/
-    /// [`Self::threshold`] — shared by the streamed and content-only paths so
-    /// their description format can't drift apart.
+    /// Build the tiered `__TEXT`-section signal, and the entropy it was built
+    /// from, if `entropy` over `len` bytes clears [`MIN_SAMPLE_BYTES`] and
+    /// [`ENTROPY_THRESHOLD`] — shared by the streamed and content-only paths.
     fn macho_signal(&self, len: u64, entropy: f64) -> Option<(f64, MatchedSignal)> {
-        if len < MIN_SAMPLE_BYTES as u64 || entropy < self.threshold {
+        if len < MIN_SAMPLE_BYTES as u64 || entropy < ENTROPY_THRESHOLD {
             return None;
         }
+        let (weight, what) = if entropy >= TEXT_PACKED_THRESHOLD {
+            (
+                TEXT_PACKED_WEIGHT,
+                "high-entropy __TEXT section — consistent with packed/obfuscated code",
+            )
+        } else {
+            (
+                TEXT_ELEVATED_WEIGHT,
+                "elevated __TEXT entropy — dense/SIMD code or partial packing",
+            )
+        };
         Some((
             entropy,
             MatchedSignal {
                 id: self.id().to_string(),
-                weight: 15,
-                description: format!(
-                    "high-entropy __TEXT section (entropy: {:.1} bits/byte over {} bytes) — \
-                     consistent with packed/obfuscated code",
-                    entropy, len
-                ),
+                weight,
+                description: format!("{what} (entropy: {entropy:.1} bits/byte over {len} bytes)"),
                 category: self.category(),
             },
         ))
@@ -804,6 +822,51 @@ mod tests {
         }
     }
 
+    /// Uniform over the first `symbols` byte values: entropy is exactly
+    /// `log2(symbols)` bits/byte.
+    fn uniform_over(symbols: usize, len: usize) -> Vec<u8> {
+        (0..len).map(|i| (i % symbols) as u8).collect()
+    }
+
+    fn text_weight(text: &[u8]) -> Option<i32> {
+        let (image, _) = crate::macho::tests_support::synth_macho_64(text);
+        let path = write_temp_file("entropy-tier", &image);
+        let ctx = ScanContext::load(&path);
+        let weight = HighEntropyRule::default()
+            .evaluate(&ctx)
+            .unwrap()
+            .map(|s| s.weight);
+        let _ = std::fs::remove_file(&path);
+        weight
+    }
+
+    #[test]
+    fn macho_text_entropy_tiers() {
+        // log2(147) = 7.20, log2(100) = 6.64.
+        assert_eq!(text_weight(&uniform_over(100, 6000)), None);
+        assert_eq!(
+            text_weight(&uniform_over(147, 147 * 40)),
+            Some(TEXT_ELEVATED_WEIGHT)
+        );
+        assert_eq!(
+            text_weight(&high_entropy_blob(65536)),
+            Some(TEXT_PACKED_WEIGHT)
+        );
+    }
+
+    #[test]
+    fn fat_binary_best_slice_decides_the_text_tier() {
+        let (elevated, _) =
+            crate::macho::tests_support::synth_macho_64(&uniform_over(147, 147 * 40));
+        let (packed, _) = crate::macho::tests_support::synth_macho_64(&high_entropy_blob(65536));
+        let fat = crate::macho::tests_support::synth_fat(&[&elevated, &packed]);
+        let path = write_temp_file("entropy-tier-fat", &fat);
+        let ctx = ScanContext::load(&path);
+        let signal = HighEntropyRule::default().evaluate(&ctx).unwrap().unwrap();
+        assert_eq!(signal.weight, TEXT_PACKED_WEIGHT);
+        let _ = std::fs::remove_file(&path);
+    }
+
     /// A `__TEXT` section whose 8 MiB-clipped prefix is pure low-entropy but
     /// whose full range (low prefix + a high-entropy tail past 8 MiB) clears
     /// the threshold overall: streaming the whole section, not just the
@@ -812,10 +875,10 @@ mod tests {
     fn macho_text_past_8mib_is_scored_on_the_whole_section() {
         // LOW_LEN fills the entire captured prefix with zero bytes; HIGH_LEN
         // (divisible by 256) cycles every byte value equally past it, giving
-        // an exact combined histogram: ~7.30 bits/byte overall (clears 7.0
-        // with margin) while the zero-only clipped prefix reads as 0.0.
+        // an exact combined histogram: ~7.61 bits/byte overall (clears the
+        // 7.5 packed tier) while the zero-only clipped prefix reads as 0.0.
         const LOW_LEN: usize = MAX_CONTENT_BYTES;
-        const HIGH_LEN: usize = 40 * 1024 * 1024;
+        const HIGH_LEN: usize = 64 * 1024 * 1024;
         let mut payload = vec![0u8; LOW_LEN];
         payload.extend((0..HIGH_LEN as u32).map(|i| (i % 256) as u8));
         let full_len = payload.len() as u64;
@@ -830,11 +893,13 @@ mod tests {
         let content = ctx.content.as_ref().unwrap();
         let prefix_start = usize::try_from(range.start).unwrap();
         assert!(shannon_entropy(&content[prefix_start..]) < ENTROPY_THRESHOLD);
+        assert!(shannon_entropy(&payload) >= TEXT_PACKED_THRESHOLD);
 
         let signal = HighEntropyRule::default()
             .evaluate(&ctx)
             .unwrap()
             .expect("the whole __TEXT section should clear the threshold");
+        assert_eq!(signal.weight, TEXT_PACKED_WEIGHT);
         assert!(signal
             .description
             .contains(&format!("over {full_len} bytes")));
