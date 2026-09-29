@@ -171,6 +171,7 @@ impl MachOStructureRule {
         // deliberately malformed slice must not hide behind the rest coming
         // back clean.
         let mut bad_paths: Vec<&str> = Vec::new();
+        let mut home_paths: Vec<&str> = Vec::new();
         let mut path_weight = 0;
         let mut entitlement_buckets: HashMap<&'static str, EntitlementBucket> = HashMap::new();
         let mut entitlements_gap = false;
@@ -184,8 +185,13 @@ impl MachOStructureRule {
             {
                 if let Some(w) = load_path_weight(p) {
                     path_weight = path_weight.max(w);
-                    if !bad_paths.contains(&p) {
-                        bad_paths.push(p);
+                    let list = if w == USER_HOME_PATH_WEIGHT {
+                        &mut home_paths
+                    } else {
+                        &mut bad_paths
+                    };
+                    if !list.contains(&p) {
+                        list.push(p);
                     }
                 }
             }
@@ -207,14 +213,21 @@ impl MachOStructureRule {
         }
 
         let mut findings: Vec<(i32, String)> = Vec::new();
-        if !bad_paths.is_empty() {
-            findings.push((
-                path_weight,
-                format!(
+        if !bad_paths.is_empty() || !home_paths.is_empty() {
+            let mut parts = Vec::new();
+            if !bad_paths.is_empty() {
+                parts.push(format!(
                     "loads from a writable/transient location: {}",
                     bad_paths.join(", ")
-                ),
-            ));
+                ));
+            }
+            if !home_paths.is_empty() {
+                parts.push(format!(
+                    "loads from another user's home directory (likely a leaked build path): {}",
+                    home_paths.join(", ")
+                ));
+            }
+            findings.push((path_weight, parts.join("; ")));
         }
         if !entitlement_buckets.is_empty() {
             // List in SUSPICIOUS_ENTITLEMENTS's fixed order for a deterministic
@@ -607,6 +620,32 @@ mod tests {
         assert_eq!(w("/usr/lib/x"), None);
         assert_eq!(w("/System/Library/x"), None);
         assert_eq!(w("/System/Volumes/Data/Library/x"), None);
+    }
+
+    #[test]
+    fn description_names_the_kind_of_path() {
+        let desc = |dylibs: &[&str], rpaths: &[&str]| {
+            let (image, _, _) = synth_macho_64_full(b"code", dylibs, rpaths, false, None);
+            MachOStructureRule
+                .evaluate(&ctx_for(image))
+                .unwrap()
+                .expect("should fire")
+                .description
+        };
+        let home = desc(&[], &["/Users/builder/work/lib"]);
+        assert!(home.contains("another user's home directory (likely a leaked build path)"));
+        assert!(home.contains("/Users/builder/work/lib"));
+        assert!(!home.contains("writable/transient"));
+
+        let tmp = desc(&[], &["/tmp/x"]);
+        assert!(tmp.contains("writable/transient location: /tmp/x"));
+        assert!(!tmp.contains("another user's home"));
+
+        let mixed = desc(&["/Users/builder/l.dylib"], &["/tmp/x"]);
+        assert!(mixed.contains("writable/transient location: /tmp/x"));
+        assert!(mixed.contains(
+            "another user's home directory (likely a leaked build path): /Users/builder/l.dylib"
+        ));
     }
 
     #[test]
