@@ -356,6 +356,8 @@ fn walk_toc(toc: &[u8], limits: &XarLimits, archive: &mut XarArchive) {
     let mut open_files: Vec<usize> = Vec::new();
     let mut nodes: Vec<Node> = Vec::new();
     let mut sig: Option<XarSignature> = None;
+    // True while the recorded root-level `<signature>` is the open element.
+    let mut in_sig = false;
     // A TOC with no `<toc>` element must halt, not come back "complete, zero
     // files" (which reads as "package contains nothing").
     let mut saw_toc = false;
@@ -412,12 +414,13 @@ fn walk_toc(toc: &[u8], limits: &XarLimits, archive: &mut XarArchive) {
                             }
                         }
                     }
-                    "signature" if sig.is_none() && parent_elem == Some("toc") => {
+                    "signature" if sig.is_none() && elems.as_slice() == ["xar", "toc"] => {
                         sig = Some(XarSignature {
                             style: xml::attr(attrs, "style").unwrap_or_default(),
                             offset: None,
                             size: None,
                         });
+                        in_sig = !self_closing;
                     }
                     "checksum" if archive.checksum_style.is_none() => {
                         archive.checksum_style = xml::attr(attrs, "style");
@@ -434,6 +437,9 @@ fn walk_toc(toc: &[u8], limits: &XarLimits, archive: &mut XarArchive) {
                 if name == "file" {
                     open_files.pop();
                 }
+                if name == "signature" && elems.len() == 3 {
+                    in_sig = false;
+                }
                 // Tolerate a stray close — entries collected so far are evidence.
                 if elems.last() == Some(&name) {
                     elems.pop();
@@ -447,15 +453,10 @@ fn walk_toc(toc: &[u8], limits: &XarLimits, archive: &mut XarArchive) {
                     .and_then(|i| elems.get(i))
                     .copied();
 
-                // Signature offset/size, which sit under the top-level
-                // <toc><signature>; a nested <signature> never fills it in.
+                // Offset/size of the recorded signature only; any other
+                // <signature> never fills it in.
                 if parent == Some("signature") {
-                    let grandparent = elems
-                        .len()
-                        .checked_sub(3)
-                        .and_then(|i| elems.get(i))
-                        .copied();
-                    if let (Some(s), Some("toc")) = (sig.as_mut(), grandparent) {
+                    if let (Some(s), true) = (sig.as_mut(), in_sig && elems.len() == 4) {
                         match elem {
                             "offset" => s.offset = parse_u64(raw),
                             "size" => s.size = parse_u64(raw),
@@ -989,6 +990,23 @@ mod tests {
         );
         let sig = both.signature.expect("top-level signature");
         assert_eq!((sig.offset, sig.size), (Some(5), Some(6)));
+    }
+
+    /// Recording is by depth (`<xar><toc>`), not by parent name, and a later
+    /// `<signature>` never overwrites the first one's fields.
+    #[test]
+    fn only_the_root_tocs_first_signature_is_recorded() {
+        let nested_toc = toc_archive(
+            r#"<file id="1"><toc><signature style="RSA"><offset>0</offset><size>8</size></signature></toc></file>"#,
+        );
+        assert!(nested_toc.signature.is_none());
+
+        let bare_then_valid = toc_archive(
+            r#"<signature style="RSA"/><signature style="RSA"><offset>0</offset><size>8</size></signature>"#,
+        );
+        let sig = bare_then_valid.signature.as_ref().expect("first signature");
+        assert_eq!((sig.offset, sig.size), (None, None));
+        assert!(!bare_then_valid.has_plausible_signature(u64::MAX));
     }
 
     #[test]
