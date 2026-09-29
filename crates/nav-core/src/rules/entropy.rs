@@ -209,8 +209,9 @@ impl HighEntropyRule {
     /// Score every image's `__TEXT` code (a fat binary can hide a packed
     /// slice behind a clean one, §5.2) and report the single strongest —
     /// the highest-entropy slice that clears the threshold. Returns
-    /// `NotApplicable` when nothing matched but the budget left a range
-    /// unscored (§10/§11.8); a match stands regardless.
+    /// `NotApplicable` when a range was left unscored (budget) or scored
+    /// prefix-only (failed stream) and there is no packed-tier match
+    /// (§10/§11.8).
     fn eval_macho_images(
         &self,
         ctx: &ScanContext,
@@ -218,14 +219,25 @@ impl HighEntropyRule {
         images: &[macho::MachOImage],
     ) -> Result<Option<MatchedSignal>, RuleOutcome> {
         let (included, all_scored) = budgeted_text_ranges(ctx, images);
-        let best = included
-            .into_iter()
-            .filter_map(|(_, range)| self.eval_macho_text(ctx, content, range))
-            .max_by(|(a, _), (b, _)| a.total_cmp(b))
-            .map(|(_, signal)| signal);
+        let mut whole = all_scored;
+        let mut best: Option<(f64, MatchedSignal)> = None;
+        for (_, range) in included {
+            let (scored, complete) = self.eval_macho_text(ctx, content, range);
+            whole &= complete;
+            if let Some((entropy, signal)) = scored {
+                if best.as_ref().map_or(true, |(b, _)| entropy > *b) {
+                    best = Some((entropy, signal));
+                }
+            }
+        }
         match best {
-            None if !all_scored => Err(RuleOutcome::NotApplicable),
-            best => Ok(best),
+            None if !whole => Err(RuleOutcome::NotApplicable),
+            // An elevated match is corroboration-only, and an unscored or
+            // prefix-only range could still hold packed code (§10/§11.8).
+            Some((_, signal)) if !whole && signal.weight < TEXT_PACKED_WEIGHT => {
+                Err(RuleOutcome::NotApplicable)
+            }
+            best => Ok(best.map(|(_, signal)| signal)),
         }
     }
 
@@ -234,17 +246,18 @@ impl HighEntropyRule {
     /// streamed; if the stream fails, only the part inside `content` is
     /// scored and the failure is recorded. Returns the entropy alongside the
     /// signal so the caller can compare candidates across a fat binary's
-    /// slices.
+    /// slices, and whether the whole range was scored (`false` after a failed
+    /// stream).
     fn eval_macho_text(
         &self,
         ctx: &ScanContext,
         content: &[u8],
         range: Range<u64>,
-    ) -> Option<(f64, MatchedSignal)> {
+    ) -> (Option<(f64, MatchedSignal)>, bool) {
         // Whole range already resident in `content`: score it directly on
         // the slice, no streaming/windowing needed (§5.2).
         if range.end <= content.len() as u64 {
-            return self.macho_signal_from_content(content, range);
+            return (self.macho_signal_from_content(content, range), true);
         }
 
         let mut counts = [0u64; 256];
@@ -256,14 +269,14 @@ impl HighEntropyRule {
             total += window.len() as u64;
         });
         if delivered {
-            return self.macho_signal(&counts, total);
+            return (self.macho_signal(&counts, total), true);
         }
         // The stream failed (or ranged reads are unavailable) — fall back to
         // what the captured prefix can still show rather than discarding a
         // score it would have found there (§10/§11.8).
         ctx.mark_stream_failed(self.id());
 
-        self.macho_signal_from_content(content, range)
+        (self.macho_signal_from_content(content, range), false)
     }
 
     /// Score the part of `range` that lies inside `content`, clamped — used
@@ -968,6 +981,30 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
+    /// A failed stream leaves only the resident prefix scored: an elevated
+    /// result there is `NotApplicable`, since the whole section may be
+    /// packed (§10/§11.8).
+    #[test]
+    fn stream_failure_with_an_elevated_prefix_is_not_applicable() {
+        const TOTAL_LEN: usize = MAX_CONTENT_BYTES + 1024 * 1024;
+        let payload = uniform_over(147, TOTAL_LEN);
+        let (image_bytes, _) = crate::macho::tests_support::synth_macho_64(&payload);
+        let path = write_temp_file("entropy-stream-failure-elevated", &image_bytes);
+        let ctx = ScanContext::load(&path);
+        assert!(ctx.truncated);
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_len(8)
+            .unwrap();
+        assert!(matches!(
+            HighEntropyRule.evaluate(&ctx),
+            Err(RuleOutcome::NotApplicable)
+        ));
+        let _ = std::fs::remove_file(&path);
+    }
+
     /// A fat binary's first slice is small and low-entropy, entirely inside
     /// the 8 MiB prefix; its second slice's `__TEXT` is high-entropy and
     /// starts past it. Scoring only `images.first()` would miss the second
@@ -1149,6 +1186,19 @@ mod tests {
         let content = ctx.content.as_ref().unwrap();
         let signal = HighEntropyRule.eval_macho_images(&ctx, content, &images);
         assert!(signal.unwrap().is_some());
+    }
+
+    /// An elevated-tier match does not stand over a range the budget left
+    /// out, but a packed-tier one does (§10/§11.8).
+    #[test]
+    fn elevated_match_does_not_stand_over_a_left_out_range() {
+        let (ctx, images) = left_out_range_images(uniform_over(147, 4116), true);
+        assert!(!budgeted_text_ranges(&ctx, &images).1);
+        let content = ctx.content.as_ref().unwrap();
+        assert!(matches!(
+            HighEntropyRule.eval_macho_images(&ctx, content, &images),
+            Err(RuleOutcome::NotApplicable)
+        ));
     }
 
     /// Slices clipping to the same absolute range are scored once.
