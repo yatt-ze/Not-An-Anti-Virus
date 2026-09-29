@@ -256,7 +256,7 @@ impl HighEntropyRule {
             total += window.len() as u64;
         });
         if delivered {
-            return self.macho_signal(total, entropy_from_histogram(&counts, total));
+            return self.macho_signal(&counts, total);
         }
         // The stream failed (or ranged reads are unavailable) — fall back to
         // what the captured prefix can still show rather than discarding a
@@ -281,13 +281,20 @@ impl HighEntropyRule {
             .ok()
             .map(|e| e.min(content.len()));
         let text = start.zip(end).and_then(|(s, e)| content.get(s..e))?;
-        self.macho_signal(text.len() as u64, shannon_entropy(text))
+        let mut counts = [0u64; 256];
+        for &b in text {
+            counts[b as usize] += 1;
+        }
+        self.macho_signal(&counts, text.len() as u64)
     }
 
-    /// Build the tiered `__TEXT`-section signal, and the entropy it was built
-    /// from, if `entropy` over `len` bytes clears [`MIN_SAMPLE_BYTES`] and
-    /// [`ENTROPY_THRESHOLD`] — shared by the streamed and content-only paths.
-    fn macho_signal(&self, len: u64, entropy: f64) -> Option<(f64, MatchedSignal)> {
+    /// Build the tiered `__TEXT`-section signal, and the bias-corrected
+    /// entropy it was built from, for a histogram over `len` bytes. Needs
+    /// [`MIN_SAMPLE_BYTES`] and the corrected entropy at or above
+    /// [`ENTROPY_THRESHOLD`]; the tier and the description use the corrected
+    /// value (§5.2). Shared by the streamed and content-only paths.
+    fn macho_signal(&self, counts: &[u64; 256], len: u64) -> Option<(f64, MatchedSignal)> {
+        let entropy = miller_madow_entropy(counts, len);
         if len < MIN_SAMPLE_BYTES as u64 || entropy < ENTROPY_THRESHOLD {
             return None;
         }
@@ -307,7 +314,9 @@ impl HighEntropyRule {
             MatchedSignal {
                 id: self.id().to_string(),
                 weight,
-                description: format!("{what} (entropy: {entropy:.2} bits/byte over {len} bytes)"),
+                description: format!(
+                    "{what} (entropy: {entropy:.2} bits/byte, bias-corrected, over {len} bytes)"
+                ),
                 category: self.category(),
             },
         ))
@@ -750,6 +759,19 @@ fn entropy_from_histogram(counts: &[u64; 256], total: u64) -> f64 {
         .sum()
 }
 
+/// [`entropy_from_histogram`] plus the Miller-Madow bias correction
+/// `(K - 1) / (2 N ln 2)` (K distinct values seen, N samples): plug-in
+/// entropy reads low on small samples, so a short packed `__text` would
+/// otherwise miss the packed tier.
+fn miller_madow_entropy(counts: &[u64; 256], total: u64) -> f64 {
+    if total == 0 {
+        return 0.0;
+    }
+    let distinct = counts.iter().filter(|&&c| c > 0).count() as f64;
+    entropy_from_histogram(counts, total)
+        + (distinct - 1.0) / (2.0 * total as f64 * std::f64::consts::LN_2)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -815,6 +837,24 @@ mod tests {
         let weight = HighEntropyRule.evaluate(&ctx).unwrap().map(|s| s.weight);
         let _ = std::fs::remove_file(&path);
         weight
+    }
+
+    /// Small samples read low under plug-in entropy (256 random bytes
+    /// ~7.18); the tier is decided on the bias-corrected value.
+    #[test]
+    fn small_packed_text_reaches_the_packed_tier() {
+        assert_eq!(
+            text_weight(&high_entropy_blob(256)),
+            Some(TEXT_PACKED_WEIGHT)
+        );
+        assert_eq!(
+            text_weight(&high_entropy_blob(384)),
+            Some(TEXT_PACKED_WEIGHT)
+        );
+        assert_eq!(
+            text_weight(&uniform_over(147, 4096 / 147 * 147)),
+            Some(TEXT_ELEVATED_WEIGHT)
+        );
     }
 
     #[test]
