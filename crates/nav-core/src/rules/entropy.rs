@@ -307,7 +307,7 @@ impl HighEntropyRule {
             MatchedSignal {
                 id: self.id().to_string(),
                 weight,
-                description: format!("{what} (entropy: {entropy:.1} bits/byte over {len} bytes)"),
+                description: format!("{what} (entropy: {entropy:.2} bits/byte over {len} bytes)"),
                 category: self.category(),
             },
         ))
