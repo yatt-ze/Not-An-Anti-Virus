@@ -611,7 +611,7 @@ fn find_pem_carrier(content: &[u8], run_start: usize) -> Option<PemArmor> {
         if end == 0 {
             return None;
         }
-        let floor = end.saturating_sub(MAX_PEM_LINE_BYTES);
+        let floor = end.saturating_sub(MAX_PEM_LINE_BYTES + 1); // +1: the '\n' before a line of exactly the cap
         let start = match content[floor..end].iter().rposition(|&b| b == b'\n') {
             Some(p) => floor + p + 1,
             None if floor == 0 => 0,
@@ -1397,39 +1397,44 @@ mod tests {
         assert!(HighEntropyRule::default().evaluate(&ctx).unwrap().is_none());
     }
 
-    /// A long single line of short identifier-like tokens must not make
-    /// carrier detection quadratic (#59).
+    /// A long single line holding many qualifying base64-alphabet runs must
+    /// not make carrier detection quadratic (#59): every run reaches
+    /// `Carrier::detect`, which used to search back to the line start.
     #[test]
-    fn long_single_line_of_short_tokens_evaluates_quickly() {
-        let content = "a1.b2(c3,d4);".repeat(80_000).into_bytes();
-        assert!(content.len() > 1_000_000 && !content.contains(&b'\n'));
+    fn long_single_line_of_many_qualifying_runs_evaluates_quickly() {
+        let content = format!("{};", "A".repeat(1100)).repeat(3800).into_bytes();
+        assert!(content.len() > 4_000_000 && !content.contains(&b'\n'));
         let ctx = make_ctx("bundle.min.js", content);
         let start = std::time::Instant::now();
         assert!(HighEntropyRule::default().evaluate(&ctx).unwrap().is_none());
         assert!(
-            start.elapsed() < std::time::Duration::from_secs(5),
+            start.elapsed() < std::time::Duration::from_secs(10),
             "took {:?}",
             start.elapsed()
         );
     }
 
-    /// A PEM header line over the cap is not armor, so the block behind it
-    /// is scored; the same block behind a short header is a carrier.
+    /// A PEM header line of exactly the cap is armor (the block behind it is
+    /// a carrier); one byte longer is not (the block is scored).
     #[test]
-    fn a_pem_header_line_over_the_cap_is_not_armor() {
+    fn a_pem_header_line_at_and_over_the_cap() {
         let payload = magic_prefixed_blob(&[0x30, 0x82, 0x00, 0x00], 1536);
         let encoded = wrap(&base64_encode(&payload), 64);
-        let mk = |header: &str| {
+        let mk = |header_len: usize| {
+            let header = format!("Comment:{}", " ".repeat(header_len - "Comment:".len()));
             let content = format!(
-                "#!/bin/sh\n-----BEGIN CERTIFICATE-----\nComment: {header}\n\n{encoded}\n\
+                "#!/bin/sh\n-----BEGIN CERTIFICATE-----\n{header}\n\n{encoded}\n\
                  -----END CERTIFICATE-----\n"
             );
             make_ctx("x.sh", content.into_bytes())
         };
         let rule = HighEntropyRule::default();
-        assert!(rule.evaluate(&mk("short")).unwrap().is_none());
-        let long = "word ".repeat(MAX_PEM_LINE_BYTES / 4);
-        assert!(rule.evaluate(&mk(&long)).unwrap().is_some());
+        assert!(rule.evaluate(&mk(20)).unwrap().is_none());
+        assert!(rule.evaluate(&mk(MAX_PEM_LINE_BYTES)).unwrap().is_none());
+        assert!(rule
+            .evaluate(&mk(MAX_PEM_LINE_BYTES + 1))
+            .unwrap()
+            .is_some());
     }
 
     #[test]
