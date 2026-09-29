@@ -325,7 +325,9 @@ fn load_path_weight(path: &str) -> Option<i32> {
     let other_user_home = path.strip_prefix("/Users/").is_some_and(|rest| {
         let mut parts = rest.split('/');
         let user = parts.next().unwrap_or("");
-        !user.eq_ignore_ascii_case("Shared") && !has_hidden_component(path)
+        !user.eq_ignore_ascii_case("Shared")
+            && !has_hidden_component(path)
+            && !has_parent_component(path)
     });
     Some(if other_user_home && !is_transient_prefix(path) {
         USER_HOME_PATH_WEIGHT
@@ -338,6 +340,12 @@ fn is_transient_prefix(path: &str) -> bool {
     super::TRANSIENT_PREFIXES
         .iter()
         .any(|p| path.starts_with(p))
+}
+
+/// True if `path` has a `..` component; dyld resolves it, so the path can
+/// leave the home directory.
+fn has_parent_component(path: &str) -> bool {
+    path.split('/').any(|c| c == "..")
 }
 
 fn has_hidden_component(path: &str) -> bool {
@@ -528,6 +536,11 @@ mod tests {
         assert_eq!(w("/tmp/x"), Some(TRANSIENT_LOCATION_WEIGHT));
         assert_eq!(w("/var/folders/zz/T/x"), Some(TRANSIENT_LOCATION_WEIGHT));
         assert_eq!(w("/opt/app/.cache/lib"), Some(TRANSIENT_LOCATION_WEIGHT));
+        assert_eq!(
+            w("/Users/x/../Shared/evil.dylib"),
+            Some(TRANSIENT_LOCATION_WEIGHT)
+        );
+        assert_eq!(w("/Users/x/../../tmp/e"), Some(TRANSIENT_LOCATION_WEIGHT));
         assert_eq!(USER_HOME_PATH_WEIGHT, 5);
     }
 
