@@ -681,21 +681,27 @@ fn find_data_uri_mime(content: &[u8], run_start: usize) -> Option<&[u8]> {
     Some(&content[search_start + data_pos + 5..mime_end])
 }
 
+/// Known binary formats: the mime types a data URI may carry them under, and
+/// the magic bytes their content starts with.
+const BINARY_MAGICS: &[(&[&[u8]], &[u8])] = &[
+    (&[b"image/png"], b"\x89PNG"),
+    (&[b"image/jpeg"], b"\xFF\xD8\xFF"),
+    (&[b"image/gif"], b"GIF8"),
+    (&[b"image/webp"], b"RIFF"),
+    (&[b"font/woff", b"application/font-woff"], b"wOFF"),
+    (&[b"font/woff2"], b"wOF2"),
+    (&[b"application/pdf"], b"%PDF"),
+    (&[b"application/zip"], b"PK\x03\x04"),
+    (&[b"application/gzip", b"application/x-gzip"], b"\x1f\x8b"),
+];
+
 /// Expected magic bytes for a known mime type carried as a data URI, or
 /// `None` for one this rule doesn't recognize.
 fn data_uri_magic(mime: &[u8]) -> Option<&'static [u8]> {
-    match mime {
-        b"image/png" => Some(b"\x89PNG"),
-        b"image/jpeg" => Some(b"\xFF\xD8\xFF"),
-        b"image/gif" => Some(b"GIF8"),
-        b"image/webp" => Some(b"RIFF"),
-        b"font/woff" | b"application/font-woff" => Some(b"wOFF"),
-        b"font/woff2" => Some(b"wOF2"),
-        b"application/pdf" => Some(b"%PDF"),
-        b"application/zip" => Some(b"PK\x03\x04"),
-        b"application/gzip" | b"application/x-gzip" => Some(b"\x1f\x8b"),
-        _ => None,
-    }
+    BINARY_MAGICS
+        .iter()
+        .find(|(mimes, _)| mimes.contains(&mime))
+        .map(|&(_, magic)| magic)
 }
 
 /// Whether `content`/`path` looks like a script or text file (which could
@@ -730,13 +736,18 @@ fn looks_like_script_or_text(content: &[u8], path: &Path) -> bool {
     // with a binary blob spliced in. Real text has no NUL, and PDF is a text
     // header over binary streams (#61).
     let prefix = &content[..content.len().min(512)];
-    if prefix.len() < MIN_SAMPLE_BYTES || prefix.contains(&0) || prefix.starts_with(b"%PDF") {
+    if prefix.len() < MIN_SAMPLE_BYTES || prefix.starts_with(b"%PDF") {
         return false;
     }
-    let printable = prefix
-        .iter()
-        .filter(|&&b| b == b'\n' || b == b'\t' || b == b'\r' || (0x20..=0x7e).contains(&b))
-        .count();
+    let mut printable = 0;
+    for &b in prefix {
+        if b == 0 {
+            return false;
+        }
+        if b == b'\n' || b == b'\t' || b == b'\r' || (0x20..=0x7e).contains(&b) {
+            printable += 1;
+        }
+    }
     printable * 100 / prefix.len() >= 85
 }
 
