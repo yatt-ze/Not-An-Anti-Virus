@@ -285,6 +285,14 @@
     ],
     "completeness": "complete"
   },
+  "suspicious/dropper_bin_bash_curl.sh": {
+    "score": 17,
+    "recommendation": "notify",
+    "rule_ids": [
+      "suspicious-strings"
+    ],
+    "completeness": "complete"
+  },
   "suspicious/dropper_curl_pipe_bash.sh": {
     "score": 19,
     "recommendation": "notify",
