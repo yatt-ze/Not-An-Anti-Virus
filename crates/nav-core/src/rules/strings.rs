@@ -158,10 +158,6 @@ impl Hits {
             patterns: [false; PATTERNS.len()],
         }
     }
-
-    fn any(&self) -> bool {
-        self.markers.iter().any(|&h| h) || self.patterns.iter().any(|&h| h)
-    }
 }
 
 fn is_word(b: u8) -> bool {
@@ -486,6 +482,37 @@ fn scan_window(text: &str, is_first: bool, is_last: bool, hits: &mut Hits) {
     scan_patterns(text, is_first, is_last, &mut hits.patterns);
 }
 
+/// Total weight and notes (patterns first, then counted names) for `hits`.
+/// Names count only when the resident content reads as script/text.
+fn score(hits: &Hits, ctx: &ScanContext) -> (i32, Vec<&'static str>) {
+    let mut weight = 0;
+    let mut notes: Vec<&'static str> = Vec::new();
+    for (p, _) in PATTERNS
+        .iter()
+        .zip(hits.patterns.iter())
+        .filter(|(_, &hit)| hit)
+    {
+        weight += p.weight;
+        notes.push(p.note);
+    }
+    // Binaries name APIs legitimately; only script/text counts names.
+    let names_count = hits.markers.iter().any(|&h| h)
+        && ctx.content.as_deref().is_some_and(|content| {
+            matches!(classify_text(content, &ctx.path), TextClass::Text { .. })
+        });
+    if names_count {
+        let names: Vec<&'static str> = MARKERS
+            .iter()
+            .zip(hits.markers.iter())
+            .filter(|(_, &hit)| hit)
+            .map(|(m, _)| m.note)
+            .collect();
+        weight += (names.len() as i32 * NAME_WEIGHT).min(NAME_FLOOR_CAP);
+        notes.extend(names);
+    }
+    (weight, notes)
+}
+
 pub struct SuspiciousStringsRule;
 
 impl Default for SuspiciousStringsRule {
@@ -518,9 +545,10 @@ impl Rule for SuspiciousStringsRule {
                 ctx.mark_stream_failed(self.id());
             }
             // A stream that failed partway still reported real hits from
-            // before the failure — keep those rather than discard them; only
-            // a failure with nothing found at all is NotApplicable.
-            if !ok && !hits.any() {
+            // before the failure — keep those rather than discard them; a
+            // failure with nothing that scores is NotApplicable, not clean
+            // (a name in a binary scores 0 but could have hidden a pattern).
+            if !ok && score(&hits, ctx).0 == 0 {
                 return Err(RuleOutcome::NotApplicable);
             }
         } else {
@@ -538,31 +566,7 @@ impl Rule for SuspiciousStringsRule {
             );
         }
 
-        let mut weight = 0;
-        let mut notes: Vec<&str> = Vec::new();
-        for (p, _) in PATTERNS
-            .iter()
-            .zip(hits.patterns.iter())
-            .filter(|(_, &hit)| hit)
-        {
-            weight += p.weight;
-            notes.push(p.note);
-        }
-        // Binaries name APIs legitimately; only script/text counts names.
-        let names_count = hits.markers.iter().any(|&h| h)
-            && ctx.content.as_deref().is_some_and(|content| {
-                matches!(classify_text(content, &ctx.path), TextClass::Text { .. })
-            });
-        if names_count {
-            let names: Vec<&str> = MARKERS
-                .iter()
-                .zip(hits.markers.iter())
-                .filter(|(_, &hit)| hit)
-                .map(|(m, _)| m.note)
-                .collect();
-            weight += (names.len() as i32 * NAME_WEIGHT).min(NAME_FLOOR_CAP);
-            notes.extend(names);
-        }
+        let (weight, notes) = score(&hits, ctx);
         if weight == 0 {
             return Ok(None);
         }
@@ -1023,6 +1027,34 @@ mod tests {
             !rule.covers_truncation(&ctx),
             "a failed stream must not claim coverage"
         );
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A stream that fails with only a name found in a binary prefix could
+    /// have hidden a pattern: NotApplicable, not a clean verdict (§10/§11.8).
+    #[test]
+    fn failed_stream_with_only_binary_names_is_not_applicable() {
+        let total_len = MAX_CONTENT_BYTES as u64 + 4096;
+        let path = sparse_temp_file("stream-fails-binary-names", total_len);
+        write_at(&path, 0, &[0x9D; 600]);
+        write_at(&path, 600, b"\0dlopen\0");
+
+        let ctx = ScanContext::load(&path);
+        assert!(ctx.truncated);
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_len(1024)
+            .unwrap();
+
+        let rule = SuspiciousStringsRule;
+        assert!(matches!(
+            rule.evaluate(&ctx),
+            Err(RuleOutcome::NotApplicable)
+        ));
+        assert!(!rule.covers_truncation(&ctx));
 
         let _ = std::fs::remove_file(&path);
     }
