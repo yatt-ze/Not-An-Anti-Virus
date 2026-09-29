@@ -77,7 +77,7 @@ pub trait Rule: Send + Sync {
 /// proving the scanner produces useful, low-noise verdicts, not coverage.
 pub fn default_ruleset() -> Vec<Box<dyn Rule>> {
     vec![
-        Box::new(HighEntropyRule::default()),
+        Box::new(HighEntropyRule),
         Box::new(SuspiciousStringsRule),
         Box::new(UnsignedBinaryRule),
         Box::new(AdHocSignedRule),
@@ -96,8 +96,5 @@ pub fn default_ruleset() -> Vec<Box<dyn Rule>> {
 /// content-only ones. Excludes anything needing a file on disk, and the
 /// package rules — so a `.pkg` in a `.pkg`'s scripts can't loop the scanner.
 pub fn embedded_content_ruleset() -> Vec<Box<dyn Rule>> {
-    vec![
-        Box::new(HighEntropyRule::default()),
-        Box::new(SuspiciousStringsRule),
-    ]
+    vec![Box::new(HighEntropyRule), Box::new(SuspiciousStringsRule)]
 }

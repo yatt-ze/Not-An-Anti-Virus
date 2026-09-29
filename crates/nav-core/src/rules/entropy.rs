@@ -18,10 +18,21 @@ use crate::macho::{self, ByteSource};
 use crate::model::{MatchedSignal, SignalCategory};
 use crate::textclass::{classify_text, TextClass, BINARY_MAGICS, MIN_SAMPLE_BYTES};
 
-/// Above this (out of 8.0 bits/byte, the max for byte-oriented Shannon
-/// entropy) content reads as packed/encrypted/compressed rather than typical
-/// machine code or text.
+/// Entry gate (bits/byte, max 8.0) for the script/text and base64 paths and
+/// for the elevated `__TEXT` tier; packed `__TEXT` needs
+/// [`TEXT_PACKED_THRESHOLD`].
 const ENTROPY_THRESHOLD: f64 = 7.0;
+
+/// `__TEXT` entropy at or above this is treated as packed/encrypted code
+/// (full weight); see §5.2.
+const TEXT_PACKED_THRESHOLD: f64 = 7.5;
+
+/// `__TEXT` entropy from [`ENTROPY_THRESHOLD`] up to [`TEXT_PACKED_THRESHOLD`]
+/// (dense SIMD code or partial packing): corroboration-only weight (§5.2).
+const TEXT_ELEVATED_WEIGHT: i32 = 4;
+
+/// Weight of a `__TEXT` section at or above [`TEXT_PACKED_THRESHOLD`].
+const TEXT_PACKED_WEIGHT: i32 = 15;
 
 /// A base64 run shorter than this (alphabet characters, `=` and line breaks
 /// not counted) is too small to be a meaningful embedded payload rather than
@@ -47,9 +58,8 @@ const MIN_FREEFORM_LINE_LEN: usize = 48;
 /// Corroboration-only (§5.1): a script embedding a compressed/encoded
 /// payload as base64 is common in benign software (installers, bundlers),
 /// so this alone must not reach Notify — it needs a second signal. Lower
-/// than the whole-content/`__TEXT` weight, which stays narrowly scoped
-/// enough (raw binary spliced into a script, or packed Mach-O code) to
-/// carry more weight alone.
+/// than [`EMBEDDED_BLOB_WEIGHT`] and [`TEXT_PACKED_WEIGHT`], which are narrow
+/// enough (raw binary in a script, packed Mach-O code) to carry more alone.
 const BASE64_PAYLOAD_WEIGHT: i32 = 8;
 
 /// Whole-content entropy in a fallback-classified file whose prefix shows
@@ -60,17 +70,7 @@ const CONTAINER_BLOB_WEIGHT: i32 = 5;
 /// Weight of a raw high-entropy blob in a script/text file (§5.1).
 const EMBEDDED_BLOB_WEIGHT: i32 = 15;
 
-pub struct HighEntropyRule {
-    threshold: f64,
-}
-
-impl Default for HighEntropyRule {
-    fn default() -> Self {
-        HighEntropyRule {
-            threshold: ENTROPY_THRESHOLD,
-        }
-    }
-}
+pub struct HighEntropyRule;
 
 impl Rule for HighEntropyRule {
     fn id(&self) -> &'static str {
@@ -208,8 +208,9 @@ impl HighEntropyRule {
     /// Score every image's `__TEXT` code (a fat binary can hide a packed
     /// slice behind a clean one, §5.2) and report the single strongest —
     /// the highest-entropy slice that clears the threshold. Returns
-    /// `NotApplicable` when nothing matched but the budget left a range
-    /// unscored (§10/§11.8); a match stands regardless.
+    /// `NotApplicable` when a range was left unscored (budget) or scored
+    /// prefix-only (failed stream) and there is no packed-tier match
+    /// (§10/§11.8).
     fn eval_macho_images(
         &self,
         ctx: &ScanContext,
@@ -217,14 +218,25 @@ impl HighEntropyRule {
         images: &[macho::MachOImage],
     ) -> Result<Option<MatchedSignal>, RuleOutcome> {
         let (included, all_scored) = budgeted_text_ranges(ctx, images);
-        let best = included
-            .into_iter()
-            .filter_map(|(_, range)| self.eval_macho_text(ctx, content, range))
-            .max_by(|(a, _), (b, _)| a.total_cmp(b))
-            .map(|(_, signal)| signal);
+        let mut whole = all_scored;
+        let mut best: Option<(f64, MatchedSignal)> = None;
+        for (_, range) in included {
+            let (scored, complete) = self.eval_macho_text(ctx, content, range);
+            whole &= complete;
+            if let Some((entropy, signal)) = scored {
+                if best.as_ref().map_or(true, |(b, _)| entropy > *b) {
+                    best = Some((entropy, signal));
+                }
+            }
+        }
         match best {
-            None if !all_scored => Err(RuleOutcome::NotApplicable),
-            best => Ok(best),
+            None if !whole => Err(RuleOutcome::NotApplicable),
+            // An elevated match is corroboration-only, and an unscored or
+            // prefix-only range could still hold packed code (§10/§11.8).
+            Some((_, signal)) if !whole && signal.weight < TEXT_PACKED_WEIGHT => {
+                Err(RuleOutcome::NotApplicable)
+            }
+            best => Ok(best.map(|(_, signal)| signal)),
         }
     }
 
@@ -233,17 +245,18 @@ impl HighEntropyRule {
     /// streamed; if the stream fails, only the part inside `content` is
     /// scored and the failure is recorded. Returns the entropy alongside the
     /// signal so the caller can compare candidates across a fat binary's
-    /// slices.
+    /// slices, and whether the whole range was scored (`false` after a failed
+    /// stream).
     fn eval_macho_text(
         &self,
         ctx: &ScanContext,
         content: &[u8],
         range: Range<u64>,
-    ) -> Option<(f64, MatchedSignal)> {
+    ) -> (Option<(f64, MatchedSignal)>, bool) {
         // Whole range already resident in `content`: score it directly on
         // the slice, no streaming/windowing needed (§5.2).
         if range.end <= content.len() as u64 {
-            return self.macho_signal_from_content(content, range);
+            return (self.macho_signal_from_content(content, range), true);
         }
 
         let mut counts = [0u64; 256];
@@ -255,14 +268,14 @@ impl HighEntropyRule {
             total += window.len() as u64;
         });
         if delivered {
-            return self.macho_signal(total, entropy_from_histogram(&counts, total));
+            return (self.macho_signal(&counts, total), true);
         }
         // The stream failed (or ranged reads are unavailable) — fall back to
         // what the captured prefix can still show rather than discarding a
         // score it would have found there (§10/§11.8).
         ctx.mark_stream_failed(self.id());
 
-        self.macho_signal_from_content(content, range)
+        (self.macho_signal_from_content(content, range), false)
     }
 
     /// Score the part of `range` that lies inside `content`, clamped — used
@@ -280,26 +293,41 @@ impl HighEntropyRule {
             .ok()
             .map(|e| e.min(content.len()));
         let text = start.zip(end).and_then(|(s, e)| content.get(s..e))?;
-        self.macho_signal(text.len() as u64, shannon_entropy(text))
+        let mut counts = [0u64; 256];
+        for &b in text {
+            counts[b as usize] += 1;
+        }
+        self.macho_signal(&counts, text.len() as u64)
     }
 
-    /// Build the `__TEXT`-section signal, and the entropy it was built from,
-    /// if `entropy` over `len` bytes clears [`MIN_SAMPLE_BYTES`]/
-    /// [`Self::threshold`] — shared by the streamed and content-only paths so
-    /// their description format can't drift apart.
-    fn macho_signal(&self, len: u64, entropy: f64) -> Option<(f64, MatchedSignal)> {
-        if len < MIN_SAMPLE_BYTES as u64 || entropy < self.threshold {
+    /// Build the tiered `__TEXT`-section signal, and the bias-corrected
+    /// entropy it was built from, for a histogram over `len` bytes. Needs
+    /// [`MIN_SAMPLE_BYTES`] and the corrected entropy at or above
+    /// [`ENTROPY_THRESHOLD`]; the tier and the description use the corrected
+    /// value (§5.2). Shared by the streamed and content-only paths.
+    fn macho_signal(&self, counts: &[u64; 256], len: u64) -> Option<(f64, MatchedSignal)> {
+        let entropy = miller_madow_entropy(counts, len);
+        if len < MIN_SAMPLE_BYTES as u64 || entropy < ENTROPY_THRESHOLD {
             return None;
         }
+        let (weight, what) = if entropy >= TEXT_PACKED_THRESHOLD {
+            (
+                TEXT_PACKED_WEIGHT,
+                "high-entropy __TEXT section — consistent with packed/obfuscated code",
+            )
+        } else {
+            (
+                TEXT_ELEVATED_WEIGHT,
+                "elevated __TEXT entropy — dense/SIMD code or partial packing",
+            )
+        };
         Some((
             entropy,
             MatchedSignal {
                 id: self.id().to_string(),
-                weight: 15,
+                weight,
                 description: format!(
-                    "high-entropy __TEXT section (entropy: {:.1} bits/byte over {} bytes) — \
-                     consistent with packed/obfuscated code",
-                    entropy, len
+                    "{what} (entropy: {entropy:.2} bits/byte, bias-corrected, over {len} bytes)"
                 ),
                 category: self.category(),
             },
@@ -318,7 +346,7 @@ impl HighEntropyRule {
     ) -> Option<MatchedSignal> {
         if content.len() >= MIN_SAMPLE_BYTES {
             let entropy = shannon_entropy(content);
-            if entropy >= self.threshold {
+            if entropy >= ENTROPY_THRESHOLD {
                 let (weight, what) = if container_evidence {
                     (
                         CONTAINER_BLOB_WEIGHT,
@@ -404,7 +432,7 @@ impl HighEntropyRule {
             return None;
         }
         let entropy = shannon_entropy(&decoded);
-        if entropy < self.threshold {
+        if entropy < ENTROPY_THRESHOLD {
             return None;
         }
         Some(MatchedSignal {
@@ -743,6 +771,19 @@ fn entropy_from_histogram(counts: &[u64; 256], total: u64) -> f64 {
         .sum()
 }
 
+/// [`entropy_from_histogram`] plus the Miller-Madow bias correction
+/// `(K - 1) / (2 N ln 2)` (K distinct values seen, N samples): plug-in
+/// entropy reads low on small samples, so a short packed `__text` would
+/// otherwise miss the packed tier.
+fn miller_madow_entropy(counts: &[u64; 256], total: u64) -> f64 {
+    if total == 0 {
+        return 0.0;
+    }
+    let distinct = counts.iter().filter(|&&c| c > 0).count() as f64;
+    entropy_from_histogram(counts, total)
+        + (distinct - 1.0) / (2.0 * total as f64 * std::f64::consts::LN_2)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -759,16 +800,7 @@ mod tests {
     }
 
     fn high_entropy_blob(len: usize) -> Vec<u8> {
-        // Deterministic pseudo-random fill, no external RNG dependency.
-        let mut state: u32 = 0x1234_5678;
-        (0..len)
-            .map(|_| {
-                state ^= state << 13;
-                state ^= state >> 17;
-                state ^= state << 5;
-                (state & 0xff) as u8
-            })
-            .collect()
+        crate::test_support::xorshift_bytes(len)
     }
 
     #[test]
@@ -804,16 +836,81 @@ mod tests {
         }
     }
 
+    /// Uniform over the first `symbols` byte values: entropy is exactly
+    /// `log2(symbols)` bits/byte.
+    fn uniform_over(symbols: usize, len: usize) -> Vec<u8> {
+        (0..len).map(|i| (i % symbols) as u8).collect()
+    }
+
+    fn text_weight(text: &[u8]) -> Option<i32> {
+        let (image, _) = crate::macho::tests_support::synth_macho_64(text);
+        let path = write_temp_file("entropy-tier", &image);
+        let ctx = ScanContext::load(&path);
+        let weight = HighEntropyRule.evaluate(&ctx).unwrap().map(|s| s.weight);
+        let _ = std::fs::remove_file(&path);
+        weight
+    }
+
+    /// Small samples read low under plug-in entropy (256 random bytes
+    /// ~7.18); the tier is decided on the bias-corrected value.
+    #[test]
+    fn small_packed_text_reaches_the_packed_tier() {
+        assert_eq!(
+            text_weight(&high_entropy_blob(256)),
+            Some(TEXT_PACKED_WEIGHT)
+        );
+        assert_eq!(
+            text_weight(&high_entropy_blob(384)),
+            Some(TEXT_PACKED_WEIGHT)
+        );
+        assert_eq!(
+            text_weight(&uniform_over(147, 4096 / 147 * 147)),
+            Some(TEXT_ELEVATED_WEIGHT)
+        );
+    }
+
+    #[test]
+    fn macho_text_entropy_tiers() {
+        // log2(147) = 7.20, log2(100) = 6.64.
+        assert_eq!(text_weight(&uniform_over(100, 6000)), None);
+        assert_eq!(
+            text_weight(&uniform_over(147, 147 * 40)),
+            Some(TEXT_ELEVATED_WEIGHT)
+        );
+        assert_eq!(
+            text_weight(&high_entropy_blob(65536)),
+            Some(TEXT_PACKED_WEIGHT)
+        );
+    }
+
+    #[test]
+    fn fat_binary_best_slice_decides_the_text_tier() {
+        let (elevated, _) =
+            crate::macho::tests_support::synth_macho_64(&uniform_over(147, 147 * 40));
+        let (packed, _) = crate::macho::tests_support::synth_macho_64(&high_entropy_blob(65536));
+        for (tag, slices) in [
+            ("elevated-first", [&elevated[..], &packed[..]]),
+            ("packed-first", [&packed[..], &elevated[..]]),
+        ] {
+            let fat = crate::macho::tests_support::synth_fat(&slices);
+            let path = write_temp_file(&format!("entropy-tier-fat-{tag}"), &fat);
+            let ctx = ScanContext::load(&path);
+            let signal = HighEntropyRule.evaluate(&ctx).unwrap().unwrap();
+            assert_eq!(signal.weight, TEXT_PACKED_WEIGHT, "{tag}");
+            let _ = std::fs::remove_file(&path);
+        }
+    }
+
     /// A `__TEXT` section whose 8 MiB-clipped prefix is pure low-entropy but
-    /// whose full range (low prefix + a high-entropy tail past 8 MiB) clears
-    /// the threshold overall: streaming the whole section, not just the
+    /// whose full range (low prefix + a high-entropy tail past 8 MiB) reaches
+    /// the elevated tier overall: streaming the whole section, not just the
     /// captured prefix, is what makes this fire (§5.2, #45).
     #[test]
     fn macho_text_past_8mib_is_scored_on_the_whole_section() {
         // LOW_LEN fills the entire captured prefix with zero bytes; HIGH_LEN
         // (divisible by 256) cycles every byte value equally past it, giving
-        // an exact combined histogram: ~7.30 bits/byte overall (clears 7.0
-        // with margin) while the zero-only clipped prefix reads as 0.0.
+        // an exact combined histogram: 7.293 bits/byte overall (elevated tier)
+        // while the zero-only clipped prefix reads as 0.0.
         const LOW_LEN: usize = MAX_CONTENT_BYTES;
         const HIGH_LEN: usize = 40 * 1024 * 1024;
         let mut payload = vec![0u8; LOW_LEN];
@@ -830,15 +927,17 @@ mod tests {
         let content = ctx.content.as_ref().unwrap();
         let prefix_start = usize::try_from(range.start).unwrap();
         assert!(shannon_entropy(&content[prefix_start..]) < ENTROPY_THRESHOLD);
+        assert!(shannon_entropy(&payload) >= ENTROPY_THRESHOLD);
 
-        let signal = HighEntropyRule::default()
+        let signal = HighEntropyRule
             .evaluate(&ctx)
             .unwrap()
             .expect("the whole __TEXT section should clear the threshold");
+        assert_eq!(signal.weight, TEXT_ELEVATED_WEIGHT);
         assert!(signal
             .description
             .contains(&format!("over {full_len} bytes")));
-        assert!(HighEntropyRule::default().covers_truncation(&ctx));
+        assert!(HighEntropyRule.covers_truncation(&ctx));
 
         let _ = std::fs::remove_file(&path);
     }
@@ -876,13 +975,37 @@ mod tests {
             .set_len(8)
             .unwrap();
 
-        let signal = HighEntropyRule::default()
+        let signal = HighEntropyRule
             .evaluate(&ctx)
             .unwrap()
             .expect("the in-prefix portion should still score");
         assert!(signal.description.contains("__TEXT"));
-        assert!(!HighEntropyRule::default().covers_truncation(&ctx));
+        assert!(!HighEntropyRule.covers_truncation(&ctx));
 
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A failed stream leaves only the resident prefix scored: an elevated
+    /// result there is `NotApplicable`, since the whole section may be
+    /// packed (§10/§11.8).
+    #[test]
+    fn stream_failure_with_an_elevated_prefix_is_not_applicable() {
+        const TOTAL_LEN: usize = MAX_CONTENT_BYTES + 1024 * 1024;
+        let payload = uniform_over(147, TOTAL_LEN);
+        let (image_bytes, _) = crate::macho::tests_support::synth_macho_64(&payload);
+        let path = write_temp_file("entropy-stream-failure-elevated", &image_bytes);
+        let ctx = ScanContext::load(&path);
+        assert!(ctx.truncated);
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_len(8)
+            .unwrap();
+        assert!(matches!(
+            HighEntropyRule.evaluate(&ctx),
+            Err(RuleOutcome::NotApplicable)
+        ));
         let _ = std::fs::remove_file(&path);
     }
 
@@ -904,12 +1027,12 @@ mod tests {
         let ctx = ScanContext::load(&path);
         assert!(ctx.truncated);
 
-        let signal = HighEntropyRule::default()
+        let signal = HighEntropyRule
             .evaluate(&ctx)
             .unwrap()
             .expect("the second slice's high-entropy __TEXT should be found");
         assert!(signal.description.contains("__TEXT"));
-        assert!(HighEntropyRule::default().covers_truncation(&ctx));
+        assert!(HighEntropyRule.covers_truncation(&ctx));
 
         let _ = std::fs::remove_file(&path);
     }
@@ -937,8 +1060,8 @@ mod tests {
             .set_len(8)
             .unwrap();
 
-        let _ = HighEntropyRule::default().evaluate(&ctx).unwrap();
-        assert!(!HighEntropyRule::default().covers_truncation(&ctx));
+        let _ = HighEntropyRule.evaluate(&ctx).unwrap();
+        assert!(!HighEntropyRule.covers_truncation(&ctx));
 
         let _ = std::fs::remove_file(&path);
     }
@@ -997,7 +1120,7 @@ mod tests {
         let mut image = base;
         image.text_range = Some(0..MAX_STREAM_BYTES + 4096);
         let images = [image];
-        let rule = HighEntropyRule::default();
+        let rule = HighEntropyRule;
         let content = ctx.content.as_ref().unwrap();
         assert!(rule
             .eval_macho_images(&ctx, content, &images)
@@ -1017,7 +1140,7 @@ mod tests {
         packed.text_range = Some(0..4096);
         let images = [decoy, packed];
         let content = ctx.content.as_ref().unwrap();
-        let signal = HighEntropyRule::default().eval_macho_images(&ctx, content, &images);
+        let signal = HighEntropyRule.eval_macho_images(&ctx, content, &images);
         assert!(signal.unwrap().is_some());
     }
 
@@ -1053,7 +1176,7 @@ mod tests {
         assert!(!budgeted_text_ranges(&ctx, &images).1);
         let content = ctx.content.as_ref().unwrap();
         assert!(matches!(
-            HighEntropyRule::default().eval_macho_images(&ctx, content, &images),
+            HighEntropyRule.eval_macho_images(&ctx, content, &images),
             Err(RuleOutcome::NotApplicable)
         ));
     }
@@ -1065,8 +1188,21 @@ mod tests {
         let (ctx, images) = left_out_range_images(high_entropy_blob(4096), true);
         assert!(!budgeted_text_ranges(&ctx, &images).1);
         let content = ctx.content.as_ref().unwrap();
-        let signal = HighEntropyRule::default().eval_macho_images(&ctx, content, &images);
+        let signal = HighEntropyRule.eval_macho_images(&ctx, content, &images);
         assert!(signal.unwrap().is_some());
+    }
+
+    /// An elevated-tier match does not stand over a range the budget left
+    /// out, but a packed-tier one does (§10/§11.8).
+    #[test]
+    fn elevated_match_does_not_stand_over_a_left_out_range() {
+        let (ctx, images) = left_out_range_images(uniform_over(147, 4116), true);
+        assert!(!budgeted_text_ranges(&ctx, &images).1);
+        let content = ctx.content.as_ref().unwrap();
+        assert!(matches!(
+            HighEntropyRule.eval_macho_images(&ctx, content, &images),
+            Err(RuleOutcome::NotApplicable)
+        ));
     }
 
     /// Slices clipping to the same absolute range are scored once.
@@ -1089,7 +1225,7 @@ mod tests {
         let cut = bytes[..range.start as usize].to_vec();
         let ctx = ScanContext::from_embedded_bytes("x.pkg!member", cut, true);
         assert!(!ctx.macho().images.is_empty());
-        assert!(!HighEntropyRule::default().covers_truncation(&ctx));
+        assert!(!HighEntropyRule.covers_truncation(&ctx));
     }
 
     /// A truncated file with no Mach-O magic and no text-like structure is
@@ -1104,8 +1240,8 @@ mod tests {
         let ctx = ScanContext::load(&path);
         assert!(ctx.truncated);
 
-        assert!(HighEntropyRule::default().evaluate(&ctx).unwrap().is_none());
-        assert!(HighEntropyRule::default().covers_truncation(&ctx));
+        assert!(HighEntropyRule.evaluate(&ctx).unwrap().is_none());
+        assert!(HighEntropyRule.covers_truncation(&ctx));
 
         let _ = std::fs::remove_file(&path);
     }
@@ -1123,7 +1259,7 @@ mod tests {
         let ctx = ScanContext::load(&path);
         assert!(ctx.truncated);
 
-        assert!(!HighEntropyRule::default().covers_truncation(&ctx));
+        assert!(!HighEntropyRule.covers_truncation(&ctx));
 
         let _ = std::fs::remove_file(&path);
     }
@@ -1144,7 +1280,7 @@ mod tests {
             macho_cache: std::sync::OnceLock::new(),
             stream_failures: std::sync::Mutex::new(Vec::new()),
         };
-        assert!(HighEntropyRule::default().evaluate(&ctx).unwrap().is_none());
+        assert!(HighEntropyRule.evaluate(&ctx).unwrap().is_none());
     }
 
     #[test]
@@ -1165,7 +1301,7 @@ mod tests {
             macho_cache: std::sync::OnceLock::new(),
             stream_failures: std::sync::Mutex::new(Vec::new()),
         };
-        let signal = HighEntropyRule::default().evaluate(&ctx).unwrap();
+        let signal = HighEntropyRule.evaluate(&ctx).unwrap();
         assert!(signal.is_some(), "script with embedded blob should score");
     }
 
@@ -1196,10 +1332,7 @@ mod tests {
 
     fn weight_of(path: &str, content: Vec<u8>) -> Option<i32> {
         let ctx = make_ctx(path, content);
-        HighEntropyRule::default()
-            .evaluate(&ctx)
-            .unwrap()
-            .map(|s| s.weight)
+        HighEntropyRule.evaluate(&ctx).unwrap().map(|s| s.weight)
     }
 
     #[test]
@@ -1278,7 +1411,7 @@ mod tests {
         let path = write_temp_file("nul-text-past-8mib", &content);
         let ctx = ScanContext::load(&path);
         assert!(ctx.truncated);
-        assert!(!HighEntropyRule::default().covers_truncation(&ctx));
+        assert!(!HighEntropyRule.covers_truncation(&ctx));
         let _ = std::fs::remove_file(&path);
     }
 
@@ -1344,7 +1477,7 @@ mod tests {
             macho_cache: std::sync::OnceLock::new(),
             stream_failures: std::sync::Mutex::new(Vec::new()),
         };
-        let signal = HighEntropyRule::default().evaluate(&ctx).unwrap();
+        let signal = HighEntropyRule.evaluate(&ctx).unwrap();
         assert!(
             signal.is_some(),
             "Mach-O with packed __TEXT should score high entropy"
@@ -1421,7 +1554,7 @@ mod tests {
              echo \"$P\" | base64 -d | sh\n"
         );
         let ctx = make_ctx("dropper.sh", content.into_bytes());
-        let signal = HighEntropyRule::default().evaluate(&ctx).unwrap();
+        let signal = HighEntropyRule.evaluate(&ctx).unwrap();
         assert!(signal.is_some(), "base64 payload in a script should score");
         let signal = signal.unwrap();
         assert!(signal.description.contains("decoded bytes"));
@@ -1438,7 +1571,7 @@ mod tests {
         let encoded = base64_encode(&payload);
         let content = format!("export const icon = \"data:image/png;base64,{encoded}\";\n");
         let ctx = make_ctx("icon.js", content.into_bytes());
-        assert!(HighEntropyRule::default().evaluate(&ctx).unwrap().is_none());
+        assert!(HighEntropyRule.evaluate(&ctx).unwrap().is_none());
     }
 
     #[test]
@@ -1453,7 +1586,7 @@ mod tests {
         let wrapped = format!("{}\n{}", wrap(first_half, 76), wrap(second_half, 50));
         let content = format!("export const icon = \"data:image/png;base64,{wrapped}\";\n");
         let ctx = make_ctx("icon.js", content.into_bytes());
-        assert!(HighEntropyRule::default().evaluate(&ctx).unwrap().is_none());
+        assert!(HighEntropyRule.evaluate(&ctx).unwrap().is_none());
     }
 
     #[test]
@@ -1465,7 +1598,7 @@ mod tests {
         let content =
             format!("P=\";base64,{encoded}\"\necho \"${{P#*,}}\" | base64 -d | gunzip | sh\n");
         let ctx = make_ctx("dropper.sh", content.into_bytes());
-        assert!(HighEntropyRule::default().evaluate(&ctx).unwrap().is_some());
+        assert!(HighEntropyRule.evaluate(&ctx).unwrap().is_some());
     }
 
     #[test]
@@ -1478,7 +1611,7 @@ mod tests {
              {encoded}\n-----END CERTIFICATE-----\nEOF\n"
         );
         let ctx = make_ctx("pem_bundle.sh", content.into_bytes());
-        assert!(HighEntropyRule::default().evaluate(&ctx).unwrap().is_none());
+        assert!(HighEntropyRule.evaluate(&ctx).unwrap().is_none());
     }
 
     #[test]
@@ -1493,7 +1626,7 @@ mod tests {
              {encoded}\n-----END FOO-----\nEOF\n"
         );
         let ctx = make_ctx("spoofed.sh", content.into_bytes());
-        assert!(HighEntropyRule::default().evaluate(&ctx).unwrap().is_some());
+        assert!(HighEntropyRule.evaluate(&ctx).unwrap().is_some());
     }
 
     #[test]
@@ -1507,7 +1640,7 @@ mod tests {
              Comment: exported\n\n{encoded}\n-----END PGP PUBLIC KEY BLOCK-----\n"
         );
         let ctx = make_ctx("key.asc", content.into_bytes());
-        assert!(HighEntropyRule::default().evaluate(&ctx).unwrap().is_none());
+        assert!(HighEntropyRule.evaluate(&ctx).unwrap().is_none());
     }
 
     #[test]
@@ -1521,7 +1654,7 @@ mod tests {
              {encoded}\n-----END RSA PRIVATE KEY-----\n"
         );
         let ctx = make_ctx("key.pem", content.into_bytes());
-        assert!(HighEntropyRule::default().evaluate(&ctx).unwrap().is_none());
+        assert!(HighEntropyRule.evaluate(&ctx).unwrap().is_none());
     }
 
     /// A long single line holding many qualifying base64-alphabet runs must
@@ -1533,7 +1666,7 @@ mod tests {
         assert!(content.len() > 4_000_000 && !content.contains(&b'\n'));
         let ctx = make_ctx("bundle.min.js", content);
         let start = std::time::Instant::now();
-        assert!(HighEntropyRule::default().evaluate(&ctx).unwrap().is_none());
+        assert!(HighEntropyRule.evaluate(&ctx).unwrap().is_none());
         assert!(
             start.elapsed() < std::time::Duration::from_secs(10),
             "took {:?}",
@@ -1555,7 +1688,7 @@ mod tests {
             );
             make_ctx("x.sh", content.into_bytes())
         };
-        let rule = HighEntropyRule::default();
+        let rule = HighEntropyRule;
         assert!(rule.evaluate(&mk(20)).unwrap().is_none());
         assert!(rule.evaluate(&mk(MAX_PEM_LINE_BYTES)).unwrap().is_none());
         assert!(rule
@@ -1571,7 +1704,7 @@ mod tests {
         let encoded = wrap(&base64_encode(text.as_bytes()), 76);
         let content = format!("#!/bin/sh\nP=\"{encoded}\"\necho \"$P\" | base64 -d\n");
         let ctx = make_ctx("encoded_text.sh", content.into_bytes());
-        assert!(HighEntropyRule::default().evaluate(&ctx).unwrap().is_none());
+        assert!(HighEntropyRule.evaluate(&ctx).unwrap().is_none());
     }
 
     #[test]
@@ -1584,7 +1717,7 @@ mod tests {
             "the quick brown fox jumps over the lazy dog ".repeat(20)
         );
         let ctx = make_ctx("short_run.sh", content.into_bytes());
-        assert!(HighEntropyRule::default().evaluate(&ctx).unwrap().is_none());
+        assert!(HighEntropyRule.evaluate(&ctx).unwrap().is_none());
     }
 
     // --- base64 segmentation (§5.1 wordlist false-run fix, and the
@@ -1676,7 +1809,7 @@ mod tests {
         let wrapped = wrap(&base64_encode(&payload), 76);
         let content = format!("Content-Transfer-Encoding: base64\n\n{wrapped}\n");
         let ctx = make_ctx("email.txt", content.into_bytes());
-        let signal = HighEntropyRule::default().evaluate(&ctx).unwrap();
+        let signal = HighEntropyRule.evaluate(&ctx).unwrap();
         assert!(
             signal.is_some(),
             "a payload right after a blank line should still be detected"
@@ -1693,7 +1826,7 @@ mod tests {
         let wrapped = wrap(&base64_encode(&payload), 76);
         let content = format!("my $data = << 'ICON';\n{wrapped}\nICON\n");
         let ctx = make_ctx("icon.pl", content.into_bytes());
-        let signal = HighEntropyRule::default().evaluate(&ctx).unwrap();
+        let signal = HighEntropyRule.evaluate(&ctx).unwrap();
         assert!(
             signal.is_some(),
             "a payload right before a terminator word should still be detected"
@@ -1726,7 +1859,7 @@ mod tests {
         );
         let ctx = make_ctx("wordlist.txt", block.into_bytes());
         assert!(
-            HighEntropyRule::default().evaluate(&ctx).unwrap().is_none(),
+            HighEntropyRule.evaluate(&ctx).unwrap().is_none(),
             "a joined wordlist run must not be treated as one base64 candidate"
         );
     }
@@ -1763,7 +1896,7 @@ mod tests {
         );
         let ctx = make_ctx("wordlist_sorted.txt", block.into_bytes());
         assert!(
-            HighEntropyRule::default().evaluate(&ctx).unwrap().is_none(),
+            HighEntropyRule.evaluate(&ctx).unwrap().is_none(),
             "consecutive equal-length short lines must not be treated as one base64 candidate"
         );
     }
@@ -1779,7 +1912,7 @@ mod tests {
         let encoded = base64_encode(&payload);
         let content = format!("#!/bin/sh\nP={encoded}\necho $P | base64 -d | gunzip | sh\n");
         let ctx = make_ctx("dropper.sh", content.into_bytes());
-        let signal = HighEntropyRule::default().evaluate(&ctx).unwrap();
+        let signal = HighEntropyRule.evaluate(&ctx).unwrap();
         assert!(
             signal.is_some(),
             "an unquoted P=<payload> assignment must still be detected"
@@ -1807,7 +1940,7 @@ mod tests {
             "P=\"{encoded_payload}\"\necho \"$P\" | base64 -d | gunzip | sh\n"
         ));
         let ctx = make_ctx("many_decoys.sh", content.into_bytes());
-        let signal = HighEntropyRule::default().evaluate(&ctx).unwrap();
+        let signal = HighEntropyRule.evaluate(&ctx).unwrap();
         assert!(
             signal.is_some(),
             "a real payload after 70 low-entropy decoys must still be found"
@@ -1837,7 +1970,7 @@ mod tests {
             "P=\"{encoded_payload}\"\necho \"$P\" | base64 -d | gunzip | sh\n"
         ));
         let ctx = make_ctx("many_icons.sh", content.into_bytes());
-        let signal = HighEntropyRule::default().evaluate(&ctx).unwrap();
+        let signal = HighEntropyRule.evaluate(&ctx).unwrap();
         assert!(
             signal.is_some(),
             "a real payload after 70 skipped data-URI decoys must still be found"
