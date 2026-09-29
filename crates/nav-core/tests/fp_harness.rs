@@ -7,9 +7,10 @@
 //! committing the result.
 //!
 //! Guards against: a rule change pushing a benign sample over the alert
-//! threshold, making scoring nondeterministic, or (via the golden snapshot)
-//! silently changing a fixture's score, recommendation, fired rule ids, or
-//! scan completeness.
+//! threshold, a suspicious fixture staying below Notify without an entry in
+//! `SUB_THRESHOLD_ALLOWLIST`, making scoring nondeterministic, or (via the
+//! golden snapshot) silently changing a fixture's score, recommendation,
+//! fired rule ids, or scan completeness.
 
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -98,17 +99,75 @@ fn benign_fixtures_never_alert() {
     }
 }
 
+/// Suspicious fixtures allowed to stay below Notify, keyed by
+/// [`fixture_key`] with the reason. Every other suspicious fixture must reach
+/// Notify (§11.1).
+const SUB_THRESHOLD_ALLOWLIST: &[(&str, &str)] = &[
+    (
+        "suspicious/macho_duplicate_code_signature",
+        "exercises a parser edge case, not a complete malicious sample",
+    ),
+    (
+        "suspicious/macho_fat_malformed_slice",
+        "exercises a parser edge case, not a complete malicious sample",
+    ),
+    (
+        "suspicious/macho_fat_many_arches",
+        "exercises a parser edge case, not a complete malicious sample",
+    ),
+    (
+        "suspicious/adhoc_named_flags=0x20000",
+        "exercises a parser edge case, not a complete malicious sample",
+    ),
+    (
+        "suspicious/dropper_curl_pipe_bash.sh",
+        "below Notify until suspicious-strings intent patterns land (#35)",
+    ),
+    (
+        "suspicious/dropper_base64_exec.sh",
+        "below Notify until suspicious-strings intent patterns land (#35)",
+    ),
+    (
+        "suspicious/dropper_osascript_fetch.sh",
+        "below Notify until suspicious-strings intent patterns land (#35)",
+    ),
+];
+
+fn sub_threshold_reason(key: &str) -> Option<&'static str> {
+    SUB_THRESHOLD_ALLOWLIST
+        .iter()
+        .find(|(k, _)| *k == key)
+        .map(|&(_, reason)| reason)
+}
+
 #[test]
-fn suspicious_fixtures_are_never_silently_clean() {
+fn suspicious_fixtures_reach_notify_unless_allowlisted() {
     for path in list_fixtures("suspicious") {
+        let key = fixture_key("suspicious", &path);
         let result = scan(&path);
-        let any_signal = result.results.iter().any(|r| !r.signals.is_empty());
-        assert!(
-            any_signal || result.recommendation() != Recommendation::NoAction,
-            "synthetic-suspicious fixture {} produced no signals at all — the scanner failed \
-             to notice content that was deliberately constructed to be suspicious.",
-            path.display(),
-        );
+        let reached_notify = result.recommendation() != Recommendation::NoAction;
+        match sub_threshold_reason(&key) {
+            None => assert!(
+                reached_notify,
+                "synthetic-suspicious fixture {key} scored NoAction — the scanner does not \
+                 alert on content deliberately constructed to be suspicious. Fix the rules, \
+                 or add it to SUB_THRESHOLD_ALLOWLIST with a reason.",
+            ),
+            Some(reason) => {
+                assert!(
+                    !reached_notify,
+                    "{key} is in SUB_THRESHOLD_ALLOWLIST ({reason}) but now reaches {:?} — \
+                     the allowlist entry is stale; remove it.",
+                    result.recommendation(),
+                );
+                assert!(
+                    result.results.iter().any(|r| !r.signals.is_empty()),
+                    "allowlisted fixture {key} produced no signals at all — the scanner \
+                     failed to notice content that was deliberately constructed to be \
+                     suspicious.",
+                );
+            }
+        }
     }
 }
 
@@ -221,6 +280,8 @@ fn report_fixture_metrics() {
 ///   * benign false-positive rate is exactly 0 — no known-good fixture alerts;
 ///   * suspicious signal coverage is 100% — every deliberately-suspicious
 ///     fixture produces at least one signal (a silent miss is a gate failure).
+///     Reaching Notify is gated separately by
+///     `suspicious_fixtures_reach_notify_unless_allowlisted`.
 ///
 /// Runtime percentiles are reported, never asserted (environment-dependent,
 /// would flake CI). Peak memory stays honestly untracked — see the TODO on
