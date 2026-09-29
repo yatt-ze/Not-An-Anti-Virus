@@ -87,8 +87,16 @@
     "rule_ids": [],
     "completeness": "complete"
   },
+  "benign/docs_install_instructions.html": {
+    "score": 4,
+    "recommendation": "no-action",
+    "rule_ids": [
+      "suspicious-strings"
+    ],
+    "completeness": "complete"
+  },
   "benign/formula.rb": {
-    "score": 3,
+    "score": 2,
     "recommendation": "no-action",
     "rule_ids": [
       "suspicious-strings"
@@ -189,6 +197,14 @@
     ],
     "completeness": "complete"
   },
+  "benign/postinstall_dialogs.sh": {
+    "score": 2,
+    "recommendation": "no-action",
+    "rule_ids": [
+      "suspicious-strings"
+    ],
+    "completeness": "complete"
+  },
   "benign/readme.txt": {
     "score": 0,
     "recommendation": "no-action",
@@ -202,16 +218,15 @@
     "completeness": "complete"
   },
   "suspicious/adhoc_named_flags=0x20000": {
-    "score": 9,
+    "score": 3,
     "recommendation": "no-action",
     "rule_ids": [
-      "adhoc-signed-binary",
-      "suspicious-strings"
+      "adhoc-signed-binary"
     ],
     "completeness": "complete"
   },
   "suspicious/com.apple.softwareupdate.plist": {
-    "score": 36,
+    "score": 41,
     "recommendation": "notify",
     "rule_ids": [
       "launchd-persistence-plist",
@@ -220,7 +235,7 @@
     "completeness": "complete"
   },
   "suspicious/dropper.sh": {
-    "score": 23,
+    "score": 20,
     "recommendation": "notify",
     "rule_ids": [
       "suspicious-strings"
@@ -228,15 +243,15 @@
     "completeness": "complete"
   },
   "suspicious/dropper_base64_exec.sh": {
-    "score": 13,
-    "recommendation": "no-action",
+    "score": 19,
+    "recommendation": "notify",
     "rule_ids": [
       "suspicious-strings"
     ],
     "completeness": "complete"
   },
   "suspicious/dropper_base64_narrow_wrap.sh": {
-    "score": 18,
+    "score": 25,
     "recommendation": "notify",
     "rule_ids": [
       "high-entropy-content",
@@ -245,7 +260,7 @@
     "completeness": "complete"
   },
   "suspicious/dropper_base64_packed.sh": {
-    "score": 18,
+    "score": 25,
     "recommendation": "notify",
     "rule_ids": [
       "high-entropy-content",
@@ -254,7 +269,7 @@
     "completeness": "complete"
   },
   "suspicious/dropper_base64_unquoted_assign.sh": {
-    "score": 18,
+    "score": 25,
     "recommendation": "notify",
     "rule_ids": [
       "high-entropy-content",
@@ -262,24 +277,48 @@
     ],
     "completeness": "complete"
   },
+  "suspicious/dropper_bash_process_subst.sh": {
+    "score": 19,
+    "recommendation": "notify",
+    "rule_ids": [
+      "suspicious-strings"
+    ],
+    "completeness": "complete"
+  },
+  "suspicious/dropper_bin_bash_curl.sh": {
+    "score": 17,
+    "recommendation": "notify",
+    "rule_ids": [
+      "suspicious-strings"
+    ],
+    "completeness": "complete"
+  },
   "suspicious/dropper_curl_pipe_bash.sh": {
-    "score": 13,
-    "recommendation": "no-action",
+    "score": 19,
+    "recommendation": "notify",
+    "rule_ids": [
+      "suspicious-strings"
+    ],
+    "completeness": "complete"
+  },
+  "suspicious/dropper_exec_curl.js": {
+    "score": 19,
+    "recommendation": "notify",
     "rule_ids": [
       "suspicious-strings"
     ],
     "completeness": "complete"
   },
   "suspicious/dropper_osascript_fetch.sh": {
-    "score": 9,
-    "recommendation": "no-action",
+    "score": 19,
+    "recommendation": "notify",
     "rule_ids": [
       "suspicious-strings"
     ],
     "completeness": "complete"
   },
   "suspicious/dropper_polyglot_nul": {
-    "score": 15,
+    "score": 22,
     "recommendation": "notify",
     "rule_ids": [
       "high-entropy-content",
@@ -288,7 +327,7 @@
     "completeness": "complete"
   },
   "suspicious/dropper_spoofed_data_uri.sh": {
-    "score": 18,
+    "score": 25,
     "recommendation": "notify",
     "rule_ids": [
       "high-entropy-content",
@@ -297,7 +336,7 @@
     "completeness": "complete"
   },
   "suspicious/installer_applescript_preinstall.pkg": {
-    "score": 15,
+    "score": 25,
     "recommendation": "notify",
     "rule_ids": [
       "installer-script-suspicious",
@@ -306,7 +345,7 @@
     "completeness": "complete"
   },
   "suspicious/installer_curl_pipe_preinstall.pkg": {
-    "score": 15,
+    "score": 25,
     "recommendation": "notify",
     "rule_ids": [
       "installer-script-suspicious",
@@ -315,7 +354,7 @@
     "completeness": "complete"
   },
   "suspicious/installer_spoofed_signature.pkg": {
-    "score": 15,
+    "score": 25,
     "recommendation": "notify",
     "rule_ids": [
       "installer-script-suspicious",
@@ -333,38 +372,34 @@
     "completeness": "complete"
   },
   "suspicious/macho_duplicate_code_signature": {
-    "score": 10,
+    "score": 4,
     "recommendation": "no-action",
     "rule_ids": [
-      "suspicious-strings",
       "unsigned-binary"
     ],
     "completeness": "partial"
   },
   "suspicious/macho_fat_malformed_slice": {
-    "score": 10,
+    "score": 4,
     "recommendation": "no-action",
     "rule_ids": [
-      "suspicious-strings",
       "unsigned-binary"
     ],
     "completeness": "partial"
   },
   "suspicious/macho_fat_many_arches": {
-    "score": 10,
+    "score": 4,
     "recommendation": "no-action",
     "rule_ids": [
-      "suspicious-strings",
       "unsigned-binary"
     ],
     "completeness": "partial"
   },
   "suspicious/macho_identity_claim_without_cms": {
-    "score": 28,
+    "score": 22,
     "recommendation": "notify",
     "rule_ids": [
       "macho-loader-anomaly",
-      "suspicious-strings",
       "unsigned-binary"
     ],
     "completeness": "complete"
@@ -388,7 +423,7 @@
     "completeness": "complete"
   },
   "suspicious/packed_payload.sh": {
-    "score": 31,
+    "score": 34,
     "recommendation": "notify",
     "rule_ids": [
       "high-entropy-content",
@@ -413,7 +448,7 @@
     "completeness": "complete"
   },
   "suspicious/tcc_keychain_exfil.sh": {
-    "score": 21,
+    "score": 24,
     "recommendation": "notify",
     "rule_ids": [
       "suspicious-strings"
