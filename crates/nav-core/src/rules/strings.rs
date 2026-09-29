@@ -296,13 +296,21 @@ fn within_span(start: usize, end: usize) -> bool {
     end - start <= PATTERN_SPAN
 }
 
-/// Whether `-d`/`--data*` at `end` is followed by `@` (a local file).
-fn upload_flag(line: &[u8], word: &[u8], end: usize) -> bool {
+/// Longest `-F` argument examined for `=@`.
+const MAX_FORM_ARG: usize = 256;
+
+/// Whether `-d`/`--data*`/`-F`/`-T`/`--upload-file` at `end` names a local
+/// file. The `-F` argument scan stops at `curl_start + PATTERN_SPAN` and at
+/// `MAX_FORM_ARG` bytes, so a run of `-F` flags stays linear.
+fn upload_flag(line: &[u8], word: &[u8], end: usize, curl_start: usize) -> bool {
     match word {
         b"--data-binary" | b"--data" | b"-d" => line.get(skip_blanks(line, end)) == Some(&b'@'),
         b"-F" => {
             let s = skip_blanks(line, end);
-            line[s..]
+            let limit = (curl_start + PATTERN_SPAN)
+                .min(s + MAX_FORM_ARG)
+                .min(line.len());
+            line[s..limit]
                 .split(|&b| is_blank(b))
                 .next()
                 .is_some_and(|arg| arg.windows(2).any(|w| w == b"=@"))
@@ -349,10 +357,10 @@ fn scan_line(line: &[u8], cut_start: bool, cut_end: bool, hits: &mut [bool; PATT
             continue;
         }
         let word = &line[s..e];
-        let cmd = at_command_position(line, s, cut_start);
+        let cmd = || at_command_position(line, s, cut_start);
 
         match word {
-            b"curl" | b"wget" if cmd => {
+            b"curl" | b"wget" if cmd() => {
                 st.downloader = Some(s);
                 if word == b"curl" {
                     st.curl = Some(s);
@@ -363,29 +371,29 @@ fn scan_line(line: &[u8], cut_start: bool, cut_end: bool, hits: &mut [bool; PATT
                     hits[DOWNLOAD_TO_SHELL] = true;
                 }
             }
-            b"sh" | b"bash" | b"zsh" | b"eval" if cmd => st.shellish = Some(s),
-            b"base64" if cmd => {
+            b"sh" | b"bash" | b"zsh" | b"eval" if cmd() => st.shellish = Some(s),
+            b"base64" if cmd() => {
                 st.decoders[0] = Some(Decoder {
                     start: s,
                     subcommand: true,
                     flag: false,
                 });
             }
-            b"openssl" if cmd => {
+            b"openssl" if cmd() => {
                 st.decoders[1] = Some(Decoder {
                     start: s,
                     subcommand: false,
                     flag: false,
                 });
             }
-            b"xxd" if cmd => {
+            b"xxd" if cmd() => {
                 st.decoders[2] = Some(Decoder {
                     start: s,
                     subcommand: true,
                     flag: false,
                 });
             }
-            b"osascript" if cmd => {
+            b"osascript" if cmd() => {
                 st.osascript = Some(s);
                 st.osascript_runs_shell = false;
             }
@@ -426,7 +434,7 @@ fn scan_line(line: &[u8], cut_start: bool, cut_end: bool, hits: &mut [bool; PATT
             _ => {}
         }
         if let Some(c) = st.curl {
-            if upload_flag(line, word, e) && within_span(c, e) {
+            if within_span(c, e) && upload_flag(line, word, e, c) {
                 hits[LOCAL_UPLOAD] = true;
             }
         }
@@ -441,7 +449,7 @@ fn scan_patterns(text: &str, is_first: bool, is_last: bool, hits: &mut [bool; PA
     }
     let bytes = text.as_bytes();
     let mut start = 0;
-    while start <= bytes.len() {
+    while start <= bytes.len() && !hits.iter().all(|&h| h) {
         let end = bytes[start..]
             .iter()
             .position(|&b| matches!(b, b'\n' | b'\r' | 0))
@@ -748,6 +756,19 @@ mod tests {
         assert!(fires("x\0curl a | sh\0y", DOWNLOAD_TO_SHELL));
         assert!(none_fire("curl a\r| sh"));
         assert!(none_fire("curl a\0| sh"));
+    }
+
+    #[test]
+    fn form_flag_runs_stay_linear() {
+        for unit in ["-F/", ",-F"] {
+            let line = format!("curl {}", unit.repeat(400_000));
+            let start = std::time::Instant::now();
+            assert!(none_fire(&line));
+            assert!(
+                start.elapsed() < std::time::Duration::from_secs(5),
+                "{unit}"
+            );
+        }
     }
 
     #[test]
