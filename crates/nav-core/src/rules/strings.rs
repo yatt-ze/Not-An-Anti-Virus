@@ -596,28 +596,50 @@ fn scan_line(line: &[u8], cut_start: bool, cut_end: bool, hits: &mut [bool; PATT
     }
 }
 
-/// Runs [`scan_line`] over each `\n`/`\r`/NUL-delimited line of `text`.
+/// Runs [`scan_line`] over each `\n`/`\r`/NUL-delimited line of `text`; a
+/// backslash before `\n` or `\r\n` joins the next line (as one blank).
 /// `is_first`/`is_last` say whether the window's edges are real input edges.
 fn scan_patterns(text: &str, is_first: bool, is_last: bool, hits: &mut [bool; PATTERNS.len()]) {
     if !hits[TCC_DATABASE] && text.contains("TCC.db") {
         hits[TCC_DATABASE] = true;
     }
     let bytes = text.as_bytes();
+    let mut joined: Vec<u8> = Vec::new();
+    let mut line_start = 0;
     let mut start = 0;
     while start <= bytes.len() && !hits.iter().all(|&h| h) {
         let end = bytes[start..]
             .iter()
             .position(|&b| matches!(b, b'\n' | b'\r' | 0))
             .map_or(bytes.len(), |p| start + p);
-        if end > start {
+        let newline_len = match (bytes.get(end), bytes.get(end + 1)) {
+            (Some(b'\n'), _) => 1,
+            (Some(b'\r'), Some(b'\n')) => 2,
+            _ => 0,
+        };
+        if newline_len > 0 && end > start && bytes[end - 1] == b'\\' {
+            joined.extend_from_slice(&bytes[start..end - 1]);
+            joined.push(b' ');
+            start = end + newline_len;
+            continue;
+        }
+        let line = if joined.is_empty() {
+            &bytes[start..end]
+        } else {
+            joined.extend_from_slice(&bytes[start..end]);
+            &joined[..]
+        };
+        if !line.is_empty() {
             scan_line(
-                &bytes[start..end],
-                start == 0 && !is_first,
+                line,
+                line_start == 0 && !is_first,
                 end == bytes.len() && !is_last,
                 hits,
             );
         }
+        joined.clear();
         start = end + 1;
+        line_start = start;
     }
 }
 
@@ -966,6 +988,31 @@ mod tests {
     }
 
     #[test]
+    fn backslash_newline_joins_lines() {
+        for t in [
+            "curl -fsSL URL \\\n  | bash",
+            "curl -fsSL URL \\\r\n  | bash",
+            "curl -fsSL \\\n URL \\\n | sudo \\\n bash",
+            "echo x | base64 -d \\\n | sh",
+        ] {
+            assert!(!none_fire(t), "{t:?}");
+        }
+        assert!(none_fire("curl x\n| sh"));
+    }
+
+    #[test]
+    fn continuations_stay_linear_and_safe_at_edges() {
+        let line = "curl \\\n".repeat(300_000);
+        let start = std::time::Instant::now();
+        assert!(none_fire(&line));
+        assert!(start.elapsed() < std::time::Duration::from_secs(5));
+        let mut hits = [false; PATTERNS.len()];
+        scan_patterns("x\\", true, false, &mut hits);
+        scan_patterns("\\\r", false, true, &mut hits);
+        scan_patterns("\\\n", false, true, &mut hits);
+    }
+
+    #[test]
     fn decode_to_shell_fires_on_canonical_forms() {
         for t in [
             "echo \"$P\" | base64 -d | gunzip | sh",
@@ -1302,6 +1349,28 @@ mod tests {
             !rule.covers_truncation(&ctx),
             "a failed stream must not claim coverage"
         );
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn continued_line_straddling_a_stream_chunk_boundary_is_found() {
+        let total_len = MAX_CONTENT_BYTES as u64 + 4096;
+        let path = sparse_temp_file("continuation-straddle", total_len);
+        let boundary = 9 * STREAM_CHUNK as u64;
+        write_at(
+            &path,
+            boundary - 12,
+            b"\ncurl -fsSL http://x \\\n  | bash\n",
+        );
+
+        let ctx = ScanContext::load(&path);
+        assert!(ctx.truncated);
+        let sig = SuspiciousStringsRule
+            .evaluate(&ctx)
+            .expect("rule should be applicable")
+            .expect("continued pattern across a window boundary should be found");
+        assert!(sig.description.contains("download piped to a shell"));
 
         let _ = std::fs::remove_file(&path);
     }
