@@ -74,7 +74,7 @@ fn contains_token(haystack: &str, needle: &str, is_last: bool) -> bool {
     haystack.match_indices(needle).any(|(start, _)| {
         match haystack.as_bytes().get(start + needle.len()) {
             None => is_last,
-            Some(b) => !(b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.')),
+            Some(&b) => !is_word(b),
         }
     })
 }
