@@ -77,6 +77,20 @@ pub(crate) const CS_LINKER_SIGNED: u32 = 0x20000;
 // Loop ceilings — far above any real Mach-O, but bound work on hostile input.
 const MAX_NCMDS: u32 = 4096;
 const MAX_NSECTS: u32 = 4096;
+/// Total sections collected into `MachOImage::segments`, across all segments.
+const MAX_SECTIONS_PER_IMAGE: usize = 4096;
+/// Segments collected into `MachOImage::segments`.
+const MAX_SEGMENTS: usize = 1024;
+
+/// Mask for the section type in `section.flags`.
+pub const SECTION_TYPE: u32 = 0xFF;
+/// Section types with no on-disk bytes.
+pub const S_ZEROFILL: u32 = 0x1;
+pub const S_GB_ZEROFILL: u32 = 0xC;
+pub const S_THREAD_LOCAL_ZEROFILL: u32 = 0x12;
+/// `maxprot`/`initprot` bits.
+pub const VM_PROT_WRITE: u32 = 0x2;
+pub const VM_PROT_EXECUTE: u32 = 0x4;
 const MAX_DYLIBS: usize = 4096;
 const MAX_RPATHS: usize = 256;
 const MAX_LC_STR_BYTES: usize = 4096;
@@ -122,9 +136,47 @@ impl SignatureRegion {
     }
 }
 
-/// A recognized Mach-O image: `__TEXT,__text`'s file range plus the loader
-/// facts (`dylibs`/`rpaths`/`has_code_signature`/`entitlements`) the
-/// structural-anomaly rule scores.
+/// One `LC_SEGMENT`/`LC_SEGMENT_64` and its section headers.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Segment {
+    /// Raw NUL-padded `segname`.
+    pub name: [u8; 16],
+    /// Absolute file range; `None` if `filesize` is 0 or the range overflows.
+    pub file_range: Option<Range<u64>>,
+    pub maxprot: u32,
+    pub initprot: u32,
+    /// Section headers that fit inside the load command, in order.
+    pub sections: Vec<Section>,
+}
+
+/// One `section`/`section_64` header.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Section {
+    /// Raw NUL-padded `sectname`.
+    pub name: [u8; 16],
+    /// Absolute file range; `None` for zerofill types, offset 0, size 0 or overflow.
+    pub file_range: Option<Range<u64>>,
+    /// Raw section flags; the type is `flags & SECTION_TYPE`.
+    pub flags: u32,
+}
+
+impl Segment {
+    /// True if the name is exactly `needle` (NUL-padded).
+    pub fn is_named(&self, needle: &[u8]) -> bool {
+        name_matches(&self.name, needle)
+    }
+}
+
+impl Section {
+    /// True if the name is exactly `needle` (NUL-padded).
+    pub fn is_named(&self, needle: &[u8]) -> bool {
+        name_matches(&self.name, needle)
+    }
+}
+
+/// A recognized Mach-O image: `__TEXT,__text`'s file range, its segment list,
+/// and the loader facts (`dylibs`/`rpaths`/`has_code_signature`/`entitlements`)
+/// the structural-anomaly rule scores.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MachOImage {
     /// True if this image was selected out of a fat/universal binary.
@@ -136,6 +188,12 @@ pub struct MachOImage {
     /// a caller with a bounded read must clip against what it holds. `None` if
     /// `__TEXT` has no on-disk content.
     pub text_range: Option<Range<u64>>,
+    /// Every segment in load-command order (capped at `MAX_SEGMENTS`). Ranges
+    /// are absolute file offsets, unclipped, like `text_range`.
+    pub segments: Vec<Segment>,
+    /// False if `segments` may be missing data: a cap was hit, or a segment's
+    /// section headers did not fit in its command or the held bytes.
+    pub segments_complete: bool,
     /// Load paths from `LC_LOAD_DYLIB` and its weak/lazy/upward/reexport
     /// variants, in load-command order. Capped at `MAX_DYLIBS`.
     pub dylibs: Vec<String>,
@@ -766,11 +824,17 @@ fn scan_ranged_slice(
     let buf = read_budgeted(src, budget, off, want)?;
     let mut image = parse_thin(&buf, 0, is_64, be, is_fat)?;
 
-    image.text_range = image.text_range.and_then(|range| {
-        let start = off.checked_add(range.start)?;
-        let end = off.checked_add(range.end)?;
-        Some(start..end)
-    });
+    let rebase = |range: Option<Range<u64>>| {
+        let range = range?;
+        Some(off.checked_add(range.start)?..off.checked_add(range.end)?)
+    };
+    image.text_range = rebase(image.text_range.take());
+    for seg in &mut image.segments {
+        seg.file_range = rebase(seg.file_range.take());
+        for sect in &mut seg.sections {
+            sect.file_range = rebase(sect.file_range.take());
+        }
+    }
 
     if let Some((dataoff, datasize)) = image.code_signature {
         read_signature_ranged(src, off, dataoff, datasize, source_len, budget, &mut image);
@@ -840,6 +904,9 @@ fn parse_thin(data: &[u8], base: usize, is_64: bool, be: bool, is_fat: bool) -> 
     let limit = cmds_start.checked_add(sizeofcmds)?.min(data.len());
 
     let mut text_range = None;
+    let mut segments = Vec::new();
+    let mut segments_complete = true;
+    let mut sections_seen = 0usize;
     let mut dylibs = Vec::new();
     let mut rpaths = Vec::new();
     let mut has_code_signature = false;
@@ -852,6 +919,7 @@ fn parse_thin(data: &[u8], base: usize, is_64: bool, be: bool, is_fat: bool) -> 
     let mut off = cmds_start;
     for _ in 0..ncmds {
         if off.checked_add(8)? > limit {
+            segments_complete = false;
             break;
         }
         let cmd = r.u32(off)?;
@@ -861,10 +929,23 @@ fn parse_thin(data: &[u8], base: usize, is_64: bool, be: bool, is_fat: bool) -> 
         }
         let cmd_end = off.checked_add(cmdsize)?;
         if cmd_end > limit {
+            segments_complete = false;
             break;
         }
 
         let is_segment = (is_64 && cmd == LC_SEGMENT_64) || (!is_64 && cmd == LC_SEGMENT);
+        if is_segment {
+            if segments.len() >= MAX_SEGMENTS {
+                segments_complete = false;
+            } else if let Some((seg, complete)) =
+                collect_segment(&r, off, cmd_end, is_64, base, &mut sections_seen)
+            {
+                segments.push(seg);
+                segments_complete &= complete;
+            } else {
+                segments_complete = false;
+            }
+        }
         if is_segment && text_range.is_none() {
             text_range = text_segment_range(&r, off, is_64, base);
         } else if is_dylib_load_command(cmd) {
@@ -919,6 +1000,8 @@ fn parse_thin(data: &[u8], base: usize, is_64: bool, be: bool, is_fat: bool) -> 
         is_fat,
         is_64,
         text_range,
+        segments,
+        segments_complete,
         dylibs,
         rpaths,
         has_code_signature,
@@ -928,6 +1011,109 @@ fn parse_thin(data: &[u8], base: usize, is_64: bool, be: bool, is_fat: bool) -> 
         signature_region,
         code_signature,
     })
+}
+
+/// Read the segment command at `off..cmd_end` and its section headers.
+/// `sections_seen` is the running section total checked against
+/// `MAX_SECTIONS_PER_IMAGE`. Returns the segment and whether every declared
+/// section was collected; `None` if the fixed header doesn't fit.
+fn collect_segment(
+    r: &Reader,
+    off: usize,
+    cmd_end: usize,
+    is_64: bool,
+    base: usize,
+    sections_seen: &mut usize,
+) -> Option<(Segment, bool)> {
+    // Field offsets (<mach-o/loader.h>): fileoff, filesize, maxprot, initprot,
+    // nsects, first section, section stride; then within a section: size,
+    // offset, flags.
+    let (hdr, stride, sect_fields) = if is_64 {
+        (72, 80, (40, 48, 64))
+    } else {
+        (56, 68, (36, 40, 56))
+    };
+    if cmd_end.checked_sub(off)? < hdr {
+        return None;
+    }
+    let name: [u8; 16] = r.bytes(off.checked_add(8)?, 16)?.try_into().ok()?;
+    let (fileoff, filesize, maxprot, initprot, nsects) = if is_64 {
+        (
+            r.u64(off.checked_add(40)?)?,
+            r.u64(off.checked_add(48)?)?,
+            r.u32(off.checked_add(56)?)?,
+            r.u32(off.checked_add(60)?)?,
+            r.u32(off.checked_add(64)?)?,
+        )
+    } else {
+        (
+            r.u32(off.checked_add(32)?)? as u64,
+            r.u32(off.checked_add(36)?)? as u64,
+            r.u32(off.checked_add(40)?)?,
+            r.u32(off.checked_add(44)?)?,
+            r.u32(off.checked_add(48)?)?,
+        )
+    };
+
+    let mut sections = Vec::new();
+    let mut complete = true;
+    for i in 0..nsects as usize {
+        let fits = i
+            .checked_mul(stride)
+            .and_then(|d| off.checked_add(hdr)?.checked_add(d))
+            .filter(|s| s.checked_add(stride).is_some_and(|e| e <= cmd_end));
+        let Some(s) = fits else {
+            complete = false;
+            break;
+        };
+        if *sections_seen >= MAX_SECTIONS_PER_IMAGE {
+            complete = false;
+            break;
+        }
+        let (size_off, offset_off, flags_off) = sect_fields;
+        let fields = (|| {
+            let (size, sect_off) = if is_64 {
+                (r.u64(s + size_off)?, r.u32(s + offset_off)? as u64)
+            } else {
+                (r.u32(s + size_off)? as u64, r.u32(s + offset_off)? as u64)
+            };
+            Some((
+                r.bytes(s, 16)?.try_into().ok()?,
+                size,
+                sect_off,
+                r.u32(s + flags_off)?,
+            ))
+        })();
+        let Some((sect_name, size, sect_off, flags)): Option<([u8; 16], u64, u64, u32)> = fields
+        else {
+            complete = false;
+            break;
+        };
+        let zerofill = matches!(
+            flags & SECTION_TYPE,
+            S_ZEROFILL | S_GB_ZEROFILL | S_THREAD_LOCAL_ZEROFILL
+        );
+        let file_range = if zerofill || sect_off == 0 {
+            None
+        } else {
+            absolute_range(base, sect_off, size)
+        };
+        sections.push(Section {
+            name: sect_name,
+            file_range,
+            flags,
+        });
+        *sections_seen += 1;
+    }
+
+    let seg = Segment {
+        name,
+        file_range: absolute_range(base, fileoff, filesize),
+        maxprot,
+        initprot,
+        sections,
+    };
+    Some((seg, complete))
 }
 
 /// True for `LC_LOAD_DYLIB` and its weak/lazy/upward/reexport variants — all
@@ -1377,7 +1563,7 @@ pub(crate) mod tests_support {
 
     /// Build a `dylib_command` (or `LC_RPATH`, sharing the same `lc_str`
     /// shape) for `path`, padded to a 4-byte cmdsize.
-    fn lc_str_command(cmd: u32, path: &str) -> Vec<u8> {
+    pub(crate) fn lc_str_command(cmd: u32, path: &str) -> Vec<u8> {
         let name_off = 12u32; // rpath_command's fixed header length
         let extra_off = if cmd == LC_RPATH { 12 } else { 24 };
         let header_len = extra_off;
@@ -2664,5 +2850,285 @@ mod tests {
         let scan = scan_ranged(&image[..]);
         assert_eq!(scan.images[0].signature_region, SignatureRegion::Read);
         assert!(scan.fully_examined());
+    }
+
+    /// (sectname, size, file offset, flags)
+    type SectSpec = (&'static [u8], u64, u32, u32);
+
+    struct SegSpec {
+        name: &'static [u8],
+        fileoff: u64,
+        filesize: u64,
+        maxprot: u32,
+        initprot: u32,
+        /// Overrides the declared `nsects` (default: `sects.len()`).
+        nsects: Option<u32>,
+        sects: Vec<SectSpec>,
+    }
+
+    fn seg(name: &'static [u8], fileoff: u64, filesize: u64, sects: Vec<SectSpec>) -> SegSpec {
+        SegSpec {
+            name,
+            fileoff,
+            filesize,
+            maxprot: 7,
+            initprot: 5,
+            nsects: None,
+            sects,
+        }
+    }
+
+    fn name16(n: &[u8]) -> [u8; 16] {
+        let mut b = [0u8; 16];
+        b[..n.len()].copy_from_slice(n);
+        b
+    }
+
+    /// Little-endian Mach-O (header, segment commands, then `tail` raw
+    /// load commands counted in `ncmds`), padded with zeros to `total` bytes.
+    fn build_segments(is_64: bool, segs: &[SegSpec], tail: &[Vec<u8>], total: usize) -> Vec<u8> {
+        let mut cmds = Vec::new();
+        for sg in segs {
+            let (hdr, stride) = if is_64 { (72usize, 80usize) } else { (56, 68) };
+            let mut c = Vec::new();
+            c.extend_from_slice(&(if is_64 { LC_SEGMENT_64 } else { LC_SEGMENT }).to_le_bytes());
+            c.extend_from_slice(&((hdr + stride * sg.sects.len()) as u32).to_le_bytes());
+            c.extend_from_slice(&name16(sg.name));
+            if is_64 {
+                c.extend_from_slice(&0u64.to_le_bytes()); // vmaddr
+                c.extend_from_slice(&0u64.to_le_bytes()); // vmsize
+                c.extend_from_slice(&sg.fileoff.to_le_bytes());
+                c.extend_from_slice(&sg.filesize.to_le_bytes());
+            } else {
+                c.extend_from_slice(&0u32.to_le_bytes());
+                c.extend_from_slice(&0u32.to_le_bytes());
+                c.extend_from_slice(&(sg.fileoff as u32).to_le_bytes());
+                c.extend_from_slice(&(sg.filesize as u32).to_le_bytes());
+            }
+            c.extend_from_slice(&sg.maxprot.to_le_bytes());
+            c.extend_from_slice(&sg.initprot.to_le_bytes());
+            let nsects = sg.nsects.unwrap_or(sg.sects.len() as u32);
+            c.extend_from_slice(&nsects.to_le_bytes());
+            c.extend_from_slice(&0u32.to_le_bytes()); // flags
+            for (name, size, offset, flags) in &sg.sects {
+                c.extend_from_slice(&name16(name));
+                c.extend_from_slice(&name16(sg.name));
+                if is_64 {
+                    c.extend_from_slice(&0u64.to_le_bytes()); // addr
+                    c.extend_from_slice(&size.to_le_bytes());
+                } else {
+                    c.extend_from_slice(&0u32.to_le_bytes());
+                    c.extend_from_slice(&(*size as u32).to_le_bytes());
+                }
+                c.extend_from_slice(&offset.to_le_bytes());
+                c.extend_from_slice(&0u32.to_le_bytes()); // align
+                c.extend_from_slice(&0u32.to_le_bytes()); // reloff
+                c.extend_from_slice(&0u32.to_le_bytes()); // nreloc
+                c.extend_from_slice(&flags.to_le_bytes());
+                c.extend_from_slice(&0u32.to_le_bytes()); // reserved1
+                c.extend_from_slice(&0u32.to_le_bytes()); // reserved2
+                if is_64 {
+                    c.extend_from_slice(&0u32.to_le_bytes()); // reserved3
+                }
+            }
+            assert_eq!(c.len(), hdr + stride * sg.sects.len());
+            cmds.extend_from_slice(&c);
+        }
+        for t in tail {
+            cmds.extend_from_slice(t);
+        }
+        let mut v = Vec::new();
+        v.extend_from_slice(&(if is_64 { MH_CIGAM_64 } else { MH_CIGAM }).to_be_bytes());
+        v.extend_from_slice(&[0u8; 12]); // cputype, cpusubtype, filetype
+        v.extend_from_slice(&((segs.len() + tail.len()) as u32).to_le_bytes());
+        v.extend_from_slice(&(cmds.len() as u32).to_le_bytes());
+        v.extend_from_slice(&0u32.to_le_bytes());
+        if is_64 {
+            v.extend_from_slice(&0u32.to_le_bytes());
+        }
+        v.extend_from_slice(&cmds);
+        if v.len() < total {
+            v.resize(total, 0);
+        }
+        v
+    }
+
+    fn multi_segment_specs() -> Vec<SegSpec> {
+        let mut data = seg(
+            b"__DATA",
+            0x3000,
+            0x1000,
+            vec![
+                (b"__data", 0x100, 0x3000, 0),
+                (b"__bss", 0x2000, 0, S_ZEROFILL),
+            ],
+        );
+        data.maxprot = 3;
+        data.initprot = 3;
+        vec![
+            seg(
+                b"__TEXT",
+                0x1000,
+                0x2000,
+                vec![
+                    (b"__text", 0x400, 0x1800, 0x8000_0400),
+                    (b"__const", 0x80, 0x1c00, 0),
+                ],
+            ),
+            data,
+            seg(b"__CUSTOM", 0x4000, 0x500, vec![]),
+        ]
+    }
+
+    fn assert_multi_segment(img: &MachOImage) {
+        assert!(img.segments_complete);
+        assert_eq!(img.segments.len(), 3);
+        let (text, data, custom) = (&img.segments[0], &img.segments[1], &img.segments[2]);
+        assert!(text.is_named(b"__TEXT") && !text.is_named(b"__TEX"));
+        assert_eq!(text.file_range, Some(0x1000..0x3000));
+        assert_eq!((text.maxprot, text.initprot), (7, 5));
+        assert_eq!(text.sections.len(), 2);
+        assert!(text.sections[0].is_named(b"__text"));
+        assert_eq!(text.sections[0].file_range, Some(0x1800..0x1c00));
+        assert_eq!(text.sections[0].flags, 0x8000_0400);
+        assert!(text.sections[1].is_named(b"__const"));
+        assert_eq!(text.sections[1].file_range, Some(0x1c00..0x1c80));
+
+        assert!(data.is_named(b"__DATA"));
+        assert_eq!((data.maxprot, data.initprot), (3, 3));
+        assert_ne!(data.maxprot & VM_PROT_WRITE, 0);
+        assert_eq!(data.maxprot & VM_PROT_EXECUTE, 0);
+        assert_eq!(data.sections[0].file_range, Some(0x3000..0x3100));
+        assert!(data.sections[1].is_named(b"__bss"));
+        assert_eq!(data.sections[1].file_range, None);
+        assert_eq!(data.sections[1].flags & SECTION_TYPE, S_ZEROFILL);
+
+        assert!(custom.is_named(b"__CUSTOM"));
+        assert!(custom.sections.is_empty());
+        assert_eq!(custom.file_range, Some(0x4000..0x4500));
+        // text_range is unchanged by segment collection.
+        assert_eq!(img.text_range, text.sections[0].file_range);
+    }
+
+    #[test]
+    fn collects_every_segment_and_section_64() {
+        let bytes = build_segments(true, &multi_segment_specs(), &[], 0x5000);
+        assert_multi_segment(&parse(&bytes).unwrap());
+        assert_multi_segment(&scan_ranged(&bytes[..]).images[0]);
+    }
+
+    #[test]
+    fn collects_every_segment_and_section_32() {
+        let bytes = build_segments(false, &multi_segment_specs(), &[], 0x5000);
+        let img = parse(&bytes).unwrap();
+        assert!(!img.is_64);
+        assert_multi_segment(&img);
+        assert_multi_segment(&scan_ranged(&bytes[..]).images[0]);
+    }
+
+    #[test]
+    fn fat_second_slice_segments_agree_across_parse_paths() {
+        let first = build_segments(true, &multi_segment_specs(), &[], 0x5000);
+        let mut specs = multi_segment_specs();
+        specs[0].sects[0].1 = 0x40; // make the slices differ
+        let second = build_segments(true, &specs, &[], 0x5000);
+        let fat = synth_fat(&[&first, &second]);
+
+        let prefix = parse_all(&fat);
+        let (sliced, _) = parse_all_slices(&fat, false);
+        let ranged = scan_ranged(&fat[..]);
+        assert_eq!(prefix.len(), 2);
+        assert_eq!(prefix[1].segments, sliced[1].segments);
+        assert_eq!(prefix[1].segments, ranged.images[1].segments);
+        assert_ne!(prefix[0].segments, prefix[1].segments);
+        let off = prefix[1].segments[0].file_range.clone().unwrap().start;
+        assert!(off > 0x1000, "ranges must be absolute, not slice-relative");
+        assert_eq!(prefix[1].text_range, ranged.images[1].text_range);
+        assert_eq!(
+            prefix[1].segments[0].sections[0].file_range,
+            prefix[1].text_range
+        );
+    }
+
+    #[test]
+    fn lying_nsects_collects_only_fitting_sections_and_walk_continues() {
+        let mut sg = seg(
+            b"__TEXT",
+            0x1000,
+            0x1000,
+            vec![(b"__text", 0x10, 0x1000, 0), (b"__const", 0x10, 0x1100, 0)],
+        );
+        sg.nsects = Some(0xFFFF);
+        let dylib = tests_support::lc_str_command(LC_LOAD_DYLIB, "/usr/lib/after.dylib");
+        let bytes = build_segments(true, &[sg], &[dylib], 0x2000);
+        let img = parse(&bytes).unwrap();
+        assert!(!img.segments_complete);
+        assert_eq!(img.segments.len(), 1);
+        assert_eq!(img.segments[0].sections.len(), 2);
+        assert_eq!(img.dylibs, vec!["/usr/lib/after.dylib".to_string()]);
+        assert_eq!(img.text_range, Some(0x1000..0x2000)); // nsects > MAX_NSECTS: segment fallback
+    }
+
+    #[test]
+    fn section_cap_marks_segments_incomplete_and_stops_at_the_cap() {
+        let per_seg = 512usize;
+        let nsegs = MAX_SECTIONS_PER_IMAGE / per_seg + 1;
+        let specs: Vec<SegSpec> = (0..nsegs)
+            .map(|_| seg(b"__S", 0, 0, vec![(b"__s", 1, 0x100, 0); per_seg]))
+            .collect();
+        let bytes = build_segments(true, &specs, &[], 0x200);
+        let img = parse(&bytes).unwrap();
+        assert!(!img.segments_complete);
+        let total: usize = img.segments.iter().map(|s| s.sections.len()).sum();
+        assert_eq!(total, MAX_SECTIONS_PER_IMAGE);
+    }
+
+    #[test]
+    fn truncated_command_walk_marks_segments_incomplete() {
+        let bytes = build_segments(true, &multi_segment_specs(), &[], 0x5000);
+        assert!(parse_all(&bytes)[0].segments_complete);
+        // Header (32) + __TEXT command (72 + 2*80 = 232) + part of __DATA's.
+        let cut = 32 + 232 + 100;
+        let imgs = parse_all(&bytes[..cut]);
+        assert_eq!(imgs.len(), 1);
+        assert!(!imgs[0].segments_complete);
+        assert_eq!(imgs[0].segments.len(), 1);
+        assert!(imgs[0].segments[0].is_named(b"__TEXT"));
+    }
+
+    #[test]
+    fn segment_cap_marks_segments_incomplete_and_walk_continues() {
+        let specs: Vec<SegSpec> = (0..MAX_SEGMENTS + 1)
+            .map(|_| seg(b"__S", 0, 0, vec![]))
+            .collect();
+        let dylib = tests_support::lc_str_command(LC_LOAD_DYLIB, "/usr/lib/after.dylib");
+        let bytes = build_segments(true, &specs, &[dylib], 0x10);
+        let img = parse(&bytes).unwrap();
+        assert!(!img.segments_complete);
+        assert_eq!(img.segments.len(), MAX_SEGMENTS);
+        assert_eq!(img.dylibs.len(), 1);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn usr_bin_true_segments_match_text_range() {
+        let bytes = std::fs::read("/usr/bin/true").unwrap();
+        let images = parse_all(&bytes);
+        assert!(!images.is_empty());
+        for img in &images {
+            let text = img
+                .segments
+                .iter()
+                .find(|s| s.is_named(b"__TEXT"))
+                .expect("__TEXT segment");
+            let sect = text
+                .sections
+                .iter()
+                .find(|s| s.is_named(b"__text"))
+                .expect("__text section");
+            assert!(sect.file_range.is_some());
+            assert_eq!(sect.file_range, img.text_range);
+            assert!(img.segments.iter().any(|s| s.is_named(b"__LINKEDIT")));
+        }
     }
 }
