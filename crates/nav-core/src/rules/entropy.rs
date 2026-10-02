@@ -56,7 +56,8 @@ const PAYLOAD_CORROBORATING_WEIGHT: i32 = 4;
 /// A region is "small text" shaped when `__text` is under 1/N of its size.
 const PAYLOAD_TEXT_RATIO: u64 = 4;
 
-/// Segments never measured as payload (§5.2, #67).
+/// Non-executable segments with these names are never measured as payload;
+/// an executable one is not exempt (§5.2, #67).
 const PAYLOAD_EXCLUDED_SEGMENTS: &[&[u8]] = &[b"__PAGEZERO", b"__LINKEDIT", b"__DWARF", b"__LLVM"];
 
 /// Segment names a toolchain emits; any other name is "non-standard".
@@ -286,7 +287,9 @@ fn payload_regions(image: &macho::MachOImage) -> Vec<PayloadRegion> {
             }
         };
     for seg in &image.segments {
-        if PAYLOAD_EXCLUDED_SEGMENTS.iter().any(|n| seg.is_named(n)) {
+        if seg.initprot & macho::VM_PROT_EXECUTE == 0
+            && PAYLOAD_EXCLUDED_SEGMENTS.iter().any(|n| seg.is_named(n))
+        {
             continue;
         }
         let seg_label = escaped_name(&seg.name);
@@ -2660,9 +2663,27 @@ mod tests {
                 payload_weight(
                     "payload-excluded",
                     &[0u8; 64],
-                    &[extra(name, 7, None, payload)]
+                    &[extra(name, 3, None, payload)]
                 ),
                 None,
+                "{}",
+                String::from_utf8_lossy(name)
+            );
+        }
+    }
+
+    #[test]
+    fn executable_segment_with_an_excluded_name_is_measured() {
+        for name in [&b"__LLVM"[..], b"__DWARF"] {
+            let name: &'static [u8] = Box::leak(name.to_vec().into_boxed_slice());
+            let payload = high_entropy_blob(80 * KIB);
+            assert_eq!(
+                payload_weight(
+                    "payload-excluded-wx",
+                    &[0u8; 64],
+                    &[extra(name, 7, None, payload)]
+                ),
+                Some(PAYLOAD_STRUCTURAL_WEIGHT),
                 "{}",
                 String::from_utf8_lossy(name)
             );
