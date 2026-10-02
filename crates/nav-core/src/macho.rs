@@ -88,6 +88,8 @@ pub const SECTION_TYPE: u32 = 0xFF;
 pub const S_ZEROFILL: u32 = 0x1;
 pub const S_GB_ZEROFILL: u32 = 0xC;
 pub const S_THREAD_LOCAL_ZEROFILL: u32 = 0x12;
+/// `mach_header.filetype` of a relocatable object (`.o`), which is never loaded.
+pub const MH_OBJECT: u32 = 0x1;
 /// `maxprot`/`initprot` bits.
 pub const VM_PROT_WRITE: u32 = 0x2;
 pub const VM_PROT_EXECUTE: u32 = 0x4;
@@ -183,6 +185,8 @@ pub struct MachOImage {
     pub is_fat: bool,
     /// True for a 64-bit image (`MH_MAGIC_64`/`MH_CIGAM_64`).
     pub is_64: bool,
+    /// `mach_header.filetype` (`MH_OBJECT`, `MH_EXECUTE`, ...).
+    pub filetype: u32,
     /// Absolute file-offset range of `__TEXT,__text`, or the `__TEXT` segment's
     /// own range if the section can't be located. Offsets into the whole file —
     /// a caller with a bounded read must clip against what it holds. `None` if
@@ -892,6 +896,7 @@ fn parse_thin(data: &[u8], base: usize, is_64: bool, be: bool, is_fat: bool) -> 
     // mach_header[_64]: magic(4), cputype(4), cpusubtype(4), filetype(4),
     // ncmds(4), sizeofcmds(4), flags(4)[, reserved(4)].
     let header_size: usize = if is_64 { 32 } else { 28 };
+    let filetype = r.u32(base.checked_add(12)?)?;
     let ncmds = r.u32(base.checked_add(16)?)?;
     let sizeofcmds = r.u32(base.checked_add(20)?)? as usize;
     if ncmds > MAX_NCMDS {
@@ -997,6 +1002,7 @@ fn parse_thin(data: &[u8], base: usize, is_64: bool, be: bool, is_fat: bool) -> 
     }
 
     Some(MachOImage {
+        filetype,
         is_fat,
         is_64,
         text_range,
@@ -1379,7 +1385,8 @@ pub(crate) mod tests_support {
     use super::{
         CSMAGIC_BLOBWRAPPER, CSMAGIC_CODEDIRECTORY, CSMAGIC_EMBEDDED_ENTITLEMENTS,
         CSMAGIC_EMBEDDED_SIGNATURE, CSSLOT_CODEDIRECTORY, CSSLOT_ENTITLEMENTS,
-        CSSLOT_SIGNATURESLOT, FAT_MAGIC, LC_CODE_SIGNATURE, LC_LOAD_DYLIB, LC_RPATH, LC_SEGMENT_64,
+        CSSLOT_SIGNATURESLOT, FAT_MAGIC, LC_CODE_SIGNATURE, LC_LOAD_DYLIB, LC_RPATH, LC_SEGMENT,
+        LC_SEGMENT_64, MH_CIGAM, MH_CIGAM_64,
     };
     use std::ops::Range;
 
@@ -1955,15 +1962,138 @@ pub(crate) mod tests_support {
 
         v
     }
+
+    /// (sectname, size, file offset, flags)
+    pub(crate) type SectSpec = (&'static [u8], u64, u32, u32);
+
+    pub(crate) struct SegSpec {
+        pub(crate) name: &'static [u8],
+        pub(crate) fileoff: u64,
+        pub(crate) filesize: u64,
+        pub(crate) maxprot: u32,
+        pub(crate) initprot: u32,
+        /// Overrides the declared `nsects` (default: `sects.len()`).
+        pub(crate) nsects: Option<u32>,
+        pub(crate) sects: Vec<SectSpec>,
+    }
+
+    pub(crate) fn seg(
+        name: &'static [u8],
+        fileoff: u64,
+        filesize: u64,
+        sects: Vec<SectSpec>,
+    ) -> SegSpec {
+        SegSpec {
+            name,
+            fileoff,
+            filesize,
+            maxprot: 7,
+            initprot: 5,
+            nsects: None,
+            sects,
+        }
+    }
+
+    pub(crate) fn name16(n: &[u8]) -> [u8; 16] {
+        let mut b = [0u8; 16];
+        b[..n.len()].copy_from_slice(n);
+        b
+    }
+
+    /// Little-endian Mach-O (header, segment commands, then `tail` raw
+    /// load commands counted in `ncmds`), padded with zeros to `total` bytes.
+    pub(crate) fn build_segments(
+        is_64: bool,
+        segs: &[SegSpec],
+        tail: &[Vec<u8>],
+        total: usize,
+    ) -> Vec<u8> {
+        build_segments_typed(is_64, 2, segs, tail, total)
+    }
+
+    /// [`build_segments`] with an explicit `mach_header.filetype`.
+    pub(crate) fn build_segments_typed(
+        is_64: bool,
+        filetype: u32,
+        segs: &[SegSpec],
+        tail: &[Vec<u8>],
+        total: usize,
+    ) -> Vec<u8> {
+        let mut cmds = Vec::new();
+        for sg in segs {
+            let (hdr, stride) = if is_64 { (72usize, 80usize) } else { (56, 68) };
+            let mut c = Vec::new();
+            c.extend_from_slice(&(if is_64 { LC_SEGMENT_64 } else { LC_SEGMENT }).to_le_bytes());
+            c.extend_from_slice(&((hdr + stride * sg.sects.len()) as u32).to_le_bytes());
+            c.extend_from_slice(&name16(sg.name));
+            if is_64 {
+                c.extend_from_slice(&0u64.to_le_bytes()); // vmaddr
+                c.extend_from_slice(&0u64.to_le_bytes()); // vmsize
+                c.extend_from_slice(&sg.fileoff.to_le_bytes());
+                c.extend_from_slice(&sg.filesize.to_le_bytes());
+            } else {
+                c.extend_from_slice(&0u32.to_le_bytes());
+                c.extend_from_slice(&0u32.to_le_bytes());
+                c.extend_from_slice(&(sg.fileoff as u32).to_le_bytes());
+                c.extend_from_slice(&(sg.filesize as u32).to_le_bytes());
+            }
+            c.extend_from_slice(&sg.maxprot.to_le_bytes());
+            c.extend_from_slice(&sg.initprot.to_le_bytes());
+            let nsects = sg.nsects.unwrap_or(sg.sects.len() as u32);
+            c.extend_from_slice(&nsects.to_le_bytes());
+            c.extend_from_slice(&0u32.to_le_bytes()); // flags
+            for (name, size, offset, flags) in &sg.sects {
+                c.extend_from_slice(&name16(name));
+                c.extend_from_slice(&name16(sg.name));
+                if is_64 {
+                    c.extend_from_slice(&0u64.to_le_bytes()); // addr
+                    c.extend_from_slice(&size.to_le_bytes());
+                } else {
+                    c.extend_from_slice(&0u32.to_le_bytes());
+                    c.extend_from_slice(&(*size as u32).to_le_bytes());
+                }
+                c.extend_from_slice(&offset.to_le_bytes());
+                c.extend_from_slice(&0u32.to_le_bytes()); // align
+                c.extend_from_slice(&0u32.to_le_bytes()); // reloff
+                c.extend_from_slice(&0u32.to_le_bytes()); // nreloc
+                c.extend_from_slice(&flags.to_le_bytes());
+                c.extend_from_slice(&0u32.to_le_bytes()); // reserved1
+                c.extend_from_slice(&0u32.to_le_bytes()); // reserved2
+                if is_64 {
+                    c.extend_from_slice(&0u32.to_le_bytes()); // reserved3
+                }
+            }
+            assert_eq!(c.len(), hdr + stride * sg.sects.len());
+            cmds.extend_from_slice(&c);
+        }
+        for t in tail {
+            cmds.extend_from_slice(t);
+        }
+        let mut v = Vec::new();
+        v.extend_from_slice(&(if is_64 { MH_CIGAM_64 } else { MH_CIGAM }).to_be_bytes());
+        v.extend_from_slice(&[0u8; 8]); // cputype, cpusubtype
+        v.extend_from_slice(&filetype.to_le_bytes());
+        v.extend_from_slice(&((segs.len() + tail.len()) as u32).to_le_bytes());
+        v.extend_from_slice(&(cmds.len() as u32).to_le_bytes());
+        v.extend_from_slice(&0u32.to_le_bytes());
+        if is_64 {
+            v.extend_from_slice(&0u32.to_le_bytes());
+        }
+        v.extend_from_slice(&cmds);
+        if v.len() < total {
+            v.resize(total, 0);
+        }
+        v
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::tests_support::{
-        synth_fat, synth_fat_with_bogus_arches, synth_fat_with_duplicate_offsets, synth_macho_64,
-        synth_macho_64_duplicate_code_signature, synth_macho_64_full,
-        synth_macho_64_full_with_cd_flags, synth_macho_64_full_with_cds,
-        synth_macho_64_full_with_cds_and_cms,
+        build_segments, seg, synth_fat, synth_fat_with_bogus_arches,
+        synth_fat_with_duplicate_offsets, synth_macho_64, synth_macho_64_duplicate_code_signature,
+        synth_macho_64_full, synth_macho_64_full_with_cd_flags, synth_macho_64_full_with_cds,
+        synth_macho_64_full_with_cds_and_cms, SegSpec,
     };
     use super::*;
 
@@ -2852,105 +2982,12 @@ mod tests {
         assert!(scan.fully_examined());
     }
 
-    /// (sectname, size, file offset, flags)
-    type SectSpec = (&'static [u8], u64, u32, u32);
-
-    struct SegSpec {
-        name: &'static [u8],
-        fileoff: u64,
-        filesize: u64,
-        maxprot: u32,
-        initprot: u32,
-        /// Overrides the declared `nsects` (default: `sects.len()`).
-        nsects: Option<u32>,
-        sects: Vec<SectSpec>,
-    }
-
-    fn seg(name: &'static [u8], fileoff: u64, filesize: u64, sects: Vec<SectSpec>) -> SegSpec {
-        SegSpec {
-            name,
-            fileoff,
-            filesize,
-            maxprot: 7,
-            initprot: 5,
-            nsects: None,
-            sects,
-        }
-    }
-
-    fn name16(n: &[u8]) -> [u8; 16] {
-        let mut b = [0u8; 16];
-        b[..n.len()].copy_from_slice(n);
-        b
-    }
-
-    /// Little-endian Mach-O (header, segment commands, then `tail` raw
-    /// load commands counted in `ncmds`), padded with zeros to `total` bytes.
-    fn build_segments(is_64: bool, segs: &[SegSpec], tail: &[Vec<u8>], total: usize) -> Vec<u8> {
-        let mut cmds = Vec::new();
-        for sg in segs {
-            let (hdr, stride) = if is_64 { (72usize, 80usize) } else { (56, 68) };
-            let mut c = Vec::new();
-            c.extend_from_slice(&(if is_64 { LC_SEGMENT_64 } else { LC_SEGMENT }).to_le_bytes());
-            c.extend_from_slice(&((hdr + stride * sg.sects.len()) as u32).to_le_bytes());
-            c.extend_from_slice(&name16(sg.name));
-            if is_64 {
-                c.extend_from_slice(&0u64.to_le_bytes()); // vmaddr
-                c.extend_from_slice(&0u64.to_le_bytes()); // vmsize
-                c.extend_from_slice(&sg.fileoff.to_le_bytes());
-                c.extend_from_slice(&sg.filesize.to_le_bytes());
-            } else {
-                c.extend_from_slice(&0u32.to_le_bytes());
-                c.extend_from_slice(&0u32.to_le_bytes());
-                c.extend_from_slice(&(sg.fileoff as u32).to_le_bytes());
-                c.extend_from_slice(&(sg.filesize as u32).to_le_bytes());
-            }
-            c.extend_from_slice(&sg.maxprot.to_le_bytes());
-            c.extend_from_slice(&sg.initprot.to_le_bytes());
-            let nsects = sg.nsects.unwrap_or(sg.sects.len() as u32);
-            c.extend_from_slice(&nsects.to_le_bytes());
-            c.extend_from_slice(&0u32.to_le_bytes()); // flags
-            for (name, size, offset, flags) in &sg.sects {
-                c.extend_from_slice(&name16(name));
-                c.extend_from_slice(&name16(sg.name));
-                if is_64 {
-                    c.extend_from_slice(&0u64.to_le_bytes()); // addr
-                    c.extend_from_slice(&size.to_le_bytes());
-                } else {
-                    c.extend_from_slice(&0u32.to_le_bytes());
-                    c.extend_from_slice(&(*size as u32).to_le_bytes());
-                }
-                c.extend_from_slice(&offset.to_le_bytes());
-                c.extend_from_slice(&0u32.to_le_bytes()); // align
-                c.extend_from_slice(&0u32.to_le_bytes()); // reloff
-                c.extend_from_slice(&0u32.to_le_bytes()); // nreloc
-                c.extend_from_slice(&flags.to_le_bytes());
-                c.extend_from_slice(&0u32.to_le_bytes()); // reserved1
-                c.extend_from_slice(&0u32.to_le_bytes()); // reserved2
-                if is_64 {
-                    c.extend_from_slice(&0u32.to_le_bytes()); // reserved3
-                }
-            }
-            assert_eq!(c.len(), hdr + stride * sg.sects.len());
-            cmds.extend_from_slice(&c);
-        }
-        for t in tail {
-            cmds.extend_from_slice(t);
-        }
-        let mut v = Vec::new();
-        v.extend_from_slice(&(if is_64 { MH_CIGAM_64 } else { MH_CIGAM }).to_be_bytes());
-        v.extend_from_slice(&[0u8; 12]); // cputype, cpusubtype, filetype
-        v.extend_from_slice(&((segs.len() + tail.len()) as u32).to_le_bytes());
-        v.extend_from_slice(&(cmds.len() as u32).to_le_bytes());
-        v.extend_from_slice(&0u32.to_le_bytes());
-        if is_64 {
-            v.extend_from_slice(&0u32.to_le_bytes());
-        }
-        v.extend_from_slice(&cmds);
-        if v.len() < total {
-            v.resize(total, 0);
-        }
-        v
+    #[test]
+    fn filetype_is_read_from_the_header() {
+        let bytes = build_segments(true, &multi_segment_specs(), &[], 0x5000);
+        assert_eq!(parse(&bytes).unwrap().filetype, 2);
+        let obj = tests_support::build_segments_typed(true, MH_OBJECT, &[], &[], 0x100);
+        assert_eq!(parse(&obj).unwrap().filetype, MH_OBJECT);
     }
 
     fn multi_segment_specs() -> Vec<SegSpec> {
