@@ -153,6 +153,14 @@
     ],
     "completeness": "complete"
   },
+  "benign/macho_compressed_const_tables": {
+    "score": 4,
+    "recommendation": "no-action",
+    "rule_ids": [
+      "unsigned-binary"
+    ],
+    "completeness": "complete"
+  },
   "benign/macho_dense_simd_text": {
     "score": 8,
     "recommendation": "no-action",
@@ -183,6 +191,15 @@
     "score": 4,
     "recommendation": "no-action",
     "rule_ids": [
+      "unsigned-binary"
+    ],
+    "completeness": "complete"
+  },
+  "benign/macho_text_with_encrypted_block": {
+    "score": 8,
+    "recommendation": "no-action",
+    "rule_ids": [
+      "high-entropy-content",
       "unsigned-binary"
     ],
     "completeness": "complete"
@@ -389,6 +406,24 @@
     ],
     "completeness": "complete"
   },
+  "suspicious/macho_custom_segment_payload": {
+    "score": 19,
+    "recommendation": "notify",
+    "rule_ids": [
+      "high-entropy-content",
+      "unsigned-binary"
+    ],
+    "completeness": "complete"
+  },
+  "suspicious/macho_data_payload_stub": {
+    "score": 8,
+    "recommendation": "no-action",
+    "rule_ids": [
+      "high-entropy-content",
+      "unsigned-binary"
+    ],
+    "completeness": "complete"
+  },
   "suspicious/macho_duplicate_code_signature": {
     "score": 4,
     "recommendation": "no-action",
@@ -454,6 +489,15 @@
     "recommendation": "notify",
     "rule_ids": [
       "macho-loader-anomaly",
+      "unsigned-binary"
+    ],
+    "completeness": "complete"
+  },
+  "suspicious/macho_wx_segment_payload": {
+    "score": 19,
+    "recommendation": "notify",
+    "rule_ids": [
+      "high-entropy-content",
       "unsigned-binary"
     ],
     "completeness": "complete"

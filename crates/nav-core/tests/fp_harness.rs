@@ -139,6 +139,10 @@ const SUB_THRESHOLD_ALLOWLIST: &[(&str, &str)] = &[
         "suspicious/adhoc_named_flags=0x20000",
         "exercises a parser edge case, not a complete malicious sample",
     ),
+    (
+        "suspicious/macho_data_payload_stub",
+        "payload in a standard segment is corroboration-only (§5.2, #67); needs a second signal",
+    ),
 ];
 
 fn sub_threshold_reason(key: &str) -> Option<&'static str> {
