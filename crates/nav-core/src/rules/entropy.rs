@@ -11,7 +11,7 @@
 //!   entropy and is deliberately not this rule's signal (issue #35).
 //! - **any other opaque binary**: not scored — expected to be high-entropy.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::ops::Range;
 
 use super::{Rule, RuleOutcome};
@@ -41,6 +41,9 @@ const TEXT_PACKED_WEIGHT: i32 = 15;
 /// Smallest file range a payload region may have, and so the window size
 /// it is scored on (§5.2, #67).
 const PAYLOAD_MIN_BYTES: u64 = 64 * 1024;
+
+/// Most payload regions measured per file; the rest count as left out (§11.9).
+const MAX_PAYLOAD_REGIONS: usize = 4096;
 
 /// A payload region's window entropy needs at least this to fire.
 const PAYLOAD_WINDOW_THRESHOLD: f64 = TEXT_PACKED_THRESHOLD;
@@ -277,39 +280,41 @@ fn payload_regions(ctx: &ScanContext, image: &macho::MachOImage) -> Vec<PayloadR
         .map(|r| clip_to_file_len(ctx, r))
         .unwrap_or(0..0);
     let mut out = Vec::new();
-    let mut push =
-        |range: &Range<u64>, writable_executable: bool, non_standard: bool, label: String| {
-            let len = range.end - range.start;
-            let overlap = text
-                .end
-                .min(range.end)
-                .saturating_sub(text.start.max(range.start));
-            let text_len = text.end - text.start - overlap;
-            let small_text = text_len.saturating_mul(PAYLOAD_TEXT_RATIO) < len;
-            if len >= PAYLOAD_MIN_BYTES && (writable_executable || non_standard || small_text) {
-                out.push(PayloadRegion {
-                    range: range.clone(),
-                    writable_executable,
-                    non_standard,
-                    small_text,
-                    label,
-                    text_len,
-                });
-            }
-        };
+    let mut push = |range: &Range<u64>,
+                    writable_executable: bool,
+                    non_standard: bool,
+                    label: &dyn Fn() -> String| {
+        let len = range.end - range.start;
+        let overlap = text
+            .end
+            .min(range.end)
+            .saturating_sub(text.start.max(range.start));
+        let text_len = text.end - text.start - overlap;
+        let small_text = text_len.saturating_mul(PAYLOAD_TEXT_RATIO) < len;
+        if len >= PAYLOAD_MIN_BYTES && (writable_executable || non_standard || small_text) {
+            out.push(PayloadRegion {
+                range: range.clone(),
+                writable_executable,
+                non_standard,
+                small_text,
+                label: label(),
+                text_len,
+            });
+        }
+    };
     for seg in &image.segments {
         if seg.initprot & macho::VM_PROT_EXECUTE == 0
             && PAYLOAD_EXCLUDED_SEGMENTS.iter().any(|n| seg.is_named(n))
         {
             continue;
         }
-        let seg_label = escaped_name(&seg.name);
+        let seg_label = || escaped_name(&seg.name);
         let non_standard = !STANDARD_SEGMENTS.iter().any(|n| seg.is_named(n));
         let wx = seg.initprot & (macho::VM_PROT_WRITE | macho::VM_PROT_EXECUTE)
             == (macho::VM_PROT_WRITE | macho::VM_PROT_EXECUTE);
         if wx || non_standard {
             if let Some(range) = &seg.file_range {
-                push(range, wx, non_standard, seg_label);
+                push(range, wx, non_standard, &seg_label);
             }
         } else if seg.sections.is_empty() {
             // A section-less segment that is itself the `__text` fallback.
@@ -318,7 +323,7 @@ fn payload_regions(ctx: &ScanContext, image: &macho::MachOImage) -> Vec<PayloadR
                 .as_ref()
                 .filter(|r| image.text_range.as_ref() != Some(*r))
             {
-                push(range, false, false, seg_label);
+                push(range, false, false, &seg_label);
             }
         } else {
             for sect in &seg.sections {
@@ -328,8 +333,8 @@ fn payload_regions(ctx: &ScanContext, image: &macho::MachOImage) -> Vec<PayloadR
                 if image.text_range.as_ref() == Some(range) {
                     continue;
                 }
-                let label = format!("{seg_label},{}", escaped_name(&sect.name));
-                push(range, false, false, label);
+                let label = || format!("{},{}", seg_label(), escaped_name(&sect.name));
+                push(range, false, false, &label);
             }
         }
     }
@@ -347,13 +352,17 @@ type Candidate = (Option<PayloadRegion>, Range<u64>);
 /// only its resident part (inside `ctx`'s held content) if that fits, else
 /// it is skipped. Returns the included candidates (with the clipped or
 /// resident range) and whether every non-empty range was included whole.
-/// Shared by evaluate and `covers_truncation` so they can't disagree.
+/// More than [`MAX_PAYLOAD_REGIONS`] distinct payload regions leaves the
+/// rest out (`false`). Shared by evaluate and `covers_truncation` so they
+/// can't disagree.
 fn budgeted_ranges(ctx: &ScanContext, images: &[macho::MachOImage]) -> (Vec<Candidate>, bool) {
     let held = ctx.content.as_ref().map_or(0, |c| c.len() as u64);
     let mut seen = HashSet::new();
     let mut texts: Vec<Candidate> = Vec::new();
     // Payload regions deduped by clipped range, keeping the heaviest.
     let mut payloads: Vec<Candidate> = Vec::new();
+    let mut payload_index: HashMap<(u64, u64), usize> = HashMap::new();
+    let mut capped = false;
     for image in images {
         if let Some(range) = image.text_range.clone() {
             let range = clip_to_file_len(ctx, range);
@@ -366,9 +375,9 @@ fn budgeted_ranges(ctx: &ScanContext, images: &[macho::MachOImage]) -> (Vec<Cand
             if range.is_empty() {
                 continue;
             }
-            let same = payloads.iter_mut().find(|(_, r)| *r == range);
-            match same {
-                Some((existing, _)) => {
+            match payload_index.get(&(range.start, range.end)) {
+                Some(&i) => {
+                    let existing = &mut payloads[i].0;
                     if existing
                         .as_ref()
                         .is_some_and(|e| region.weight() > e.weight())
@@ -376,7 +385,11 @@ fn budgeted_ranges(ctx: &ScanContext, images: &[macho::MachOImage]) -> (Vec<Cand
                         *existing = Some(region);
                     }
                 }
-                None => payloads.push((Some(region), range)),
+                None if payloads.len() >= MAX_PAYLOAD_REGIONS => capped = true,
+                None => {
+                    payload_index.insert((range.start, range.end), payloads.len());
+                    payloads.push((Some(region), range));
+                }
             }
         }
     }
@@ -394,7 +407,7 @@ fn budgeted_ranges(ctx: &ScanContext, images: &[macho::MachOImage]) -> (Vec<Cand
     }
     let mut included = Vec::new();
     let mut total = 0u64;
-    let mut all_scored = true;
+    let mut all_scored = !capped;
     for (region, range) in texts.into_iter().chain(payloads) {
         let is_payload = region.is_some();
         let remaining = MAX_STREAM_BYTES - total;
@@ -2748,6 +2761,31 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(signal.weight, PAYLOAD_STRUCTURAL_WEIGHT);
+    }
+
+    #[test]
+    fn payload_region_count_is_capped() {
+        const SEGMENTS: u64 = 50_000;
+        const LEN: u64 = PAYLOAD_MIN_BYTES;
+        let (bytes, _) = crate::macho::tests_support::synth_macho_64(&[0u8; 64]);
+        let mut ctx = make_ctx("many-regions", bytes);
+        let mut image = ctx.macho().images[0].clone();
+        ctx.file_len = Some(SEGMENTS * LEN);
+        image.text_range = None;
+        image.segments = (0..SEGMENTS)
+            .map(|i| macho::Segment {
+                name: *b"__PACK\0\0\0\0\0\0\0\0\0\0",
+                file_range: Some(i * LEN..(i + 1) * LEN),
+                maxprot: 7,
+                initprot: 5,
+                sections: vec![],
+            })
+            .collect();
+        image.segments_complete = true;
+        assert_eq!(payload_regions(&ctx, &image).len(), SEGMENTS as usize);
+        let (included, all_scored) = budgeted_ranges(&ctx, &[image]);
+        assert_eq!(included.len(), MAX_PAYLOAD_REGIONS);
+        assert!(!all_scored);
     }
 
     #[test]
