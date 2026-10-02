@@ -195,6 +195,15 @@
     ],
     "completeness": "complete"
   },
+  "benign/macho_text_with_encrypted_block": {
+    "score": 8,
+    "recommendation": "no-action",
+    "rule_ids": [
+      "high-entropy-content",
+      "unsigned-binary"
+    ],
+    "completeness": "complete"
+  },
   "benign/pdf_with_binary_stream.pdf": {
     "score": 5,
     "recommendation": "no-action",
