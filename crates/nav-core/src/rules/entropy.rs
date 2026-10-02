@@ -188,7 +188,7 @@ fn declares_range_past_a_non_authoritative_capture(
     let file_len = ctx.file_len.unwrap_or(0);
     images.iter().any(|image| {
         image.text_range.as_ref().is_some_and(|r| r.end > file_len)
-            || payload_regions(image)
+            || payload_regions(ctx, image)
                 .iter()
                 .any(|r| r.range.end > file_len)
     })
@@ -207,7 +207,7 @@ struct PayloadRegion {
     small_text: bool,
     /// Escaped `__SEG` or `__SEG,__sect`, safe to embed in a description.
     label: String,
-    /// Length of the image's `__text` range (0 if none).
+    /// Length of the image's clipped `__text` outside this region.
     text_len: u64,
 }
 
@@ -264,16 +264,27 @@ fn escaped_name(raw: &[u8; 16]) -> String {
 /// least [`PAYLOAD_MIN_BYTES`] with at least one shape qualifier — a
 /// writable+executable segment, a non-standard segment name, or a `__text`
 /// much smaller than the region (§5.2, #67).
-fn payload_regions(image: &macho::MachOImage) -> Vec<PayloadRegion> {
+fn payload_regions(ctx: &ScanContext, image: &macho::MachOImage) -> Vec<PayloadRegion> {
     // An object file is never loaded; its single unnamed rwx segment is normal.
     if image.filetype == macho::MH_OBJECT {
         return Vec::new();
     }
-    let text_len = image.text_range.as_ref().map_or(0, |r| r.end - r.start);
+    // EOF-clipped, and per region minus its overlap with the region: a
+    // declared-huge `__text` header must not hide a small stub.
+    let text = image
+        .text_range
+        .clone()
+        .map(|r| clip_to_file_len(ctx, r))
+        .unwrap_or(0..0);
     let mut out = Vec::new();
     let mut push =
         |range: &Range<u64>, writable_executable: bool, non_standard: bool, label: String| {
             let len = range.end - range.start;
+            let overlap = text
+                .end
+                .min(range.end)
+                .saturating_sub(text.start.max(range.start));
+            let text_len = text.end - text.start - overlap;
             let small_text = text_len.saturating_mul(PAYLOAD_TEXT_RATIO) < len;
             if len >= PAYLOAD_MIN_BYTES && (writable_executable || non_standard || small_text) {
                 out.push(PayloadRegion {
@@ -301,7 +312,12 @@ fn payload_regions(image: &macho::MachOImage) -> Vec<PayloadRegion> {
                 push(range, wx, non_standard, seg_label);
             }
         } else if seg.sections.is_empty() {
-            if let Some(range) = &seg.file_range {
+            // A section-less segment that is itself the `__text` fallback.
+            if let Some(range) = seg
+                .file_range
+                .as_ref()
+                .filter(|r| image.text_range.as_ref() != Some(*r))
+            {
                 push(range, false, false, seg_label);
             }
         } else {
@@ -345,7 +361,7 @@ fn budgeted_ranges(ctx: &ScanContext, images: &[macho::MachOImage]) -> (Vec<Cand
                 texts.push((None, range));
             }
         }
-        for region in payload_regions(image) {
+        for region in payload_regions(ctx, image) {
             let range = clip_to_file_len(ctx, region.range.clone());
             if range.is_empty() {
                 continue;
@@ -2691,6 +2707,50 @@ mod tests {
     }
 
     #[test]
+    fn inflated_text_size_does_not_hide_a_small_stub() {
+        let payload = high_entropy_blob(80 * KIB);
+        let total = PAYLOAD_AT as usize + payload.len();
+        let mut text_seg = seg(
+            b"__TEXT",
+            TEXT_OFF,
+            64,
+            vec![(b"__text", 1u64 << 40, total as u32 - 16, 0x8000_0400)],
+        );
+        text_seg.initprot = 5;
+        let mut pack = seg(b"__PACK", PAYLOAD_AT, payload.len() as u64, vec![]);
+        pack.initprot = 5;
+        let mut bytes = build_segments(true, &[text_seg, pack], &[], total);
+        bytes[PAYLOAD_AT as usize..].copy_from_slice(&payload);
+        let signal = eval_bytes("payload-inflated-text", &bytes)
+            .unwrap()
+            .unwrap();
+        assert_eq!(signal.weight, PAYLOAD_STRUCTURAL_WEIGHT);
+    }
+
+    #[test]
+    fn text_header_spanning_the_payload_does_not_hide_a_small_stub() {
+        let payload = high_entropy_blob(80 * KIB);
+        // Payload right after the real stub, so little of the span is non-payload.
+        let at = 0x2000u64;
+        let total = at as usize + payload.len();
+        let mut text_seg = seg(
+            b"__TEXT",
+            TEXT_OFF,
+            64,
+            vec![(b"__text", 1u64 << 40, TEXT_OFF as u32, 0x8000_0400)],
+        );
+        text_seg.initprot = 5;
+        let mut pack = seg(b"__PACK", at, payload.len() as u64, vec![]);
+        pack.initprot = 5;
+        let mut bytes = build_segments(true, &[text_seg, pack], &[], total);
+        bytes[at as usize..].copy_from_slice(&payload);
+        let signal = eval_bytes("payload-spanning-text", &bytes)
+            .unwrap()
+            .unwrap();
+        assert_eq!(signal.weight, PAYLOAD_STRUCTURAL_WEIGHT);
+    }
+
+    #[test]
     fn qualifying_region_under_64kib_is_not_measured() {
         let payload = high_entropy_blob(64 * KIB - 1);
         assert_eq!(
@@ -2870,7 +2930,7 @@ mod tests {
         let streamed = HighEntropyRule.evaluate(&ctx).unwrap().unwrap();
         assert!(HighEntropyRule.covers_truncation(&ctx));
 
-        let regions = payload_regions(&ctx.macho().images[0]);
+        let regions = payload_regions(&ctx, &ctx.macho().images[0]);
         let (_, resident) = HighEntropyRule
             .macho_signal_from_content(&bytes, regions[0].range.clone(), Some(&regions[0]))
             .unwrap();
@@ -2904,7 +2964,7 @@ mod tests {
         let ctx = ScanContext::load(&path);
         let image = &ctx.macho().images[0];
         assert_eq!(image.filetype, macho::MH_OBJECT);
-        assert!(payload_regions(image).is_empty());
+        assert!(payload_regions(&ctx, image).is_empty());
         assert!(HighEntropyRule.evaluate(&ctx).unwrap().is_none());
         let _ = std::fs::remove_file(&path);
     }
