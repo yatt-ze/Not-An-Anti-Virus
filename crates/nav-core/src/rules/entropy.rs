@@ -1,7 +1,9 @@
 //! High-entropy content detection — a weak generic signal on its own (§5.1).
 //!
 //! Structure-aware, not whole-file (§5.2):
-//! - **Mach-O**: scores the `__TEXT` code section.
+//! - **Mach-O**: scores the `__TEXT` code section as a whole, and its 64 KiB
+//!   windows for a packed region inside otherwise ordinary code (a window
+//!   alone only reaches the elevated tier).
 //! - **script/text**: scores the whole content first (weight 15), then a
 //!   base64-encoded payload's *decoded* bytes (weight 8, corroboration-only
 //!   — see [`BASE64_PAYLOAD_WEIGHT`]). Base64 of plain text decodes to low
@@ -27,12 +29,17 @@ const ENTROPY_THRESHOLD: f64 = 7.0;
 /// (full weight); see §5.2.
 const TEXT_PACKED_THRESHOLD: f64 = 7.5;
 
-/// `__TEXT` entropy from [`ENTROPY_THRESHOLD`] up to [`TEXT_PACKED_THRESHOLD`]
-/// (dense SIMD code or partial packing): corroboration-only weight (§5.2).
+/// Weight of a `__TEXT` section from [`ENTROPY_THRESHOLD`] up to
+/// [`TEXT_PACKED_THRESHOLD`] (dense SIMD code, partial packing), or with a
+/// window at or above it: corroboration-only (§5.2).
 const TEXT_ELEVATED_WEIGHT: i32 = 4;
 
-/// Weight of a `__TEXT` section at or above [`TEXT_PACKED_THRESHOLD`].
+/// Weight of a whole `__TEXT` section at or above [`TEXT_PACKED_THRESHOLD`].
 const TEXT_PACKED_WEIGHT: i32 = 15;
+
+/// Block size for window scoring: a window is two consecutive blocks (64 KiB,
+/// stride one block), aligned to the start of the scored range.
+const WINDOW_BLOCK_BYTES: usize = 32 * 1024;
 
 /// A base64 run shorter than this (alphabet characters, `=` and line breaks
 /// not counted) is too small to be a meaningful embedded payload rather than
@@ -207,9 +214,9 @@ fn budgeted_text_ranges<'a>(
 impl HighEntropyRule {
     /// Score every image's `__TEXT` code (a fat binary can hide a packed
     /// slice behind a clean one, §5.2) and report the single strongest —
-    /// the highest-entropy slice that clears the threshold. Returns
+    /// highest weight, then highest entropy. Returns
     /// `NotApplicable` when a range was left unscored (budget) or scored
-    /// prefix-only (failed stream) and there is no packed-tier match
+    /// prefix-only (failed stream) and there is no whole-section packed match
     /// (§10/§11.8).
     fn eval_macho_images(
         &self,
@@ -224,7 +231,10 @@ impl HighEntropyRule {
             let (scored, complete) = self.eval_macho_text(ctx, content, range);
             whole &= complete;
             if let Some((entropy, signal)) = scored {
-                if best.as_ref().map_or(true, |(b, _)| entropy > *b) {
+                let better = best
+                    .as_ref()
+                    .map_or(true, |(b, s)| (signal.weight, entropy) > (s.weight, *b));
+                if better {
                     best = Some((entropy, signal));
                 }
             }
@@ -243,10 +253,10 @@ impl HighEntropyRule {
     /// Score one `__TEXT` range from [`budgeted_text_ranges`] (EOF-clipped,
     /// at most `MAX_STREAM_BYTES`): read from `content` when resident, else
     /// streamed; if the stream fails, only the part inside `content` is
-    /// scored and the failure is recorded. Returns the entropy alongside the
-    /// signal so the caller can compare candidates across a fat binary's
-    /// slices, and whether the whole range was scored (`false` after a failed
-    /// stream).
+    /// scored and the failure is recorded. Returns the signal with its
+    /// entropy (whole-section, or the window's for the windowed tier) for
+    /// comparing slices, and whether the whole range was scored (`false`
+    /// after a failed stream).
     fn eval_macho_text(
         &self,
         ctx: &ScanContext,
@@ -259,16 +269,12 @@ impl HighEntropyRule {
             return (self.macho_signal_from_content(content, range), true);
         }
 
-        let mut counts = [0u64; 256];
-        let mut total = 0u64;
+        let mut acc = TextEntropy::new();
         let delivered = ctx.for_each_window(range.clone(), 0, |window, _is_last| {
-            for &b in window {
-                counts[b as usize] += 1;
-            }
-            total += window.len() as u64;
+            acc.feed(window);
         });
         if delivered {
-            return (self.macho_signal(&counts, total), true);
+            return (self.macho_signal(acc), true);
         }
         // The stream failed (or ranged reads are unavailable) — fall back to
         // what the captured prefix can still show rather than discarding a
@@ -293,42 +299,56 @@ impl HighEntropyRule {
             .ok()
             .map(|e| e.min(content.len()));
         let text = start.zip(end).and_then(|(s, e)| content.get(s..e))?;
-        let mut counts = [0u64; 256];
-        for &b in text {
-            counts[b as usize] += 1;
-        }
-        self.macho_signal(&counts, text.len() as u64)
+        let mut acc = TextEntropy::new();
+        acc.feed(text);
+        self.macho_signal(acc)
     }
 
-    /// Build the tiered `__TEXT`-section signal, and the bias-corrected
-    /// entropy it was built from, for a histogram over `len` bytes. Needs
-    /// [`MIN_SAMPLE_BYTES`] and the corrected entropy at or above
-    /// [`ENTROPY_THRESHOLD`]; the tier and the description use the corrected
-    /// value (§5.2). Shared by the streamed and content-only paths.
-    fn macho_signal(&self, counts: &[u64; 256], len: u64) -> Option<(f64, MatchedSignal)> {
-        let entropy = miller_madow_entropy(counts, len);
-        if len < MIN_SAMPLE_BYTES as u64 || entropy < ENTROPY_THRESHOLD {
+    /// Build the tiered `__TEXT` signal and the entropy it was decided on
+    /// from a fully fed accumulator. Needs [`MIN_SAMPLE_BYTES`]; tiers use
+    /// bias-corrected entropy (§5.2): whole section at or above
+    /// [`TEXT_PACKED_THRESHOLD`] is packed, at or above [`ENTROPY_THRESHOLD`]
+    /// is elevated, else a window at or above the packed threshold is
+    /// elevated. Shared by the streamed and resident paths.
+    fn macho_signal(&self, acc: TextEntropy) -> Option<(f64, MatchedSignal)> {
+        let (counts, len, max_window) = acc.finish();
+        if len < MIN_SAMPLE_BYTES as u64 {
             return None;
         }
-        let (weight, what) = if entropy >= TEXT_PACKED_THRESHOLD {
+        let entropy = miller_madow_entropy(&counts, len);
+        let (weight, shown, description) = if entropy >= TEXT_PACKED_THRESHOLD {
             (
                 TEXT_PACKED_WEIGHT,
-                "high-entropy __TEXT section — consistent with packed/obfuscated code",
+                entropy,
+                format!(
+                    "high-entropy __TEXT section — consistent with packed/obfuscated code (entropy: {entropy:.2} bits/byte, bias-corrected, over {len} bytes)"
+                ),
             )
-        } else {
+        } else if entropy >= ENTROPY_THRESHOLD {
             (
                 TEXT_ELEVATED_WEIGHT,
-                "elevated __TEXT entropy — dense/SIMD code or partial packing",
+                entropy,
+                format!(
+                    "elevated __TEXT entropy — dense/SIMD code or partial packing (entropy: {entropy:.2} bits/byte, bias-corrected, over {len} bytes)"
+                ),
+            )
+        } else {
+            let window = max_window.filter(|&w| w >= TEXT_PACKED_THRESHOLD)?;
+            (
+                TEXT_ELEVATED_WEIGHT,
+                window,
+                format!(
+                    "high-entropy region inside __TEXT section — packed payload or embedded data (window entropy: {window:.2} bits/byte over {} KiB; section {entropy:.2} over {len} bytes)",
+                    2 * WINDOW_BLOCK_BYTES / 1024
+                ),
             )
         };
         Some((
-            entropy,
+            shown,
             MatchedSignal {
                 id: self.id().to_string(),
                 weight,
-                description: format!(
-                    "{what} (entropy: {entropy:.2} bits/byte, bias-corrected, over {len} bytes)"
-                ),
+                description,
                 category: self.category(),
             },
         ))
@@ -745,6 +765,84 @@ fn clip_to_file_len(ctx: &ScanContext, range: Range<u64>) -> Range<u64> {
     range.start..end
 }
 
+/// Accumulates a `__TEXT` range's whole-range histogram and the highest
+/// Miller–Madow entropy over its 64 KiB windows ([`WINDOW_BLOCK_BYTES`]).
+/// Results do not depend on how the bytes are split across `feed` calls.
+struct TextEntropy {
+    counts: [u64; 256],
+    len: u64,
+    block: [u64; 256],
+    block_len: usize,
+    prev: Option<[u64; 256]>,
+    max_window: Option<f64>,
+}
+
+impl TextEntropy {
+    fn new() -> Self {
+        Self {
+            counts: [0; 256],
+            len: 0,
+            block: [0; 256],
+            block_len: 0,
+            prev: None,
+            max_window: None,
+        }
+    }
+
+    fn feed(&mut self, mut bytes: &[u8]) {
+        while !bytes.is_empty() {
+            let take = bytes.len().min(WINDOW_BLOCK_BYTES - self.block_len);
+            let (head, rest) = bytes.split_at(take);
+            for &b in head {
+                self.block[b as usize] += 1;
+            }
+            self.block_len += take;
+            self.len += take as u64;
+            bytes = rest;
+            if self.block_len == WINDOW_BLOCK_BYTES {
+                self.score_window();
+                for (c, b) in self.counts.iter_mut().zip(self.block.iter()) {
+                    *c += *b;
+                }
+                self.prev = Some(self.block);
+                self.block = [0; 256];
+                self.block_len = 0;
+            }
+        }
+    }
+
+    /// Score the previous block plus the current (possibly partial) one.
+    fn score_window(&mut self) {
+        let Some(prev) = &self.prev else { return };
+        let mut window = *prev;
+        for (w, b) in window.iter_mut().zip(self.block.iter()) {
+            *w += *b;
+        }
+        let total = WINDOW_BLOCK_BYTES as u64 + self.block_len as u64;
+        let e = miller_madow_entropy(&window, total);
+        self.max_window = Some(self.max_window.map_or(e, |m| m.max(e)));
+    }
+
+    /// Returns the whole-range histogram, its length, and the best window
+    /// entropy (`None` under two blocks).
+    fn finish(mut self) -> ([u64; 256], u64, Option<f64>) {
+        if self.block_len > 0 {
+            if self.len >= 2 * WINDOW_BLOCK_BYTES as u64 {
+                self.score_window();
+            }
+            for (c, b) in self.counts.iter_mut().zip(self.block.iter()) {
+                *c += *b;
+            }
+        }
+        let max_window = if self.len >= 2 * WINDOW_BLOCK_BYTES as u64 {
+            self.max_window
+        } else {
+            None
+        };
+        (self.counts, self.len, max_window)
+    }
+}
+
 fn shannon_entropy(data: &[u8]) -> f64 {
     let mut counts = [0u64; 256];
     for &b in data {
@@ -894,6 +992,149 @@ mod tests {
         ] {
             let fat = crate::macho::tests_support::synth_fat(&slices);
             let path = write_temp_file(&format!("entropy-tier-fat-{tag}"), &fat);
+            let ctx = ScanContext::load(&path);
+            let signal = HighEntropyRule.evaluate(&ctx).unwrap().unwrap();
+            assert_eq!(signal.weight, TEXT_PACKED_WEIGHT, "{tag}");
+            let _ = std::fs::remove_file(&path);
+        }
+    }
+
+    fn text_signal(text: &[u8]) -> Option<MatchedSignal> {
+        let (image, _) = crate::macho::tests_support::synth_macho_64(text);
+        let path = write_temp_file("entropy-signal", &image);
+        let ctx = ScanContext::load(&path);
+        let signal = HighEntropyRule.evaluate(&ctx).unwrap();
+        let _ = std::fs::remove_file(&path);
+        signal
+    }
+
+    /// `low_len` code-like bytes (about 5.6 bits/byte) then `random_len`
+    /// random bytes: the whole section stays under the elevated gate while
+    /// a window over the random tail reaches about 8.0.
+    fn code_then_random(low_len: usize, random_len: usize) -> Vec<u8> {
+        let mut text = uniform_over(50, low_len);
+        text.extend(high_entropy_blob(random_len));
+        text
+    }
+
+    const KIB: usize = 1024;
+
+    #[test]
+    fn packed_region_inside_low_entropy_text_is_elevated() {
+        let text = code_then_random(448 * KIB, 96 * KIB);
+        assert!(shannon_entropy(&text) < ENTROPY_THRESHOLD);
+        let signal = text_signal(&text).expect("the random window should be found");
+        assert_eq!(signal.weight, TEXT_ELEVATED_WEIGHT);
+        assert!(
+            signal.description.contains("window entropy: 8.0"),
+            "{}",
+            signal.description
+        );
+    }
+
+    /// #67: 87% random then 13% zeros reads just under the packed gate
+    /// whole-section; it must not reach the packed weight.
+    #[test]
+    fn padded_packed_payload_is_elevated_not_packed() {
+        let total = 512 * KIB;
+        let random = total * 87 / 100;
+        let mut text = high_entropy_blob(random);
+        text.resize(total, 0);
+        assert_eq!(text_weight(&text), Some(TEXT_ELEVATED_WEIGHT));
+    }
+
+    #[test]
+    fn uniform_low_entropy_text_has_no_window_signal() {
+        assert_eq!(text_weight(&uniform_over(100, 512 * KIB)), None);
+    }
+
+    #[test]
+    fn text_under_64kib_gets_no_window_score() {
+        let text = code_then_random(56 * KIB, 4 * KIB);
+        assert!(shannon_entropy(&text) < ENTROPY_THRESHOLD);
+        let mut acc = TextEntropy::new();
+        acc.feed(&text);
+        assert_eq!(acc.finish().2, None);
+        assert_eq!(text_weight(&text), None);
+        // Whole-section rules still apply to a short, wholly random section.
+        assert_eq!(
+            text_weight(&high_entropy_blob(60 * KIB)),
+            Some(TEXT_PACKED_WEIGHT)
+        );
+    }
+
+    #[test]
+    fn streamed_windowed_text_matches_the_resident_score() {
+        let payload = code_then_random(MAX_CONTENT_BYTES + 512 * KIB, 96 * KIB);
+        let (image, range) = crate::macho::tests_support::synth_macho_64(&payload);
+        let path = write_temp_file("entropy-window-streamed", &image);
+        let ctx = ScanContext::load(&path);
+        assert!(ctx.truncated);
+        let streamed = HighEntropyRule
+            .evaluate(&ctx)
+            .unwrap()
+            .expect("the window past the 8 MiB capture should be found");
+        let (_, resident) = HighEntropyRule
+            .macho_signal_from_content(&image, range)
+            .expect("resident score");
+        assert_eq!(streamed.weight, TEXT_ELEVATED_WEIGHT);
+        assert_eq!(streamed.weight, resident.weight);
+        assert_eq!(streamed.description, resident.description);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn text_entropy_is_independent_of_chunking() {
+        let text = code_then_random(300 * KIB, 100 * KIB);
+        let finish = |chunks: &mut dyn FnMut(&mut TextEntropy)| {
+            let mut acc = TextEntropy::new();
+            chunks(&mut acc);
+            acc.finish()
+        };
+        let one = finish(&mut |a| a.feed(&text));
+        let odd = finish(&mut |a| text.chunks(7001).for_each(|c| a.feed(c)));
+        let path = write_temp_file("entropy-chunking", &text);
+        let ctx = ScanContext::load(&path);
+        let streamed = finish(&mut |a| {
+            assert!(ctx.for_each_window(0..text.len() as u64, 0, |w, _| a.feed(w)));
+        });
+        let _ = std::fs::remove_file(&path);
+        assert!(one.2.is_some());
+        assert_eq!(one, odd);
+        assert_eq!(one, streamed);
+    }
+
+    #[test]
+    fn fat_binary_windowed_slice_beats_a_weaker_whole_tier() {
+        let (elevated, _) =
+            crate::macho::tests_support::synth_macho_64(&uniform_over(147, 147 * 40));
+        let (windowed, _) =
+            crate::macho::tests_support::synth_macho_64(&code_then_random(448 * KIB, 96 * KIB));
+        for (tag, slices) in [
+            ("elevated-first", [&elevated[..], &windowed[..]]),
+            ("windowed-first", [&windowed[..], &elevated[..]]),
+        ] {
+            let fat = crate::macho::tests_support::synth_fat(&slices);
+            let path = write_temp_file(&format!("entropy-fat-window-{tag}"), &fat);
+            let ctx = ScanContext::load(&path);
+            let signal = HighEntropyRule.evaluate(&ctx).unwrap().unwrap();
+            assert_eq!(signal.weight, TEXT_ELEVATED_WEIGHT, "{tag}");
+            assert!(signal.description.contains("window entropy"), "{tag}");
+            let _ = std::fs::remove_file(&path);
+        }
+    }
+
+    #[test]
+    fn fat_binary_whole_packed_slice_beats_a_windowed_slice() {
+        let (packed, _) = crate::macho::tests_support::synth_macho_64(&high_entropy_blob(65536));
+        let (windowed, _) =
+            crate::macho::tests_support::synth_macho_64(&code_then_random(448 * KIB, 96 * KIB));
+        for (tag, slices) in [
+            ("packed-first", [&packed[..], &windowed[..]]),
+            ("windowed-first", [&windowed[..], &packed[..]]),
+        ] {
+            let fat = crate::macho::tests_support::synth_fat(&slices);
+            let path = write_temp_file(&format!("entropy-fat-packed-{tag}"), &fat);
             let ctx = ScanContext::load(&path);
             let signal = HighEntropyRule.evaluate(&ctx).unwrap().unwrap();
             assert_eq!(signal.weight, TEXT_PACKED_WEIGHT, "{tag}");
