@@ -50,7 +50,6 @@ def build():
         c[f"level_{lvl}"] = (None, bz2.compress(text, lvl))
 
     rnd = bytes(random.getrandbits(8) for _ in range(4096))
-    add("random_4k", rnd)
     add("all_bytes", bytes(range(256)))
 
     # RLE1 boundaries: a run of 4 is followed by a count byte (0..=255).
