@@ -490,7 +490,7 @@ mod tests {
 
     /// A poisoned failure list still records and reports failures.
     #[test]
-    fn stream_failures_survive_a_poisoned_lock() {
+    fn incomplete_marks_survive_a_poisoned_lock() {
         let ctx = ScanContext::from_embedded_bytes("x", vec![1], false);
         let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let _guard = ctx.incomplete_rules.lock().unwrap();
