@@ -293,6 +293,22 @@ pub fn read_entry(
     file: &XarFile,
     limits: &XarLimits,
 ) -> Result<Vec<u8>, XarEntryError> {
+    match read_entry_partial(data, archive, file, limits)? {
+        (bytes, None) => Ok(bytes),
+        (_, Some(e)) => Err(e),
+    }
+}
+
+/// Like [`read_entry`], but a bzip2 entry that fails partway still yields
+/// the blocks decoded before the failure. `Ok((bytes, None))` is a full read;
+/// `Ok((bytes, Some(err)))` is a non-empty partial one. Callers must treat the
+/// latter as incomplete evidence, never as a clean read.
+pub fn read_entry_partial(
+    data: &[u8],
+    archive: &XarArchive,
+    file: &XarFile,
+    limits: &XarLimits,
+) -> Result<(Vec<u8>, Option<XarEntryError>), XarEntryError> {
     let (offset, length) = match (file.offset, file.length) {
         (Some(o), Some(l)) => (o, l),
         _ => return Err(XarEntryError::NoHeapLocation),
@@ -314,19 +330,26 @@ pub fn read_entry(
     if raw.starts_with(&[0xFD, b'7', b'z', b'X', b'Z', 0x00]) {
         Err(XarEntryError::UnknownEncoding)
     } else if crate::bzip2::has_bzip2_magic(raw) {
-        crate::bzip2::bzip2_decompress(raw, limits.max_entry_bytes)
-            .map_err(XarEntryError::Undecodable)
+        let (bytes, result) = crate::bzip2::bzip2_decompress_partial(raw, limits.max_entry_bytes);
+        match result {
+            Ok(()) => Ok((bytes, None)),
+            // Installer reads what libxar yields before the stream fails.
+            Err(e) if !bytes.is_empty() => Ok((bytes, Some(XarEntryError::Undecodable(e)))),
+            Err(e) => Err(XarEntryError::Undecodable(e)),
+        }
     } else if raw.len() >= 2 && raw[0] == 0x1f && raw[1] == 0x8b {
-        inflate::gzip_decompress(raw, limits.max_entry_bytes).map_err(XarEntryError::Undecodable)
+        inflate::gzip_decompress(raw, limits.max_entry_bytes)
+            .map(|v| (v, None))
+            .map_err(XarEntryError::Undecodable)
     } else if raw.first().is_some_and(|b| b & 0x0f == 8) {
         // Plausible zlib CMF; if the header checks fail, treat it as stored.
         match inflate::zlib_decompress(raw, limits.max_entry_bytes) {
-            Ok(v) => Ok(v),
-            Err(DecodeError::BadHeader) => stored(raw, limits),
+            Ok(v) => Ok((v, None)),
+            Err(DecodeError::BadHeader) => stored(raw, limits).map(|v| (v, None)),
             Err(e) => Err(XarEntryError::Undecodable(e)),
         }
     } else {
-        stored(raw, limits)
+        stored(raw, limits).map(|v| (v, None))
     }
 }
 
@@ -911,6 +934,30 @@ mod tests {
             read_single(b"BZh1", &XarLimits::default()),
             Err(XarEntryError::Undecodable(DecodeError::Truncated))
         );
+    }
+
+    /// A bzip2 entry missing its trailer: strict read fails, but libxar (so
+    /// Installer) still yields the plaintext; the partial reader does too.
+    #[test]
+    fn a_bzip2_entry_without_its_trailer_reads_partially() {
+        let full = include_bytes!("../testdata/bzip2/distribution_dropper.in");
+        let cut = crate::bzip2::cut_trailer(full);
+        let limits = XarLimits::default();
+        let bytes = single_entry(cut);
+        let a = parse(&bytes, &limits).expect("xar");
+        let f = a.files.first().expect("entry");
+        let trunc = XarEntryError::Undecodable(DecodeError::Truncated);
+        assert_eq!(read_entry(&bytes, &a, f, &limits), Err(trunc));
+        let plain = include_bytes!("../testdata/bzip2/distribution_dropper.out");
+        assert_eq!(
+            read_entry_partial(&bytes, &a, f, &limits),
+            Ok((plain.to_vec(), Some(trunc)))
+        );
+        // An entry that fails before its first block yields nothing.
+        let bytes = single_entry(&cut[..8]);
+        let a = parse(&bytes, &limits).expect("xar");
+        let f = a.files.first().expect("entry");
+        assert_eq!(read_entry_partial(&bytes, &a, f, &limits), Err(trunc));
     }
 
     #[test]

@@ -72,6 +72,22 @@ pub(crate) fn has_bzip2_magic(data: &[u8]) -> bool {
 /// Decode one bzip2 stream, producing at most `budget` bytes. Bytes after
 /// the first stream are ignored, as libxar does.
 pub fn bzip2_decompress(data: &[u8], budget: usize) -> Result<Vec<u8>, DecodeError> {
+    let (out, result) = bzip2_decompress_partial(data, budget);
+    result.map(|()| out)
+}
+
+/// Like [`bzip2_decompress`], but on error also returns the bytes of every
+/// block fully decoded and CRC-verified before it. A block that fails
+/// contributes nothing; a bad header yields an empty `Vec`.
+pub fn bzip2_decompress_partial(data: &[u8], budget: usize) -> (Vec<u8>, Result<(), DecodeError>) {
+    let mut out = Vec::with_capacity(budget.min(INITIAL_OUTPUT_CAPACITY));
+    let result = decode_stream(data, budget, &mut out);
+    (out, result)
+}
+
+/// Decode the stream into `out`. On error `out` holds exactly the blocks
+/// that completed.
+fn decode_stream(data: &[u8], budget: usize, out: &mut Vec<u8>) -> Result<(), DecodeError> {
     let mut r = BitReader::new(data);
     for expected in *b"BZh" {
         if r.bits(8)? != u32::from(expected) {
@@ -84,7 +100,6 @@ pub fn bzip2_decompress(data: &[u8], budget: usize) -> Result<Vec<u8>, DecodeErr
     }
     let max_block = (level - u32::from(b'0')) as usize * 100_000;
 
-    let mut out = Vec::with_capacity(budget.min(INITIAL_OUTPUT_CAPACITY));
     let mut tt: Vec<u32> = Vec::new();
     let mut combined: u32 = 0;
 
@@ -92,14 +107,20 @@ pub fn bzip2_decompress(data: &[u8], budget: usize) -> Result<Vec<u8>, DecodeErr
         let magic = (u64::from(r.bits(24)?) << 24) | u64::from(r.bits(24)?);
         match magic {
             BLOCK_MAGIC => {
-                let crc = decode_block(&mut r, max_block, &mut tt, &mut out, budget)?;
-                combined = combined.rotate_left(1) ^ crc;
+                let start = out.len();
+                match decode_block(&mut r, max_block, &mut tt, out, budget) {
+                    Ok(crc) => combined = combined.rotate_left(1) ^ crc,
+                    Err(e) => {
+                        out.truncate(start);
+                        return Err(e);
+                    }
+                }
             }
             END_MAGIC => {
                 if r.bits(32)? != combined {
                     return Err(DecodeError::ChecksumMismatch);
                 }
-                return Ok(out);
+                return Ok(());
             }
             _ => return Err(DecodeError::Malformed),
         }
@@ -519,6 +540,24 @@ fn crc32_msb(data: &[u8]) -> u32 {
         crc = (crc << 8) ^ CRC_TABLE[usize::from((crc >> 24) as u8 ^ b)];
     }
     !crc
+}
+
+/// Test helper: `stream` without its end-of-stream trailer (end magic, CRC
+/// and padding), keeping every block bit. Panics if no trailer is found.
+#[cfg(test)]
+pub(crate) fn cut_trailer(stream: &[u8]) -> &[u8] {
+    let total_bits = stream.len() * 8;
+    for pad in 0..8 {
+        let end_off = total_bits - 80 - pad;
+        let mut v = 0u64;
+        for bit in end_off..end_off + 48 {
+            v = (v << 1) | u64::from((stream[bit / 8] >> (7 - bit % 8)) & 1);
+        }
+        if v == END_MAGIC {
+            return &stream[..end_off.div_ceil(8)];
+        }
+    }
+    panic!("no end-of-stream trailer");
 }
 
 #[cfg(test)]
@@ -1290,5 +1329,81 @@ mod tests {
             bzip2_decompress(&stream(b'9', &[], 1), BIG),
             Err(DecodeError::ChecksumMismatch)
         );
+    }
+
+    // ----- partial decode -----
+
+    /// Bit offsets at which the 48-bit `magic` occurs.
+    fn find_magic(data: &[u8], magic: u64) -> Vec<usize> {
+        let mut found = Vec::new();
+        let mut window = 0u64;
+        for bit in 0..data.len() * 8 {
+            window = ((window << 1) | u64::from((data[bit / 8] >> (7 - bit % 8)) & 1))
+                & 0xFFFF_FFFF_FFFF;
+            if bit >= 47 && window == magic {
+                found.push(bit - 47);
+            }
+        }
+        found
+    }
+
+    #[test]
+    fn partial_decode_keeps_only_completed_blocks() {
+        let input = vec_in!("multi_block");
+        let expected = vec_out!("multi_block");
+        let starts = find_magic(input, BLOCK_MAGIC);
+        assert_eq!(starts.len(), 3, "three blocks");
+
+        // Intact: everything, Ok.
+        let (all, r) = bzip2_decompress_partial(input, BIG);
+        assert_eq!(r, Ok(()));
+        assert!(all == expected);
+
+        // Trailer cut: all blocks, Truncated.
+        let cut = cut_trailer(input);
+        let (got, r) = bzip2_decompress_partial(cut, BIG);
+        assert_eq!(r, Err(DecodeError::Truncated));
+        assert!(got == expected);
+        assert_eq!(bzip2_decompress(cut, BIG), Err(DecodeError::Truncated));
+
+        // Cut inside block 2: exactly block 1's bytes.
+        let mid2 = starts[1] / 8 + 100;
+        let (b1, r) = bzip2_decompress_partial(&input[..mid2], BIG);
+        assert_eq!(r, Err(DecodeError::Truncated));
+        assert!(!b1.is_empty() && b1.len() < 100_000);
+        assert!(b1[..] == expected[..b1.len()]);
+        assert_eq!(
+            bzip2_decompress(&input[..mid2], BIG),
+            Err(DecodeError::Truncated)
+        );
+
+        // Bad CRC in block 2 (first bit of its stored CRC): block 1 only.
+        let mut bad = input.to_vec();
+        let crc_bit = starts[1] + 48;
+        bad[crc_bit / 8] ^= 0x80 >> (crc_bit % 8);
+        let (got, r) = bzip2_decompress_partial(&bad, BIG);
+        assert_eq!(r, Err(DecodeError::ChecksumMismatch));
+        assert!(got == b1);
+        assert_eq!(
+            bzip2_decompress(&bad, BIG),
+            Err(DecodeError::ChecksumMismatch)
+        );
+
+        // Budget hit inside block 2: block 1 only.
+        let budget = b1.len() + 10;
+        let (got, r) = bzip2_decompress_partial(input, budget);
+        assert_eq!(r, Err(DecodeError::BudgetExceeded));
+        assert!(got == b1);
+        assert_eq!(
+            bzip2_decompress(input, budget),
+            Err(DecodeError::BudgetExceeded)
+        );
+    }
+
+    #[test]
+    fn partial_decode_of_a_bad_header_is_empty() {
+        let (got, r) = bzip2_decompress_partial(b"XZh9 rest", BIG);
+        assert!(got.is_empty());
+        assert_eq!(r, Err(DecodeError::BadHeader));
     }
 }
