@@ -131,7 +131,7 @@ fn decode_block(
         let used = r.bits(16)?;
         for j in 0..16u32 {
             if (used >> (15 - j)) & 1 == 1 {
-                // At most 256 distinct values, so `n_in_use` stays below 256.
+                // At most 256 values are in use, so the slot lookup cannot miss.
                 if let Some(slot) = seq_to_unseq.get_mut(n_in_use) {
                     *slot = (i * 16 + j) as u8;
                 }

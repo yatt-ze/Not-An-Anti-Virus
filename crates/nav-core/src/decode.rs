@@ -7,13 +7,12 @@
 pub enum DecodeError {
     /// Input ended mid-stream.
     Truncated,
-    /// Structurally invalid: bad block type, over-subscribed Huffman table,
-    /// out-of-range symbol, or a back-reference before the start of output.
+    /// Structurally invalid: a field, table or symbol the format forbids.
     Malformed,
     /// Output would exceed the caller's budget. Not a maliciousness finding (§6.2).
     BudgetExceeded,
-    /// zlib/gzip header invalid, or it requests an unsupported preset dictionary.
+    /// The stream's header or magic is invalid or unsupported.
     BadHeader,
-    /// Adler-32 (zlib) or CRC-32/ISIZE (gzip) trailer did not match the output.
+    /// A stored checksum did not match the decoded bytes.
     ChecksumMismatch,
 }
