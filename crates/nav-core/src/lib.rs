@@ -13,6 +13,7 @@ pub(crate) mod base64;
 pub mod bundle;
 pub mod context;
 pub mod cpio;
+pub mod decode;
 pub mod inflate;
 pub mod macho;
 pub mod model;
