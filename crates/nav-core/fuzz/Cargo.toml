@@ -50,6 +50,13 @@ test = false
 doc = false
 bench = false
 
+[[bin]]
+name = "bzip2"
+path = "fuzz_targets/bzip2.rs"
+test = false
+doc = false
+bench = false
+
 # Empty table: makes this package its own workspace root so the parent
 # workspace (crates listed explicitly in ../../../Cargo.toml) never tries to
 # build it. See the comment above.
