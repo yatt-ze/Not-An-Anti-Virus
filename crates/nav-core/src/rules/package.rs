@@ -6,10 +6,11 @@
 //!   scripts' contents and the JavaScript in the `Distribution` file;
 //! - `unsigned-installer-package` (`ProvenanceConcern`) notes a missing signature.
 //!
-//! The script rule adds no heuristics of its own: it reaches the script text
-//! (xar TOC → heap → gzip → cpio, or `Distribution` XML) and hands the bytes
-//! to the existing content rules — the container work buys *reach*, not a new detection. Only the named
-//! metadata entries are read; `Payload` is left for §6.2's Phase 0b path.
+//! The script rule mostly buys reach: it extracts the script text (xar TOC →
+//! heap → gzip → cpio, or `Distribution` XML) and hands the bytes to the
+//! existing content rules. The one heuristic of its own is a narrow marker for
+//! a `Distribution` that launches an interpreter. Only the named metadata
+//! entries are read; `Payload` is left for §6.2's Phase 0b path.
 
 use super::{embedded_content_ruleset, Rule, RuleOutcome};
 use crate::context::ScanContext;
@@ -176,9 +177,13 @@ const DISTRIBUTION_JS_ATTRS: &[&str] = &[
 /// Extracts the installer JavaScript from `Distribution` XML: `<script>`
 /// bodies (raw, `<![CDATA[` stripped or entities decoded) and the
 /// [`DISTRIBUTION_JS_ATTRS`] values, joined with `\n`. Empty if there is none.
-/// `NotApplicable` on malformed XML or an unterminated `<script>`.
-fn distribution_js(xml_bytes: &[u8]) -> Result<Vec<u8>, RuleOutcome> {
+/// `NotApplicable` on malformed XML, an unterminated `<script>`, or bytes with
+/// no element at all (compressed or otherwise undecodable, §11.8).
+fn distribution_js(raw: &[u8]) -> Result<Vec<u8>, RuleOutcome> {
+    let decoded = utf16_to_utf8(raw);
+    let xml_bytes = decoded.as_deref().unwrap_or(raw);
     let mut pieces: Vec<String> = Vec::new();
+    let mut saw_element = false;
     let mut scanner = xml::Scanner::new(xml_bytes);
     loop {
         match scanner.next_event() {
@@ -189,6 +194,7 @@ fn distribution_js(xml_bytes: &[u8]) -> Result<Vec<u8>, RuleOutcome> {
                 attrs,
                 self_closing,
             }) => {
+                saw_element = true;
                 for want in DISTRIBUTION_JS_ATTRS {
                     if let Some(v) = xml::attr(attrs, want) {
                         pieces.push(v);
@@ -204,8 +210,35 @@ fn distribution_js(xml_bytes: &[u8]) -> Result<Vec<u8>, RuleOutcome> {
             xml::Next::Event(_) => {}
         }
     }
+    if !saw_element {
+        return Err(RuleOutcome::NotApplicable);
+    }
     pieces.retain(|p| !p.trim().is_empty());
     Ok(pieces.join("\n").into_bytes())
+}
+
+/// Transcodes UTF-16 (BOM, or BOM-less starting `<\0` / `\0<`) to UTF-8
+/// bytes; `None` if `b` doesn't look like UTF-16. A trailing odd byte is dropped.
+fn utf16_to_utf8(b: &[u8]) -> Option<Vec<u8>> {
+    let (big_endian, body) = match b {
+        [0xFF, 0xFE, rest @ ..] => (false, rest),
+        [0xFE, 0xFF, rest @ ..] => (true, rest),
+        [b'<', 0, ..] => (false, b),
+        [0, b'<', ..] => (true, b),
+        _ => return None,
+    };
+    let units: Vec<u16> = body
+        .chunks_exact(2)
+        .map(|c| {
+            let pair = [c[0], c[1]];
+            if big_endian {
+                u16::from_be_bytes(pair)
+            } else {
+                u16::from_le_bytes(pair)
+            }
+        })
+        .collect();
+    Some(String::from_utf16_lossy(&units).into_bytes())
 }
 
 /// Text of a raw `<script>` body: the CDATA content if wrapped in one,
@@ -581,6 +614,69 @@ mod tests {
             signal.description,
             "distribution script: system.run launches an interpreter (sh)"
         );
+    }
+
+    #[test]
+    fn a_distribution_with_no_element_is_not_applicable() {
+        for blob in [
+            b"".as_slice(),
+            b"BZh91AY&SY\x01\x02\x03\x04 junk",
+            b"plain text, no markup",
+        ] {
+            assert!(
+                matches!(distribution_js(blob), Err(RuleOutcome::NotApplicable)),
+                "{blob:?}"
+            );
+        }
+    }
+
+    fn utf16(s: &str, big_endian: bool, bom: bool) -> Vec<u8> {
+        let mut out = Vec::new();
+        if bom {
+            out.extend(if big_endian {
+                [0xFE, 0xFF]
+            } else {
+                [0xFF, 0xFE]
+            });
+        }
+        for u in s.encode_utf16() {
+            out.extend(if big_endian {
+                u.to_be_bytes()
+            } else {
+                u.to_le_bytes()
+            });
+        }
+        out
+    }
+
+    #[test]
+    fn utf16_distributions_are_transcoded() {
+        let xml = r#"<a><script>system.run("/bin/bash", "-c", "x");</script></a>"#;
+        for (be, bom) in [(false, true), (true, true), (false, false)] {
+            let out = distribution_js(&utf16(xml, be, bom)).expect("readable");
+            let out = String::from_utf8(out).unwrap();
+            assert!(
+                out.contains(r#"system.run("/bin/bash""#),
+                "be={be} bom={bom}: {out}"
+            );
+        }
+    }
+
+    /// A bzip2-compressed Distribution (as in real packages) is not checked.
+    #[test]
+    fn a_compressed_distribution_in_a_package_is_not_applicable() {
+        let blob = b"BZh91AY&SY\x01\x02\x03\x04 junk";
+        let toc = format!(
+            r#"<file id="1"><name>Distribution</name><type>file</type><data><offset>0</offset><length>{n}</length><size>{n}</size><encoding style="application/x-bzip2"/></data></file>"#,
+            n = blob.len()
+        );
+        let mut bytes = xar::toc_xar_bytes(&toc);
+        bytes.extend_from_slice(blob);
+        let c = ctx("compressed.pkg", &bytes);
+        assert!(matches!(
+            InstallerScriptRule.evaluate(&c),
+            Err(RuleOutcome::NotApplicable)
+        ));
     }
 
     #[test]
