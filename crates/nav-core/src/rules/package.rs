@@ -430,7 +430,8 @@ fn scan_distribution_entry(
             format!("distribution script: system.run launches an interpreter ({name})"),
         );
     }
-    let label = format!("{}!{}", ctx.path.display(), entry.path);
+    // The `.js` suffix makes `classify_text` treat even a short buffer as script.
+    let label = format!("{}!{}.js", ctx.path.display(), entry.path);
     findings.scan(label, js, "distribution script");
     Ok(())
 }
@@ -957,6 +958,35 @@ mod tests {
             assert_eq!(r.completeness, crate::model::ScanCompleteness::Partial);
             assert_eq!(r.signals.len(), 1);
         }
+    }
+
+    /// A product-style xar whose only entry is a stored `Distribution`.
+    fn pkg_with_distribution(dist: &[u8]) -> Vec<u8> {
+        let toc = format!(
+            r#"<file id="1"><name>Distribution</name><type>file</type><data><offset>0</offset><length>{n}</length><size>{n}</size><encoding style="application/octet-stream"/></data></file>"#,
+            n = dist.len()
+        );
+        let mut bytes = xar::toc_xar_bytes(&toc);
+        bytes.extend_from_slice(dist);
+        bytes
+    }
+
+    /// Under 256 bytes, so only the script-extension path makes it "text"
+    /// for the name markers.
+    #[test]
+    fn a_short_distribution_script_is_scored_as_script_text() {
+        let dist = br#"<a><script>system.run("/usr/bin/osascript", "-e", "x");</script></a>"#;
+        assert!(dist.len() < 256);
+        let c = ctx("short.pkg", &pkg_with_distribution(dist));
+        let signal = InstallerScriptRule
+            .evaluate(&c)
+            .expect("evaluates")
+            .expect("fires");
+        assert!(
+            signal.description.contains("references osascript"),
+            "{}",
+            signal.description
+        );
     }
 
     #[test]
