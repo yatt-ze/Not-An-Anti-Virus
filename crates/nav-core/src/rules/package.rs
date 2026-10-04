@@ -22,6 +22,10 @@ use crate::{cpio, xar, xml};
 /// fast when several markers match, and Phase 0a scoring is a plain sum (§12).
 const MAX_SCRIPT_WEIGHT: i32 = 20;
 
+/// Weight for a Distribution that launches an interpreter via `system.run`.
+/// Corroboration only: below Notify on its own (§5.1).
+const DISTRIBUTION_INTERPRETER_WEIGHT: i32 = 8;
+
 /// Weight for a package with no signature. Well below the notify threshold:
 /// plenty of legitimate packages are unsigned (all default `pkgbuild` output).
 /// Earns its place by corroborating (§5.1, §5.4).
@@ -104,6 +108,12 @@ impl ScriptFindings {
             self.descriptions
                 .push(format!("{prefix}: {}", signal.description));
         }
+    }
+
+    /// Records a finding that did not come from a content-rule signal.
+    fn add(&mut self, weight: i32, description: String) {
+        self.total = self.total.saturating_add(weight);
+        self.descriptions.push(description);
     }
 }
 
@@ -235,9 +245,62 @@ fn scan_distribution_entry(
     if js.is_empty() {
         return Ok(());
     }
+    if let Some(name) = launched_interpreter(&String::from_utf8_lossy(&js)) {
+        findings.add(
+            DISTRIBUTION_INTERPRETER_WEIGHT,
+            format!("distribution script: system.run launches an interpreter ({name})"),
+        );
+    }
     let label = format!("{}!{}", ctx.path.display(), entry.path);
     findings.scan(label, js, "distribution script");
     Ok(())
+}
+
+/// Shells and script interpreters that `system.run` should not be launching
+/// directly from a Distribution (matched on basename).
+const INTERPRETERS: &[&str] = &[
+    "sh",
+    "bash",
+    "zsh",
+    "ksh",
+    "csh",
+    "tcsh",
+    "dash",
+    "osascript",
+    "python",
+    "python3",
+    "perl",
+    "ruby",
+    "php",
+    "curl",
+    "env",
+];
+
+/// Basename of the first `system.run(` / `system.runOnce(` call in `js` whose
+/// first argument is a string literal naming an interpreter. Non-literal
+/// first arguments never match.
+fn launched_interpreter(js: &str) -> Option<&'static str> {
+    for (at, _) in js.match_indices("system.run") {
+        let rest = js.get(at + "system.run".len()..)?;
+        let rest = rest.strip_prefix("Once").unwrap_or(rest);
+        let Some(rest) = rest.trim_start().strip_prefix('(') else {
+            continue;
+        };
+        let rest = rest.trim_start();
+        let Some(quote) = rest.chars().next().filter(|c| matches!(c, '"' | '\'')) else {
+            continue;
+        };
+        let body = rest.get(1..).unwrap_or("");
+        let Some(end) = body.find(quote) else {
+            continue;
+        };
+        let literal = body.get(..end).unwrap_or("");
+        let base = literal.rsplit('/').next().unwrap_or(literal);
+        if let Some(hit) = INTERPRETERS.iter().find(|i| **i == base) {
+            return Some(hit);
+        }
+    }
+    None
 }
 
 /// Notes an installer package that carries no signature.
@@ -443,6 +506,81 @@ mod tests {
     fn an_ordinary_distribution_script_scores_nothing() {
         let c = ctx("ordinary.pkg", pkg!("distribution_ordinary"));
         assert!(matches!(InstallerScriptRule.evaluate(&c), Ok(None)));
+    }
+
+    #[test]
+    fn interpreter_launch_forms_match() {
+        for (js, want) in [
+            (r#"system.run("/bin/bash", "-c", "x")"#, "bash"),
+            ("system.run('/bin/sh', '-c', 'x')", "sh"),
+            ("system.run(  \"/usr/bin/osascript\" )", "osascript"),
+            ("system.runOnce('/usr/bin/python3', 'x.py')", "python3"),
+            ("system.run('bash', '-c', 'x')", "bash"),
+            ("system.run(\"/usr/bin/env\", \"curl\")", "env"),
+            (
+                "a(); system.run('unload.sh'); system.run('/usr/bin/perl')",
+                "perl",
+            ),
+        ] {
+            assert_eq!(launched_interpreter(js), Some(want), "{js}");
+        }
+    }
+
+    #[test]
+    fn non_interpreter_launches_do_not_match() {
+        for js in [
+            "system.run('unload.sh')",
+            "system.run('./bash_helper')",
+            "system.run('/Applications/Foo.app/bash-wrapper')",
+            "system.run(cmd, '-c', 'x')",
+            "system.run(\"/bin/bash",
+            "system.running('/bin/bash')",
+            "system.run",
+            "system.log('/bin/bash')",
+            "",
+        ] {
+            assert_eq!(launched_interpreter(js), None, "{js}");
+        }
+    }
+
+    fn marker_count(c: &ScanContext) -> usize {
+        match InstallerScriptRule.evaluate(c) {
+            Ok(Some(s)) => s.description.matches("launches an interpreter").count(),
+            _ => 0,
+        }
+    }
+
+    #[test]
+    fn the_interpreter_marker_counts_once_per_distribution() {
+        let c = ctx("dropper.pkg", pkg!("distribution_dropper"));
+        assert_eq!(marker_count(&c), 1);
+        let signal = InstallerScriptRule.evaluate(&c).unwrap().unwrap();
+        assert!(
+            signal
+                .description
+                .contains("distribution script: system.run launches an interpreter (bash)"),
+            "{}",
+            signal.description
+        );
+        // The marker plus the content-rule hit exceed the cap.
+        assert_eq!(signal.weight, MAX_SCRIPT_WEIGHT);
+    }
+
+    #[test]
+    fn an_ordinary_distribution_has_no_interpreter_marker() {
+        let c = ctx("ordinary.pkg", pkg!("distribution_ordinary"));
+        assert_eq!(marker_count(&c), 0);
+    }
+
+    #[test]
+    fn a_shell_launch_alone_stays_below_notify_weight() {
+        let c = ctx("shell.pkg", pkg!("distribution_shell_launch"));
+        let signal = InstallerScriptRule.evaluate(&c).unwrap().unwrap();
+        assert_eq!(signal.weight, DISTRIBUTION_INTERPRETER_WEIGHT);
+        assert_eq!(
+            signal.description,
+            "distribution script: system.run launches an interpreter (sh)"
+        );
     }
 
     #[test]
