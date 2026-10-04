@@ -176,11 +176,13 @@ fn scan_scripts_entry(
 /// bodies as an XML parser would deliver them (see [`script_body_texts`]) and
 /// every attribute value (entity-decoded), joined with `\n`. Over-inclusive on
 /// purpose: any attribute can carry an expression. Empty if there is none.
-/// `NotApplicable` on malformed XML, an unterminated `<script>`, or bytes with
-/// no element at all (compressed or otherwise undecodable, §11.8).
+/// `NotApplicable` on malformed XML, an unterminated `<script>`, or any
+/// document we could not read the way Installer's parser would (see
+/// [`check_faithfully_readable`], §11.8).
 fn distribution_js(raw: &[u8]) -> Result<Vec<u8>, RuleOutcome> {
     let decoded = utf16_to_utf8(raw);
     let xml_bytes = decoded.as_deref().unwrap_or(raw);
+    check_faithfully_readable(xml_bytes)?;
     let mut pieces: Vec<String> = Vec::new();
     let mut saw_element = false;
     let mut scanner = xml::Scanner::new(xml_bytes);
@@ -195,13 +197,14 @@ fn distribution_js(raw: &[u8]) -> Result<Vec<u8>, RuleOutcome> {
             }) => {
                 saw_element = true;
                 for (_, value) in xml::attrs(attrs) {
+                    check_entities(value)?;
                     pieces.push(xml::decode_entities(value));
                 }
                 if name == "script" && !self_closing {
                     let raw = scanner
                         .raw_until_close("script")
                         .ok_or(RuleOutcome::NotApplicable)?;
-                    pieces.extend(script_body_texts(raw));
+                    pieces.extend(script_body_texts(raw)?);
                 }
             }
             xml::Next::Event(_) => {}
@@ -243,7 +246,7 @@ fn utf16_to_utf8(b: &[u8]) -> Option<Vec<u8>> {
 /// starts none of those stays literal, as in `a < b`). A second variant with
 /// tag-shaped runs removed is added when it differs, covering child elements
 /// that split a token (`cu<b/>rl`).
-fn script_body_texts(raw: &[u8]) -> Vec<String> {
+fn script_body_texts(raw: &[u8]) -> Result<Vec<String>, RuleOutcome> {
     let mut with_tags = String::new();
     let mut without_tags = String::new();
     let (mut seg_start, mut from) = (0usize, 0usize);
@@ -263,11 +266,9 @@ fn script_body_texts(raw: &[u8]) -> Vec<String> {
             from = at.saturating_add(1);
             continue;
         };
-        flush_segment(
-            raw.get(seg_start..at).unwrap_or(&[]),
-            &mut with_tags,
-            &mut without_tags,
-        );
+        let seg = raw.get(seg_start..at).unwrap_or(&[]);
+        check_entities(seg)?;
+        flush_segment(seg, &mut with_tags, &mut without_tags);
         let body_start = at.saturating_add(open_len);
         let body = raw.get(body_start..).unwrap_or(&[]);
         let (inner, after) = match xml::find(body, closer) {
@@ -285,16 +286,93 @@ fn script_body_texts(raw: &[u8]) -> Vec<String> {
         seg_start = after;
         from = after;
     }
-    flush_segment(
-        raw.get(seg_start..).unwrap_or(&[]),
-        &mut with_tags,
-        &mut without_tags,
-    );
+    let seg = raw.get(seg_start..).unwrap_or(&[]);
+    check_entities(seg)?;
+    flush_segment(seg, &mut with_tags, &mut without_tags);
     let mut out = vec![with_tags.clone()];
     if without_tags != with_tags {
         out.push(without_tags);
     }
-    out
+    Ok(out)
+}
+
+/// `NotApplicable` unless the document would be read by Installer's parser as
+/// the characters we are scanning: it must start with `<` (after an optional
+/// UTF-8 BOM and whitespace), declare no unsupported `encoding`, and declare
+/// no entities.
+fn check_faithfully_readable(b: &[u8]) -> Result<(), RuleOutcome> {
+    let b = b.strip_prefix(b"\xEF\xBB\xBF".as_slice()).unwrap_or(b);
+    let start = b
+        .iter()
+        .position(|c| !c.is_ascii_whitespace())
+        .unwrap_or(b.len());
+    let head = b.get(start..).unwrap_or(&[]);
+    if head.first() != Some(&b'<') {
+        return Err(RuleOutcome::NotApplicable);
+    }
+    if head.starts_with(b"<?xml") {
+        let decl_end = xml::find(head, b"?>").unwrap_or(head.len());
+        let decl = head.get(..decl_end).unwrap_or(&[]);
+        if let Some(i) = xml::find(decl, b"encoding") {
+            let after = decl.get(i + "encoding".len()..).unwrap_or(&[]);
+            let value = after
+                .iter()
+                .position(|c| *c == b'"' || *c == b'\'')
+                .and_then(|q| {
+                    let rest = after.get(q + 1..)?;
+                    let end = rest.iter().position(|c| Some(c) == after.get(q))?;
+                    rest.get(..end)
+                })
+                .map(|v| String::from_utf8_lossy(v).to_ascii_lowercase());
+            let ok = value.as_deref().is_some_and(|v| {
+                matches!(
+                    v,
+                    "utf-8"
+                        | "utf8"
+                        | "us-ascii"
+                        | "ascii"
+                        | "iso-8859-1"
+                        | "latin-1"
+                        | "latin1"
+                        | "utf-16"
+                )
+            });
+            if !ok {
+                return Err(RuleOutcome::NotApplicable);
+            }
+        }
+    }
+    if xml::find(b, b"<!ENTITY").is_some() {
+        return Err(RuleOutcome::NotApplicable);
+    }
+    Ok(())
+}
+
+/// `NotApplicable` if `text` has a named entity reference other than the five
+/// predefined ones: a DTD could define it to be anything.
+fn check_entities(text: &[u8]) -> Result<(), RuleOutcome> {
+    let mut from = 0usize;
+    while let Some(off) = text.get(from..).and_then(|r| xml::find(r, b"&")) {
+        let at = from.saturating_add(off).saturating_add(1);
+        from = at;
+        let window = text.get(at..).unwrap_or(&[]);
+        let window = window
+            .get(..window.len().min(xml::MAX_ENTITY_BODY + 1))
+            .unwrap_or(&[]);
+        let Some(semi) = window.iter().position(|c| *c == b';') else {
+            continue;
+        };
+        let body = window.get(..semi).unwrap_or(&[]);
+        let is_name = !body.is_empty()
+            && body
+                .iter()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, b'_' | b'.' | b':' | b'-'));
+        let known = matches!(body, b"lt" | b"gt" | b"amp" | b"quot" | b"apos");
+        if is_name && !known {
+            return Err(RuleOutcome::NotApplicable);
+        }
+    }
+    Ok(())
 }
 
 /// Appends the entity-decoded `seg` to the with-tags text, and the same with
@@ -609,6 +687,49 @@ mod tests {
     fn every_attribute_value_is_extracted() {
         let out = js(r#"<pkg-ref active="system.run('/bin/bash')"/>"#).unwrap();
         assert!(out.contains("system.run('/bin/bash')"), "{out}");
+    }
+
+    fn not_applicable(doc: &[u8]) -> bool {
+        matches!(distribution_js(doc), Err(RuleOutcome::NotApplicable))
+    }
+
+    #[test]
+    fn a_distribution_not_starting_with_markup_is_not_applicable() {
+        assert!(not_applicable(b"\x1f\x8b\x08 compressed <a/>"));
+        assert!(not_applicable(b"BZh91AY&SY<a/>"));
+        assert!(distribution_js(b"\xEF\xBB\xBF \n<a/>").is_ok());
+    }
+
+    #[test]
+    fn an_unsupported_declared_encoding_is_not_applicable() {
+        for decl in ["UTF-16", "utf-8", "US-ASCII", "ISO-8859-1", "Latin1"] {
+            let doc = format!(r#"<?xml version="1.0" encoding="{decl}"?><a/>"#);
+            assert!(distribution_js(doc.as_bytes()).is_ok(), "{decl}");
+        }
+        for decl in ["UTF-7", "Shift_JIS", "EBCDIC-US", "x-mac-roman"] {
+            let doc = format!(r#"<?xml version="1.0" encoding="{decl}"?><a/>"#);
+            assert!(not_applicable(doc.as_bytes()), "{decl}");
+        }
+        assert!(not_applicable(b"<?xml version='1.0' encoding=?><a/>"));
+    }
+
+    #[test]
+    fn dtd_entities_are_not_applicable() {
+        let doc =
+            br#"<!DOCTYPE d [<!ENTITY p "system.run('/bin/bash')">]><a><script>&p;</script></a>"#;
+        assert!(not_applicable(doc));
+        // A reference to an entity declared elsewhere (external DTD).
+        assert!(not_applicable(b"<a><script>&p;</script></a>"));
+        assert!(not_applicable(br#"<a b="&p;"/>"#));
+    }
+
+    #[test]
+    fn predefined_numeric_and_bare_ampersands_are_fine() {
+        let out = js("<a><script>if (a &amp;&amp; b &lt; c &#38; d &#x26; e &quot; &apos; &gt;) x(a && b);</script></a>").unwrap();
+        assert!(out.contains("a && b < c"), "{out}");
+        assert!(js("<a><script>x = a & b; y = '&' + ';';</script></a>").is_ok());
+        // Inside CDATA nothing is an entity reference.
+        assert!(js("<a><script><![CDATA[ &p; ]]></script></a>").is_ok());
     }
 
     #[test]
