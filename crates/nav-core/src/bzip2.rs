@@ -941,28 +941,58 @@ mod tests {
         assert_eq!(decode(Spec::aaa()), Ok(b"aaa".to_vec()));
     }
 
+    /// Guards the builder itself: `/usr/bin/bzip2` must accept every valid
+    /// hand-built baseline and print the same bytes. Skipped only when the
+    /// tool is absent. The stream goes in on stdin, so nothing touches disk.
     #[test]
     fn hand_built_streams_are_accepted_by_the_real_tool() {
-        // Guards the builder itself: write the baseline for manual
-        // `bzip2 -t`. Skipped silently when the tool is absent.
-        let dir = std::env::temp_dir();
-        let path = dir.join(format!("nav-bzip2-baseline-{}.bz2", std::process::id()));
-        if std::fs::write(&path, one(Spec::aaa())).is_ok() {
-            if let Ok(out) = std::process::Command::new("/usr/bin/bzip2")
+        use std::io::Write;
+        use std::process::{Command, Stdio};
+
+        let a = Spec::aaa();
+        let two_crc = a.crc.rotate_left(1) ^ a.crc;
+        let cases = [
+            ("aaa", one(Spec::aaa()), b"aaa".to_vec()),
+            (
+                "two blocks",
+                stream(b'1', &[a.clone(), a.clone()], two_crc),
+                b"aaaaaa".to_vec(),
+            ),
+            ("no blocks", stream(b'9', &[], 0), Vec::new()),
+        ];
+        for (name, input, expected) in cases {
+            let child = Command::new("/usr/bin/bzip2")
                 .arg("-dc")
-                .arg(&path)
-                .output()
-            {
-                if out.status.success() {
-                    assert_eq!(out.stdout, b"aaa");
-                }
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn();
+            let mut child = match child {
+                Ok(c) => c,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => return,
+                Err(e) => panic!("spawning bzip2: {e}"),
+            };
+            let mut stdin = child.stdin.take().expect("piped stdin");
+            let writer = std::thread::spawn({
+                let input = input.clone();
+                move || stdin.write_all(&input)
+            });
+            let out = child.wait_with_output().expect("bzip2 runs");
+            writer.join().expect("writer").expect("write to bzip2");
+            assert!(
+                out.status.success(),
+                "{name}: bzip2 rejected it: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            // Ours must agree with the reference on what these decode to.
+            let ours = bzip2_decompress(&input, BIG).expect("our decode");
+            assert_eq!(out.stdout, ours, "{name}: differs from bzip2");
+            if !expected.is_empty() {
+                assert_eq!(ours, expected, "{name}");
             }
-            let _ = std::fs::remove_file(&path);
         }
     }
 
-    /// Static vectors: a real stream with the randomised flag set, libbz2's
-    /// output, CRCs patched (see `testdata/bzip2/generate.py`).
     #[test]
     fn randomised_blocks_decode_as_libbz2_does() {
         for (name, input, expected) in
