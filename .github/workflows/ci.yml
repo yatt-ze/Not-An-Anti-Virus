@@ -113,6 +113,13 @@ jobs:
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-fuzz
+      # fuzz/corpus is gitignored, so bzip2 would start from nothing; seed it
+      # with the real-libbz2 vectors (the other targets still start empty).
+      - name: seed bzip2 corpus
+        working-directory: crates/nav-core
+        run: |
+          mkdir -p fuzz/corpus/bzip2
+          cp testdata/bzip2/*.in fuzz/corpus/bzip2/
       # 60s/target bounds wall-clock (~5min total) rather than depth; it
       # catches regressions cargo-fuzz's corpus already knows about, not new
       # ones. Sustained/corpus-growing fuzzing stays a deferred item (§12).
