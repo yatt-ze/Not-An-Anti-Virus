@@ -58,7 +58,10 @@ pub trait Rule: Send + Sync {
     /// Evaluate against the given context. Implementations return
     /// `Ok(Some(signal))` when the rule matched, `Ok(None)` when it ran but
     /// found nothing, and `Err(RuleOutcome::NotApplicable)` when the rule
-    /// itself couldn't run here.
+    /// itself couldn't run here. A rule that matched but could not cover
+    /// everything returns `Ok(Some(signal))` and calls
+    /// `ctx.mark_incomplete(self.id())`; with nothing matched it returns
+    /// `Err(NotApplicable)` as before.
     fn evaluate(&self, ctx: &ScanContext) -> Result<Option<MatchedSignal>, RuleOutcome>;
 
     /// True only when this rule's result for `ctx` doesn't depend on bytes

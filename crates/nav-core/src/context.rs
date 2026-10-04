@@ -393,6 +393,14 @@ impl ScanContext {
         }
     }
 
+    /// Number of distinct rules marked incomplete this scan.
+    pub fn incomplete_rule_count(&self) -> usize {
+        self.incomplete_rules
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .len()
+    }
+
     /// Whether `rule_id` was marked incomplete this scan.
     pub fn marked_incomplete(&self, rule_id: &'static str) -> bool {
         self.incomplete_rules

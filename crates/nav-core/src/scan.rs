@@ -84,6 +84,7 @@ pub fn scan_context(ctx: &ScanContext, rules: &[Box<dyn Rule>]) -> ScanResult {
     let completeness = if !ctx.readable() {
         ScanCompleteness::Indeterminate
     } else if not_applicable_count > 0
+        || ctx.incomplete_rule_count() > 0
         || truncation_uncovered
         || (ctx.truncated && evaluated_count == 0)
     {
@@ -102,7 +103,12 @@ pub fn scan_context(ctx: &ScanContext, rules: &[Box<dyn Rule>]) -> ScanResult {
 
     let recommendation = classify(score, non_informational_categories.len());
 
-    let confidence = confidence_for(&completeness, evaluated_count, not_applicable_count);
+    // A rule marked incomplete counts like one that couldn't run.
+    let confidence = confidence_for(
+        &completeness,
+        evaluated_count,
+        not_applicable_count.saturating_add(ctx.incomplete_rule_count()),
+    );
 
     ScanResult {
         path: ctx.path.clone(),
@@ -333,6 +339,52 @@ mod tests {
         fn covers_truncation(&self, _ctx: &ScanContext) -> bool {
             self.covers
         }
+    }
+
+    /// Matches a signal but records that it couldn't cover everything.
+    struct MatchedButIncompleteStub;
+
+    impl Rule for MatchedButIncompleteStub {
+        fn id(&self) -> &'static str {
+            "stub-matched-incomplete"
+        }
+        fn category(&self) -> SignalCategory {
+            SignalCategory::StaticSuspicion
+        }
+        fn evaluate(&self, ctx: &ScanContext) -> Result<Option<MatchedSignal>, RuleOutcome> {
+            ctx.mark_incomplete(self.id());
+            Ok(Some(MatchedSignal {
+                id: self.id().to_string(),
+                weight: 7,
+                description: "found something".to_string(),
+                category: self.category(),
+            }))
+        }
+    }
+
+    #[test]
+    fn a_matched_but_incomplete_rule_reports_its_signal_and_partial() {
+        let rules: Vec<Box<dyn Rule>> = vec![
+            Box::new(StubRule { covers: true }),
+            Box::new(MatchedButIncompleteStub),
+        ];
+        let r = scan_context(&ctx(false), &rules);
+        assert_eq!(r.completeness, ScanCompleteness::Partial);
+        assert_eq!(r.signals.len(), 1);
+        assert_eq!(r.score, 7);
+        // Same confidence as one rule that couldn't run.
+        assert_eq!(r.confidence, EvidenceConfidence::Medium);
+    }
+
+    #[test]
+    fn marking_incomplete_never_upgrades_an_unreadable_scan() {
+        let unreadable = ScanContext {
+            content: None,
+            ..ctx(false)
+        };
+        let rules: Vec<Box<dyn Rule>> = vec![Box::new(MatchedButIncompleteStub)];
+        let r = scan_context(&unreadable, &rules);
+        assert_eq!(r.completeness, ScanCompleteness::Indeterminate);
     }
 
     /// Can't run at all here, but claims to cover truncation — NotApplicable

