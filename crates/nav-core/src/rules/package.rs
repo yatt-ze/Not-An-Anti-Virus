@@ -139,9 +139,10 @@ fn scan_scripts_entry(
     findings: &mut ScriptFindings,
 ) -> Result<(), RuleOutcome> {
     // An entry we can't reach (bounded read stopped short) is
-    // unreadable, not absent.
-    let raw =
-        xar::read_entry(content, archive, entry, limits).map_err(|_| RuleOutcome::NotApplicable)?;
+    // unreadable, not absent. A partial bzip2 read is scanned, then reported
+    // unreadable below.
+    let (raw, gap) = xar::read_entry_partial(content, archive, entry, limits)
+        .map_err(|_| RuleOutcome::NotApplicable)?;
 
     // Scripts is normally gzip-wrapped cpio; if not gzip, `read_entry`
     // already undid the heap encoding.
@@ -154,9 +155,8 @@ fn scan_scripts_entry(
         // Something is in there, but not in a shape we can read.
         return Err(RuleOutcome::NotApplicable);
     };
-    if !members.is_complete() {
-        return Err(RuleOutcome::NotApplicable);
-    }
+    // Members that did parse are scanned even when the archive is cut short.
+    let complete = members.is_complete() && gap.is_none();
 
     for member in &members.entries {
         if !member.is_regular_file() || member.data.is_empty() {
@@ -169,7 +169,11 @@ fn scan_scripts_entry(
             &format!("install script {}", member.name),
         );
     }
-    Ok(())
+    if complete {
+        Ok(())
+    } else {
+        Err(RuleOutcome::NotApplicable)
+    }
 }
 
 /// Extracts the installer JavaScript from `Distribution` XML: `<script>`
@@ -418,9 +422,25 @@ fn scan_distribution_entry(
     limits: &xar::XarLimits,
     findings: &mut ScriptFindings,
 ) -> Result<(), RuleOutcome> {
-    let raw =
-        xar::read_entry(content, archive, entry, limits).map_err(|_| RuleOutcome::NotApplicable)?;
-    let js = distribution_js(&raw)?;
+    let (raw, gap) = xar::read_entry_partial(content, archive, entry, limits)
+        .map_err(|_| RuleOutcome::NotApplicable)?;
+    let scanned = scan_distribution_bytes(ctx, entry, &raw, findings);
+    // A partial read is evidence, not a clean read: findings stay, the entry
+    // is reported unreadable.
+    if gap.is_some() {
+        return Err(RuleOutcome::NotApplicable);
+    }
+    scanned
+}
+
+/// Scans the JavaScript of `Distribution` bytes already read from `entry`.
+fn scan_distribution_bytes(
+    ctx: &ScanContext,
+    entry: &xar::XarFile,
+    raw: &[u8],
+    findings: &mut ScriptFindings,
+) -> Result<(), RuleOutcome> {
+    let js = distribution_js(raw)?;
     if js.is_empty() {
         return Ok(());
     }
@@ -972,6 +992,49 @@ mod tests {
             signal.description
         );
         assert!(!c.marked_incomplete("installer-script-suspicious"));
+    }
+
+    /// A bzip2 `Distribution` missing its trailer still reads in libxar, so
+    /// Installer runs it. The decoded part is scanned and the gap reported.
+    #[test]
+    fn a_trailerless_bzip2_dropper_distribution_scores_and_marks_incomplete() {
+        let full = include_bytes!("../../testdata/bzip2/distribution_dropper.in");
+        let cut = crate::bzip2::cut_trailer(full);
+        assert!(cut.len() < full.len());
+        let bytes = bzip2_distribution_pkg(cut);
+
+        let c = ctx("cut.pkg", &bytes);
+        let signal = InstallerScriptRule
+            .evaluate(&c)
+            .expect("evaluates")
+            .expect("the decoded part scores");
+        assert!(
+            signal.description.starts_with("distribution script:"),
+            "{}",
+            signal.description
+        );
+        assert!(c.marked_incomplete("installer-script-suspicious"));
+
+        let c = ctx("cut.pkg", &bytes);
+        let rules: Vec<Box<dyn Rule>> = vec![Box::new(InstallerScriptRule)];
+        let r = crate::scan::scan_context(&c, &rules);
+        assert_eq!(r.completeness, crate::model::ScanCompleteness::Partial);
+        assert_eq!(r.signals.len(), 1);
+    }
+
+    /// Same cut, nothing found: unreadable, never clean.
+    #[test]
+    fn a_trailerless_bzip2_benign_distribution_is_not_applicable() {
+        let full = include_bytes!("../../testdata/bzip2/distribution_ordinary.in");
+        let cut = crate::bzip2::cut_trailer(full);
+        let c = ctx("cut.pkg", &bzip2_distribution_pkg(cut));
+        assert!(matches!(
+            InstallerScriptRule.evaluate(&c),
+            Err(RuleOutcome::NotApplicable)
+        ));
+        // Intact, it is clean.
+        let c = ctx("ok.pkg", &bzip2_distribution_pkg(full));
+        assert!(matches!(InstallerScriptRule.evaluate(&c), Ok(None)));
     }
 
     /// A corrupt bzip2 Distribution is unreadable, not clean.

