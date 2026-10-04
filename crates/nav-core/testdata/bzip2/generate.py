@@ -7,6 +7,9 @@ than against itself. Deterministic: the RNG is seeded.
 
 Each case pairs <name>.in (bzip2 stream) with <name>.out (expected plaintext).
 level_N.in (N=1..9) have no .out of their own: they all decode to text.out.
+The randomised_* vectors are static, not regenerated here: each is a real
+stream with the randomised flag set, libbz2's decoded output taken as the
+expectation, and the block and stream CRCs patched to match.
 bomb.in deliberately has no .out - it must be rejected as BudgetExceeded.
 
 Usage: python3 generate.py <output-dir>
