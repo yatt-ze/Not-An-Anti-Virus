@@ -1037,18 +1037,32 @@ mod tests {
         assert!(matches!(InstallerScriptRule.evaluate(&c), Ok(None)));
     }
 
-    /// A corrupt bzip2 Distribution is unreadable, not clean.
+    /// A wrong block CRC does not hide the decoded bytes: libxar yields them
+    /// without checking, so they are scanned and the entry reported unreadable.
     #[test]
-    fn a_corrupt_bzip2_distribution_is_not_applicable() {
+    fn a_bzip2_distribution_with_a_wrong_crc_is_scanned_and_marked_incomplete() {
         let mut blob = include_bytes!("../../testdata/bzip2/distribution_dropper.in").to_vec();
         blob[10] ^= 0x80; // block CRC
-        for blob in [blob.as_slice(), b"BZh91AY&SY\x01\x02\x03\x04 junk"] {
-            let c = ctx("bad.pkg", &bzip2_distribution_pkg(blob));
-            assert!(matches!(
-                InstallerScriptRule.evaluate(&c),
-                Err(RuleOutcome::NotApplicable)
-            ));
-        }
+        let c = ctx("bad.pkg", &bzip2_distribution_pkg(&blob));
+        let signal = InstallerScriptRule
+            .evaluate(&c)
+            .expect("evaluates")
+            .expect("the decoded block scores");
+        assert!(signal.description.starts_with("distribution script:"));
+        assert!(c.marked_incomplete("installer-script-suspicious"));
+    }
+
+    /// Undecodable bytes with nothing scoring are unreadable, not clean.
+    #[test]
+    fn an_undecodable_bzip2_distribution_is_not_applicable() {
+        let c = ctx(
+            "bad.pkg",
+            &bzip2_distribution_pkg(b"BZh91AY&SY\x01\x02\x03\x04 junk"),
+        );
+        assert!(matches!(
+            InstallerScriptRule.evaluate(&c),
+            Err(RuleOutcome::NotApplicable)
+        ));
     }
 
     /// A product-style xar with a readable dropper `Distribution` and a

@@ -300,7 +300,8 @@ pub fn read_entry(
 }
 
 /// Like [`read_entry`], but a bzip2 entry that fails partway still yields
-/// the blocks decoded before the failure. `Ok((bytes, None))` is a full read;
+/// the bytes decoded before the failure, which may include an unverified or
+/// cut-short final block. `Ok((bytes, None))` is a full read;
 /// `Ok((bytes, Some(err)))` is a non-empty partial one. Callers must treat the
 /// latter as incomplete evidence, never as a clean read.
 pub fn read_entry_partial(

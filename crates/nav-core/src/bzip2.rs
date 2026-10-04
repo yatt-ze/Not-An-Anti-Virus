@@ -76,17 +76,17 @@ pub fn bzip2_decompress(data: &[u8], budget: usize) -> Result<Vec<u8>, DecodeErr
     result.map(|()| out)
 }
 
-/// Like [`bzip2_decompress`], but on error also returns the bytes of every
-/// block fully decoded and CRC-verified before it. A block that fails
-/// contributes nothing; a bad header yields an empty `Vec`.
+/// Like [`bzip2_decompress`], but on error also returns every byte written
+/// before the failure (at most `budget`). Bytes after the last verified
+/// block are unverified: they may be a prefix of the failing block, or all of
+/// a block whose CRC mismatched. A bad header yields an empty `Vec`.
 pub fn bzip2_decompress_partial(data: &[u8], budget: usize) -> (Vec<u8>, Result<(), DecodeError>) {
     let mut out = Vec::with_capacity(budget.min(INITIAL_OUTPUT_CAPACITY));
     let result = decode_stream(data, budget, &mut out);
     (out, result)
 }
 
-/// Decode the stream into `out`. On error `out` holds exactly the blocks
-/// that completed.
+/// Decode the stream into `out`. On error `out` holds whatever was written.
 fn decode_stream(data: &[u8], budget: usize, out: &mut Vec<u8>) -> Result<(), DecodeError> {
     let mut r = BitReader::new(data);
     for expected in *b"BZh" {
@@ -107,14 +107,8 @@ fn decode_stream(data: &[u8], budget: usize, out: &mut Vec<u8>) -> Result<(), De
         let magic = (u64::from(r.bits(24)?) << 24) | u64::from(r.bits(24)?);
         match magic {
             BLOCK_MAGIC => {
-                let start = out.len();
-                match decode_block(&mut r, max_block, &mut tt, out, budget) {
-                    Ok(crc) => combined = combined.rotate_left(1) ^ crc,
-                    Err(e) => {
-                        out.truncate(start);
-                        return Err(e);
-                    }
-                }
+                let crc = decode_block(&mut r, max_block, &mut tt, out, budget)?;
+                combined = combined.rotate_left(1) ^ crc;
             }
             END_MAGIC => {
                 if r.bits(32)? != combined {
@@ -357,17 +351,16 @@ fn put_byte(out: &mut Vec<u8>, byte: u8, budget: usize) -> Result<(), DecodeErro
     Ok(())
 }
 
-/// Append `n` copies of `byte`, refusing (before writing any) to pass `budget`.
+/// Append `n` copies of `byte`. Writes only what fits under `budget` and
+/// returns `BudgetExceeded` if that is fewer than `n`.
 fn put_run(out: &mut Vec<u8>, byte: u8, n: usize, budget: usize) -> Result<(), DecodeError> {
-    let end = out
-        .len()
-        .checked_add(n)
-        .ok_or(DecodeError::BudgetExceeded)?;
-    if end > budget {
+    let room = budget.saturating_sub(out.len());
+    let take = n.min(room);
+    reserve(out, take, budget);
+    out.resize(out.len() + take, byte);
+    if take < n {
         return Err(DecodeError::BudgetExceeded);
     }
-    reserve(out, n, budget);
-    out.resize(end, byte);
     Ok(())
 }
 
@@ -1348,7 +1341,7 @@ mod tests {
     }
 
     #[test]
-    fn partial_decode_keeps_only_completed_blocks() {
+    fn partial_decode_keeps_everything_written_before_the_failure() {
         let input = vec_in!("multi_block");
         let expected = vec_out!("multi_block");
         let starts = find_magic(input, BLOCK_MAGIC);
@@ -1366,38 +1359,85 @@ mod tests {
         assert!(got == expected);
         assert_eq!(bzip2_decompress(cut, BIG), Err(DecodeError::Truncated));
 
-        // Cut inside block 2: exactly block 1's bytes.
-        let mid2 = starts[1] / 8 + 100;
-        let (b1, r) = bzip2_decompress_partial(&input[..mid2], BIG);
+        // Cut inside a block's bitstream: it never reaches the output stage,
+        // so only the verified blocks before it are returned.
+        let (b1, r) = bzip2_decompress_partial(&input[..starts[1] / 8 + 100], BIG);
         assert_eq!(r, Err(DecodeError::Truncated));
         assert!(!b1.is_empty() && b1.len() < 100_000);
         assert!(b1[..] == expected[..b1.len()]);
+        let (b12, r) = bzip2_decompress_partial(&input[..starts[2] / 8 + 100], BIG);
+        assert_eq!(r, Err(DecodeError::Truncated));
+        assert!(b12.len() > b1.len() && b12[..] == expected[..b12.len()]);
         assert_eq!(
-            bzip2_decompress(&input[..mid2], BIG),
+            bzip2_decompress(&input[..starts[1] / 8 + 100], BIG),
             Err(DecodeError::Truncated)
         );
 
-        // Bad CRC in block 2 (first bit of its stored CRC): block 1 only.
+        // Bad CRC in block 2 (first bit of its stored CRC): the whole of
+        // block 2 is returned, unverified.
         let mut bad = input.to_vec();
         let crc_bit = starts[1] + 48;
         bad[crc_bit / 8] ^= 0x80 >> (crc_bit % 8);
         let (got, r) = bzip2_decompress_partial(&bad, BIG);
         assert_eq!(r, Err(DecodeError::ChecksumMismatch));
-        assert!(got == b1);
+        assert!(got == b12);
         assert_eq!(
             bzip2_decompress(&bad, BIG),
             Err(DecodeError::ChecksumMismatch)
         );
 
-        // Budget hit inside block 2: block 1 only.
+        // Budget hit inside block 2: exactly `budget` bytes.
         let budget = b1.len() + 10;
         let (got, r) = bzip2_decompress_partial(input, budget);
         assert_eq!(r, Err(DecodeError::BudgetExceeded));
-        assert!(got == b1);
+        assert_eq!(got.len(), budget);
+        assert!(got[..] == expected[..budget]);
         assert_eq!(
             bzip2_decompress(input, budget),
             Err(DecodeError::BudgetExceeded)
         );
+    }
+
+    /// A block whose CRC is wrong and whose trailer is missing: libxar never
+    /// reaches the CRC check, so the block's bytes are the evidence.
+    #[test]
+    fn partial_decode_returns_a_block_with_a_wrong_crc() {
+        let full = vec_in!("distribution_dropper");
+        let mut bad = cut_trailer(full).to_vec();
+        bad[10] ^= 0x01;
+        let (got, r) = bzip2_decompress_partial(&bad, BIG);
+        assert_eq!(r, Err(DecodeError::ChecksumMismatch));
+        assert!(got == vec_out!("distribution_dropper"));
+        assert_eq!(
+            bzip2_decompress(&bad, BIG),
+            Err(DecodeError::ChecksumMismatch)
+        );
+    }
+
+    /// A tiny stream that exceeds the budget inside its only block: the
+    /// in-budget prefix (which holds the dropper) is returned.
+    #[test]
+    fn partial_decode_returns_the_in_budget_prefix_of_a_big_block() {
+        let input = vec_in!("distribution_big");
+        let budget = 4 << 20;
+        let (got, r) = bzip2_decompress_partial(input, budget);
+        assert_eq!(r, Err(DecodeError::BudgetExceeded));
+        assert_eq!(got.len(), budget);
+        assert!(got.starts_with(vec_out!("distribution_dropper")));
+        assert!(got.capacity() <= budget);
+        assert_eq!(
+            bzip2_decompress(input, budget),
+            Err(DecodeError::BudgetExceeded)
+        );
+    }
+
+    /// Valid CRCs, no trailer: every decoded byte comes back, junk tail included.
+    #[test]
+    fn partial_decode_returns_a_trailerless_stream_whole() {
+        let full = vec_in!("distribution_junk_tail");
+        let (got, r) = bzip2_decompress_partial(cut_trailer(full), BIG);
+        assert_eq!(r, Err(DecodeError::Truncated));
+        assert!(got == vec_out!("distribution_junk_tail"));
     }
 
     #[test]

