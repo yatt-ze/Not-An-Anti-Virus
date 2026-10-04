@@ -16,7 +16,8 @@
 //! Hand-written per §3. XML goes through [`crate::xml`], shared with the plist
 //! reader so there is only one XML implementation to fuzz.
 
-use crate::inflate::{self, InflateError};
+use crate::decode::DecodeError;
+use crate::inflate;
 use crate::xml::{self, Event, Next, Scanner};
 
 /// `xar!`, read big-endian.
@@ -195,7 +196,7 @@ pub enum XarEntryError {
     /// The entry's bytes are not a compression format we recognize.
     UnknownEncoding,
     /// Decompression failed or exceeded `max_entry_bytes`.
-    Undecodable(InflateError),
+    Undecodable(DecodeError),
 }
 
 /// True if `data` opens with the xar magic (`xar!`). [`parse`] uses this same
@@ -269,7 +270,7 @@ pub fn parse(data: &[u8], limits: &XarLimits) -> Option<XarArchive> {
 
     let toc = match inflate::zlib_decompress(toc_compressed, limits.max_toc_bytes) {
         Ok(t) => t,
-        Err(InflateError::BudgetExceeded) => {
+        Err(DecodeError::BudgetExceeded) => {
             archive.halted = Some(XarHalt::TocTooLarge);
             return Some(archive);
         }
@@ -321,7 +322,7 @@ pub fn read_entry(
         // Plausible zlib CMF; if the header checks fail, treat it as stored.
         match inflate::zlib_decompress(raw, limits.max_entry_bytes) {
             Ok(v) => Ok(v),
-            Err(InflateError::BadHeader) => stored(raw, limits),
+            Err(DecodeError::BadHeader) => stored(raw, limits),
             Err(e) => Err(XarEntryError::Undecodable(e)),
         }
     } else {
@@ -332,7 +333,7 @@ pub fn read_entry(
 /// An entry stored without compression, subject to the same ceiling.
 fn stored(raw: &[u8], limits: &XarLimits) -> Result<Vec<u8>, XarEntryError> {
     if raw.len() > limits.max_entry_bytes {
-        return Err(XarEntryError::Undecodable(InflateError::BudgetExceeded));
+        return Err(XarEntryError::Undecodable(DecodeError::BudgetExceeded));
     }
     Ok(raw.to_vec())
 }
@@ -903,12 +904,12 @@ mod tests {
         bad[10] ^= 0x80; // block CRC
         assert_eq!(
             read_single(&bad, &XarLimits::default()),
-            Err(XarEntryError::Undecodable(InflateError::ChecksumMismatch))
+            Err(XarEntryError::Undecodable(DecodeError::ChecksumMismatch))
         );
         // A bare header is a truncated stream, not "unknown".
         assert_eq!(
             read_single(b"BZh1", &XarLimits::default()),
-            Err(XarEntryError::Undecodable(InflateError::Truncated))
+            Err(XarEntryError::Undecodable(DecodeError::Truncated))
         );
     }
 
@@ -920,7 +921,7 @@ mod tests {
         };
         assert_eq!(
             read_single(include_bytes!("../testdata/bzip2/bomb.in"), &limits),
-            Err(XarEntryError::Undecodable(InflateError::BudgetExceeded))
+            Err(XarEntryError::Undecodable(DecodeError::BudgetExceeded))
         );
     }
 
@@ -945,7 +946,7 @@ mod tests {
         let f = a.files.first().expect("one entry");
         assert_eq!(
             read_entry(adversarial!("heap_entry_bomb"), &a, f, &limits),
-            Err(XarEntryError::Undecodable(InflateError::BudgetExceeded))
+            Err(XarEntryError::Undecodable(DecodeError::BudgetExceeded))
         );
     }
 
