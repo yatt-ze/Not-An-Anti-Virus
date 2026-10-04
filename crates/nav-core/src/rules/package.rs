@@ -51,67 +51,28 @@ impl Rule for InstallerScriptRule {
             return Err(RuleOutcome::NotApplicable);
         }
 
-        let mut findings: Vec<String> = Vec::new();
-        let mut total: i32 = 0;
+        let mut findings = ScriptFindings::default();
         let mut saw_scripts = false;
 
         for entry in archive.metadata_entries() {
-            if entry.name != "Scripts" {
-                continue;
-            }
-            saw_scripts = true;
-
-            // An entry we can't reach (bounded read stopped short) is
-            // unreadable, not absent.
-            let raw = xar::read_entry(content, &archive, entry, &limits)
-                .map_err(|_| RuleOutcome::NotApplicable)?;
-
-            // Scripts is normally gzip-wrapped cpio; if not gzip, `read_entry`
-            // already undid the heap encoding.
-            let archive_bytes = match crate::inflate::gzip_decompress(&raw, limits.max_entry_bytes)
-            {
-                Ok(v) => v,
-                Err(_) => raw,
-            };
-
-            let Some(members) = cpio::parse(&archive_bytes, &cpio::CpioLimits::default()) else {
-                // Something is in there, but not in a shape we can read.
-                return Err(RuleOutcome::NotApplicable);
-            };
-            if !members.is_complete() {
-                return Err(RuleOutcome::NotApplicable);
-            }
-
-            for member in &members.entries {
-                if !member.is_regular_file() || member.data.is_empty() {
-                    continue;
+            match entry.name.as_str() {
+                "Scripts" => {
+                    saw_scripts = true;
+                    scan_scripts_entry(ctx, content, &archive, entry, &limits, &mut findings)?;
                 }
-                let label = format!("{}!{}/{}", ctx.path.display(), entry.path, member.name);
-                let result = scan_embedded_bytes(
-                    label,
-                    member.data.to_vec(),
-                    false,
-                    &embedded_content_ruleset(),
-                );
-                for signal in &result.signals {
-                    total = total.saturating_add(signal.weight);
-                    findings.push(format!(
-                        "install script {}: {}",
-                        member.name, signal.description
-                    ));
-                }
+                _ => continue,
             }
         }
 
         // No scripts at all, or scripts that scored nothing: a clean read.
-        if !saw_scripts || findings.is_empty() || total <= 0 {
+        if !saw_scripts || findings.descriptions.is_empty() || findings.total <= 0 {
             return Ok(None);
         }
 
         Ok(Some(MatchedSignal {
             id: self.id().to_string(),
-            weight: total.min(MAX_SCRIPT_WEIGHT),
-            description: findings.join("; "),
+            weight: findings.total.min(MAX_SCRIPT_WEIGHT),
+            description: findings.descriptions.join("; "),
             category: self.category(),
         }))
     }
@@ -123,6 +84,70 @@ impl Rule for InstallerScriptRule {
             .as_deref()
             .is_some_and(|c| !xar::has_xar_magic(c))
     }
+}
+
+/// Signal descriptions and summed weight collected across scanned script text.
+#[derive(Default)]
+struct ScriptFindings {
+    descriptions: Vec<String>,
+    total: i32,
+}
+
+impl ScriptFindings {
+    /// Scans `bytes` with the embedded-content rules; each signal is recorded
+    /// as `"{prefix}: {description}"`.
+    fn scan(&mut self, label: String, bytes: Vec<u8>, prefix: &str) {
+        let result = scan_embedded_bytes(label, bytes, false, &embedded_content_ruleset());
+        for signal in &result.signals {
+            self.total = self.total.saturating_add(signal.weight);
+            self.descriptions
+                .push(format!("{prefix}: {}", signal.description));
+        }
+    }
+}
+
+/// Reads the `Scripts` entry (gzip-wrapped cpio) and scans each regular
+/// member. Errors with `NotApplicable` if any step can't be read in full.
+fn scan_scripts_entry(
+    ctx: &ScanContext,
+    content: &[u8],
+    archive: &xar::XarArchive,
+    entry: &xar::XarFile,
+    limits: &xar::XarLimits,
+    findings: &mut ScriptFindings,
+) -> Result<(), RuleOutcome> {
+    // An entry we can't reach (bounded read stopped short) is
+    // unreadable, not absent.
+    let raw =
+        xar::read_entry(content, archive, entry, limits).map_err(|_| RuleOutcome::NotApplicable)?;
+
+    // Scripts is normally gzip-wrapped cpio; if not gzip, `read_entry`
+    // already undid the heap encoding.
+    let archive_bytes = match crate::inflate::gzip_decompress(&raw, limits.max_entry_bytes) {
+        Ok(v) => v,
+        Err(_) => raw,
+    };
+
+    let Some(members) = cpio::parse(&archive_bytes, &cpio::CpioLimits::default()) else {
+        // Something is in there, but not in a shape we can read.
+        return Err(RuleOutcome::NotApplicable);
+    };
+    if !members.is_complete() {
+        return Err(RuleOutcome::NotApplicable);
+    }
+
+    for member in &members.entries {
+        if !member.is_regular_file() || member.data.is_empty() {
+            continue;
+        }
+        let label = format!("{}!{}/{}", ctx.path.display(), entry.path, member.name);
+        findings.scan(
+            label,
+            member.data.to_vec(),
+            &format!("install script {}", member.name),
+        );
+    }
+    Ok(())
 }
 
 /// Notes an installer package that carries no signature.
