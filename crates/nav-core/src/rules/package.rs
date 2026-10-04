@@ -946,21 +946,46 @@ mod tests {
         }
     }
 
-    /// A bzip2-compressed Distribution (as in real packages) is not checked.
-    #[test]
-    fn a_compressed_distribution_in_a_package_is_not_applicable() {
-        let blob = b"BZh91AY&SY\x01\x02\x03\x04 junk";
+    /// A xar whose only entry is a `Distribution` holding `blob`, labelled bzip2.
+    fn bzip2_distribution_pkg(blob: &[u8]) -> Vec<u8> {
         let toc = format!(
             r#"<file id="1"><name>Distribution</name><type>file</type><data><offset>0</offset><length>{n}</length><size>{n}</size><encoding style="application/x-bzip2"/></data></file>"#,
             n = blob.len()
         );
         let mut bytes = xar::toc_xar_bytes(&toc);
         bytes.extend_from_slice(blob);
-        let c = ctx("compressed.pkg", &bytes);
-        assert!(matches!(
-            InstallerScriptRule.evaluate(&c),
-            Err(RuleOutcome::NotApplicable)
-        ));
+        bytes
+    }
+
+    /// Real bzip2 (`testdata/bzip2/distribution_dropper.in`) of a dropper Distribution.
+    #[test]
+    fn a_bzip2_distribution_in_a_package_is_checked() {
+        let blob = include_bytes!("../../testdata/bzip2/distribution_dropper.in");
+        let c = ctx("bz.pkg", &bzip2_distribution_pkg(blob));
+        let signal = InstallerScriptRule
+            .evaluate(&c)
+            .expect("evaluates")
+            .expect("the decoded Distribution scores");
+        assert!(
+            signal.description.starts_with("distribution script:"),
+            "{}",
+            signal.description
+        );
+        assert!(!c.marked_incomplete("installer-script-suspicious"));
+    }
+
+    /// A corrupt bzip2 Distribution is unreadable, not clean.
+    #[test]
+    fn a_corrupt_bzip2_distribution_is_not_applicable() {
+        let mut blob = include_bytes!("../../testdata/bzip2/distribution_dropper.in").to_vec();
+        blob[10] ^= 0x80; // block CRC
+        for blob in [blob.as_slice(), b"BZh91AY&SY\x01\x02\x03\x04 junk"] {
+            let c = ctx("bad.pkg", &bzip2_distribution_pkg(blob));
+            assert!(matches!(
+                InstallerScriptRule.evaluate(&c),
+                Err(RuleOutcome::NotApplicable)
+            ));
+        }
     }
 
     /// A product-style xar with a readable dropper `Distribution` and a

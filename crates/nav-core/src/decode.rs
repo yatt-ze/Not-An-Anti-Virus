@@ -1,4 +1,4 @@
-//! Error type shared by the bounded decompressors (currently `inflate`).
+//! Error type shared by the bounded decompressors (`inflate`, `bzip2`).
 //! `BudgetExceeded` is a §6.2 policy stop, not malformation.
 
 /// Why a stream could not be decoded. `BudgetExceeded` is a §6.2 policy stop,
