@@ -3,12 +3,12 @@
 //! code corroborates across §5.1's two-category requirement:
 //!
 //! - `installer-script-suspicious` (`StaticSuspicion`) scores the install
-//!   scripts' contents;
+//!   scripts' contents and the JavaScript in the `Distribution` file;
 //! - `unsigned-installer-package` (`ProvenanceConcern`) notes a missing signature.
 //!
 //! The script rule adds no heuristics of its own: it reaches the script text
-//! (xar TOC → heap → gzip → cpio) and hands the bytes to the existing content
-//! rules — the container work buys *reach*, not a new detection. Only the named
+//! (xar TOC → heap → gzip → cpio, or `Distribution` XML) and hands the bytes
+//! to the existing content rules — the container work buys *reach*, not a new detection. Only the named
 //! metadata entries are read; `Payload` is left for §6.2's Phase 0b path.
 
 use super::{embedded_content_ruleset, Rule, RuleOutcome};
@@ -16,7 +16,7 @@ use crate::context::ScanContext;
 use crate::macho::ByteSource;
 use crate::model::{MatchedSignal, SignalCategory};
 use crate::scan::scan_embedded_bytes;
-use crate::{cpio, xar};
+use crate::{cpio, xar, xml};
 
 /// Ceiling on what the script rule can contribute — the sub-scan total climbs
 /// fast when several markers match, and Phase 0a scoring is a plain sum (§12).
@@ -27,7 +27,7 @@ const MAX_SCRIPT_WEIGHT: i32 = 20;
 /// Earns its place by corroborating (§5.1, §5.4).
 const UNSIGNED_PACKAGE_WEIGHT: i32 = 6;
 
-/// Scores the contents of a package's install scripts.
+/// Scores a package's install scripts and `Distribution` JavaScript.
 pub struct InstallerScriptRule;
 
 impl Rule for InstallerScriptRule {
@@ -52,20 +52,21 @@ impl Rule for InstallerScriptRule {
         }
 
         let mut findings = ScriptFindings::default();
-        let mut saw_scripts = false;
 
         for entry in archive.metadata_entries() {
             match entry.name.as_str() {
                 "Scripts" => {
-                    saw_scripts = true;
                     scan_scripts_entry(ctx, content, &archive, entry, &limits, &mut findings)?;
+                }
+                "Distribution" => {
+                    scan_distribution_entry(ctx, content, &archive, entry, &limits, &mut findings)?;
                 }
                 _ => continue,
             }
         }
 
-        // No scripts at all, or scripts that scored nothing: a clean read.
-        if !saw_scripts || findings.descriptions.is_empty() || findings.total <= 0 {
+        // Nothing scanned, or scanned and scored nothing: a clean read.
+        if findings.descriptions.is_empty() || findings.total <= 0 {
             return Ok(None);
         }
 
@@ -147,6 +148,95 @@ fn scan_scripts_entry(
             &format!("install script {}", member.name),
         );
     }
+    Ok(())
+}
+
+/// `Distribution` attributes whose value is a JavaScript expression.
+const DISTRIBUTION_JS_ATTRS: &[&str] = &[
+    "selected",
+    "enabled",
+    "visible",
+    "start_selected",
+    "start_enabled",
+    "start_visible",
+    "onConclusionScript",
+    "script",
+];
+
+/// Extracts the installer JavaScript from `Distribution` XML: `<script>`
+/// bodies (raw, `<![CDATA[` stripped or entities decoded) and the
+/// [`DISTRIBUTION_JS_ATTRS`] values, joined with `\n`. Empty if there is none.
+/// `NotApplicable` on malformed XML or an unterminated `<script>`.
+fn distribution_js(xml_bytes: &[u8]) -> Result<Vec<u8>, RuleOutcome> {
+    let mut pieces: Vec<String> = Vec::new();
+    let mut scanner = xml::Scanner::new(xml_bytes);
+    loop {
+        match scanner.next_event() {
+            xml::Next::End => break,
+            xml::Next::Bad => return Err(RuleOutcome::NotApplicable),
+            xml::Next::Event(xml::Event::Open {
+                name,
+                attrs,
+                self_closing,
+            }) => {
+                for want in DISTRIBUTION_JS_ATTRS {
+                    if let Some(v) = xml::attr(attrs, want) {
+                        pieces.push(v);
+                    }
+                }
+                if name == "script" && !self_closing {
+                    let raw = scanner
+                        .raw_until_close("script")
+                        .ok_or(RuleOutcome::NotApplicable)?;
+                    pieces.push(script_body_text(raw));
+                }
+            }
+            xml::Next::Event(_) => {}
+        }
+    }
+    pieces.retain(|p| !p.trim().is_empty());
+    Ok(pieces.join("\n").into_bytes())
+}
+
+/// Text of a raw `<script>` body: the CDATA content if wrapped in one,
+/// otherwise the entity-decoded body.
+fn script_body_text(raw: &[u8]) -> String {
+    let start = raw
+        .iter()
+        .position(|c| !c.is_ascii_whitespace())
+        .unwrap_or(raw.len());
+    let end = raw
+        .iter()
+        .rposition(|c| !c.is_ascii_whitespace())
+        .map_or(start, |i| i + 1);
+    let trimmed = raw.get(start..end).unwrap_or(&[]);
+    match trimmed
+        .strip_prefix(b"<![CDATA[".as_slice())
+        .and_then(|r| r.strip_suffix(b"]]>".as_slice()))
+    {
+        Some(inner) => String::from_utf8_lossy(inner).into_owned(),
+        None => xml::decode_entities(raw),
+    }
+}
+
+/// Reads the `Distribution` entry and scans its JavaScript. Errors with
+/// `NotApplicable` if it can't be read or parsed in full.
+fn scan_distribution_entry(
+    ctx: &ScanContext,
+    content: &[u8],
+    archive: &xar::XarArchive,
+    entry: &xar::XarFile,
+    limits: &xar::XarLimits,
+    findings: &mut ScriptFindings,
+) -> Result<(), RuleOutcome> {
+    let raw =
+        xar::read_entry(content, archive, entry, limits).map_err(|_| RuleOutcome::NotApplicable)?;
+    let js = distribution_js(&raw)?;
+    if js.is_empty() {
+        return Ok(());
+    }
+    let label = format!("{}!{}", ctx.path.display(), entry.path);
+    findings.scan(label, js, "distribution script");
     Ok(())
 }
 
@@ -275,6 +365,83 @@ mod tests {
     fn scripts_inside_a_nested_package_are_reached() {
         let c = ctx("product.pkg", pkg!("product"));
         // product.pkg wraps the benign package, whose scripts are clean.
+        assert!(matches!(InstallerScriptRule.evaluate(&c), Ok(None)));
+    }
+
+    fn js(xml: &str) -> Result<String, RuleOutcome> {
+        distribution_js(xml.as_bytes()).map(|v| String::from_utf8(v).unwrap())
+    }
+
+    #[test]
+    fn distribution_script_body_is_extracted() {
+        let out = js("<a><script>\n system.run('x');\n</script></a>").unwrap();
+        assert!(out.contains("system.run('x');"), "{out}");
+    }
+
+    #[test]
+    fn distribution_script_cdata_is_unwrapped() {
+        let out = js("<a><script><![CDATA[ if (a < b && c) { go(); } ]]></script></a>").unwrap();
+        assert_eq!(out.trim(), "if (a < b && c) { go(); }");
+    }
+
+    #[test]
+    fn distribution_script_with_raw_angle_bracket_is_extracted() {
+        let out = js("<a><script>if (a < b) { go(); }</script></a>").unwrap();
+        assert_eq!(out, "if (a < b) { go(); }");
+    }
+
+    #[test]
+    fn distribution_script_entities_are_decoded() {
+        let out = js("<a><script>if (a &lt; b &amp;&amp; c) go();</script></a>").unwrap();
+        assert_eq!(out, "if (a < b && c) go();");
+    }
+
+    #[test]
+    fn distribution_attribute_expressions_are_extracted_and_decoded() {
+        let out = js(
+            r#"<c selected="system.compareVersions(v, '10.9') &lt; 1" title="Not JS" onConclusionScript="done()"/>"#,
+        )
+        .unwrap();
+        assert_eq!(out, "system.compareVersions(v, '10.9') < 1\ndone()");
+    }
+
+    #[test]
+    fn unterminated_distribution_script_is_not_applicable() {
+        assert!(matches!(
+            js("<a><script>system.run('x');"),
+            Err(RuleOutcome::NotApplicable)
+        ));
+        assert!(matches!(js("<a><script"), Err(RuleOutcome::NotApplicable)));
+    }
+
+    #[test]
+    fn distribution_without_js_extracts_nothing() {
+        assert_eq!(
+            js(r#"<a><title>T</title><script/><choice id="x"/></a>"#).unwrap(),
+            ""
+        );
+        assert_eq!(js("<a><script>  \n </script></a>").unwrap(), "");
+    }
+
+    #[test]
+    fn a_distribution_dropper_is_found_through_the_container() {
+        let c = ctx("dropper.pkg", pkg!("distribution_dropper"));
+        let signal = InstallerScriptRule
+            .evaluate(&c)
+            .expect("rule should evaluate")
+            .expect("should fire on a curl-pipe-to-shell in Distribution JS");
+        assert_eq!(signal.id, "installer-script-suspicious");
+        assert!(
+            signal.description.starts_with("distribution script:"),
+            "{}",
+            signal.description
+        );
+    }
+
+    /// `unload.sh` and `compareVersions` are what real packages ship (§1).
+    #[test]
+    fn an_ordinary_distribution_script_scores_nothing() {
+        let c = ctx("ordinary.pkg", pkg!("distribution_ordinary"));
         assert!(matches!(InstallerScriptRule.evaluate(&c), Ok(None)));
     }
 

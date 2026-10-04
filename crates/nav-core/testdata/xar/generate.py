@@ -9,7 +9,7 @@ misbehave. Per design doc §3, the "small input, huge materialization" shapes
 here are NOT reachable by mutating a valid-file seed corpus, so they are also
 seeded deliberately into the parse_xar fuzz target (§11.9).
 
-The four .pkg files alongside these vectors are NOT produced by this script:
+The static .pkg files alongside these vectors are NOT produced by this script:
 they are real pkgbuild/productbuild output, kept as static bytes because those
 tools embed inode/mtime/uid and so are not reproducible. Synthetic containers
 cannot prove we read what Apple's tooling actually emits.

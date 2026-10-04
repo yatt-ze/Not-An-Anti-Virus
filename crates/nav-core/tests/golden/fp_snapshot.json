@@ -121,6 +121,14 @@
     "rule_ids": [],
     "completeness": "complete"
   },
+  "benign/installer_distribution_js_ordinary.pkg": {
+    "score": 6,
+    "recommendation": "no-action",
+    "rule_ids": [
+      "unsigned-installer-package"
+    ],
+    "completeness": "complete"
+  },
   "benign/installer_nested.pkg": {
     "score": 6,
     "recommendation": "no-action",
@@ -381,6 +389,15 @@
   },
   "suspicious/installer_curl_pipe_preinstall.pkg": {
     "score": 25,
+    "recommendation": "notify",
+    "rule_ids": [
+      "installer-script-suspicious",
+      "unsigned-installer-package"
+    ],
+    "completeness": "complete"
+  },
+  "suspicious/installer_distribution_js_dropper.pkg": {
+    "score": 21,
     "recommendation": "notify",
     "rule_ids": [
       "installer-script-suspicious",

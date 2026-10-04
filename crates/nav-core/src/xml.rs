@@ -368,6 +368,31 @@ impl<'a> Scanner<'a> {
             };
         }
     }
+
+    /// Called right after an `Open` event for `name`: returns the raw bytes up
+    /// to the matching `</name>` (untokenised, so `<` in a script body is
+    /// fine) and advances past it. `None`, position unchanged, if there is no
+    /// close tag.
+    pub fn raw_until_close(&mut self, name: &str) -> Option<&'a [u8]> {
+        let rest = self.b.get(self.pos..)?;
+        let needle = format!("</{name}");
+        let mut from = 0usize;
+        loop {
+            let at = from.checked_add(find(rest.get(from..)?, needle.as_bytes())?)?;
+            let after = at.checked_add(needle.len())?;
+            // Reject longer names such as `</scripts>`.
+            if rest
+                .get(after)
+                .is_some_and(|c| *c == b'>' || *c == b'/' || c.is_ascii_whitespace())
+            {
+                let gt = after.checked_add(find(rest.get(after..)?, b">")?)?;
+                let body = rest.get(..at)?;
+                self.pos = self.pos.saturating_add(gt.checked_add(1)?);
+                return Some(body);
+            }
+            from = after;
+        }
+    }
 }
 
 #[cfg(test)]
@@ -506,5 +531,45 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn raw_until_close_returns_untokenised_body() {
+        let doc = b"<a><script>if (a < b) { x(\"</p>\"); }</script><b/></a>";
+        let mut sc = Scanner::new(doc);
+        sc.next_event();
+        assert!(matches!(
+            sc.next_event(),
+            Next::Event(Event::Open { name: "script", .. })
+        ));
+        assert_eq!(
+            sc.raw_until_close("script"),
+            Some(b"if (a < b) { x(\"</p>\"); }".as_slice())
+        );
+        assert!(matches!(
+            sc.next_event(),
+            Next::Event(Event::Open { name: "b", .. })
+        ));
+    }
+
+    #[test]
+    fn raw_until_close_skips_longer_names_and_tolerates_space() {
+        let mut sc = Scanner::new(b"x</scripts>y</script >z");
+        assert_eq!(
+            sc.raw_until_close("script"),
+            Some(b"x</scripts>y".as_slice())
+        );
+        assert!(matches!(sc.next_event(), Next::Event(Event::Text(b"z"))));
+    }
+
+    #[test]
+    fn raw_until_close_without_close_is_none_and_does_not_move() {
+        for doc in [b"body only".as_slice(), b"x</script", b"x</scripts>"] {
+            let mut sc = Scanner::new(doc);
+            assert_eq!(sc.raw_until_close("script"), None);
+            assert_eq!(sc.pos, 0);
+        }
+        let mut sc = Scanner::new(b"");
+        assert_eq!(sc.raw_until_close("script"), None);
     }
 }
