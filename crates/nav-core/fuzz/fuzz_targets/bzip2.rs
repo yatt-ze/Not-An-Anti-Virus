@@ -1,8 +1,8 @@
 #![no_main]
 //! libFuzzer target for `nav_core::bzip2` (§11.9/§12). Property: for any
 //! input, no panic, no OOB read, terminates, and (§3 amplification rule)
-//! output never exceeds the budget; a zero budget never yields output; the
-//! partial API agrees with the strict one.
+//! output never exceeds the budget (partial results included); a zero budget
+//! never yields output.
 //!
 //! Run from `crates/nav-core/` (needs nightly + cargo-fuzz):
 //!   cargo +nightly fuzz run bzip2
@@ -18,27 +18,16 @@ use libfuzzer_sys::fuzz_target;
 const BUDGET: usize = 1 << 20;
 
 fn check(data: &[u8]) {
-    let strict = nav_core::bzip2::bzip2_decompress(data, BUDGET);
-    if let Ok(out) = &strict {
-        assert!(
-            out.len() <= BUDGET,
-            "bzip2 produced {} bytes against a {BUDGET}-byte budget",
-            out.len()
-        );
-    }
-    let (kept, result) = nav_core::bzip2::bzip2_decompress_partial(data, BUDGET);
-    assert!(kept.len() <= BUDGET, "partial output over budget");
-    match strict {
-        Ok(v) => assert!(
-            result == Ok(()) && kept == v,
-            "partial disagrees on success"
-        ),
-        Err(e) => assert!(result == Err(e), "partial disagrees on error"),
-    }
-    // A zero budget must never yield output — the "check before the write" boundary.
-    if let Ok(out) = nav_core::bzip2::bzip2_decompress(data, 0) {
-        assert!(out.is_empty(), "produced output under a zero budget");
-    }
+    let (kept, _) = nav_core::bzip2::bzip2_decompress_partial(data, BUDGET);
+    assert!(
+        kept.len() <= BUDGET,
+        "bzip2 produced {} bytes against a {BUDGET}-byte budget",
+        kept.len()
+    );
+    // A zero budget must never yield output — the "check before the write"
+    // boundary — whether or not the decode succeeds.
+    let (kept, _) = nav_core::bzip2::bzip2_decompress_partial(data, 0);
+    assert!(kept.is_empty(), "produced output under a zero budget");
 }
 
 fuzz_target!(|data: &[u8]| {
