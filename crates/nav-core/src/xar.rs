@@ -310,7 +310,8 @@ pub fn read_entry(
 
     // Dispatch on the bytes, not the `encoding` attribute (see module docs).
     // Formats we have no decoder for must not come back as "stored" text.
-    if is_bzip2(raw) || raw.starts_with(&[0xFD, b'7', b'z', b'X', b'Z', 0x00]) {
+    if crate::bzip2::has_bzip2_magic(raw) || raw.starts_with(&[0xFD, b'7', b'z', b'X', b'Z', 0x00])
+    {
         Err(XarEntryError::UnknownEncoding)
     } else if raw.len() >= 2 && raw[0] == 0x1f && raw[1] == 0x8b {
         inflate::gzip_decompress(raw, limits.max_entry_bytes).map_err(XarEntryError::Undecodable)
@@ -324,11 +325,6 @@ pub fn read_entry(
     } else {
         stored(raw, limits)
     }
-}
-
-/// `BZh` plus a block-size digit 1-9: a bzip2 stream header.
-fn is_bzip2(raw: &[u8]) -> bool {
-    matches!(raw, [b'B', b'Z', b'h', b'1'..=b'9', ..])
 }
 
 /// An entry stored without compression, subject to the same ceiling.
