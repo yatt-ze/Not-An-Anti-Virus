@@ -454,30 +454,49 @@ const INTERPRETERS: &[&str] = &[
     "php",
     "curl",
     "env",
+    "osacompile",
+    "wget",
+    "nc",
 ];
 
 /// Basename of the first `system.run(` / `system.runOnce(` call in `js` whose
-/// first argument is a string literal naming an interpreter. Non-literal
-/// first arguments never match.
-fn launched_interpreter(js: &str) -> Option<&'static str> {
-    for (at, _) in js.match_indices("system.run") {
-        let rest = js.get(at + "system.run".len()..)?;
+/// first argument is a string literal (`'`, `"` or `` ` `` quoted) naming an
+/// interpreter: a listed name, optionally followed only by digits and dots
+/// (`python3.11`). Whitespace around the dot, paren and literal is ignored;
+/// non-literal first arguments never match.
+fn launched_interpreter(js: &str) -> Option<String> {
+    for (at, _) in js.match_indices("system") {
+        let rest = js.get(at + "system".len()..)?;
+        let Some(rest) = rest.trim_start().strip_prefix('.') else {
+            continue;
+        };
+        let Some(rest) = rest.trim_start().strip_prefix("run") else {
+            continue;
+        };
         let rest = rest.strip_prefix("Once").unwrap_or(rest);
         let Some(rest) = rest.trim_start().strip_prefix('(') else {
             continue;
         };
         let rest = rest.trim_start();
-        let Some(quote) = rest.chars().next().filter(|c| matches!(c, '"' | '\'')) else {
+        let Some(quote) = rest
+            .chars()
+            .next()
+            .filter(|c| matches!(c, '"' | '\'' | '`'))
+        else {
             continue;
         };
         let body = rest.get(1..).unwrap_or("");
         let Some(end) = body.find(quote) else {
             continue;
         };
-        let literal = body.get(..end).unwrap_or("");
+        let literal = body.get(..end).unwrap_or("").trim();
         let base = literal.rsplit('/').next().unwrap_or(literal);
-        if let Some(hit) = INTERPRETERS.iter().find(|i| **i == base) {
-            return Some(hit);
+        let is_interpreter = INTERPRETERS.iter().any(|name| {
+            base.strip_prefix(name)
+                .is_some_and(|v| v.chars().all(|c| c.is_ascii_digit() || c == '.'))
+        });
+        if is_interpreter {
+            return Some(base.to_string());
         }
     }
     None
@@ -784,7 +803,43 @@ mod tests {
                 "perl",
             ),
         ] {
-            assert_eq!(launched_interpreter(js), Some(want), "{js}");
+            assert_eq!(launched_interpreter(js).as_deref(), Some(want), "{js}");
+        }
+    }
+
+    #[test]
+    fn interpreter_literal_variants_match() {
+        for (js, want) in [
+            ("system.run(`/bin/bash`, '-c', 'x')", "bash"),
+            ("system . run ('/bin/bash')", "bash"),
+            ("system\n.\trunOnce  (\"/bin/zsh\")", "zsh"),
+            ("system.run('/bin/sh ')", "sh"),
+            ("system.run(' /bin/sh')", "sh"),
+            ("system.run('/usr/bin/python3.11', 'x')", "python3.11"),
+            ("system.run('python2.7')", "python2.7"),
+            ("system.run('/opt/bin/perl5.34')", "perl5.34"),
+            ("system.run('ruby3.2')", "ruby3.2"),
+            ("system.run('/usr/bin/osacompile')", "osacompile"),
+            ("system.run('/usr/bin/wget')", "wget"),
+            ("system.run('/usr/bin/nc')", "nc"),
+        ] {
+            assert_eq!(launched_interpreter(js).as_deref(), Some(want), "{js}");
+        }
+    }
+
+    #[test]
+    fn near_miss_names_do_not_match() {
+        for js in [
+            "system.run('pythonista')",
+            "system.run('bash-wrapper')",
+            "system.run('/usr/bin/open')",
+            "system.run('python3.x')",
+            "system.run('nco')",
+            "system.run(`${cmd}`)",
+            "mysystem.run",
+            "system.run('unload.sh')",
+        ] {
+            assert_eq!(launched_interpreter(js), None, "{js}");
         }
     }
 
