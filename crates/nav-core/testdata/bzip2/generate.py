@@ -72,7 +72,7 @@ def build():
     add("distribution_junk_tail", dist + b"\n" * 400 + b"<" * 3000)
 
     # The benign counterpart (the installer_distribution_js_ordinary fixture's).
-    add("distribution_ordinary", (
+    ordinary = (
         b'<?xml version="1.0" encoding="utf-8" standalone="yes"?>\n'
         b'<installer-gui-script minSpecVersion="1">\n'
         b'    <title>Example App</title>\n'
@@ -94,7 +94,9 @@ def build():
         b'        <bundle-version/>\n'
         b'    </pkg-ref>\n'
         b'</installer-gui-script>'
-    ))
+    )
+    add("distribution_ordinary", ordinary)
+    add("distribution_ordinary_junk_tail", ordinary + b"\n" * 400 + b"<" * 3000)
 
     add("zeros_64k", b"\x00" * 65536)
 
