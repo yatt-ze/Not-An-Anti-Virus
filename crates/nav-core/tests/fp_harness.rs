@@ -143,6 +143,10 @@ const SUB_THRESHOLD_ALLOWLIST: &[(&str, &str)] = &[
         "suspicious/macho_data_payload_stub",
         "payload in a standard segment is corroboration-only (§5.2, #67); needs a second signal",
     ),
+    (
+        "suspicious/installer_distribution_js_shell_launch.pkg",
+        "corroboration-only marker by design (§5.1); needs a second signal",
+    ),
 ];
 
 fn sub_threshold_reason(key: &str) -> Option<&'static str> {

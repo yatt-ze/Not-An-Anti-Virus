@@ -309,7 +309,10 @@ pub fn read_entry(
     let raw = data.get(start..end).ok_or(XarEntryError::OutOfRange)?;
 
     // Dispatch on the bytes, not the `encoding` attribute (see module docs).
-    if raw.len() >= 2 && raw[0] == 0x1f && raw[1] == 0x8b {
+    // Formats we have no decoder for must not come back as "stored" text.
+    if is_bzip2(raw) || raw.starts_with(&[0xFD, b'7', b'z', b'X', b'Z', 0x00]) {
+        Err(XarEntryError::UnknownEncoding)
+    } else if raw.len() >= 2 && raw[0] == 0x1f && raw[1] == 0x8b {
         inflate::gzip_decompress(raw, limits.max_entry_bytes).map_err(XarEntryError::Undecodable)
     } else if raw.first().is_some_and(|b| b & 0x0f == 8) {
         // Plausible zlib CMF; if the header checks fail, treat it as stored.
@@ -321,6 +324,11 @@ pub fn read_entry(
     } else {
         stored(raw, limits)
     }
+}
+
+/// `BZh` plus a block-size digit 1-9: a bzip2 stream header.
+fn is_bzip2(raw: &[u8]) -> bool {
+    matches!(raw, [b'B', b'Z', b'h', b'1'..=b'9', ..])
 }
 
 /// An entry stored without compression, subject to the same ceiling.
@@ -848,6 +856,39 @@ mod tests {
         let a = parse(adversarial!("wide_toc"), &limits).expect("xar");
         assert_eq!(a.halted, Some(XarHalt::EntryLimit));
         assert_eq!(a.files.len(), 32);
+    }
+
+    /// Compressed formats we can't decode are not returned as stored bytes.
+    #[test]
+    fn bzip2_and_xz_entries_are_unknown_encodings() {
+        for blob in [
+            b"BZh91AY&SY\x01\x02".as_slice(),
+            b"BZh1",
+            b"\xFD7zXZ\x00\x00\x04",
+        ] {
+            let toc = format!(
+                r#"<file id="1"><name>Distribution</name><type>file</type><data><offset>0</offset><length>{n}</length><size>{n}</size></data></file>"#,
+                n = blob.len()
+            );
+            let mut bytes = toc_xar_bytes(&toc);
+            bytes.extend_from_slice(blob);
+            let limits = XarLimits::default();
+            let a = parse(&bytes, &limits).expect("xar");
+            let f = a.files.first().expect("entry");
+            assert_eq!(
+                read_entry(&bytes, &a, f, &limits),
+                Err(XarEntryError::UnknownEncoding),
+                "{blob:?}"
+            );
+        }
+        // Plain text that merely starts with B is still stored.
+        let toc = r#"<file id="1"><name>D</name><type>file</type><data><offset>0</offset><length>3</length><size>3</size></data></file>"#;
+        let mut bytes = toc_xar_bytes(toc);
+        bytes.extend_from_slice(b"BZx");
+        let limits = XarLimits::default();
+        let a = parse(&bytes, &limits).expect("xar");
+        let f = a.files.first().expect("entry");
+        assert_eq!(read_entry(&bytes, &a, f, &limits), Ok(b"BZx".to_vec()));
     }
 
     #[test]

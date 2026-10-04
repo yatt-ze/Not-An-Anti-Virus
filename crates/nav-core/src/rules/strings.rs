@@ -759,7 +759,7 @@ impl Rule for SuspiciousStringsRule {
                 first = false;
             });
             if !ok {
-                ctx.mark_stream_failed(self.id());
+                ctx.mark_incomplete(self.id());
             }
             // A stream that failed partway still reported real hits from
             // before the failure — keep those rather than discard them; a
@@ -802,7 +802,7 @@ impl Rule for SuspiciousStringsRule {
     /// within the streaming cap and the stream didn't fail partway —
     /// otherwise unread bytes past the 8 MiB prefix may hide a marker.
     fn covers_truncation(&self, ctx: &ScanContext) -> bool {
-        can_stream(ctx) && !ctx.stream_failed(self.id())
+        can_stream(ctx) && !ctx.marked_incomplete(self.id())
     }
 }
 
@@ -1529,7 +1529,7 @@ mod tests {
             codesign_dv_cache: std::sync::OnceLock::new(),
             spctl_cache: std::sync::OnceLock::new(),
             macho_cache: std::sync::OnceLock::new(),
-            stream_failures: std::sync::Mutex::new(Vec::new()),
+            incomplete_rules: std::sync::Mutex::new(Vec::new()),
         };
         assert!(!SuspiciousStringsRule.covers_truncation(&ctx));
     }

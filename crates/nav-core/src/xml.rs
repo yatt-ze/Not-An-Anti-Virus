@@ -198,50 +198,77 @@ pub fn find_tag_end(rest: &[u8], from: usize) -> Option<usize> {
     None
 }
 
-/// Read a quoted attribute value by name out of a tag's attribute region.
-pub fn attr(attrs: &[u8], want: &str) -> Option<String> {
-    let mut i = 0usize;
-    while i < attrs.len() {
-        while attrs.get(i).is_some_and(|c| c.is_ascii_whitespace()) {
+/// Iterator over a tag's attributes as raw `(name, value)` byte slices
+/// (value undecoded, quotes stripped). Valueless attributes are skipped; it
+/// stops at the first malformed one. Always advances.
+pub struct Attrs<'a> {
+    attrs: &'a [u8],
+    i: usize,
+}
+
+/// Attributes of a tag's attribute region; see [`Attrs`].
+pub fn attrs(attrs: &[u8]) -> Attrs<'_> {
+    Attrs { attrs, i: 0 }
+}
+
+impl<'a> Iterator for Attrs<'a> {
+    type Item = (&'a [u8], &'a [u8]);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let a = self.attrs;
+        let mut i = self.i;
+        loop {
+            if i >= a.len() {
+                self.i = a.len();
+                return None;
+            }
+            while a.get(i).is_some_and(|c| c.is_ascii_whitespace()) {
+                i = i.checked_add(1)?;
+            }
+            let start = i;
+            while a
+                .get(i)
+                .is_some_and(|c| !c.is_ascii_whitespace() && *c != b'=')
+            {
+                i = i.checked_add(1)?;
+            }
+            let name = a.get(start..i)?;
+            if name.is_empty() {
+                self.i = a.len();
+                return None;
+            }
+            while a.get(i).is_some_and(|c| c.is_ascii_whitespace()) {
+                i = i.checked_add(1)?;
+            }
+            if a.get(i) != Some(&b'=') {
+                continue; // valueless attribute; move on
+            }
             i = i.checked_add(1)?;
-        }
-        let start = i;
-        while attrs
-            .get(i)
-            .is_some_and(|c| !c.is_ascii_whitespace() && *c != b'=')
-        {
+            while a.get(i).is_some_and(|c| c.is_ascii_whitespace()) {
+                i = i.checked_add(1)?;
+            }
+            let q = *a.get(i)?;
+            if q != b'"' && q != b'\'' {
+                self.i = a.len();
+                return None;
+            }
             i = i.checked_add(1)?;
-        }
-        let name = attrs.get(start..i)?;
-        if name.is_empty() {
-            return None;
-        }
-        while attrs.get(i).is_some_and(|c| c.is_ascii_whitespace()) {
-            i = i.checked_add(1)?;
-        }
-        if attrs.get(i) != Some(&b'=') {
-            continue; // valueless attribute; move on
-        }
-        i = i.checked_add(1)?;
-        while attrs.get(i).is_some_and(|c| c.is_ascii_whitespace()) {
-            i = i.checked_add(1)?;
-        }
-        let q = *attrs.get(i)?;
-        if q != b'"' && q != b'\'' {
-            return None;
-        }
-        i = i.checked_add(1)?;
-        let vstart = i;
-        while attrs.get(i).is_some_and(|c| *c != q) {
-            i = i.checked_add(1)?;
-        }
-        let value = attrs.get(vstart..i)?;
-        i = i.checked_add(1)?;
-        if name == want.as_bytes() {
-            return Some(decode_entities(value));
+            let vstart = i;
+            while a.get(i).is_some_and(|c| *c != q) {
+                i = i.checked_add(1)?;
+            }
+            let value = a.get(vstart..i)?;
+            self.i = i.checked_add(1)?;
+            return Some((name, value));
         }
     }
-    None
+}
+
+/// Read a quoted attribute value by name out of a tag's attribute region.
+pub fn attr(attr_region: &[u8], want: &str) -> Option<String> {
+    attrs(attr_region)
+        .find(|(name, _)| *name == want.as_bytes())
+        .map(|(_, value)| decode_entities(value))
 }
 
 // --- event scanning ------------------------------------------------------
@@ -366,6 +393,50 @@ impl<'a> Scanner<'a> {
                     self_closing,
                 })
             };
+        }
+    }
+
+    /// Called right after an `Open` event for `name`: returns the raw bytes up
+    /// to the matching `</name>` (untokenised, so `<` in a script body is
+    /// fine) and advances past it. A `</name` inside a CDATA section, comment
+    /// or processing instruction does not count. `None`, position unchanged,
+    /// if there is no close tag or one of those is unterminated.
+    pub fn raw_until_close(&mut self, name: &str) -> Option<&'a [u8]> {
+        let rest = self.b.get(self.pos..)?;
+        let needle = format!("</{name}");
+        let mut i = 0usize;
+        loop {
+            i = i.checked_add(find(rest.get(i..)?, b"<")?)?;
+            let here = rest.get(i..)?;
+            let skip: Option<(usize, &[u8])> = if here.starts_with(b"<![CDATA[") {
+                Some((9, b"]]>"))
+            } else if here.starts_with(b"<!--") {
+                Some((4, b"-->"))
+            } else if here.starts_with(b"<?") {
+                Some((2, b"?>"))
+            } else {
+                None
+            };
+            if let Some((open_len, closer)) = skip {
+                let from = i.checked_add(open_len)?;
+                let end = from.checked_add(find(rest.get(from..)?, closer)?)?;
+                i = end.checked_add(closer.len())?;
+                continue;
+            }
+            if here.starts_with(needle.as_bytes()) {
+                let after = i.checked_add(needle.len())?;
+                // Reject longer names such as `</scripts>`.
+                if rest
+                    .get(after)
+                    .is_some_and(|c| *c == b'>' || *c == b'/' || c.is_ascii_whitespace())
+                {
+                    let gt = after.checked_add(find(rest.get(after..)?, b">")?)?;
+                    let body = rest.get(..i)?;
+                    self.pos = self.pos.saturating_add(gt.checked_add(1)?);
+                    return Some(body);
+                }
+            }
+            i = i.checked_add(1)?;
         }
     }
 }
@@ -506,5 +577,85 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn raw_until_close_returns_untokenised_body() {
+        let doc = b"<a><script>if (a < b) { x(\"</p>\"); }</script><b/></a>";
+        let mut sc = Scanner::new(doc);
+        sc.next_event();
+        assert!(matches!(
+            sc.next_event(),
+            Next::Event(Event::Open { name: "script", .. })
+        ));
+        assert_eq!(
+            sc.raw_until_close("script"),
+            Some(b"if (a < b) { x(\"</p>\"); }".as_slice())
+        );
+        assert!(matches!(
+            sc.next_event(),
+            Next::Event(Event::Open { name: "b", .. })
+        ));
+    }
+
+    #[test]
+    fn raw_until_close_skips_longer_names_and_tolerates_space() {
+        let mut sc = Scanner::new(b"x</scripts>y</script >z");
+        assert_eq!(
+            sc.raw_until_close("script"),
+            Some(b"x</scripts>y".as_slice())
+        );
+        assert!(matches!(sc.next_event(), Next::Event(Event::Text(b"z"))));
+    }
+
+    #[test]
+    fn raw_until_close_without_close_is_none_and_does_not_move() {
+        for doc in [b"body only".as_slice(), b"x</script", b"x</scripts>"] {
+            let mut sc = Scanner::new(doc);
+            assert_eq!(sc.raw_until_close("script"), None);
+            assert_eq!(sc.pos, 0);
+        }
+        let mut sc = Scanner::new(b"");
+        assert_eq!(sc.raw_until_close("script"), None);
+    }
+
+    #[test]
+    fn raw_until_close_ignores_close_tags_in_cdata_comments_and_pis() {
+        for (doc, body) in [
+            (
+                "a<![CDATA[</script>]]>b</script>z",
+                "a<![CDATA[</script>]]>b",
+            ),
+            ("a<!-- </script> -->b</script>z", "a<!-- </script> -->b"),
+            ("a<? </script> ?>b</script>z", "a<? </script> ?>b"),
+        ] {
+            let mut sc = Scanner::new(doc.as_bytes());
+            assert_eq!(sc.raw_until_close("script"), Some(body.as_bytes()), "{doc}");
+            assert!(matches!(sc.next_event(), Next::Event(Event::Text(b"z"))));
+        }
+        for doc in ["a<![CDATA[x</script>", "a<!-- x</script>", "a<? x</script>"] {
+            let mut sc = Scanner::new(doc.as_bytes());
+            assert_eq!(sc.raw_until_close("script"), None, "{doc}");
+            assert_eq!(sc.pos, 0);
+        }
+    }
+
+    #[test]
+    fn attribute_iterator_yields_every_pair_and_agrees_with_attr() {
+        let region = br#" a="1" flag b='x &amp; y' c = "3""#;
+        let got: Vec<(&[u8], &[u8])> = attrs(region).collect();
+        assert_eq!(
+            got,
+            vec![
+                (b"a".as_slice(), b"1".as_slice()),
+                (b"b", b"x &amp; y"),
+                (b"c", b"3")
+            ]
+        );
+        assert_eq!(attr(region, "b").as_deref(), Some("x & y"));
+        assert_eq!(attr(region, "flag"), None);
+        // Malformed (unquoted) value ends iteration.
+        assert_eq!(attrs(b" a=1 b=\"2\"").count(), 0);
+        assert_eq!(attrs(b"").count(), 0);
     }
 }

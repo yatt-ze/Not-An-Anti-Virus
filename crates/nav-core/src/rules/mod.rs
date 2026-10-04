@@ -58,14 +58,17 @@ pub trait Rule: Send + Sync {
     /// Evaluate against the given context. Implementations return
     /// `Ok(Some(signal))` when the rule matched, `Ok(None)` when it ran but
     /// found nothing, and `Err(RuleOutcome::NotApplicable)` when the rule
-    /// itself couldn't run here.
+    /// itself couldn't run here. A rule that matched but could not cover
+    /// everything returns `Ok(Some(signal))` and calls
+    /// `ctx.mark_incomplete(self.id())`; with nothing matched it returns
+    /// `Err(NotApplicable)` as before.
     fn evaluate(&self, ctx: &ScanContext) -> Result<Option<MatchedSignal>, RuleOutcome>;
 
     /// True only when this rule's result for `ctx` doesn't depend on bytes
     /// past `ctx.content` — it doesn't read content, or it read what it
     /// needed itself (`read_at`/`for_each_window`). A failed read must
     /// return `NotApplicable` or be recorded with
-    /// `ScanContext::mark_stream_failed` so this returns `false`; it is
+    /// `ScanContext::mark_incomplete` so this returns `false`; it is
     /// called after `evaluate`. Only consulted when `ctx` is truncated; the
     /// default keeps "truncated ⇒ Partial" (§5.5).
     fn covers_truncation(&self, _ctx: &ScanContext) -> bool {

@@ -48,10 +48,17 @@ pub fn scan_context(ctx: &ScanContext, rules: &[Box<dyn Rule>]) -> ScanResult {
     let mut signals: Vec<MatchedSignal> = Vec::new();
     let mut not_applicable_count = 0usize;
     let mut evaluated_count = 0usize;
+    let mut marked_evaluated_count = 0usize;
     let mut truncation_uncovered = false;
 
     for rule in rules {
-        match rule.evaluate(ctx) {
+        let outcome = rule.evaluate(ctx);
+        // Counted for confidence only when the rule also returned `Ok`; one
+        // that marked itself and returned NotApplicable is already counted.
+        if outcome.is_ok() && ctx.marked_incomplete(rule.id()) {
+            marked_evaluated_count += 1;
+        }
+        match outcome {
             Ok(Some(signal)) => {
                 evaluated_count += 1;
                 signals.push(signal);
@@ -84,6 +91,7 @@ pub fn scan_context(ctx: &ScanContext, rules: &[Box<dyn Rule>]) -> ScanResult {
     let completeness = if !ctx.readable() {
         ScanCompleteness::Indeterminate
     } else if not_applicable_count > 0
+        || ctx.incomplete_rule_count() > 0
         || truncation_uncovered
         || (ctx.truncated && evaluated_count == 0)
     {
@@ -102,7 +110,13 @@ pub fn scan_context(ctx: &ScanContext, rules: &[Box<dyn Rule>]) -> ScanResult {
 
     let recommendation = classify(score, non_informational_categories.len());
 
-    let confidence = confidence_for(&completeness, evaluated_count, not_applicable_count);
+    // A rule that evaluated but was marked incomplete counts like one that
+    // couldn't run.
+    let confidence = confidence_for(
+        &completeness,
+        evaluated_count,
+        not_applicable_count.saturating_add(marked_evaluated_count),
+    );
 
     ScanResult {
         path: ctx.path.clone(),
@@ -268,7 +282,7 @@ mod tests {
             codesign_dv_cache: OnceLock::new(),
             spctl_cache: OnceLock::new(),
             macho_cache: OnceLock::new(),
-            stream_failures: std::sync::Mutex::new(Vec::new()),
+            incomplete_rules: std::sync::Mutex::new(Vec::new()),
         };
 
         // No rules object, so truncation is the only thing that can lower it.
@@ -311,7 +325,7 @@ mod tests {
             codesign_dv_cache: OnceLock::new(),
             spctl_cache: OnceLock::new(),
             macho_cache: OnceLock::new(),
-            stream_failures: std::sync::Mutex::new(Vec::new()),
+            incomplete_rules: std::sync::Mutex::new(Vec::new()),
         }
     }
 
@@ -333,6 +347,84 @@ mod tests {
         fn covers_truncation(&self, _ctx: &ScanContext) -> bool {
             self.covers
         }
+    }
+
+    /// Matches a signal but records that it couldn't cover everything.
+    struct MatchedButIncompleteStub;
+
+    impl Rule for MatchedButIncompleteStub {
+        fn id(&self) -> &'static str {
+            "stub-matched-incomplete"
+        }
+        fn category(&self) -> SignalCategory {
+            SignalCategory::StaticSuspicion
+        }
+        fn evaluate(&self, ctx: &ScanContext) -> Result<Option<MatchedSignal>, RuleOutcome> {
+            ctx.mark_incomplete(self.id());
+            Ok(Some(MatchedSignal {
+                id: self.id().to_string(),
+                weight: 7,
+                description: "found something".to_string(),
+                category: self.category(),
+            }))
+        }
+    }
+
+    #[test]
+    fn a_matched_but_incomplete_rule_reports_its_signal_and_partial() {
+        let rules: Vec<Box<dyn Rule>> = vec![
+            Box::new(StubRule { covers: true }),
+            Box::new(MatchedButIncompleteStub),
+        ];
+        let r = scan_context(&ctx(false), &rules);
+        assert_eq!(r.completeness, ScanCompleteness::Partial);
+        assert_eq!(r.signals.len(), 1);
+        assert_eq!(r.score, 7);
+        // Same confidence as one rule that couldn't run.
+        assert_eq!(r.confidence, EvidenceConfidence::Medium);
+    }
+
+    #[test]
+    fn marking_incomplete_never_upgrades_an_unreadable_scan() {
+        let unreadable = ScanContext {
+            content: None,
+            ..ctx(false)
+        };
+        let rules: Vec<Box<dyn Rule>> = vec![Box::new(MatchedButIncompleteStub)];
+        let r = scan_context(&unreadable, &rules);
+        assert_eq!(r.completeness, ScanCompleteness::Indeterminate);
+    }
+
+    /// Marks itself incomplete and also returns NotApplicable.
+    struct MarkedAndNotApplicableStub;
+
+    impl Rule for MarkedAndNotApplicableStub {
+        fn id(&self) -> &'static str {
+            "stub-marked-not-applicable"
+        }
+        fn category(&self) -> SignalCategory {
+            SignalCategory::Informational
+        }
+        fn evaluate(&self, ctx: &ScanContext) -> Result<Option<MatchedSignal>, RuleOutcome> {
+            ctx.mark_incomplete(self.id());
+            Err(RuleOutcome::NotApplicable)
+        }
+    }
+
+    /// One rule that is both marked and NotApplicable is weighed once, the
+    /// same as a plain NotApplicable rule.
+    #[test]
+    fn a_rule_marked_and_not_applicable_is_not_counted_twice() {
+        let clean = || -> Box<dyn Rule> { Box::new(StubRule { covers: true }) };
+        let mut plain = vec![Box::new(NotApplicableCoveringStub) as Box<dyn Rule>];
+        let mut marked = vec![Box::new(MarkedAndNotApplicableStub) as Box<dyn Rule>];
+        plain.push(clean());
+        marked.push(clean());
+        let a = scan_context(&ctx(false), &plain);
+        let b = scan_context(&ctx(false), &marked);
+        assert_eq!(a.completeness, b.completeness);
+        assert_eq!(a.confidence, b.confidence);
+        assert_eq!(b.confidence, EvidenceConfidence::Medium);
     }
 
     /// Can't run at all here, but claims to cover truncation — NotApplicable
@@ -437,7 +529,7 @@ mod tests {
             codesign_dv_cache: OnceLock::new(),
             spctl_cache: OnceLock::new(),
             macho_cache: OnceLock::new(),
-            stream_failures: std::sync::Mutex::new(Vec::new()),
+            incomplete_rules: std::sync::Mutex::new(Vec::new()),
         };
         assert_eq!(
             scan_context(&ctx, &default_ruleset()).completeness,
