@@ -268,7 +268,7 @@ mod tests {
             codesign_dv_cache: OnceLock::new(),
             spctl_cache: OnceLock::new(),
             macho_cache: OnceLock::new(),
-            stream_failures: std::sync::Mutex::new(Vec::new()),
+            incomplete_rules: std::sync::Mutex::new(Vec::new()),
         };
 
         // No rules object, so truncation is the only thing that can lower it.
@@ -311,7 +311,7 @@ mod tests {
             codesign_dv_cache: OnceLock::new(),
             spctl_cache: OnceLock::new(),
             macho_cache: OnceLock::new(),
-            stream_failures: std::sync::Mutex::new(Vec::new()),
+            incomplete_rules: std::sync::Mutex::new(Vec::new()),
         }
     }
 
@@ -437,7 +437,7 @@ mod tests {
             codesign_dv_cache: OnceLock::new(),
             spctl_cache: OnceLock::new(),
             macho_cache: OnceLock::new(),
-            stream_failures: std::sync::Mutex::new(Vec::new()),
+            incomplete_rules: std::sync::Mutex::new(Vec::new()),
         };
         assert_eq!(
             scan_context(&ctx, &default_ruleset()).completeness,

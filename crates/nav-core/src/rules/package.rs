@@ -411,7 +411,7 @@ mod tests {
             codesign_dv_cache: std::sync::OnceLock::new(),
             spctl_cache: std::sync::OnceLock::new(),
             macho_cache: std::sync::OnceLock::new(),
-            stream_failures: std::sync::Mutex::new(Vec::new()),
+            incomplete_rules: std::sync::Mutex::new(Vec::new()),
         }
     }
 

@@ -123,11 +123,10 @@ pub struct ScanContext {
     /// about the same file. `pub(crate)` for the same reason as the caches
     /// above; use [`ScanContext::macho`] to read it.
     pub(crate) macho_cache: OnceLock<crate::macho::MachOScan>,
-    /// Ids of rules whose `for_each_window` stream failed partway this scan,
-    /// so their `covers_truncation` can report the gap instead of coverage
-    /// they didn't get (§10/§11.8). Keyed per rule so one streaming rule's
-    /// failure can't clobber another's.
-    pub(crate) stream_failures: std::sync::Mutex<Vec<&'static str>>,
+    /// Ids of rules that evaluated but could not cover everything they should
+    /// have this scan (§10/§11.8). Keyed per rule so one rule's gap can't
+    /// clobber another's.
+    pub(crate) incomplete_rules: std::sync::Mutex<Vec<&'static str>>,
 }
 
 impl ScanContext {
@@ -170,7 +169,7 @@ impl ScanContext {
             codesign_dv_cache: OnceLock::new(),
             spctl_cache: OnceLock::new(),
             macho_cache: OnceLock::new(),
-            stream_failures: std::sync::Mutex::new(Vec::new()),
+            incomplete_rules: std::sync::Mutex::new(Vec::new()),
         }
     }
 
@@ -195,7 +194,7 @@ impl ScanContext {
             codesign_dv_cache: OnceLock::new(),
             spctl_cache: OnceLock::new(),
             macho_cache: OnceLock::new(),
-            stream_failures: std::sync::Mutex::new(Vec::new()),
+            incomplete_rules: std::sync::Mutex::new(Vec::new()),
         }
     }
 
@@ -382,21 +381,21 @@ impl ScanContext {
             .get_or_init(|| crate::macho::scan_ranged(self))
     }
 
-    /// Records that `rule_id`'s [`Self::for_each_window`] stream failed
-    /// partway this scan.
-    pub fn mark_stream_failed(&self, rule_id: &'static str) {
-        let mut failures = self
-            .stream_failures
+    /// Records that `rule_id` evaluated but could not cover everything it
+    /// should have this scan.
+    pub fn mark_incomplete(&self, rule_id: &'static str) {
+        let mut marked = self
+            .incomplete_rules
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if !failures.contains(&rule_id) {
-            failures.push(rule_id);
+        if !marked.contains(&rule_id) {
+            marked.push(rule_id);
         }
     }
 
-    /// Whether `rule_id`'s stream failed partway this scan.
-    pub fn stream_failed(&self, rule_id: &'static str) -> bool {
-        self.stream_failures
+    /// Whether `rule_id` was marked incomplete this scan.
+    pub fn marked_incomplete(&self, rule_id: &'static str) -> bool {
+        self.incomplete_rules
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .contains(&rule_id)
@@ -486,13 +485,13 @@ mod tests {
     fn stream_failures_survive_a_poisoned_lock() {
         let ctx = ScanContext::from_embedded_bytes("x", vec![1], false);
         let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let _guard = ctx.stream_failures.lock().unwrap();
+            let _guard = ctx.incomplete_rules.lock().unwrap();
             panic!("poison the lock");
         }));
-        assert!(ctx.stream_failures.is_poisoned());
-        assert!(!ctx.stream_failed("a"));
-        ctx.mark_stream_failed("a");
-        assert!(ctx.stream_failed("a"));
+        assert!(ctx.incomplete_rules.is_poisoned());
+        assert!(!ctx.marked_incomplete("a"));
+        ctx.mark_incomplete("a");
+        assert!(ctx.marked_incomplete("a"));
     }
 
     /// A real, opened file supports ranged reads; embedded content (no file

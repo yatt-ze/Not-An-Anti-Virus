@@ -65,7 +65,7 @@ pub trait Rule: Send + Sync {
     /// past `ctx.content` — it doesn't read content, or it read what it
     /// needed itself (`read_at`/`for_each_window`). A failed read must
     /// return `NotApplicable` or be recorded with
-    /// `ScanContext::mark_stream_failed` so this returns `false`; it is
+    /// `ScanContext::mark_incomplete` so this returns `false`; it is
     /// called after `evaluate`. Only consulted when `ctx` is truncated; the
     /// default keeps "truncated ⇒ Partial" (§5.5).
     fn covers_truncation(&self, _ctx: &ScanContext) -> bool {

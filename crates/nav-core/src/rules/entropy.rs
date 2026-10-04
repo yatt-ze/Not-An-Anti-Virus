@@ -147,7 +147,7 @@ impl Rule for HighEntropyRule {
     fn covers_truncation(&self, ctx: &ScanContext) -> bool {
         let scan = ctx.macho();
         if !scan.images.is_empty() {
-            if ctx.stream_failed(self.id())
+            if ctx.marked_incomplete(self.id())
                 || scan.skipped_slices > 0
                 || scan.images.iter().any(|image| !image.segments_complete)
             {
@@ -561,7 +561,7 @@ impl HighEntropyRule {
         // The stream failed (or ranged reads are unavailable) — fall back to
         // what the captured prefix can still show rather than discarding a
         // score it would have found there (§10/§11.8).
-        ctx.mark_stream_failed(self.id());
+        ctx.mark_incomplete(self.id());
 
         (
             self.macho_signal_from_content(content, range, region),
@@ -1823,7 +1823,7 @@ mod tests {
             codesign_dv_cache: std::sync::OnceLock::new(),
             spctl_cache: std::sync::OnceLock::new(),
             macho_cache: std::sync::OnceLock::new(),
-            stream_failures: std::sync::Mutex::new(Vec::new()),
+            incomplete_rules: std::sync::Mutex::new(Vec::new()),
         };
         assert!(HighEntropyRule.evaluate(&ctx).unwrap().is_none());
     }
@@ -1844,7 +1844,7 @@ mod tests {
             codesign_dv_cache: std::sync::OnceLock::new(),
             spctl_cache: std::sync::OnceLock::new(),
             macho_cache: std::sync::OnceLock::new(),
-            stream_failures: std::sync::Mutex::new(Vec::new()),
+            incomplete_rules: std::sync::Mutex::new(Vec::new()),
         };
         let signal = HighEntropyRule.evaluate(&ctx).unwrap();
         assert!(signal.is_some(), "script with embedded blob should score");
@@ -2020,7 +2020,7 @@ mod tests {
             codesign_dv_cache: std::sync::OnceLock::new(),
             spctl_cache: std::sync::OnceLock::new(),
             macho_cache: std::sync::OnceLock::new(),
-            stream_failures: std::sync::Mutex::new(Vec::new()),
+            incomplete_rules: std::sync::Mutex::new(Vec::new()),
         };
         let signal = HighEntropyRule.evaluate(&ctx).unwrap();
         assert!(
@@ -2043,7 +2043,7 @@ mod tests {
             codesign_dv_cache: std::sync::OnceLock::new(),
             spctl_cache: std::sync::OnceLock::new(),
             macho_cache: std::sync::OnceLock::new(),
-            stream_failures: std::sync::Mutex::new(Vec::new()),
+            incomplete_rules: std::sync::Mutex::new(Vec::new()),
         }
     }
 
