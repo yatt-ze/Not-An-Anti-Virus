@@ -356,7 +356,7 @@ fn partial_read(
 ) -> Result<(Vec<u8>, Option<XarEntryError>), XarEntryError> {
     match result {
         Ok(()) => Ok((bytes, None)),
-        // Installer reads what libxar yields before the stream fails.
+        // Decoded bytes are kept as evidence for every error kind (§5.2).
         Err(e) if !bytes.is_empty() => Ok((bytes, Some(XarEntryError::Undecodable(e)))),
         Err(e) => Err(XarEntryError::Undecodable(e)),
     }
@@ -1020,6 +1020,45 @@ mod tests {
         let full = include_bytes!("../testdata/gzip/scripts_dropper.in");
         let plain = include_bytes!("../testdata/gzip/scripts_dropper.out");
         assert_reads_partially(&full[..full.len() - 8], plain, DecodeError::Truncated);
+    }
+
+    #[test]
+    fn a_gzip_entry_cut_mid_stream_reads_a_prefix() {
+        let full = include_bytes!("../testdata/gzip/scripts_dropper_long.in");
+        let plain = include_bytes!("../testdata/gzip/scripts_dropper_long.out");
+        let e = XarEntryError::Undecodable(DecodeError::Truncated);
+        let (strict, partial) = read_both(&full[..full.len() - 8 - 100], &XarLimits::default());
+        assert_eq!(strict, Err(e));
+        let (bytes, gap) = partial.expect("partial read");
+        assert_eq!(gap, Some(e));
+        assert!(!bytes.is_empty() && bytes.len() < plain.len());
+        assert!(plain.starts_with(&bytes));
+    }
+
+    #[test]
+    fn a_gzip_entry_with_a_bad_crc_or_isize_reads_in_full() {
+        let full = include_bytes!("../testdata/gzip/scripts_dropper.in");
+        let plain = include_bytes!("../testdata/gzip/scripts_dropper.out");
+        for from_end in [8, 4] {
+            let mut bad = full.to_vec();
+            let i = bad.len() - from_end;
+            *bad.get_mut(i).expect("in range") ^= 0xff;
+            assert_reads_partially(&bad, plain, DecodeError::ChecksumMismatch);
+        }
+    }
+
+    #[test]
+    fn an_over_budget_gzip_entry_yields_exactly_the_budget() {
+        let full = include_bytes!("../testdata/gzip/scripts_dropper_long.in");
+        let plain = include_bytes!("../testdata/gzip/scripts_dropper_long.out");
+        let limits = XarLimits {
+            max_entry_bytes: 100,
+            ..XarLimits::default()
+        };
+        let e = XarEntryError::Undecodable(DecodeError::BudgetExceeded);
+        let (strict, partial) = read_both(full, &limits);
+        assert_eq!(strict, Err(e));
+        assert_eq!(partial, Ok((plain[..100].to_vec(), Some(e))));
     }
 
     #[test]
