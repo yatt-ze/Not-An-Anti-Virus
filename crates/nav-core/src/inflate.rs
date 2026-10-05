@@ -55,6 +55,21 @@ pub fn inflate(data: &[u8], budget: usize) -> Result<Vec<u8>, InflateError> {
 /// Decode an RFC 1950 zlib stream (2-byte header, DEFLATE body, 4-byte BE
 /// Adler-32), producing at most `budget` bytes. Entry point for the xar TOC.
 pub fn zlib_decompress(data: &[u8], budget: usize) -> Result<Vec<u8>, InflateError> {
+    let (out, result) = zlib_decompress_partial(data, budget);
+    result.map(|()| out)
+}
+
+/// Like [`zlib_decompress`], but on error also returns every byte decoded
+/// before the failure (at most `budget`), unverified by the trailer. A header
+/// failure, including `BadHeader`, yields an empty `Vec`.
+pub fn zlib_decompress_partial(data: &[u8], budget: usize) -> (Vec<u8>, Result<(), InflateError>) {
+    let mut out = Vec::with_capacity(budget.min(INITIAL_OUTPUT_CAPACITY));
+    let result = zlib_into(data, budget, &mut out);
+    (out, result)
+}
+
+/// Decode a zlib stream into `out`. On error `out` holds whatever was written.
+fn zlib_into(data: &[u8], budget: usize, out: &mut Vec<u8>) -> Result<(), InflateError> {
     let cmf = *data.first().ok_or(InflateError::Truncated)?;
     let flg = *data.get(1).ok_or(InflateError::Truncated)?;
 
@@ -72,8 +87,7 @@ pub fn zlib_decompress(data: &[u8], budget: usize) -> Result<Vec<u8>, InflateErr
     }
 
     let body = data.get(2..).ok_or(InflateError::Truncated)?;
-    let mut out = Vec::with_capacity(budget.min(INITIAL_OUTPUT_CAPACITY));
-    let used = inflate_into(body, budget, &mut out)?;
+    let used = inflate_into(body, budget, out)?;
 
     let end = used.checked_add(4).ok_or(InflateError::Malformed)?;
     let trailer: [u8; 4] = body
@@ -81,10 +95,10 @@ pub fn zlib_decompress(data: &[u8], budget: usize) -> Result<Vec<u8>, InflateErr
         .ok_or(InflateError::Truncated)?
         .try_into()
         .map_err(|_| InflateError::Truncated)?;
-    if adler32(&out) != u32::from_be_bytes(trailer) {
+    if adler32(out) != u32::from_be_bytes(trailer) {
         return Err(InflateError::ChecksumMismatch);
     }
-    Ok(out)
+    Ok(())
 }
 
 /// Decode an RFC 1952 gzip stream (10-byte header, optional
@@ -96,6 +110,21 @@ pub fn zlib_decompress(data: &[u8], budget: usize) -> Result<Vec<u8>, InflateErr
 /// `application/octet-stream` is actually gzip — so callers dispatch between
 /// this and [`zlib_decompress`] on the leading bytes, not the label.
 pub fn gzip_decompress(data: &[u8], budget: usize) -> Result<Vec<u8>, InflateError> {
+    let (out, result) = gzip_decompress_partial(data, budget);
+    result.map(|()| out)
+}
+
+/// Like [`gzip_decompress`], but on error also returns every byte decoded
+/// before the failure (at most `budget`), unverified by the trailer. A header
+/// failure, including `BadHeader`, yields an empty `Vec`.
+pub fn gzip_decompress_partial(data: &[u8], budget: usize) -> (Vec<u8>, Result<(), InflateError>) {
+    let mut out = Vec::with_capacity(budget.min(INITIAL_OUTPUT_CAPACITY));
+    let result = gzip_into(data, budget, &mut out);
+    (out, result)
+}
+
+/// Decode a gzip stream into `out`. On error `out` holds whatever was written.
+fn gzip_into(data: &[u8], budget: usize, out: &mut Vec<u8>) -> Result<(), InflateError> {
     const FHCRC: u8 = 1 << 1;
     const FEXTRA: u8 = 1 << 2;
     const FNAME: u8 = 1 << 3;
@@ -147,8 +176,7 @@ pub fn gzip_decompress(data: &[u8], budget: usize) -> Result<Vec<u8>, InflateErr
     }
 
     let body = data.get(off..).ok_or(InflateError::Truncated)?;
-    let mut out = Vec::with_capacity(budget.min(INITIAL_OUTPUT_CAPACITY));
-    let used = inflate_into(body, budget, &mut out)?;
+    let used = inflate_into(body, budget, out)?;
 
     let end = used.checked_add(8).ok_or(InflateError::Malformed)?;
     let trailer = body.get(used..end).ok_or(InflateError::Truncated)?;
@@ -163,7 +191,7 @@ pub fn gzip_decompress(data: &[u8], budget: usize) -> Result<Vec<u8>, InflateErr
         .try_into()
         .map_err(|_| InflateError::Truncated)?;
 
-    if crc32(&out) != u32::from_le_bytes(crc) {
+    if crc32(out) != u32::from_le_bytes(crc) {
         return Err(InflateError::ChecksumMismatch);
     }
     // ISIZE is the output length mod 2^32; a mismatch means the stream and
@@ -171,7 +199,7 @@ pub fn gzip_decompress(data: &[u8], budget: usize) -> Result<Vec<u8>, InflateErr
     if (out.len() as u64 & 0xFFFF_FFFF) as u32 != u32::from_le_bytes(isize_bytes) {
         return Err(InflateError::ChecksumMismatch);
     }
-    Ok(out)
+    Ok(())
 }
 
 /// Decode a DEFLATE stream into `out` (empty on entry), returning how many
@@ -210,11 +238,17 @@ fn stored_block(r: &mut BitReader, out: &mut Vec<u8>, budget: usize) -> Result<(
         return Err(InflateError::Malformed);
     }
     let len = len as usize;
-    if out.len().checked_add(len).ok_or(InflateError::Malformed)? > budget {
+    // Copy what fits and is present, then report why the rest is missing.
+    let room = budget.saturating_sub(out.len());
+    let want = len.min(room);
+    let bytes = r.take_up_to(want);
+    out.extend_from_slice(bytes);
+    if len > room {
         return Err(InflateError::BudgetExceeded);
     }
-    let bytes = r.take_bytes(len)?;
-    out.extend_from_slice(bytes);
+    if bytes.len() < want {
+        return Err(InflateError::Truncated);
+    }
     Ok(())
 }
 
@@ -256,16 +290,18 @@ fn compressed_block(
                 if distance == 0 || distance > out.len() {
                     return Err(InflateError::Malformed);
                 }
-                if out.len().checked_add(len).ok_or(InflateError::Malformed)? > budget {
-                    return Err(InflateError::BudgetExceeded);
-                }
+                let room = budget.saturating_sub(out.len());
+                let n = len.min(room);
 
                 // Byte-at-a-time: `len` may exceed `distance`, so the copy can
                 // legitimately read bytes it just wrote.
                 let start = out.len() - distance;
-                for i in 0..len {
+                for i in 0..n {
                     let b = *out.get(start + i).ok_or(InflateError::Malformed)?;
                     out.push(b);
+                }
+                if len > room {
+                    return Err(InflateError::BudgetExceeded);
                 }
             }
         }
@@ -502,6 +538,19 @@ impl<'a> BitReader<'a> {
         self.buf = 0;
         self.cnt = 0;
         Ok(s)
+    }
+
+    /// Take up to `n` whole bytes (fewer if the input ends), aligning first
+    /// and dropping any buffered bits.
+    fn take_up_to(&mut self, n: usize) -> &'a [u8] {
+        self.align();
+        let start = self.byte_pos();
+        let rest = self.data.get(start..).unwrap_or_default();
+        let s = rest.get(..n.min(rest.len())).unwrap_or_default();
+        self.pos = start.saturating_add(s.len());
+        self.buf = 0;
+        self.cnt = 0;
+        s
     }
 
     fn take_u16_le(&mut self) -> Result<u16, InflateError> {
@@ -983,5 +1032,204 @@ mod tests {
         assert_eq!(crc32(b"a"), 0xE8B7_BE43);
         assert_eq!(crc32(b"abc"), 0x3524_41C2);
         assert_eq!(crc32(b"123456789"), 0xCBF4_3926);
+    }
+
+    // --- partial decoding (#75) ---------------------------------------------
+
+    type Partial = (Vec<u8>, Result<(), InflateError>);
+
+    fn zlib_wrap(raw: &[u8], plain: &[u8]) -> Vec<u8> {
+        let mut v = vec![0x78, 0x9c];
+        v.extend_from_slice(raw);
+        v.extend_from_slice(&adler32(plain).to_be_bytes());
+        v
+    }
+
+    /// Strict and partial must agree: same error, and `Ok` iff `Ok`.
+    fn assert_agree(strict: Result<Vec<u8>, InflateError>, partial: &Partial, what: &str) {
+        match (&strict, &partial.1) {
+            (Ok(s), Ok(())) => assert_eq!(s, &partial.0, "{what}"),
+            (Err(a), Err(b)) => assert_eq!(a, b, "{what}"),
+            _ => panic!("{what}: strict {strict:?} vs partial {:?}", partial.1),
+        }
+    }
+
+    type WrappedCase = (
+        &'static str,
+        &'static [u8],
+        &'static [u8],
+        fn(&[u8], usize) -> Partial,
+        fn(&[u8], usize) -> Result<Vec<u8>, InflateError>,
+    );
+
+    fn all_wrapped_cases() -> Vec<WrappedCase> {
+        let mut v: Vec<WrappedCase> = Vec::new();
+        for (n, i, o) in zlib_cases() {
+            v.push((n, i, o, zlib_decompress_partial, zlib_decompress));
+        }
+        for (n, i, o) in gzip_cases() {
+            v.push((n, i, o, gzip_decompress_partial, gzip_decompress));
+        }
+        v
+    }
+
+    #[test]
+    fn partial_on_an_intact_stream_is_the_full_output() {
+        for (name, input, expected, partial, _) in all_wrapped_cases() {
+            assert_eq!(partial(input, BIG), (expected.to_vec(), Ok(())), "{name}");
+        }
+    }
+
+    #[test]
+    fn partial_with_a_missing_trailer_keeps_everything() {
+        let (_, zl, zl_out) = zlib_cases()[1];
+        for cut in [4, 2] {
+            let got = zlib_decompress_partial(&zl[..zl.len() - cut], BIG);
+            assert_eq!(got, (zl_out.to_vec(), Err(InflateError::Truncated)));
+        }
+        let (_, gz, gz_out) = gzip_cases()[0];
+        for cut in [8, 4] {
+            let got = gzip_decompress_partial(&gz[..gz.len() - cut], BIG);
+            assert_eq!(got, (gz_out.to_vec(), Err(InflateError::Truncated)));
+        }
+    }
+
+    #[test]
+    fn partial_with_a_bad_trailer_keeps_everything() {
+        let (_, zl, zl_out) = zlib_cases()[1];
+        let mut v = zl.to_vec();
+        *v.last_mut().unwrap() ^= 0xff;
+        assert_eq!(
+            zlib_decompress_partial(&v, BIG),
+            (zl_out.to_vec(), Err(InflateError::ChecksumMismatch))
+        );
+        let (_, gz, gz_out) = gzip_cases()[0];
+        for from_end in [8, 4] {
+            let mut v = gz.to_vec();
+            let n = v.len();
+            v[n - from_end] ^= 0xff;
+            assert_eq!(
+                gzip_decompress_partial(&v, BIG),
+                (gz_out.to_vec(), Err(InflateError::ChecksumMismatch)),
+                "flip at -{from_end}"
+            );
+        }
+    }
+
+    #[test]
+    fn partial_prefixes_are_monotonic_prefixes_and_agree_with_strict() {
+        for (name, input, expected, partial, strict) in all_wrapped_cases() {
+            let mut last = 0;
+            for n in probe_offsets(input.len()) {
+                let cut = &input[..n];
+                let got = partial(cut, BIG);
+                assert!(expected.starts_with(&got.0), "{name}@{n}: not a prefix");
+                assert!(got.0.len() >= last, "{name}@{n}: output shrank");
+                last = got.0.len();
+                assert!(got.1.is_err(), "{name}@{n}: a strict prefix decoded");
+                assert_agree(strict(cut, BIG), &got, &format!("{name}@{n}"));
+            }
+        }
+    }
+
+    #[test]
+    fn partial_bit_flips_respect_budget_and_agree_with_strict() {
+        for (name, input, _, partial, strict) in all_wrapped_cases() {
+            for byte in probe_offsets(input.len()) {
+                for bit in 0..8 {
+                    let mut v = input.to_vec();
+                    if let Some(b) = v.get_mut(byte) {
+                        *b ^= 1 << bit;
+                    }
+                    let got = partial(&v, FLIP_BUDGET);
+                    assert!(got.0.len() <= FLIP_BUDGET, "{name}@{byte}.{bit}");
+                    assert_agree(
+                        strict(&v, FLIP_BUDGET),
+                        &got,
+                        &format!("{name}@{byte}.{bit}"),
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn partial_budget_clamps_a_bomb_to_exactly_the_budget() {
+        let mut zl = vec![0x78, 0x01];
+        zl.extend_from_slice(BOMB);
+        for budget in [4096, 5000] {
+            let want = (vec![0u8; budget], Err(InflateError::BudgetExceeded));
+            assert_eq!(zlib_decompress_partial(&zl, budget), want);
+            assert_eq!(gzip_decompress_partial(GZIP_BOMB, budget), want);
+        }
+        assert_eq!(
+            zlib_decompress_partial(&zl, 0),
+            (Vec::new(), Err(InflateError::BudgetExceeded))
+        );
+        assert_eq!(
+            gzip_decompress_partial(GZIP_BOMB, 0),
+            (Vec::new(), Err(InflateError::BudgetExceeded))
+        );
+    }
+
+    /// Literals, long back-references, and stored blocks each cross the budget.
+    #[test]
+    fn partial_budget_clamps_every_block_kind() {
+        for (name, raw, plain) in raw_cases() {
+            if plain.len() < 2 {
+                continue;
+            }
+            let zl = zlib_wrap(raw, plain);
+            for budget in [1, plain.len() / 2, plain.len() - 1] {
+                let (out, r) = zlib_decompress_partial(&zl, budget);
+                assert_eq!(r, Err(InflateError::BudgetExceeded), "{name}@{budget}");
+                assert_eq!(out, &plain[..budget], "{name}@{budget}");
+            }
+        }
+    }
+
+    #[test]
+    fn partial_stored_block_cut_short_yields_the_present_bytes() {
+        let mut zl = vec![0x78, 0x01, 0x01, 10, 0, !10u8, 0xff];
+        zl.extend_from_slice(b"abcdef");
+        assert_eq!(
+            zlib_decompress_partial(&zl, BIG),
+            (b"abcdef".to_vec(), Err(InflateError::Truncated))
+        );
+        // Over budget and cut short: the policy stop wins, as in the strict path.
+        assert_eq!(
+            zlib_decompress_partial(&zl, 4),
+            (b"abcd".to_vec(), Err(InflateError::BudgetExceeded))
+        );
+    }
+
+    #[test]
+    fn partial_header_failures_return_nothing() {
+        let bad_zlib: [&[u8]; 5] = [
+            &[],
+            &[0x78],
+            &[0x77, 0x9c, 0x00],
+            &[0x78, 0x9d, 0x00],
+            &[0x78, 0xbb, 0x00],
+        ];
+        for input in bad_zlib {
+            let (out, r) = zlib_decompress_partial(input, BIG);
+            assert!(out.is_empty() && r.is_err(), "{input:?}");
+        }
+        let bad_gzip: [&[u8]; 5] = [
+            &[],
+            &[0x1f],
+            &[0x1f, 0x8c, 8, 0],
+            &[0x1f, 0x8b, 8, 0x20],
+            &[0x1f, 0x8b, 8, 0x08, 0, 0, 0, 0, 0, 3, b'x'],
+        ];
+        for input in bad_gzip {
+            let (out, r) = gzip_decompress_partial(input, BIG);
+            assert!(out.is_empty() && r.is_err(), "{input:?}");
+        }
+        assert_eq!(
+            zlib_decompress_partial(&[0x77, 0x9c, 0], BIG).1,
+            Err(InflateError::BadHeader)
+        );
     }
 }
