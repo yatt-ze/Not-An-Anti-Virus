@@ -11,12 +11,13 @@
 //!   resolved in a second pass once every node's name is known.
 //! - The `encoding` attribute is unreliable: `application/x-gzip` entries are
 //!   really zlib, and `Scripts` (`application/octet-stream`) is really gzip.
-//!   [`read_entry`] dispatches on the leading bytes.
+//!   [`read_entry`] dispatches on the leading bytes (gzip, zlib, bzip2).
 //!
 //! Hand-written per §3. XML goes through [`crate::xml`], shared with the plist
 //! reader so there is only one XML implementation to fuzz.
 
-use crate::inflate::{self, InflateError};
+use crate::decode::DecodeError;
+use crate::inflate;
 use crate::xml::{self, Event, Next, Scanner};
 
 /// `xar!`, read big-endian.
@@ -195,7 +196,7 @@ pub enum XarEntryError {
     /// The entry's bytes are not a compression format we recognize.
     UnknownEncoding,
     /// Decompression failed or exceeded `max_entry_bytes`.
-    Undecodable(InflateError),
+    Undecodable(DecodeError),
 }
 
 /// True if `data` opens with the xar magic (`xar!`). [`parse`] uses this same
@@ -269,7 +270,7 @@ pub fn parse(data: &[u8], limits: &XarLimits) -> Option<XarArchive> {
 
     let toc = match inflate::zlib_decompress(toc_compressed, limits.max_toc_bytes) {
         Ok(t) => t,
-        Err(InflateError::BudgetExceeded) => {
+        Err(DecodeError::BudgetExceeded) => {
             archive.halted = Some(XarHalt::TocTooLarge);
             return Some(archive);
         }
@@ -292,6 +293,23 @@ pub fn read_entry(
     file: &XarFile,
     limits: &XarLimits,
 ) -> Result<Vec<u8>, XarEntryError> {
+    match read_entry_partial(data, archive, file, limits)? {
+        (bytes, None) => Ok(bytes),
+        (_, Some(e)) => Err(e),
+    }
+}
+
+/// Like [`read_entry`], but a bzip2 entry that fails partway still yields
+/// the bytes decoded before the failure, which may include an unverified or
+/// cut-short final block. `Ok((bytes, None))` is a full read;
+/// `Ok((bytes, Some(err)))` is a non-empty partial one. Callers must treat the
+/// latter as incomplete evidence, never as a clean read.
+pub fn read_entry_partial(
+    data: &[u8],
+    archive: &XarArchive,
+    file: &XarFile,
+    limits: &XarLimits,
+) -> Result<(Vec<u8>, Option<XarEntryError>), XarEntryError> {
     let (offset, length) = match (file.offset, file.length) {
         (Some(o), Some(l)) => (o, l),
         _ => return Err(XarEntryError::NoHeapLocation),
@@ -309,32 +327,37 @@ pub fn read_entry(
     let raw = data.get(start..end).ok_or(XarEntryError::OutOfRange)?;
 
     // Dispatch on the bytes, not the `encoding` attribute (see module docs).
-    // Formats we have no decoder for must not come back as "stored" text.
-    if is_bzip2(raw) || raw.starts_with(&[0xFD, b'7', b'z', b'X', b'Z', 0x00]) {
+    // Formats we have no decoder for (xz) must not come back as "stored" text.
+    if raw.starts_with(&[0xFD, b'7', b'z', b'X', b'Z', 0x00]) {
         Err(XarEntryError::UnknownEncoding)
+    } else if crate::bzip2::has_bzip2_magic(raw) {
+        let (bytes, result) = crate::bzip2::bzip2_decompress_partial(raw, limits.max_entry_bytes);
+        match result {
+            Ok(()) => Ok((bytes, None)),
+            // Installer reads what libxar yields before the stream fails.
+            Err(e) if !bytes.is_empty() => Ok((bytes, Some(XarEntryError::Undecodable(e)))),
+            Err(e) => Err(XarEntryError::Undecodable(e)),
+        }
     } else if raw.len() >= 2 && raw[0] == 0x1f && raw[1] == 0x8b {
-        inflate::gzip_decompress(raw, limits.max_entry_bytes).map_err(XarEntryError::Undecodable)
+        inflate::gzip_decompress(raw, limits.max_entry_bytes)
+            .map(|v| (v, None))
+            .map_err(XarEntryError::Undecodable)
     } else if raw.first().is_some_and(|b| b & 0x0f == 8) {
         // Plausible zlib CMF; if the header checks fail, treat it as stored.
         match inflate::zlib_decompress(raw, limits.max_entry_bytes) {
-            Ok(v) => Ok(v),
-            Err(InflateError::BadHeader) => stored(raw, limits),
+            Ok(v) => Ok((v, None)),
+            Err(DecodeError::BadHeader) => stored(raw, limits).map(|v| (v, None)),
             Err(e) => Err(XarEntryError::Undecodable(e)),
         }
     } else {
-        stored(raw, limits)
+        stored(raw, limits).map(|v| (v, None))
     }
-}
-
-/// `BZh` plus a block-size digit 1-9: a bzip2 stream header.
-fn is_bzip2(raw: &[u8]) -> bool {
-    matches!(raw, [b'B', b'Z', b'h', b'1'..=b'9', ..])
 }
 
 /// An entry stored without compression, subject to the same ceiling.
 fn stored(raw: &[u8], limits: &XarLimits) -> Result<Vec<u8>, XarEntryError> {
     if raw.len() > limits.max_entry_bytes {
-        return Err(XarEntryError::Undecodable(InflateError::BudgetExceeded));
+        return Err(XarEntryError::Undecodable(DecodeError::BudgetExceeded));
     }
     Ok(raw.to_vec())
 }
@@ -858,37 +881,107 @@ mod tests {
         assert_eq!(a.files.len(), 32);
     }
 
-    /// Compressed formats we can't decode are not returned as stored bytes.
+    /// One-entry xar whose heap is `blob`.
+    fn single_entry(blob: &[u8]) -> Vec<u8> {
+        let toc = format!(
+            r#"<file id="1"><name>Distribution</name><type>file</type><data><offset>0</offset><length>{n}</length><size>{n}</size></data></file>"#,
+            n = blob.len()
+        );
+        let mut bytes = toc_xar_bytes(&toc);
+        bytes.extend_from_slice(blob);
+        bytes
+    }
+
+    fn read_single(blob: &[u8], limits: &XarLimits) -> Result<Vec<u8>, XarEntryError> {
+        let bytes = single_entry(blob);
+        let a = parse(&bytes, limits).expect("xar");
+        let f = a.files.first().expect("entry");
+        read_entry(&bytes, &a, f, limits)
+    }
+
+    /// xz is not decoded and must not come back as stored bytes.
     #[test]
-    fn bzip2_and_xz_entries_are_unknown_encodings() {
-        for blob in [
-            b"BZh91AY&SY\x01\x02".as_slice(),
-            b"BZh1",
-            b"\xFD7zXZ\x00\x00\x04",
-        ] {
-            let toc = format!(
-                r#"<file id="1"><name>Distribution</name><type>file</type><data><offset>0</offset><length>{n}</length><size>{n}</size></data></file>"#,
-                n = blob.len()
-            );
-            let mut bytes = toc_xar_bytes(&toc);
-            bytes.extend_from_slice(blob);
-            let limits = XarLimits::default();
-            let a = parse(&bytes, &limits).expect("xar");
-            let f = a.files.first().expect("entry");
-            assert_eq!(
-                read_entry(&bytes, &a, f, &limits),
-                Err(XarEntryError::UnknownEncoding),
-                "{blob:?}"
-            );
-        }
+    fn xz_entries_are_unknown_encodings() {
+        assert_eq!(
+            read_single(b"\xFD7zXZ\x00\x00\x04", &XarLimits::default()),
+            Err(XarEntryError::UnknownEncoding)
+        );
         // Plain text that merely starts with B is still stored.
-        let toc = r#"<file id="1"><name>D</name><type>file</type><data><offset>0</offset><length>3</length><size>3</size></data></file>"#;
-        let mut bytes = toc_xar_bytes(toc);
-        bytes.extend_from_slice(b"BZx");
+        assert_eq!(
+            read_single(b"BZx", &XarLimits::default()),
+            Ok(b"BZx".to_vec())
+        );
+    }
+
+    #[test]
+    fn bzip2_entries_are_decoded() {
+        let hello = include_bytes!("../testdata/bzip2/hello.in");
+        assert_eq!(
+            read_single(hello, &XarLimits::default()),
+            Ok(b"hello".to_vec())
+        );
+    }
+
+    #[test]
+    fn a_corrupt_bzip2_entry_is_undecodable() {
+        let mut bad = include_bytes!("../testdata/bzip2/hello.in").to_vec();
+        bad[10] ^= 0x80; // block CRC
+        assert_eq!(
+            read_single(&bad, &XarLimits::default()),
+            Err(XarEntryError::Undecodable(DecodeError::ChecksumMismatch))
+        );
+        // A bare header is a truncated stream, not "unknown".
+        assert_eq!(
+            read_single(b"BZh1", &XarLimits::default()),
+            Err(XarEntryError::Undecodable(DecodeError::Truncated))
+        );
+    }
+
+    /// A bzip2 entry missing its trailer: strict read fails, but libxar (so
+    /// Installer) still yields the plaintext; the partial reader does too.
+    #[test]
+    fn a_bzip2_entry_without_its_trailer_reads_partially() {
+        let full = include_bytes!("../testdata/bzip2/distribution_dropper.in");
+        let cut = crate::bzip2::cut_trailer(full);
         let limits = XarLimits::default();
+        let bytes = single_entry(cut);
         let a = parse(&bytes, &limits).expect("xar");
         let f = a.files.first().expect("entry");
-        assert_eq!(read_entry(&bytes, &a, f, &limits), Ok(b"BZx".to_vec()));
+        let trunc = XarEntryError::Undecodable(DecodeError::Truncated);
+        assert_eq!(read_entry(&bytes, &a, f, &limits), Err(trunc));
+        let plain = include_bytes!("../testdata/bzip2/distribution_dropper.out");
+        assert_eq!(
+            read_entry_partial(&bytes, &a, f, &limits),
+            Ok((plain.to_vec(), Some(trunc)))
+        );
+        // An entry that fails before its first block yields nothing.
+        let bytes = single_entry(&cut[..8]);
+        let a = parse(&bytes, &limits).expect("xar");
+        let f = a.files.first().expect("entry");
+        assert_eq!(read_entry_partial(&bytes, &a, f, &limits), Err(trunc));
+    }
+
+    #[test]
+    fn a_bzip2_bomb_entry_is_stopped_by_the_entry_budget() {
+        let limits = XarLimits {
+            max_entry_bytes: 1 << 20,
+            ..XarLimits::default()
+        };
+        assert_eq!(
+            read_single(include_bytes!("../testdata/bzip2/bomb.in"), &limits),
+            Err(XarEntryError::Undecodable(DecodeError::BudgetExceeded))
+        );
+    }
+
+    /// libxar extracts only the first stream and ignores what follows.
+    #[test]
+    fn a_bzip2_entry_followed_by_junk_decodes_the_first_stream() {
+        let mut blob = include_bytes!("../testdata/bzip2/hello.in").to_vec();
+        blob.extend_from_slice(b"\x00\x01 trailing junk");
+        assert_eq!(
+            read_single(&blob, &XarLimits::default()),
+            Ok(b"hello".to_vec())
+        );
     }
 
     #[test]
@@ -901,7 +994,7 @@ mod tests {
         let f = a.files.first().expect("one entry");
         assert_eq!(
             read_entry(adversarial!("heap_entry_bomb"), &a, f, &limits),
-            Err(XarEntryError::Undecodable(InflateError::BudgetExceeded))
+            Err(XarEntryError::Undecodable(DecodeError::BudgetExceeded))
         );
     }
 

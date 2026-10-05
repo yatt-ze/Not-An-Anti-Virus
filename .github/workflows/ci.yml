@@ -99,7 +99,7 @@ jobs:
     name: bounded fuzz run (nightly)
     # Off the PR path by design (NAV-014) — scheduled, or manually via
     # workflow_dispatch. Priority order per the issue: xml/plist, xar, cpio,
-    # inflate, then macho.
+    # inflate, bzip2, then macho.
     if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     steps:
@@ -113,6 +113,13 @@ jobs:
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-fuzz
+      # fuzz/corpus is gitignored, so bzip2 would start from nothing; seed it
+      # with the real-libbz2 vectors (the other targets still start empty).
+      - name: seed bzip2 corpus
+        working-directory: crates/nav-core
+        run: |
+          mkdir -p fuzz/corpus/bzip2
+          cp testdata/bzip2/*.in fuzz/corpus/bzip2/
       # 60s/target bounds wall-clock (~5min total) rather than depth; it
       # catches regressions cargo-fuzz's corpus already knows about, not new
       # ones. Sustained/corpus-growing fuzzing stays a deferred item (§12).
@@ -120,7 +127,7 @@ jobs:
         working-directory: crates/nav-core
         run: |
           set -euo pipefail
-          for target in parse_plist parse_xar parse_cpio inflate parse_macho; do
+          for target in parse_plist parse_xar parse_cpio inflate bzip2 parse_macho; do
             echo "::group::fuzz ${target} (60s)"
             cargo fuzz run --target x86_64-unknown-linux-gnu "${target}" -- -max_total_time=60
             echo "::endgroup::"

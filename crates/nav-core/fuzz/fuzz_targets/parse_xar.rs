@@ -4,8 +4,8 @@
 //! heap entries).
 //!
 //! Beyond no-panic/no-OOB/terminates, asserts: the §6.2 ceilings hold on what
-//! comes back (entry count, depth); `read_entry` respects its budget per
-//! entry; a complete archive is not also halted.
+//! comes back (entry count, depth); `read_entry_partial` respects its budget
+//! per entry (full and partial results alike); a complete archive is not also halted.
 //!
 //! Run from `crates/nav-core/` (needs nightly + cargo-fuzz):
 //!   cargo +nightly fuzz run parse_xar
@@ -46,16 +46,24 @@ fuzz_target!(|data: &[u8]| {
             limits.max_depth
         );
 
-        // read_entry is where a hostile container turns a few TOC bytes into
-        // an allocation. Output must fit the budget; failing is fine.
-        if let Ok(bytes) = xar::read_entry(data, &archive, f, &limits) {
-            assert!(
-                bytes.len() <= limits.max_entry_bytes,
-                "entry {:?} produced {} bytes against a {}-byte budget",
-                f.path,
-                bytes.len(),
-                limits.max_entry_bytes
-            );
+        // read_entry_partial is where a hostile container turns a few TOC
+        // bytes into an allocation. Output must fit the budget; failing is fine.
+        match xar::read_entry_partial(data, &archive, f, &limits) {
+            Ok((bytes, gap)) => {
+                assert!(
+                    bytes.len() <= limits.max_entry_bytes,
+                    "entry {:?} produced {} bytes against a {}-byte budget",
+                    f.path,
+                    bytes.len(),
+                    limits.max_entry_bytes
+                );
+                assert!(
+                    gap.is_none() || !bytes.is_empty(),
+                    "entry {:?}: a partial read must carry bytes",
+                    f.path
+                );
+            }
+            Err(_) => {}
         }
     }
 

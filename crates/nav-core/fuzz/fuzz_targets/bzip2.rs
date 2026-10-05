@@ -1,0 +1,39 @@
+#![no_main]
+//! libFuzzer target for `nav_core::bzip2` (§11.9/§12). Property: for any
+//! input, no panic, no OOB read, terminates, and (§3 amplification rule)
+//! output never exceeds the budget (partial results included); a zero budget
+//! never yields output.
+//!
+//! Run from `crates/nav-core/` (needs nightly + cargo-fuzz):
+//!   cargo +nightly fuzz run bzip2
+//!
+//! Seed from `testdata/bzip2/*.in` plus hostile streams: a huge RUNA/RUNB
+//! run, more than 18002 selectors, a 6-group block, the 512 MiB bomb —
+//! none reachable by mutating a valid stream. Each input is also tried with
+//! a `BZh9` header prepended so mutations reach the block parser quickly.
+
+use libfuzzer_sys::fuzz_target;
+
+/// Small, so a violation is obvious and the fuzzer stays on decode paths.
+const BUDGET: usize = 1 << 20;
+
+fn check(data: &[u8]) {
+    let (kept, _) = nav_core::bzip2::bzip2_decompress_partial(data, BUDGET);
+    assert!(
+        kept.len() <= BUDGET,
+        "bzip2 produced {} bytes against a {BUDGET}-byte budget",
+        kept.len()
+    );
+    // A zero budget must never yield output — the "check before the write"
+    // boundary — whether or not the decode succeeds.
+    let (kept, _) = nav_core::bzip2::bzip2_decompress_partial(data, 0);
+    assert!(kept.is_empty(), "produced output under a zero budget");
+}
+
+fuzz_target!(|data: &[u8]| {
+    check(data);
+    let mut with_header = Vec::with_capacity(data.len() + 4);
+    with_header.extend_from_slice(b"BZh9");
+    with_header.extend_from_slice(data);
+    check(&with_header);
+});

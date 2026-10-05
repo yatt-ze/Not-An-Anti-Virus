@@ -8,6 +8,8 @@
 //! materialized. [`InflateError::BudgetExceeded`] is a §6.2 policy stop, not
 //! evidence of malice — callers must keep it distinct from `Malformed`.
 
+use crate::decode::DecodeError;
+
 /// Longest Huffman code permitted by RFC 1951 §3.2.7.
 const MAX_BITS: usize = 15;
 
@@ -40,22 +42,8 @@ const CLEN_ORDER: [usize; 19] = [
     16, 17, 18, 0, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3, 13, 2, 14, 1, 15,
 ];
 
-/// Why a stream could not be decoded. `BudgetExceeded` is a §6.2 policy stop,
-/// not malformation — keep it distinct (§10/§11.8).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum InflateError {
-    /// Input ended mid-stream.
-    Truncated,
-    /// Structurally invalid: bad block type, over-subscribed Huffman table,
-    /// out-of-range symbol, or a back-reference before the start of output.
-    Malformed,
-    /// Output would exceed the caller's budget. Not a maliciousness finding (§6.2).
-    BudgetExceeded,
-    /// zlib/gzip header invalid, or it requests an unsupported preset dictionary.
-    BadHeader,
-    /// Adler-32 (zlib) or CRC-32/ISIZE (gzip) trailer did not match the output.
-    ChecksumMismatch,
-}
+/// Inflate's name for the shared decode error.
+pub type InflateError = DecodeError;
 
 /// Decode a raw DEFLATE stream, producing at most `budget` bytes.
 pub fn inflate(data: &[u8], budget: usize) -> Result<Vec<u8>, InflateError> {

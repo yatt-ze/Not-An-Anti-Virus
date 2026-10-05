@@ -305,6 +305,11 @@ impl<'a> Scanner<'a> {
         Scanner { b, pos: 0 }
     }
 
+    /// The bytes not yet consumed.
+    pub fn rest(&self) -> &'a [u8] {
+        self.b.get(self.pos..).unwrap_or(&[])
+    }
+
     pub fn next_event(&mut self) -> Next<'a> {
         // Loops past skippable constructs — see `skip_junk`.
         loop {
