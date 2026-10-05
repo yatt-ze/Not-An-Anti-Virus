@@ -147,13 +147,16 @@ fn scan_scripts_entry(
     let label = format!("{}!{}", ctx.path.display(), entry.path);
     // Scripts is normally gzip-wrapped cpio; if not gzip, `read_entry`
     // already undid the heap encoding. A damaged inner gzip is scanned as far
-    // as it decoded, and the raw bytes are scanned too: both are evidence.
+    // as it decoded, and the raw bytes are scanned too unless the stream was
+    // merely over budget (valid DEFLATE has nothing to find).
     let archive_bytes = match crate::inflate::gzip_decompress_partial(&raw, limits.max_entry_bytes)
     {
         (v, Ok(())) => v,
         (v, Err(e)) if !v.is_empty() => {
+            if e != crate::decode::DecodeError::BudgetExceeded {
+                findings.scan(label.clone(), raw, "install scripts (unparsed)");
+            }
             gap.get_or_insert(xar::XarEntryError::Undecodable(e));
-            findings.scan(label.clone(), raw, "install scripts (unparsed)");
             v
         }
         (_, Err(_)) => raw,
