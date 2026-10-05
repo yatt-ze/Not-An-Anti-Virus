@@ -69,6 +69,15 @@ pub(crate) fn has_bzip2_magic(data: &[u8]) -> bool {
     matches!(data, [b'B', b'Z', b'h', b'1'..=b'9', ..])
 }
 
+/// The block size in bytes (level digit x 100,000) of a stream header, or
+/// `None` if `data` does not start with one.
+pub(crate) fn block_size(data: &[u8]) -> Option<usize> {
+    match data {
+        [b'B', b'Z', b'h', d @ b'1'..=b'9', ..] => Some(usize::from(d - b'0') * 100_000),
+        _ => None,
+    }
+}
+
 /// Decode one bzip2 stream, producing at most `budget` bytes. Bytes after
 /// the first stream are ignored, as libxar does.
 pub fn bzip2_decompress(data: &[u8], budget: usize) -> Result<Vec<u8>, DecodeError> {
@@ -641,6 +650,10 @@ mod tests {
         assert!(!has_bzip2_magic(b"BZh:"));
         assert!(!has_bzip2_magic(b"BZh"));
         assert!(!has_bzip2_magic(b"bZh1"));
+        assert_eq!(block_size(b"BZh1"), Some(100_000));
+        assert_eq!(block_size(b"BZh9rest"), Some(900_000));
+        assert_eq!(block_size(b"BZh0"), None);
+        assert_eq!(block_size(b"BZh"), None);
     }
 
     #[test]

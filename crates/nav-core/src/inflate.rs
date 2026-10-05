@@ -103,6 +103,11 @@ fn zlib_into(data: &[u8], budget: usize, out: &mut Vec<u8>) -> Result<(), Inflat
     Ok(())
 }
 
+/// The gzip magic `1f 8b`: a gzip stream header.
+pub(crate) fn has_gzip_magic(data: &[u8]) -> bool {
+    data.starts_with(&[0x1f, 0x8b])
+}
+
 /// Decode an RFC 1952 gzip stream (10-byte header, optional
 /// FEXTRA/FNAME/FCOMMENT/FHCRC fields, DEFLATE body, LE CRC-32 + ISIZE
 /// trailer), producing at most `budget` bytes.
