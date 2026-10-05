@@ -310,6 +310,15 @@ pub fn read_entry_partial(
     file: &XarFile,
     limits: &XarLimits,
 ) -> Result<(Vec<u8>, Option<XarEntryError>), XarEntryError> {
+    decode_entry(entry_bytes(data, archive, file)?, limits)
+}
+
+/// The entry's bytes in the heap. `data` must be the buffer given to [`parse`].
+fn entry_bytes<'d>(
+    data: &'d [u8],
+    archive: &XarArchive,
+    file: &XarFile,
+) -> Result<&'d [u8], XarEntryError> {
     let (offset, length) = match (file.offset, file.length) {
         (Some(o), Some(l)) => (o, l),
         _ => return Err(XarEntryError::NoHeapLocation),
@@ -324,16 +333,27 @@ pub fn read_entry_partial(
         .ok()
         .and_then(|l| start.checked_add(l))
         .ok_or(XarEntryError::OutOfRange)?;
-    let raw = data.get(start..end).ok_or(XarEntryError::OutOfRange)?;
+    data.get(start..end).ok_or(XarEntryError::OutOfRange)
+}
 
+/// An xz stream: a format with no decoder here.
+fn is_xz(raw: &[u8]) -> bool {
+    raw.starts_with(&[0xFD, b'7', b'z', b'X', b'Z', 0x00])
+}
+
+/// Decodes one entry's raw heap bytes under `limits`; results as [`read_entry_partial`].
+fn decode_entry(
+    raw: &[u8],
+    limits: &XarLimits,
+) -> Result<(Vec<u8>, Option<XarEntryError>), XarEntryError> {
     // Dispatch on the bytes, not the `encoding` attribute (see module docs).
     // Formats we have no decoder for (xz) must not come back as "stored" text.
-    if raw.starts_with(&[0xFD, b'7', b'z', b'X', b'Z', 0x00]) {
+    if is_xz(raw) {
         Err(XarEntryError::UnknownEncoding)
     } else if crate::bzip2::has_bzip2_magic(raw) {
         let (bytes, result) = crate::bzip2::bzip2_decompress_partial(raw, limits.max_entry_bytes);
         partial_read(bytes, result)
-    } else if raw.len() >= 2 && raw[0] == 0x1f && raw[1] == 0x8b {
+    } else if inflate::has_gzip_magic(raw) {
         let (bytes, result) = inflate::gzip_decompress_partial(raw, limits.max_entry_bytes);
         partial_read(bytes, result)
     } else if raw.first().is_some_and(|b| b & 0x0f == 8) {
