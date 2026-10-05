@@ -333,7 +333,10 @@ fn fixed_tables() -> Result<(Huffman, Huffman), InflateError> {
     // All 32 distance codes are 5 bits. Symbols 30 and 31 decode but have no
     // base distance, so `compressed_block` rejects them.
     let dist = [5u8; 32];
-    Ok((Huffman::new(&lit)?, Huffman::new(&dist)?))
+    Ok((
+        Huffman::new(&lit, LoneCode::Allowed)?,
+        Huffman::new(&dist, LoneCode::Allowed)?,
+    ))
 }
 
 /// Read a dynamic block's code-length table and build its two Huffman trees.
@@ -353,7 +356,7 @@ fn dynamic_tables(r: &mut BitReader) -> Result<(Huffman, Huffman), InflateError>
         let v = r.bits(3)? as u8;
         *clens.get_mut(idx).ok_or(InflateError::Malformed)? = v;
     }
-    let clh = Huffman::new(&clens)?;
+    let clh = Huffman::new(&clens, LoneCode::Rejected)?;
 
     let total = hlit.checked_add(hdist).ok_or(InflateError::Malformed)?;
     let mut lengths = vec![0u8; total];
@@ -396,8 +399,16 @@ fn dynamic_tables(r: &mut BitReader) -> Result<(Huffman, Huffman), InflateError>
         }
     }
 
-    let lit = Huffman::new(lengths.get(..hlit).ok_or(InflateError::Malformed)?)?;
-    let dist = Huffman::new(lengths.get(hlit..).ok_or(InflateError::Malformed)?)?;
+    let lit_lengths = lengths.get(..hlit).ok_or(InflateError::Malformed)?;
+    // A block with no end-of-block code can never finish.
+    if lit_lengths.get(256).copied().unwrap_or(0) == 0 {
+        return Err(InflateError::Malformed);
+    }
+    let lit = Huffman::new(lit_lengths, LoneCode::Allowed)?;
+    let dist = Huffman::new(
+        lengths.get(hlit..).ok_or(InflateError::Malformed)?,
+        LoneCode::Allowed,
+    )?;
     Ok((lit, dist))
 }
 
@@ -406,11 +417,24 @@ fn dynamic_tables(r: &mut BitReader) -> Result<(Huffman, Huffman), InflateError>
 /// on hostile input, and TOCs are kilobytes.
 struct Huffman {
     counts: [u16; MAX_BITS + 1],
+    /// Longest assigned code length; 0 for an empty table.
+    max_len: usize,
     symbols: Vec<u16>,
 }
 
+/// Whether an incomplete set that is a lone 1-bit code is accepted: zlib allows
+/// it for literal/length and distance tables, not for the code-length code.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum LoneCode {
+    Allowed,
+    Rejected,
+}
+
 impl Huffman {
-    fn new(lengths: &[u8]) -> Result<Self, InflateError> {
+    /// Build a table from per-symbol code lengths. Rejects over-subscribed
+    /// sets and, as zlib does, incomplete ones except a lone 1-bit code in a
+    /// literal/length or distance table (`lone`); an empty set is accepted.
+    fn new(lengths: &[u8], lone: LoneCode) -> Result<Self, InflateError> {
         let mut counts = [0u16; MAX_BITS + 1];
         for &l in lengths {
             let l = l as usize;
@@ -420,9 +444,6 @@ impl Huffman {
             *counts.get_mut(l).ok_or(InflateError::Malformed)? += 1;
         }
 
-        // Over-subscribed (more codes at a length than the tree fits) is
-        // malformed. Incomplete is tolerated — some encoders emit a one-entry
-        // distance table, and uncovered codes fail in `decode` anyway.
         let mut left: i32 = 1;
         for len in 1..=MAX_BITS {
             left <<= 1;
@@ -431,8 +452,12 @@ impl Huffman {
                 return Err(InflateError::Malformed);
             }
         }
-
         let total: usize = counts.iter().skip(1).map(|&c| c as usize).sum();
+        let lone_one_bit = lone == LoneCode::Allowed && total == 1 && counts.get(1) == Some(&1);
+        if left > 0 && total > 0 && !lone_one_bit {
+            return Err(InflateError::Malformed);
+        }
+
         let mut offsets = [0u16; MAX_BITS + 2];
         for len in 1..=MAX_BITS {
             let next = offsets
@@ -455,15 +480,24 @@ impl Huffman {
             *slot += 1;
         }
 
-        Ok(Huffman { counts, symbols })
+        let max_len = (1..=MAX_BITS)
+            .rev()
+            .find(|&l| counts.get(l).is_some_and(|&c| c > 0))
+            .unwrap_or(0);
+        Ok(Huffman {
+            counts,
+            max_len,
+            symbols,
+        })
     }
 
-    /// Decode one symbol, consuming between 1 and `MAX_BITS` bits.
+    /// Decode one symbol, consuming at most the table's longest code length; a
+    /// code the table doesn't assign is `Malformed`.
     fn decode(&self, r: &mut BitReader) -> Result<u16, InflateError> {
         let mut code: i32 = 0;
         let mut first: i32 = 0;
         let mut index: i32 = 0;
-        for len in 1..=MAX_BITS {
+        for len in 1..=self.max_len {
             code |= r.bits(1)? as i32;
             let count = *self.counts.get(len).ok_or(InflateError::Malformed)? as i32;
             if code - first < count {
@@ -865,18 +899,36 @@ mod tests {
     }
 
     #[test]
-    fn over_subscribed_huffman_table_is_rejected() {
+    fn huffman_table_completeness_follows_zlib() {
         // Three one-bit codes cannot coexist: the tree has room for two.
         assert_eq!(
-            Huffman::new(&[1, 1, 1]).err(),
+            Huffman::new(&[1, 1, 1], LoneCode::Allowed).err(),
             Some(InflateError::Malformed)
         );
         // A length beyond the 15-bit maximum.
-        assert_eq!(Huffman::new(&[16]).err(), Some(InflateError::Malformed));
+        assert_eq!(
+            Huffman::new(&[16], LoneCode::Allowed).err(),
+            Some(InflateError::Malformed)
+        );
         // A complete two-code table is fine.
-        assert!(Huffman::new(&[1, 1]).is_ok());
-        // So is an incomplete one.
-        assert!(Huffman::new(&[1]).is_ok());
+        assert!(Huffman::new(&[1, 1], LoneCode::Allowed).is_ok());
+        // Incomplete sets are rejected, except a lone 1-bit code where zlib allows one.
+        assert_eq!(
+            Huffman::new(&[2, 2], LoneCode::Allowed).err(),
+            Some(InflateError::Malformed)
+        );
+        assert_eq!(
+            Huffman::new(&[1], LoneCode::Rejected).err(),
+            Some(InflateError::Malformed)
+        );
+        assert!(Huffman::new(&[1], LoneCode::Allowed).is_ok());
+        // An empty set is accepted; decoding from it fails without reading input.
+        assert!(Huffman::new(&[0, 0], LoneCode::Allowed).is_ok());
+        let empty = Huffman::new(&[0, 0], LoneCode::Rejected).unwrap();
+        assert_eq!(
+            empty.decode(&mut BitReader::new(&[])),
+            Err(InflateError::Malformed)
+        );
     }
 
     #[test]
@@ -1239,5 +1291,183 @@ mod tests {
             zlib_decompress_partial(&[0x77, 0x9c, 0], BIG).1,
             Err(InflateError::BadHeader)
         );
+    }
+
+    // --- Huffman completeness (#78) -----------------------------------------
+
+    /// DEFLATE bit packer: `lsb` for header fields, `code` for Huffman codes.
+    #[derive(Default)]
+    struct BitW(Vec<bool>);
+
+    impl BitW {
+        fn lsb(&mut self, v: u32, n: u32) {
+            self.0.extend((0..n).map(|i| (v >> i) & 1 == 1));
+        }
+        fn code(&mut self, v: u32, n: u32) {
+            self.0.extend((0..n).rev().map(|i| (v >> i) & 1 == 1));
+        }
+        fn align(&mut self) {
+            while self.0.len() % 8 != 0 {
+                self.0.push(false);
+            }
+        }
+        fn finish(mut self) -> Vec<u8> {
+            self.align();
+            self.0
+                .chunks(8)
+                .map(|c| {
+                    c.iter()
+                        .enumerate()
+                        .fold(0u8, |a, (i, &b)| a | (u8::from(b) << i))
+                })
+                .collect()
+        }
+    }
+
+    /// 258 literal/length code lengths, all zero but the given `(symbol, length)`s.
+    fn lit_lens(set: &[(usize, u8)]) -> Vec<u8> {
+        let mut l = vec![0u8; 258];
+        for &(s, n) in set {
+            l[s] = n;
+        }
+        l
+    }
+
+    /// Dynamic block header whose code-length code gives symbols 0-3 two bits each.
+    fn dynamic_header(w: &mut BitW, bfinal: u32, lit: &[u8], dist: &[u8]) {
+        w.lsb(bfinal, 1);
+        w.lsb(2, 2);
+        w.lsb(lit.len() as u32 - 257, 5);
+        w.lsb(dist.len() as u32 - 1, 5);
+        w.lsb(14, 4); // HCLEN = 18 entries, enough to reach symbol 1
+        for sym in CLEN_ORDER.iter().take(18) {
+            w.lsb(if *sym <= 3 { 2 } else { 0 }, 3);
+        }
+        for &l in lit.iter().chain(dist) {
+            w.code(u32::from(l), 2);
+        }
+    }
+
+    /// Complete literal/length set: `a`, `b`, 256, 257 at two bits each (00, 01, 10, 11).
+    fn complete_lit() -> Vec<u8> {
+        lit_lens(&[(97, 2), (98, 2), (256, 2), (257, 2)])
+    }
+
+    /// `a`, then a length-3 match at distance 1, then end-of-block.
+    fn match_body(w: &mut BitW, dist_code: (u32, u32)) {
+        w.code(0, 2);
+        w.code(3, 2);
+        w.code(dist_code.0, dist_code.1);
+        w.code(2, 2);
+    }
+
+    fn one_block(lit: &[u8], dist: &[u8], body: impl FnOnce(&mut BitW)) -> Vec<u8> {
+        let mut w = BitW::default();
+        dynamic_header(&mut w, 1, lit, dist);
+        body(&mut w);
+        w.finish()
+    }
+
+    /// Each comment gives what libz 1.2.12 (the system `/usr/lib/libz.1.dylib`)
+    /// returns for the same raw bytes via `decompressobj(-15)`.
+    #[test]
+    fn incomplete_code_sets_follow_zlib() {
+        let bad = Err(InflateError::Malformed);
+        let aaaa = Ok(b"aaaa".to_vec());
+
+        // 1. complete lit/len + complete dist: ok, "aaaa".
+        let s = one_block(&complete_lit(), &[1, 1], |w| match_body(w, (0, 1)));
+        assert_eq!(inflate(&s, BIG), aaaa);
+
+        // 2. two-code incomplete lit/len: "invalid literal/lengths set".
+        let s = one_block(&lit_lens(&[(97, 2), (256, 2)]), &[1, 1], |w| {
+            w.code(0, 2);
+            w.code(1, 2);
+        });
+        assert_eq!(inflate(&s, BIG), bad);
+
+        // 3. two-code incomplete dist: "invalid distances set".
+        let s = one_block(&complete_lit(), &[2, 2], |w| match_body(w, (0, 2)));
+        assert_eq!(inflate(&s, BIG), bad);
+
+        // 4. a lone 1-bit distance code, used: ok, "aaaa".
+        let s = one_block(&complete_lit(), &[1], |w| match_body(w, (0, 1)));
+        assert_eq!(inflate(&s, BIG), aaaa);
+
+        // 5. empty distance set, literals only: ok, "a".
+        let s = one_block(&lit_lens(&[(97, 1), (256, 1)]), &[0], |w| {
+            w.code(0, 1);
+            w.code(1, 1);
+        });
+        assert_eq!(inflate(&s, BIG), Ok(b"a".to_vec()));
+
+        // 6a. lone 1-bit lit/len code that is 256: ok, empty output.
+        let lone_eob = lit_lens(&[(256, 1)]);
+        let s = one_block(&lone_eob, &[0], |w| w.code(0, 1));
+        assert_eq!(inflate(&s, BIG), Ok(Vec::new()));
+        // 6a'. the same table, reading its unused half: "invalid literal/length code".
+        let s = one_block(&lone_eob, &[0], |w| {
+            w.code(1, 1);
+        });
+        assert_eq!(inflate(&s, BIG), bad);
+
+        // 6b. lone 1-bit lit/len code that is not 256: "invalid code -- missing end-of-block".
+        let s = one_block(&lit_lens(&[(97, 1)]), &[0], |w| {
+            w.code(0, 1);
+            w.code(1, 1);
+        });
+        assert_eq!(inflate(&s, BIG), bad);
+
+        // 8. complete lit/len set (`a`, `b`) with 256 at length 0: "invalid code -- missing end-of-block".
+        let s = one_block(&lit_lens(&[(97, 1), (98, 1)]), &[0], |w| {
+            w.code(0, 1);
+            w.code(1, 1);
+        });
+        assert_eq!(inflate(&s, BIG), bad);
+
+        // 10. empty distance set, a length symbol used: "invalid distance code".
+        let lit = lit_lens(&[(97, 2), (256, 2), (257, 1)]);
+        let s = one_block(&lit, &[0], |w| w.code(0, 1));
+        assert_eq!(inflate(&s, BIG), bad);
+    }
+
+    /// Case 7: a code-length code that is a single 1-bit code: "invalid code lengths set".
+    #[test]
+    fn incomplete_code_length_code_is_rejected() {
+        let mut w = BitW::default();
+        w.lsb(1, 1);
+        w.lsb(2, 2);
+        w.lsb(0, 5);
+        w.lsb(0, 5);
+        w.lsb(0, 4); // HCLEN = 4: entries for 16, 17, 18, 0
+        for v in [0, 0, 0, 1] {
+            w.lsb(v, 3);
+        }
+        w.lsb(0, 32);
+        assert_eq!(inflate(&w.finish(), BIG), Err(InflateError::Malformed));
+    }
+
+    /// Case 9: a stored block then a dynamic block with an incomplete lit/len
+    /// set; libz yields "invalid literal/lengths set" after the stored bytes.
+    #[test]
+    fn rejected_table_keeps_earlier_blocks_in_partial_output() {
+        let mut w = BitW::default();
+        w.lsb(0, 1); // BFINAL = 0
+        w.lsb(0, 2); // stored
+        w.align();
+        w.lsb(3, 16);
+        w.lsb(0xfffc, 16);
+        for b in *b"abc" {
+            w.lsb(u32::from(b), 8);
+        }
+        dynamic_header(&mut w, 1, &lit_lens(&[(97, 2), (256, 2)]), &[1, 1]);
+        w.code(0, 2);
+        w.code(1, 2);
+        let wrapped = zlib_wrap(&w.finish(), b"abc");
+        assert_eq!(
+            zlib_decompress_partial(&wrapped, BIG),
+            (b"abc".to_vec(), Err(InflateError::Malformed))
+        );
+        assert_eq!(zlib_decompress(&wrapped, BIG), Err(InflateError::Malformed));
     }
 }
