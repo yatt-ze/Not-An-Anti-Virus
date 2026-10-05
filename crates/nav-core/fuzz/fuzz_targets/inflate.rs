@@ -51,7 +51,7 @@ fuzz_target!(|data: &[u8]| {
         );
     }
 
-    // A zero budget must never yield output — the "check before the write" boundary.
+    // A zero budget must never yield output — the clamp-to-budget boundary.
     for r in [
         nav_core::inflate::inflate(data, 0),
         nav_core::inflate::zlib_decompress(data, 0),

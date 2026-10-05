@@ -3,10 +3,12 @@
 //! install scripts are a gzip stream in the heap (§5.2, §6.1).
 //!
 //! Hand-written per §3 (no third-party code on the parse path). Contract:
-//! never panics, every offset bounds-checked, and a cumulative output
-//! `budget` checked *before* each write, so a bomb is refused rather than
-//! materialized. [`InflateError::BudgetExceeded`] is a §6.2 policy stop, not
-//! evidence of malice — callers must keep it distinct from `Malformed`.
+//! never panics, every offset bounds-checked, and output never exceeds
+//! `budget`: a write that would cross it is clamped, then the stream is
+//! refused with [`InflateError::BudgetExceeded`]. The strict entry points
+//! return no bytes on error; the `_partial` ones return the clamped output.
+//! `BudgetExceeded` is a §6.2 policy stop, not evidence of malice — callers
+//! must keep it distinct from `Malformed`.
 
 use crate::decode::DecodeError;
 
@@ -47,7 +49,7 @@ pub type InflateError = DecodeError;
 
 /// Decode a raw DEFLATE stream, producing at most `budget` bytes.
 pub fn inflate(data: &[u8], budget: usize) -> Result<Vec<u8>, InflateError> {
-    let mut out = Vec::with_capacity(budget.min(INITIAL_OUTPUT_CAPACITY));
+    let mut out = Vec::new();
     inflate_into(data, budget, &mut out)?;
     Ok(out)
 }
@@ -63,7 +65,7 @@ pub fn zlib_decompress(data: &[u8], budget: usize) -> Result<Vec<u8>, InflateErr
 /// before the failure (at most `budget`), unverified by the trailer. A header
 /// failure, including `BadHeader`, yields an empty `Vec`.
 pub fn zlib_decompress_partial(data: &[u8], budget: usize) -> (Vec<u8>, Result<(), InflateError>) {
-    let mut out = Vec::with_capacity(budget.min(INITIAL_OUTPUT_CAPACITY));
+    let mut out = Vec::new();
     let result = zlib_into(data, budget, &mut out);
     (out, result)
 }
@@ -118,7 +120,7 @@ pub fn gzip_decompress(data: &[u8], budget: usize) -> Result<Vec<u8>, InflateErr
 /// before the failure (at most `budget`), unverified by the trailer. A header
 /// failure, including `BadHeader`, yields an empty `Vec`.
 pub fn gzip_decompress_partial(data: &[u8], budget: usize) -> (Vec<u8>, Result<(), InflateError>) {
-    let mut out = Vec::with_capacity(budget.min(INITIAL_OUTPUT_CAPACITY));
+    let mut out = Vec::new();
     let result = gzip_into(data, budget, &mut out);
     (out, result)
 }
@@ -205,6 +207,7 @@ fn gzip_into(data: &[u8], budget: usize, out: &mut Vec<u8>) -> Result<(), Inflat
 /// Decode a DEFLATE stream into `out` (empty on entry), returning how many
 /// bytes of `data` were consumed. On error `out` holds whatever was written.
 fn inflate_into(data: &[u8], budget: usize, out: &mut Vec<u8>) -> Result<usize, InflateError> {
+    out.reserve(budget.min(INITIAL_OUTPUT_CAPACITY));
     let mut r = BitReader::new(data);
 
     loop {
