@@ -45,10 +45,28 @@ impl Rule for InstallerScriptRule {
     }
 
     fn evaluate(&self, ctx: &ScanContext) -> Result<Option<MatchedSignal>, RuleOutcome> {
-        let content = ctx.content.as_ref().ok_or(RuleOutcome::NotApplicable)?;
-        let limits = xar::XarLimits::default();
+        self.evaluate_with(ctx, &xar::XarLimits::default())
+    }
 
-        let Some(archive) = xar::parse(content, &limits) else {
+    /// A truncated prefix that isn't even a xar archive has no scripts this
+    /// rule could have missed past the cap.
+    fn covers_truncation(&self, ctx: &ScanContext) -> bool {
+        ctx.content
+            .as_deref()
+            .is_some_and(|c| !xar::has_xar_magic(c))
+    }
+}
+
+impl InstallerScriptRule {
+    /// [`Rule::evaluate`] under the given xar `limits`.
+    fn evaluate_with(
+        &self,
+        ctx: &ScanContext,
+        limits: &xar::XarLimits,
+    ) -> Result<Option<MatchedSignal>, RuleOutcome> {
+        let content = ctx.content.as_ref().ok_or(RuleOutcome::NotApplicable)?;
+
+        let Some(archive) = xar::parse(content, limits) else {
             return Ok(None); // not a package
         };
         // Couldn't read in full => "couldn't check", never "clean" (§10, §11.8).
@@ -62,10 +80,10 @@ impl Rule for InstallerScriptRule {
         for entry in archive.metadata_entries() {
             let result = match entry.name.as_str() {
                 "Scripts" => {
-                    scan_scripts_entry(ctx, content, &archive, entry, &limits, &mut findings)
+                    scan_scripts_entry(ctx, content, &archive, entry, limits, &mut findings)
                 }
                 "Distribution" => {
-                    scan_distribution_entry(ctx, content, &archive, entry, &limits, &mut findings)
+                    scan_distribution_entry(ctx, content, &archive, entry, limits, &mut findings)
                 }
                 _ => continue,
             };
@@ -91,14 +109,6 @@ impl Rule for InstallerScriptRule {
             description: findings.descriptions.join("; "),
             category: self.category(),
         }))
-    }
-
-    /// A truncated prefix that isn't even a xar archive has no scripts this
-    /// rule could have missed past the cap.
-    fn covers_truncation(&self, ctx: &ScanContext) -> bool {
-        ctx.content
-            .as_deref()
-            .is_some_and(|c| !xar::has_xar_magic(c))
     }
 }
 
