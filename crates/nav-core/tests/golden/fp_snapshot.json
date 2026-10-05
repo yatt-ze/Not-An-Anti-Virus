@@ -404,6 +404,15 @@
     ],
     "completeness": "complete"
   },
+  "suspicious/installer_curl_pipe_preinstall_gzip_trailerless.pkg": {
+    "score": 25,
+    "recommendation": "notify",
+    "rule_ids": [
+      "installer-script-suspicious",
+      "unsigned-installer-package"
+    ],
+    "completeness": "partial"
+  },
   "suspicious/installer_distribution_js_bzip2_dropper.pkg": {
     "score": 26,
     "recommendation": "notify",
@@ -439,6 +448,15 @@
       "unsigned-installer-package"
     ],
     "completeness": "complete"
+  },
+  "suspicious/installer_distribution_js_zlib_trailerless_dropper.pkg": {
+    "score": 26,
+    "recommendation": "notify",
+    "rule_ids": [
+      "installer-script-suspicious",
+      "unsigned-installer-package"
+    ],
+    "completeness": "partial"
   },
   "suspicious/installer_spoofed_signature.pkg": {
     "score": 25,

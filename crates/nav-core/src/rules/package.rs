@@ -1096,6 +1096,72 @@ mod tests {
         assert!(matches!(InstallerScriptRule.evaluate(&c), Ok(None)));
     }
 
+    /// A xar whose only entry is a `Distribution` holding `blob`, labelled zlib.
+    fn zlib_distribution_pkg(blob: &[u8]) -> Vec<u8> {
+        let toc = format!(
+            r#"<file id="1"><name>Distribution</name><type>file</type><data><offset>0</offset><length>{n}</length><size>{n}</size><encoding style="application/x-gzip"/></data></file>"#,
+            n = blob.len()
+        );
+        let mut bytes = xar::toc_xar_bytes(&toc);
+        bytes.extend_from_slice(blob);
+        bytes
+    }
+
+    /// A zlib `Distribution` missing its Adler-32 still extracts in libxar:
+    /// the decoded text is scanned and the gap reported (#75).
+    #[test]
+    fn a_trailerless_zlib_dropper_distribution_scores_and_marks_incomplete() {
+        let full = include_bytes!("../../testdata/inflate/zlib_distribution_dropper.in");
+        assert_scored_but_partial(&zlib_distribution_pkg(&full[..full.len() - 4]));
+        assert_scored_but_partial(&zlib_distribution_pkg(&full[..full.len() - 2]));
+    }
+
+    /// Cut mid-stream, with the dropper still inside the decoded prefix.
+    #[test]
+    fn a_zlib_distribution_cut_mid_stream_scores_the_decoded_prefix() {
+        let full = include_bytes!("../../testdata/inflate/zlib_distribution_padded.in");
+        assert_scored_but_partial(&zlib_distribution_pkg(&full[..full.len() / 2]));
+    }
+
+    #[test]
+    fn a_trailerless_zlib_benign_distribution_is_not_applicable() {
+        let full = include_bytes!("../../testdata/inflate/zlib_distribution_ordinary.in");
+        let c = ctx("cut.pkg", &zlib_distribution_pkg(&full[..full.len() - 4]));
+        assert!(matches!(
+            InstallerScriptRule.evaluate(&c),
+            Err(RuleOutcome::NotApplicable)
+        ));
+        // Intact, it is clean.
+        let c = ctx("ok.pkg", &zlib_distribution_pkg(full));
+        assert!(matches!(InstallerScriptRule.evaluate(&c), Ok(None)));
+    }
+
+    /// A stored gzip-wrapped cpio `Scripts` missing its gzip trailer: the
+    /// decoded members are scanned and the gap reported (#75).
+    #[test]
+    fn a_trailerless_gzip_scripts_entry_scores_and_marks_incomplete() {
+        let full = include_bytes!("../../testdata/gzip/scripts_dropper.in");
+        let c = ctx("s.pkg", &pkg_with_scripts(&full[..full.len() - 8]));
+        let signal = InstallerScriptRule
+            .evaluate(&c)
+            .expect("evaluates")
+            .expect("the decoded preinstall scores");
+        assert!(
+            signal.description.contains("install script preinstall"),
+            "{}",
+            signal.description
+        );
+        assert!(c.marked_incomplete("installer-script-suspicious"));
+
+        // Intact, the same entry reads complete.
+        let c = ctx("s.pkg", &pkg_with_scripts(full));
+        assert!(InstallerScriptRule
+            .evaluate(&c)
+            .expect("evaluates")
+            .is_some());
+        assert!(!c.marked_incomplete("installer-script-suspicious"));
+    }
+
     /// A wrong block CRC does not hide the decoded bytes: libxar yields them
     /// without checking, so they are scanned and the entry reported unreadable.
     #[test]
