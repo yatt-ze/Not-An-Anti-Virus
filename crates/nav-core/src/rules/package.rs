@@ -1827,4 +1827,34 @@ mod tests {
             UnsignedPackageRule.category()
         );
     }
+
+    fn evaluate_small(
+        bytes: &[u8],
+        limits: &xar::XarLimits,
+    ) -> (Result<Option<MatchedSignal>, RuleOutcome>, ScanContext) {
+        let c = ctx("b.pkg", bytes);
+        (InstallerScriptRule.evaluate_with(&c, limits), c)
+    }
+
+    /// A stored `Distribution` over the entry cap whose script is inside the
+    /// cap: the prefix scores, and the cut is reported.
+    #[test]
+    fn a_stored_dropper_distribution_over_the_cap_scores_and_marks_incomplete() {
+        let mut dist =
+            br#"<a><script>system.run("/usr/bin/osascript", "-e", "x");</script></a>"#.to_vec();
+        let script_end = dist.len();
+        dist.resize(script_end + 300, b' ');
+        let limits = xar::XarLimits {
+            max_entry_bytes: script_end + 10,
+            ..xar::XarLimits::default()
+        };
+        let (r, c) = evaluate_small(&pkg_with_distribution(&dist), &limits);
+        let signal = r.expect("evaluates").expect("the prefix scores");
+        assert!(
+            signal.description.contains("references osascript"),
+            "{}",
+            signal.description
+        );
+        assert!(c.marked_incomplete("installer-script-suspicious"));
+    }
 }

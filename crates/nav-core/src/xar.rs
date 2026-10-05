@@ -299,11 +299,12 @@ pub fn read_entry(
     }
 }
 
-/// Like [`read_entry`], but a compressed (bzip2, gzip, zlib) entry that fails
-/// partway still yields the bytes decoded before the failure, which may
-/// include an unverified or cut-short final block. `Ok((bytes, None))` is a full read;
-/// `Ok((bytes, Some(err)))` is a non-empty partial one. Callers must treat the
-/// latter as incomplete evidence, never as a clean read.
+/// Like [`read_entry`], but an entry that fails partway (a compressed one
+/// that breaks, a stored one over `max_entry_bytes`) still yields the bytes
+/// before the failure, which may include an unverified or cut-short final
+/// block. `Ok((bytes, None))` is a full read; `Ok((bytes, Some(err)))` is a
+/// non-empty partial one. Callers must treat the latter as incomplete
+/// evidence, never as a clean read.
 pub fn read_entry_partial(
     data: &[u8],
     archive: &XarArchive,
@@ -360,11 +361,11 @@ fn decode_entry(
         // Plausible zlib CMF; if the header checks fail, treat it as stored.
         let (bytes, result) = inflate::zlib_decompress_partial(raw, limits.max_entry_bytes);
         match result {
-            Err(DecodeError::BadHeader) => stored(raw, limits).map(|v| (v, None)),
+            Err(DecodeError::BadHeader) => stored(raw, limits),
             result => partial_read(bytes, result),
         }
     } else {
-        stored(raw, limits).map(|v| (v, None))
+        stored(raw, limits)
     }
 }
 
@@ -382,12 +383,23 @@ fn partial_read(
     }
 }
 
-/// An entry stored without compression, subject to the same ceiling.
-fn stored(raw: &[u8], limits: &XarLimits) -> Result<Vec<u8>, XarEntryError> {
-    if raw.len() > limits.max_entry_bytes {
-        return Err(XarEntryError::Undecodable(DecodeError::BudgetExceeded));
+/// An entry stored without compression. Over `max_entry_bytes` it yields the
+/// first `max_entry_bytes` bytes with `BudgetExceeded`, or `Err` if that is none.
+fn stored(
+    raw: &[u8],
+    limits: &XarLimits,
+) -> Result<(Vec<u8>, Option<XarEntryError>), XarEntryError> {
+    let over = XarEntryError::Undecodable(DecodeError::BudgetExceeded);
+    match raw.get(..limits.max_entry_bytes) {
+        Some(prefix) if prefix.len() < raw.len() => {
+            if prefix.is_empty() {
+                Err(over)
+            } else {
+                Ok((prefix.to_vec(), Some(over)))
+            }
+        }
+        _ => Ok((raw.to_vec(), None)),
     }
-    Ok(raw.to_vec())
 }
 
 // --- TOC walking ---------------------------------------------------------
