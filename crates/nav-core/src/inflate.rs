@@ -47,7 +47,9 @@ pub type InflateError = DecodeError;
 
 /// Decode a raw DEFLATE stream, producing at most `budget` bytes.
 pub fn inflate(data: &[u8], budget: usize) -> Result<Vec<u8>, InflateError> {
-    inflate_inner(data, budget).map(|(out, _)| out)
+    let mut out = Vec::with_capacity(budget.min(INITIAL_OUTPUT_CAPACITY));
+    inflate_into(data, budget, &mut out)?;
+    Ok(out)
 }
 
 /// Decode an RFC 1950 zlib stream (2-byte header, DEFLATE body, 4-byte BE
@@ -70,7 +72,8 @@ pub fn zlib_decompress(data: &[u8], budget: usize) -> Result<Vec<u8>, InflateErr
     }
 
     let body = data.get(2..).ok_or(InflateError::Truncated)?;
-    let (out, used) = inflate_inner(body, budget)?;
+    let mut out = Vec::with_capacity(budget.min(INITIAL_OUTPUT_CAPACITY));
+    let used = inflate_into(body, budget, &mut out)?;
 
     let end = used.checked_add(4).ok_or(InflateError::Malformed)?;
     let trailer: [u8; 4] = body
@@ -144,7 +147,8 @@ pub fn gzip_decompress(data: &[u8], budget: usize) -> Result<Vec<u8>, InflateErr
     }
 
     let body = data.get(off..).ok_or(InflateError::Truncated)?;
-    let (out, used) = inflate_inner(body, budget)?;
+    let mut out = Vec::with_capacity(budget.min(INITIAL_OUTPUT_CAPACITY));
+    let used = inflate_into(body, budget, &mut out)?;
 
     let end = used.checked_add(8).ok_or(InflateError::Malformed)?;
     let trailer = body.get(used..end).ok_or(InflateError::Truncated)?;
@@ -170,23 +174,22 @@ pub fn gzip_decompress(data: &[u8], budget: usize) -> Result<Vec<u8>, InflateErr
     Ok(out)
 }
 
-/// Decode a DEFLATE stream, returning the output and how many bytes of
-/// `data` were consumed (needed to locate the zlib trailer).
-fn inflate_inner(data: &[u8], budget: usize) -> Result<(Vec<u8>, usize), InflateError> {
+/// Decode a DEFLATE stream into `out` (empty on entry), returning how many
+/// bytes of `data` were consumed. On error `out` holds whatever was written.
+fn inflate_into(data: &[u8], budget: usize, out: &mut Vec<u8>) -> Result<usize, InflateError> {
     let mut r = BitReader::new(data);
-    let mut out = Vec::with_capacity(budget.min(INITIAL_OUTPUT_CAPACITY));
 
     loop {
         let final_block = r.bits(1)? == 1;
         match r.bits(2)? {
-            0 => stored_block(&mut r, &mut out, budget)?,
+            0 => stored_block(&mut r, out, budget)?,
             1 => {
                 let (lit, dist) = fixed_tables()?;
-                compressed_block(&mut r, &mut out, budget, &lit, &dist)?;
+                compressed_block(&mut r, out, budget, &lit, &dist)?;
             }
             2 => {
                 let (lit, dist) = dynamic_tables(&mut r)?;
-                compressed_block(&mut r, &mut out, budget, &lit, &dist)?;
+                compressed_block(&mut r, out, budget, &lit, &dist)?;
             }
             // BTYPE=11 is reserved.
             _ => return Err(InflateError::Malformed),
@@ -196,7 +199,7 @@ fn inflate_inner(data: &[u8], budget: usize) -> Result<(Vec<u8>, usize), Inflate
         }
     }
 
-    Ok((out, r.bytes_consumed()))
+    Ok(r.bytes_consumed())
 }
 
 /// An uncompressed block: byte-aligned, with a length and its ones-complement.
