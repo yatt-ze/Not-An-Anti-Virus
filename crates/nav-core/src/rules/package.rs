@@ -139,16 +139,22 @@ fn scan_scripts_entry(
     findings: &mut ScriptFindings,
 ) -> Result<(), RuleOutcome> {
     // An entry we can't reach (bounded read stopped short) is
-    // unreadable, not absent. A partial bzip2 read is scanned, then reported
+    // unreadable, not absent. A partial read is scanned, then reported
     // unreadable below.
-    let (raw, gap) = xar::read_entry_partial(content, archive, entry, limits)
+    let (raw, mut gap) = xar::read_entry_partial(content, archive, entry, limits)
         .map_err(|_| RuleOutcome::NotApplicable)?;
 
     // Scripts is normally gzip-wrapped cpio; if not gzip, `read_entry`
-    // already undid the heap encoding.
-    let archive_bytes = match crate::inflate::gzip_decompress(&raw, limits.max_entry_bytes) {
-        Ok(v) => v,
-        Err(_) => raw,
+    // already undid the heap encoding. A damaged inner gzip is scanned as far
+    // as it decoded and reported incomplete.
+    let archive_bytes = match crate::inflate::gzip_decompress_partial(&raw, limits.max_entry_bytes)
+    {
+        (v, Ok(())) => v,
+        (v, Err(e)) if !v.is_empty() => {
+            gap.get_or_insert(xar::XarEntryError::Undecodable(e));
+            v
+        }
+        (_, Err(_)) => raw,
     };
 
     let Some(members) = cpio::parse(&archive_bytes, &cpio::CpioLimits::default()) else {
@@ -1382,6 +1388,46 @@ mod tests {
         let mut bytes = xar::toc_xar_bytes(&toc);
         bytes.extend_from_slice(blob);
         bytes
+    }
+
+    /// A complete (stored-block) zlib stream holding `inner`.
+    fn zlib_stored(inner: &[u8]) -> Vec<u8> {
+        let n = u16::try_from(inner.len()).expect("small blob");
+        let mut v = vec![0x78, 0x01, 0x01];
+        v.extend_from_slice(&n.to_le_bytes());
+        v.extend_from_slice(&(!n).to_le_bytes());
+        v.extend_from_slice(inner);
+        v.extend_from_slice(&crate::inflate::adler32(inner).to_be_bytes());
+        v
+    }
+
+    /// `Scripts` that is zlib on the heap and gzip-wrapped cpio inside: a
+    /// cut-short inner gzip is scanned and reported incomplete (#75).
+    #[test]
+    fn a_damaged_inner_gzip_scripts_stream_scores_and_marks_incomplete() {
+        let full = include_bytes!("../../testdata/gzip/scripts_dropper.in");
+        let c = ctx(
+            "s.pkg",
+            &pkg_with_scripts(&zlib_stored(&full[..full.len() - 8])),
+        );
+        let signal = InstallerScriptRule
+            .evaluate(&c)
+            .expect("evaluates")
+            .expect("the decoded preinstall scores");
+        assert!(
+            signal.description.contains("install script preinstall"),
+            "{}",
+            signal.description
+        );
+        assert!(c.marked_incomplete("installer-script-suspicious"));
+
+        // Intact inner gzip reads complete.
+        let c = ctx("s.pkg", &pkg_with_scripts(&zlib_stored(full)));
+        assert!(InstallerScriptRule
+            .evaluate(&c)
+            .expect("evaluates")
+            .is_some());
+        assert!(!c.marked_incomplete("installer-script-suspicious"));
     }
 
     #[test]
