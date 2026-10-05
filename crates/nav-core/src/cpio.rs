@@ -81,6 +81,9 @@ pub struct CpioArchive<'a> {
     /// `None` when the walk reached the trailer cleanly. `Some` means
     /// `entries` is a partial view and the caller must say so.
     pub halted: Option<CpioHalt>,
+    /// From the start of the header at which the walk halted through the end
+    /// of the input; empty when `halted` is `None`.
+    pub unparsed: &'a [u8],
 }
 
 impl CpioArchive<'_> {
@@ -108,12 +111,12 @@ pub fn parse<'a>(data: &'a [u8], limits: &CpioLimits) -> Option<CpioArchive<'a>>
 
     // Past this point never return `None` (which means "not cpio") — a
     // mid-archive failure breaks with a `CpioHalt` instead (§10/§11.8).
-    let halted = loop {
+    let (halted, unparsed) = loop {
         let Some(magic_end) = off.checked_add(6) else {
-            break Some(CpioHalt::Malformed);
+            break (Some(CpioHalt::Malformed), rest(data, off));
         };
         let Some(magic) = data.get(off..magic_end) else {
-            break Some(CpioHalt::Truncated);
+            break (Some(CpioHalt::Truncated), rest(data, off));
         };
 
         let parsed = if magic == ODC_MAGIC {
@@ -121,42 +124,45 @@ pub fn parse<'a>(data: &'a [u8], limits: &CpioLimits) -> Option<CpioArchive<'a>>
         } else if magic == NEWC_MAGIC || magic == NEWC_CRC_MAGIC {
             read_newc(data, off)
         } else {
-            break Some(CpioHalt::Malformed);
+            break (Some(CpioHalt::Malformed), rest(data, off));
         };
 
         let Some(hdr) = parsed else {
             // "Bytes ran out" vs. "bytes are wrong" — only one suggests tampering.
-            break Some(if data.len().saturating_sub(off) < NEWC_HEADER {
-                CpioHalt::Truncated
-            } else {
-                CpioHalt::Malformed
-            });
+            break (
+                Some(if data.len().saturating_sub(off) < NEWC_HEADER {
+                    CpioHalt::Truncated
+                } else {
+                    CpioHalt::Malformed
+                }),
+                rest(data, off),
+            );
         };
 
         let Some(name_bytes) = data.get(hdr.name_start..hdr.name_end) else {
-            break Some(CpioHalt::Truncated);
+            break (Some(CpioHalt::Truncated), rest(data, off));
         };
         // The recorded namesize includes a trailing NUL.
         let name_bytes = name_bytes.strip_suffix(b"\0").unwrap_or(name_bytes);
 
         if name_bytes == TRAILER {
-            break None; // clean end of archive
+            break (None, Default::default()); // clean end of archive
         }
         if entries.len() >= limits.max_entries {
-            break Some(CpioHalt::EntryLimit);
+            break (Some(CpioHalt::EntryLimit), rest(data, off));
         }
         let Some(running) = total.checked_add(hdr.filesize) else {
-            break Some(CpioHalt::Malformed);
+            break (Some(CpioHalt::Malformed), rest(data, off));
         };
         if running > limits.max_total_bytes {
-            break Some(CpioHalt::ByteLimit);
+            break (Some(CpioHalt::ByteLimit), rest(data, off));
         }
 
         let Some(data_end) = hdr.data_start.checked_add(hdr.filesize) else {
-            break Some(CpioHalt::Malformed);
+            break (Some(CpioHalt::Malformed), rest(data, off));
         };
         let Some(body) = data.get(hdr.data_start..data_end) else {
-            break Some(CpioHalt::Truncated);
+            break (Some(CpioHalt::Truncated), rest(data, off));
         };
 
         let name_lossy = std::str::from_utf8(name_bytes).is_err();
@@ -169,16 +175,25 @@ pub fn parse<'a>(data: &'a [u8], limits: &CpioLimits) -> Option<CpioArchive<'a>>
         total = running;
 
         let Some(next) = hdr.next_offset(data_end) else {
-            break Some(CpioHalt::Malformed);
+            break (Some(CpioHalt::Malformed), rest(data, off));
         };
         // Every iteration must advance, or a zero-size entry could spin.
         if next <= off {
-            break Some(CpioHalt::Malformed);
+            break (Some(CpioHalt::Malformed), rest(data, off));
         }
         off = next;
     };
 
-    Some(CpioArchive { entries, halted })
+    Some(CpioArchive {
+        entries,
+        halted,
+        unparsed,
+    })
+}
+
+/// `data` from `off` to the end; empty when `off` is past it.
+fn rest(data: &[u8], off: usize) -> &[u8] {
+    data.get(off..).unwrap_or_default()
 }
 
 /// The fields this reader needs out of a header, plus where the entry's
@@ -484,6 +499,35 @@ mod tests {
             assert_eq!(a.halted, Some(CpioHalt::Malformed), "{name}");
             assert!(a.entries.is_empty(), "{name}");
         }
+    }
+
+    #[test]
+    fn unparsed_starts_at_the_header_that_could_not_be_read() {
+        let cfg = CpioLimits::default();
+
+        let full = vector!("odc_valid");
+        let a = parse(full, &cfg).expect("cpio");
+        assert!(a.is_complete());
+        assert!(a.unparsed.is_empty());
+
+        // Cut inside the only member's body: its header magic through the
+        // present part of the body.
+        let cut = vector!("odc_truncated_data");
+        let a = parse(cut, &cfg).expect("cpio");
+        assert_eq!(a.halted, Some(CpioHalt::Truncated));
+        assert!(a.entries.is_empty());
+        assert!(a.unparsed.starts_with(b"070707"));
+        assert!(a.unparsed.ends_with(b"#!/"));
+        assert_eq!(a.unparsed, cut);
+
+        // One whole member, then a header with a bad magic.
+        let member = vector!("odc_no_trailer");
+        let mut bytes = member.to_vec();
+        bytes.extend_from_slice(b"garbage-after-the-first-member");
+        let a = parse(&bytes, &cfg).expect("cpio");
+        assert_eq!(a.halted, Some(CpioHalt::Malformed));
+        assert_eq!(a.entries.len(), 1);
+        assert_eq!(a.unparsed, b"garbage-after-the-first-member");
     }
 
     #[test]
