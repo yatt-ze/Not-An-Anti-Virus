@@ -45,6 +45,13 @@ fuzz_target!(|data: &[u8]| {
         );
     }
 
+    // A cut-short member exists only on a truncation, and its data is the
+    // input's tail.
+    if let Some(cut) = &archive.cut_short {
+        assert_eq!(archive.halted, Some(cpio::CpioHalt::Truncated));
+        assert!(data.ends_with(cut.data), "cut-short data is not a suffix");
+    }
+
     // Complete => reached the trailer, so not also halted (§10/§11.8).
     if archive.is_complete() {
         assert!(archive.halted.is_none());
