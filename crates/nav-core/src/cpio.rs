@@ -81,6 +81,10 @@ pub struct CpioArchive<'a> {
     /// `None` when the walk reached the trailer cleanly. `Some` means
     /// `entries` is a partial view and the caller must say so.
     pub halted: Option<CpioHalt>,
+    /// Present only with `halted == Some(Truncated)`: the member whose header
+    /// and name were read but whose body runs past the input. Its `data` is a
+    /// prefix of the body; callers must treat it as incomplete.
+    pub cut_short: Option<CpioEntry<'a>>,
 }
 
 impl CpioArchive<'_> {
@@ -108,6 +112,7 @@ pub fn parse<'a>(data: &'a [u8], limits: &CpioLimits) -> Option<CpioArchive<'a>>
 
     // Past this point never return `None` (which means "not cpio") — a
     // mid-archive failure breaks with a `CpioHalt` instead (§10/§11.8).
+    let mut cut_short = None;
     let halted = loop {
         let Some(magic_end) = off.checked_add(6) else {
             break Some(CpioHalt::Malformed);
@@ -155,11 +160,17 @@ pub fn parse<'a>(data: &'a [u8], limits: &CpioLimits) -> Option<CpioArchive<'a>>
         let Some(data_end) = hdr.data_start.checked_add(hdr.filesize) else {
             break Some(CpioHalt::Malformed);
         };
+        let name_lossy = std::str::from_utf8(name_bytes).is_err();
         let Some(body) = data.get(hdr.data_start..data_end) else {
+            cut_short = Some(CpioEntry {
+                name: String::from_utf8_lossy(name_bytes).into_owned(),
+                name_lossy,
+                mode: hdr.mode,
+                data: data.get(hdr.data_start..).unwrap_or_default(),
+            });
             break Some(CpioHalt::Truncated);
         };
 
-        let name_lossy = std::str::from_utf8(name_bytes).is_err();
         entries.push(CpioEntry {
             name: String::from_utf8_lossy(name_bytes).into_owned(),
             name_lossy,
@@ -178,7 +189,11 @@ pub fn parse<'a>(data: &'a [u8], limits: &CpioLimits) -> Option<CpioArchive<'a>>
         off = next;
     };
 
-    Some(CpioArchive { entries, halted })
+    Some(CpioArchive {
+        entries,
+        halted,
+        cut_short,
+    })
 }
 
 /// The fields this reader needs out of a header, plus where the entry's
@@ -483,6 +498,48 @@ mod tests {
                 .unwrap_or_else(|| panic!("{name}: magic is intact, so this is still cpio"));
             assert_eq!(a.halted, Some(CpioHalt::Malformed), "{name}");
             assert!(a.entries.is_empty(), "{name}");
+        }
+    }
+
+    #[test]
+    fn cut_short_is_the_member_whose_body_ran_out() {
+        let cfg = CpioLimits::default();
+
+        let a = parse(vector!("odc_valid"), &cfg).expect("cpio");
+        assert!(a.cut_short.is_none());
+
+        let a = parse(vector!("odc_truncated_data"), &cfg).expect("cpio");
+        assert_eq!(a.halted, Some(CpioHalt::Truncated));
+        assert!(a.entries.is_empty());
+        let cut = a.cut_short.expect("cut-short member");
+        assert_eq!(cut.name, "preinstall");
+        assert!(cut.is_regular_file());
+        assert!(cut.data.ends_with(b"#!/"));
+        assert!(vector!("odc_truncated_data").ends_with(cut.data));
+
+        // newc: cut eight bytes into the 17-byte body of `preinstall`.
+        let newc = &vector!("newc_valid")[..0x84];
+        let a = parse(newc, &cfg).expect("cpio");
+        assert_eq!(a.halted, Some(CpioHalt::Truncated));
+        let cut = a.cut_short.expect("cut-short member");
+        assert_eq!(cut.name, "preinstall");
+        assert_eq!(cut.data, b"#!/bin/s");
+
+        // A bad magic after a whole member.
+        let mut bytes = vector!("odc_no_trailer").to_vec();
+        bytes.extend_from_slice(b"garbage-after-the-first-member");
+        let a = parse(&bytes, &cfg).expect("cpio");
+        assert_eq!(a.halted, Some(CpioHalt::Malformed));
+        assert!(a.cut_short.is_none());
+
+        // Truncated inside a header and inside a name.
+        for name in [
+            vector!("odc_truncated_header"),
+            vector!("odc_truncated_name"),
+        ] {
+            let a = parse(name, &cfg).expect("cpio");
+            assert_eq!(a.halted, Some(CpioHalt::Truncated));
+            assert!(a.cut_short.is_none());
         }
     }
 

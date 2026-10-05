@@ -2,7 +2,8 @@
 //! libFuzzer target for `nav_core::inflate` (§11.9/§12). Property: for any
 //! input, no panic, no OOB read, terminates (a compressed format makes the
 //! last easy to get wrong — a back-reference loop hangs). Plus the §3
-//! amplification rule — output never exceeds the budget.
+//! amplification rule — output never exceeds the budget, partial results
+//! included.
 //!
 //! Run from `crates/nav-core/` (needs nightly + cargo-fuzz):
 //!   cargo +nightly fuzz run inflate
@@ -39,8 +40,18 @@ fuzz_target!(|data: &[u8]| {
             out.len()
         );
     }
+    for (name, (out, _)) in [
+        ("zlib partial", nav_core::inflate::zlib_decompress_partial(data, BUDGET)),
+        ("gzip partial", nav_core::inflate::gzip_decompress_partial(data, BUDGET)),
+    ] {
+        assert!(
+            out.len() <= BUDGET,
+            "{name} produced {} bytes against a {BUDGET}-byte budget",
+            out.len()
+        );
+    }
 
-    // A zero budget must never yield output — the "check before the write" boundary.
+    // A zero budget must never yield output — the clamp-to-budget boundary.
     for r in [
         nav_core::inflate::inflate(data, 0),
         nav_core::inflate::zlib_decompress(data, 0),
@@ -49,5 +60,11 @@ fuzz_target!(|data: &[u8]| {
         if let Ok(out) = r {
             assert!(out.is_empty(), "produced output under a zero budget");
         }
+    }
+    for (out, _) in [
+        nav_core::inflate::zlib_decompress_partial(data, 0),
+        nav_core::inflate::gzip_decompress_partial(data, 0),
+    ] {
+        assert!(out.is_empty(), "partial produced output under a zero budget");
     }
 });

@@ -32,7 +32,10 @@ pub mod xml;
 pub use bundle::BundleLayout;
 pub use context::{ContentSource, ScanContext};
 pub use cpio::{CpioArchive, CpioEntry, CpioHalt, CpioLimits};
-pub use inflate::{gzip_decompress, inflate, zlib_decompress, InflateError};
+pub use inflate::{
+    gzip_decompress, gzip_decompress_partial, inflate, zlib_decompress, zlib_decompress_partial,
+    InflateError,
+};
 pub use model::{
     EvidenceConfidence, MatchedSignal, Recommendation, ScanCompleteness, ScanResult, SignalCategory,
 };
