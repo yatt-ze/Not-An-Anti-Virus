@@ -332,12 +332,7 @@ pub fn read_entry_partial(
         Err(XarEntryError::UnknownEncoding)
     } else if crate::bzip2::has_bzip2_magic(raw) {
         let (bytes, result) = crate::bzip2::bzip2_decompress_partial(raw, limits.max_entry_bytes);
-        match result {
-            Ok(()) => Ok((bytes, None)),
-            // Installer reads what libxar yields before the stream fails.
-            Err(e) if !bytes.is_empty() => Ok((bytes, Some(XarEntryError::Undecodable(e)))),
-            Err(e) => Err(XarEntryError::Undecodable(e)),
-        }
+        partial_read(bytes, result)
     } else if raw.len() >= 2 && raw[0] == 0x1f && raw[1] == 0x8b {
         inflate::gzip_decompress(raw, limits.max_entry_bytes)
             .map(|v| (v, None))
@@ -351,6 +346,20 @@ pub fn read_entry_partial(
         }
     } else {
         stored(raw, limits).map(|v| (v, None))
+    }
+}
+
+/// A decoder's result as a partial read: a failure with output is
+/// `Ok((bytes, Some(err)))`, a failure with none is `Err`.
+fn partial_read(
+    bytes: Vec<u8>,
+    result: Result<(), DecodeError>,
+) -> Result<(Vec<u8>, Option<XarEntryError>), XarEntryError> {
+    match result {
+        Ok(()) => Ok((bytes, None)),
+        // Installer reads what libxar yields before the stream fails.
+        Err(e) if !bytes.is_empty() => Ok((bytes, Some(XarEntryError::Undecodable(e)))),
+        Err(e) => Err(XarEntryError::Undecodable(e)),
     }
 }
 
