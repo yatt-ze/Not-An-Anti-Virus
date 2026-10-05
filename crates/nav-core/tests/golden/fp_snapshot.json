@@ -422,6 +422,15 @@
     ],
     "completeness": "complete"
   },
+  "suspicious/installer_distribution_js_mixed_utf16_dropper.pkg": {
+    "score": 26,
+    "recommendation": "notify",
+    "rule_ids": [
+      "installer-script-suspicious",
+      "unsigned-installer-package"
+    ],
+    "completeness": "partial"
+  },
   "suspicious/installer_distribution_js_shell_launch.pkg": {
     "score": 14,
     "recommendation": "no-action",
