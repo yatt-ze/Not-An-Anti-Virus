@@ -1040,15 +1040,20 @@ mod tests {
         }
     }
 
-    /// A xar whose only entry is a `Distribution` holding `blob`, labelled bzip2.
-    fn bzip2_distribution_pkg(blob: &[u8]) -> Vec<u8> {
+    /// A xar whose only entry is a `Distribution` holding `blob`, with the
+    /// given heap `encoding style`.
+    fn distribution_pkg(style: &str, blob: &[u8]) -> Vec<u8> {
         let toc = format!(
-            r#"<file id="1"><name>Distribution</name><type>file</type><data><offset>0</offset><length>{n}</length><size>{n}</size><encoding style="application/x-bzip2"/></data></file>"#,
+            r#"<file id="1"><name>Distribution</name><type>file</type><data><offset>0</offset><length>{n}</length><size>{n}</size><encoding style="{style}"/></data></file>"#,
             n = blob.len()
         );
         let mut bytes = xar::toc_xar_bytes(&toc);
         bytes.extend_from_slice(blob);
         bytes
+    }
+
+    fn bzip2_distribution_pkg(blob: &[u8]) -> Vec<u8> {
+        distribution_pkg("application/x-bzip2", blob)
     }
 
     /// Real bzip2 (`testdata/bzip2/distribution_dropper.in`) of a dropper Distribution.
@@ -1111,15 +1116,8 @@ mod tests {
         assert!(matches!(InstallerScriptRule.evaluate(&c), Ok(None)));
     }
 
-    /// A xar whose only entry is a `Distribution` holding `blob`, labelled zlib.
     fn zlib_distribution_pkg(blob: &[u8]) -> Vec<u8> {
-        let toc = format!(
-            r#"<file id="1"><name>Distribution</name><type>file</type><data><offset>0</offset><length>{n}</length><size>{n}</size><encoding style="application/x-gzip"/></data></file>"#,
-            n = blob.len()
-        );
-        let mut bytes = xar::toc_xar_bytes(&toc);
-        bytes.extend_from_slice(blob);
-        bytes
+        distribution_pkg("application/x-gzip", blob)
     }
 
     /// A zlib `Distribution` missing its Adler-32 still extracts in libxar:
