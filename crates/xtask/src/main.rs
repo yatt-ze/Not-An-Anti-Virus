@@ -2,6 +2,11 @@
 //! --fake` drives it against a temp prefix with `FakeSystemOps` (what CI runs);
 //! `verify --real` drives the same calls against `/` with `RealSystemOps`
 //! under sudo. Both modes exercise one code path so they can't drift apart.
+//! `corpus` scans real files with two navctl builds and diffs the verdicts.
+
+mod corpus;
+
+use std::process::ExitCode;
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -31,18 +36,23 @@ enum Command {
         #[arg(long, conflicts_with = "fake")]
         real: bool,
     },
+    /// Real-machine false-positive check: scan a corpus, diff two builds.
+    #[command(subcommand)]
+    Corpus(corpus::CorpusCommand),
 }
 
-fn main() -> Result<()> {
+fn main() -> Result<ExitCode> {
     let cli = Cli::parse();
     match cli.command {
         Command::Verify { real, .. } => {
             if real {
-                verify_real()
+                verify_real()?
             } else {
-                verify_fake()
+                verify_fake()?
             }
+            Ok(ExitCode::SUCCESS)
         }
+        Command::Corpus(cmd) => corpus::run(cmd),
     }
 }
 

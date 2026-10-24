@@ -361,7 +361,9 @@ dependencies = [
  "anyhow",
  "clap",
  "libc",
+ "nav-core",
  "nav-service",
+ "serde_json",
 ]
 
 [[package]]

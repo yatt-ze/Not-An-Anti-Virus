@@ -111,6 +111,10 @@ it with `--no-verify` — fix the failure instead.
   `crates/nav-core/tests/fp_harness.rs` picks up new fixtures automatically
   — no code changes needed, but a rule with zero fixture coverage is an
   untested rule.
+- Before calling a score-moving change merge-ready, run
+  `cargo xtask corpus compare` (real-machine benign corpus vs `origin/main`)
+  and put the summary in the PR. A nonzero exit means a file's verdict got
+  worse or went missing — explain or fix it.
 
 ## Scope discipline
 
