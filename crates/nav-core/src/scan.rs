@@ -268,21 +268,14 @@ mod tests {
     /// absent (NAV-001 / §5.5).
     #[test]
     fn truncation_alone_prevents_a_complete_scan() {
-        use crate::context::{ContentSource, ScanContext};
-        use std::sync::OnceLock;
+        use crate::context::ScanContext;
 
         let ctx = |truncated: bool| ScanContext {
             path: "big.bin".into(),
             content: Some(b"benign".to_vec()),
             truncated,
             file_len: Some(u64::MAX),
-            identity: None,
-            source: ContentSource::File,
-            file: None,
-            codesign_dv_cache: OnceLock::new(),
-            spctl_cache: OnceLock::new(),
-            macho_cache: OnceLock::new(),
-            incomplete_rules: std::sync::Mutex::new(Vec::new()),
+            ..Default::default()
         };
 
         // No rules object, so truncation is the only thing that can lower it.
@@ -311,21 +304,12 @@ mod tests {
     }
 
     fn ctx(truncated: bool) -> ScanContext {
-        use crate::context::ContentSource;
-        use std::sync::OnceLock;
-
         ScanContext {
             path: "big.bin".into(),
             content: Some(b"benign".to_vec()),
             truncated,
             file_len: Some(u64::MAX),
-            identity: None,
-            source: ContentSource::File,
-            file: None,
-            codesign_dv_cache: OnceLock::new(),
-            spctl_cache: OnceLock::new(),
-            macho_cache: OnceLock::new(),
-            incomplete_rules: std::sync::Mutex::new(Vec::new()),
+            ..Default::default()
         }
     }
 
@@ -515,21 +499,12 @@ mod tests {
     /// here still stays `Partial`.
     #[test]
     fn default_ruleset_on_truncated_macho_content_is_still_partial() {
-        use crate::context::ContentSource;
-        use std::sync::OnceLock;
-
         let ctx = ScanContext {
             path: "app".into(),
             content: Some(b"\xfe\xed\xfa\xcf".to_vec()),
             truncated: true,
             file_len: Some(u64::MAX),
-            identity: None,
-            source: ContentSource::File,
-            file: None,
-            codesign_dv_cache: OnceLock::new(),
-            spctl_cache: OnceLock::new(),
-            macho_cache: OnceLock::new(),
-            incomplete_rules: std::sync::Mutex::new(Vec::new()),
+            ..Default::default()
         };
         assert_eq!(
             scan_context(&ctx, &default_ruleset()).completeness,

@@ -708,15 +708,8 @@ mod tests {
         ScanContext {
             path: PathBuf::from(name),
             content: Some(body.to_vec()),
-            truncated: false,
             file_len: Some(body.len() as u64),
-            identity: None,
-            source: ContentSource::File,
-            file: None,
-            codesign_dv_cache: std::sync::OnceLock::new(),
-            spctl_cache: std::sync::OnceLock::new(),
-            macho_cache: std::sync::OnceLock::new(),
-            incomplete_rules: std::sync::Mutex::new(Vec::new()),
+            ..Default::default()
         }
     }
 

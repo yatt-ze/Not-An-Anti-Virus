@@ -305,15 +305,8 @@ mod tests {
         ScanContext {
             path: PathBuf::from(path),
             content: Some(body.to_vec()),
-            truncated: false,
             file_len: Some(body.len() as u64),
-            identity: None,
-            source: crate::context::ContentSource::File,
-            file: None,
-            codesign_dv_cache: std::sync::OnceLock::new(),
-            spctl_cache: std::sync::OnceLock::new(),
-            macho_cache: std::sync::OnceLock::new(),
-            incomplete_rules: std::sync::Mutex::new(Vec::new()),
+            ..Default::default()
         }
     }
 
@@ -455,13 +448,7 @@ mod tests {
             content: Some(ORDINARY.to_vec()),
             truncated: true,
             file_len: Some(64 * 1024 * 1024),
-            identity: None,
-            source: crate::context::ContentSource::File,
-            file: None,
-            codesign_dv_cache: std::sync::OnceLock::new(),
-            spctl_cache: std::sync::OnceLock::new(),
-            macho_cache: std::sync::OnceLock::new(),
-            incomplete_rules: std::sync::Mutex::new(Vec::new()),
+            ..Default::default()
         };
         assert!(matches!(
             LaunchdPersistenceRule.evaluate(&c),
@@ -534,15 +521,8 @@ mod tests {
         let c = ScanContext {
             path: PathBuf::from("/Library/LaunchDaemons/x.plist"),
             content: None,
-            truncated: false,
             file_len: None,
-            identity: None,
-            source: crate::context::ContentSource::File,
-            file: None,
-            codesign_dv_cache: std::sync::OnceLock::new(),
-            spctl_cache: std::sync::OnceLock::new(),
-            macho_cache: std::sync::OnceLock::new(),
-            incomplete_rules: std::sync::Mutex::new(Vec::new()),
+            ..Default::default()
         };
         assert!(matches!(
             LaunchdPersistenceRule.evaluate(&c),

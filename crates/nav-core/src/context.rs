@@ -159,17 +159,12 @@ impl ScanContext {
         };
 
         ScanContext {
-            path: path.to_path_buf(),
             content,
             truncated,
             file_len,
             identity,
-            source: ContentSource::File,
             file,
-            codesign_dv_cache: OnceLock::new(),
-            spctl_cache: OnceLock::new(),
-            macho_cache: OnceLock::new(),
-            incomplete_rules: std::sync::Mutex::new(Vec::new()),
+            ..Self::empty(path.to_path_buf(), ContentSource::File)
         }
     }
 
@@ -184,12 +179,23 @@ impl ScanContext {
     ) -> Self {
         let len = content.len() as u64;
         ScanContext {
-            path: label.into(),
             content: Some(content),
             truncated,
             file_len: Some(len),
+            ..Self::empty(label.into(), ContentSource::Embedded)
+        }
+    }
+
+    /// No content, no file, empty caches: the base every constructor fills
+    /// in, so the field list lives in one place.
+    fn empty(path: PathBuf, source: ContentSource) -> Self {
+        ScanContext {
+            path,
+            content: None,
+            truncated: false,
+            file_len: None,
             identity: None,
-            source: ContentSource::Embedded,
+            source,
             file: None,
             codesign_dv_cache: OnceLock::new(),
             spctl_cache: OnceLock::new(),
@@ -407,6 +413,15 @@ impl ScanContext {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .contains(&rule_id)
+    }
+}
+
+/// Test base for struct literals: an unreadable real-file context with empty
+/// caches. Literals set what they need and take the rest with `..Default::default()`.
+#[cfg(test)]
+impl Default for ScanContext {
+    fn default() -> Self {
+        Self::empty(PathBuf::new(), ContentSource::File)
     }
 }
 

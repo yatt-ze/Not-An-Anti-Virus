@@ -1885,15 +1885,8 @@ mod tests {
         let ctx = ScanContext {
             path: PathBuf::from("archive.bin"),
             content: Some(high_entropy_blob(4096)),
-            truncated: false,
             file_len: Some(4096),
-            identity: None,
-            source: crate::context::ContentSource::File,
-            file: None,
-            codesign_dv_cache: std::sync::OnceLock::new(),
-            spctl_cache: std::sync::OnceLock::new(),
-            macho_cache: std::sync::OnceLock::new(),
-            incomplete_rules: std::sync::Mutex::new(Vec::new()),
+            ..Default::default()
         };
         assert!(HighEntropyRule.evaluate(&ctx).unwrap().is_none());
     }
@@ -1906,15 +1899,8 @@ mod tests {
         let ctx = ScanContext {
             path: PathBuf::from("dropper.sh"),
             content: Some(content),
-            truncated: false,
             file_len,
-            identity: None,
-            source: crate::context::ContentSource::File,
-            file: None,
-            codesign_dv_cache: std::sync::OnceLock::new(),
-            spctl_cache: std::sync::OnceLock::new(),
-            macho_cache: std::sync::OnceLock::new(),
-            incomplete_rules: std::sync::Mutex::new(Vec::new()),
+            ..Default::default()
         };
         let signal = HighEntropyRule.evaluate(&ctx).unwrap();
         assert!(signal.is_some(), "script with embedded blob should score");
@@ -2082,15 +2068,8 @@ mod tests {
         let ctx = ScanContext {
             path: PathBuf::from("packed"),
             content: Some(image_bytes),
-            truncated: false,
             file_len,
-            identity: None,
-            source: crate::context::ContentSource::File,
-            file: None,
-            codesign_dv_cache: std::sync::OnceLock::new(),
-            spctl_cache: std::sync::OnceLock::new(),
-            macho_cache: std::sync::OnceLock::new(),
-            incomplete_rules: std::sync::Mutex::new(Vec::new()),
+            ..Default::default()
         };
         let signal = HighEntropyRule.evaluate(&ctx).unwrap();
         assert!(
@@ -2105,15 +2084,8 @@ mod tests {
         ScanContext {
             path: PathBuf::from(path),
             content: Some(content),
-            truncated: false,
             file_len,
-            identity: None,
-            source: crate::context::ContentSource::File,
-            file: None,
-            codesign_dv_cache: std::sync::OnceLock::new(),
-            spctl_cache: std::sync::OnceLock::new(),
-            macho_cache: std::sync::OnceLock::new(),
-            incomplete_rules: std::sync::Mutex::new(Vec::new()),
+            ..Default::default()
         }
     }
 
