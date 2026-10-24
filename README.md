@@ -70,6 +70,9 @@ navctl scan ./some-binary
 # Scan a folder
 navctl scan ./some-dir --recursive
 
+# Scan a .app: one verdict line for the whole bundle (--verbose lists every file)
+navctl scan ./Some.app
+
 # Full signal-by-signal breakdown for a file, folder, or .app bundle.
 # A .app is scanned as one unit: its real executable is located, compiled
 # resources (nibs, asset catalogs) are skipped, and the bundle's verdict is

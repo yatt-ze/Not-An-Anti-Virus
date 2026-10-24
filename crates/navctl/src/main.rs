@@ -42,6 +42,9 @@ enum Command {
         recursive: bool,
         #[arg(long)]
         json: bool,
+        /// List every file of a `.app` bundle before its verdict line.
+        #[arg(long)]
+        verbose: bool,
         #[arg(long)]
         quick: bool,
         #[arg(long)]
@@ -160,9 +163,10 @@ fn main() -> ExitCode {
             path,
             json,
             recursive,
+            verbose,
             quick: _,
             full: _,
-        } => output::run_scan(&path, recursive, json),
+        } => output::run_scan(&path, recursive, json, verbose),
 
         Command::Rules { command } => match command {
             RulesCommand::Test {

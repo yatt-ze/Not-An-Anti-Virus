@@ -4,7 +4,8 @@
 //! `nav_core::ScanResult` (§5.5), plus a top-level `schema_version` marking
 //! the JSON as a versioned contract (§8), via the shared envelope in
 //! `nav_core::presentation`.
-//! `scan` prints one terse line per file;
+//! `scan` prints one terse line per file, except a `.app` bundle, which gets
+//! one line for the bundle (per-file lines with `--verbose`);
 //! `rules test` prints the worst file's full breakdown plus a roll-up.
 
 use std::path::{Path, PathBuf};
@@ -19,7 +20,7 @@ use nav_core::{
 
 use crate::exit;
 
-pub fn run_scan(path: &Path, recursive: bool, json: bool) -> ExitCode {
+pub fn run_scan(path: &Path, recursive: bool, json: bool, verbose: bool) -> ExitCode {
     let scan = match scan_target(path, recursive) {
         Ok(s) => s,
         Err(e) => {
@@ -36,15 +37,19 @@ pub fn run_scan(path: &Path, recursive: bool, json: bool) -> ExitCode {
         return exit::code(empty_scan_exit_code(&scan));
     }
 
+    let bundle_line = !json && scan.kind == TargetKind::Bundle;
     for result in &scan.results {
         if json {
             match with_schema_version(result) {
                 Ok(v) => println!("{v}"),
                 Err(e) => return json_error(&e),
             }
-        } else {
+        } else if !bundle_line || verbose {
             print_scan_summary(result);
         }
+    }
+    if bundle_line {
+        println!("{}", bundle_summary_line(&scan));
     }
     // Budget-exhausted coverage goes to stderr (keeping the --json stream on
     // stdout parseable as one object per file) and is folded into the exit
@@ -131,13 +136,66 @@ pub fn run_rules_list() -> ExitCode {
 
 fn print_scan_summary(result: &ScanResult) {
     println!(
-        "{}  score={:<4} confidence={:<6} completeness={:<13} -> {}",
-        result.path.display(),
-        result.score,
-        confidence_str(result.confidence),
-        completeness_str(result.completeness),
-        recommendation_str(result.recommendation),
+        "{}",
+        summary_line(
+            &result.path.display().to_string(),
+            result.score,
+            result.confidence,
+            result.completeness,
+            result.recommendation,
+        )
     );
+}
+
+fn summary_line(
+    path: &str,
+    score: i32,
+    confidence: EvidenceConfidence,
+    completeness: ScanCompleteness,
+    recommendation: Recommendation,
+) -> String {
+    format!(
+        "{path}  score={:<4} confidence={:<6} completeness={:<13} -> {}",
+        score,
+        confidence_str(confidence),
+        completeness_str(completeness),
+        recommendation_str(recommendation),
+    )
+}
+
+/// One line for a bundle: the worst file's verdict plus a file-count suffix.
+/// Completeness is `Partial` when the worst file was `Complete` but the
+/// target's coverage was not. Precondition: `scan.results` is non-empty.
+fn bundle_summary_line(scan: &TargetScan) -> String {
+    let worst = scan.worst().expect("non-empty results");
+    let completeness = match worst.completeness {
+        ScanCompleteness::Complete if !scan.coverage_complete() => ScanCompleteness::Partial,
+        c => c,
+    };
+    let line = summary_line(
+        &scan.root.display().to_string(),
+        worst.score,
+        worst.confidence,
+        completeness,
+        worst.recommendation,
+    );
+    let n = scan.results.len();
+    // `worst()` ranks by severity then score, so this holds for every member.
+    let all_clean = worst.completeness == ScanCompleteness::Complete
+        && worst.recommendation == Recommendation::NoAction
+        && worst.score <= 0;
+    if all_clean {
+        return format!("{line}  (bundle: {n} files)");
+    }
+    let star = if scan.primary.as_deref() == Some(worst.path.as_path()) {
+        "*"
+    } else {
+        ""
+    };
+    format!(
+        "{line}  (bundle: {n} files; worst: {}{star})",
+        display_relative(&scan.root, &worst.path)
+    )
 }
 
 fn print_rules_test(result: &ScanResult) {
@@ -532,5 +590,162 @@ mod tests {
             serde_json::json!(["/tmp/u\u{FFFD}\u{FFFD}"])
         );
         assert_eq!(v["results"][0]["path"], "/tmp/r\u{FFFD}");
+    }
+
+    fn member(path: &str, score: i32, completeness: ScanCompleteness) -> ScanResult {
+        let mut r = sample_result();
+        r.path = PathBuf::from(path);
+        r.score = score;
+        r.completeness = completeness;
+        if score >= 40 {
+            r.recommendation = Recommendation::Notify;
+        }
+        r
+    }
+
+    fn bundle(results: Vec<ScanResult>, budget: BudgetOutcome) -> TargetScan {
+        TargetScan {
+            root: PathBuf::from("/Apps/X.app"),
+            kind: TargetKind::Bundle,
+            primary: Some(PathBuf::from("/Apps/X.app/Contents/MacOS/X")),
+            skipped: Vec::new(),
+            unreadable: Vec::new(),
+            results,
+            budget,
+        }
+    }
+
+    const MAIN: &str = "/Apps/X.app/Contents/MacOS/X";
+    const EVIL: &str = "/Apps/X.app/Contents/Resources/evil.sh";
+
+    #[test]
+    fn bundle_line_clean_and_complete_has_no_worst() {
+        let scan = bundle(
+            vec![
+                member(MAIN, 0, ScanCompleteness::Complete),
+                member(EVIL, 0, ScanCompleteness::Complete),
+            ],
+            BudgetOutcome::Within,
+        );
+        let line = bundle_summary_line(&scan);
+        assert!(line.starts_with("/Apps/X.app  score="), "{line}");
+        assert!(line.ends_with("(bundle: 2 files)"), "{line}");
+        assert!(line.contains("completeness=Complete"), "{line}");
+        assert!(line.contains("no action (clean)"), "{line}");
+        assert!(!line.contains("worst:"), "{line}");
+    }
+
+    #[test]
+    fn bundle_line_names_the_worst_file() {
+        let scan = bundle(
+            vec![
+                member(MAIN, 0, ScanCompleteness::Complete),
+                member(EVIL, 40, ScanCompleteness::Complete),
+            ],
+            BudgetOutcome::Within,
+        );
+        let line = bundle_summary_line(&scan);
+        assert!(line.contains("score=40"), "{line}");
+        assert!(line.contains("-> notify"), "{line}");
+        assert!(
+            line.ends_with("worst: Contents/Resources/evil.sh)"),
+            "{line}"
+        );
+    }
+
+    #[test]
+    fn bundle_line_marks_the_main_executable() {
+        let scan = bundle(
+            vec![
+                member(MAIN, 40, ScanCompleteness::Complete),
+                member(EVIL, 0, ScanCompleteness::Complete),
+            ],
+            BudgetOutcome::Within,
+        );
+        assert!(
+            bundle_summary_line(&scan).contains("worst: Contents/MacOS/X*)"),
+            "{}",
+            bundle_summary_line(&scan)
+        );
+    }
+
+    #[test]
+    fn bundle_line_reports_a_clean_partial_member() {
+        let scan = bundle(
+            vec![
+                member(MAIN, 0, ScanCompleteness::Complete),
+                member(EVIL, 0, ScanCompleteness::Partial),
+            ],
+            BudgetOutcome::Within,
+        );
+        let line = bundle_summary_line(&scan);
+        assert!(line.contains("completeness=Partial"), "{line}");
+        assert!(line.contains("worst: Contents/Resources/evil.sh"), "{line}");
+    }
+
+    #[test]
+    fn bundle_line_is_partial_when_the_budget_cut_the_scan_short() {
+        let scan = bundle(
+            vec![
+                member(MAIN, 0, ScanCompleteness::Complete),
+                member(EVIL, 0, ScanCompleteness::Complete),
+            ],
+            BudgetOutcome::Exhausted(BudgetLimit::Files),
+        );
+        let line = bundle_summary_line(&scan);
+        assert!(line.contains("completeness=Partial"), "{line}");
+        assert!(!line.contains("completeness=Complete"), "{line}");
+        assert!(!line.contains("worst:"), "{line}");
+    }
+
+    #[test]
+    fn bundle_line_with_negative_scores_has_no_worst() {
+        let scan = bundle(
+            vec![
+                member(MAIN, -3, ScanCompleteness::Complete),
+                member(EVIL, 0, ScanCompleteness::Complete),
+            ],
+            BudgetOutcome::Within,
+        );
+        let line = bundle_summary_line(&scan);
+        assert!(line.ends_with("(bundle: 2 files)"), "{line}");
+        assert!(!line.contains("worst:"), "{line}");
+
+        let single = bundle(
+            vec![member(MAIN, -3, ScanCompleteness::Complete)],
+            BudgetOutcome::Within,
+        );
+        let line = bundle_summary_line(&single);
+        assert!(line.contains("score=-3"), "{line}");
+        assert!(!line.contains("worst:"), "{line}");
+    }
+
+    #[test]
+    fn bundle_line_names_a_low_nonzero_score() {
+        let scan = bundle(
+            vec![
+                member(MAIN, 0, ScanCompleteness::Complete),
+                member(EVIL, 3, ScanCompleteness::Complete),
+            ],
+            BudgetOutcome::Within,
+        );
+        let line = bundle_summary_line(&scan);
+        assert!(line.contains("worst: Contents/Resources/evil.sh"), "{line}");
+    }
+
+    /// Guards the per-file format against drift.
+    #[test]
+    fn summary_line_matches_the_per_file_format() {
+        let r = sample_result();
+        assert_eq!(
+            summary_line(
+                &r.path.display().to_string(),
+                r.score,
+                r.confidence,
+                r.completeness,
+                r.recommendation
+            ),
+            "/tmp/sample  score=0    confidence=Low    completeness=Complete      -> no action (clean)"
+        );
     }
 }
