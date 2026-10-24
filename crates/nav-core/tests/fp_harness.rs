@@ -124,6 +124,10 @@ fn benign_fixtures_never_alert() {
 /// least an incomplete scan.
 const SUB_THRESHOLD_ALLOWLIST: &[(&str, &str)] = &[
     (
+        "suspicious/dropper_in_disk_image.dmg",
+        "disk image contents not inspected until #86 part 2; must scan Partial, never clean",
+    ),
+    (
         "suspicious/macho_self_signed_identity",
         "an unanchored signing identity is corroboration-only by design (§5.1, #89); needs a second signal",
     ),

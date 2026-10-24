@@ -7,6 +7,7 @@ use crate::context::ScanContext;
 use crate::model::{MatchedSignal, SignalCategory};
 
 mod codesign;
+mod container;
 mod entropy;
 mod macho_structure;
 mod package;
@@ -18,6 +19,7 @@ pub use codesign::{
     AdHocSignedRule, NotarizedRule, RevokedSignatureRule, UnanchoredIdentityRule,
     UnnotarizedSignedRule, UnsignedBinaryRule,
 };
+pub use container::UninspectedContainerRule;
 pub use entropy::HighEntropyRule;
 pub use macho_structure::MachOStructureRule;
 pub use package::{InstallerScriptRule, UnsignedPackageRule};
@@ -94,6 +96,7 @@ pub fn default_ruleset() -> Vec<Box<dyn Rule>> {
         Box::new(InstallerScriptRule),
         Box::new(UnsignedPackageRule),
         Box::new(MachOStructureRule),
+        Box::new(UninspectedContainerRule),
     ]
 }
 

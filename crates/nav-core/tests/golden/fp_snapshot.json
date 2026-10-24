@@ -360,6 +360,14 @@
     ],
     "completeness": "complete"
   },
+  "suspicious/dropper_in_disk_image.dmg": {
+    "score": 0,
+    "recommendation": "no-action",
+    "rule_ids": [
+      "uninspected-container"
+    ],
+    "completeness": "partial"
+  },
   "suspicious/dropper_osascript_fetch.sh": {
     "score": 19,
     "recommendation": "notify",

@@ -61,6 +61,11 @@ pub fn run_scan(path: &Path, recursive: bool, json: bool, verbose: bool) -> Exit
             path.display()
         );
     }
+    if !json {
+        for note in uninspected_notes(&scan.results) {
+            eprintln!("{note}");
+        }
+    }
     if let Some(note) = unreadable_note(&scan) {
         eprintln!("{note}");
     }
@@ -379,6 +384,20 @@ fn unreadable_note(scan: &TargetScan) -> Option<String> {
     ))
 }
 
+/// One stderr line per result carrying the `uninspected-container` signal
+/// (§10, §11.8), so a human sees why a clean-looking score exits 3.
+fn uninspected_notes(results: &[ScanResult]) -> Vec<String> {
+    results
+        .iter()
+        .flat_map(|r| {
+            r.signals
+                .iter()
+                .filter(|s| s.id == "uninspected-container")
+                .map(|s| format!("navctl: {}: {}", r.path.display(), s.description))
+        })
+        .collect()
+}
+
 /// Human-output counterpart to [`unreadable_note`], formatted like
 /// [`budget_note`] for `rules test`'s multi-file breakdown.
 fn unreadable_coverage_note(scan: &TargetScan) -> Option<String> {
@@ -466,6 +485,22 @@ mod tests {
             engine_version: "test".to_string(),
             evaluated_at: SystemTime::UNIX_EPOCH,
         }
+    }
+
+    #[test]
+    fn uninspected_notes_name_only_results_with_the_signal() {
+        let mut flagged = sample_result();
+        flagged.signals.push(nav_core::model::MatchedSignal {
+            id: "uninspected-container".to_string(),
+            weight: 0,
+            description: "disk image not inspected".to_string(),
+            category: nav_core::model::SignalCategory::Informational,
+        });
+        let notes = uninspected_notes(&[sample_result(), flagged]);
+        assert_eq!(
+            notes,
+            vec!["navctl: /tmp/sample: disk image not inspected".to_string()]
+        );
     }
 
     #[test]
