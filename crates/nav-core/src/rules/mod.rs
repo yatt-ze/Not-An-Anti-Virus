@@ -15,7 +15,8 @@ mod quarantine_xattr;
 mod strings;
 
 pub use codesign::{
-    AdHocSignedRule, NotarizedRule, RevokedSignatureRule, UnnotarizedSignedRule, UnsignedBinaryRule,
+    AdHocSignedRule, NotarizedRule, RevokedSignatureRule, UnanchoredIdentityRule,
+    UnnotarizedSignedRule, UnsignedBinaryRule,
 };
 pub use entropy::HighEntropyRule;
 pub use macho_structure::MachOStructureRule;
@@ -84,6 +85,7 @@ pub fn default_ruleset() -> Vec<Box<dyn Rule>> {
         Box::new(SuspiciousStringsRule),
         Box::new(UnsignedBinaryRule),
         Box::new(AdHocSignedRule),
+        Box::new(UnanchoredIdentityRule),
         Box::new(RevokedSignatureRule),
         Box::new(UnnotarizedSignedRule),
         Box::new(NotarizedRule),
