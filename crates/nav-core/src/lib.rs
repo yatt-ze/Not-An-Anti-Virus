@@ -44,7 +44,9 @@ pub use presentation::{
     exit_code, for_result, for_target, scan_result_json, with_schema_version, CLEAN, HIGH_RISK,
     INDETERMINATE, OPERATIONAL_ERROR, SCAN_JSON_SCHEMA_VERSION, SUSPICIOUS,
 };
-pub use rules::{default_ruleset, embedded_content_ruleset, Rule, RuleOutcome};
+pub use rules::{
+    default_ruleset, embedded_content_ruleset, Rule, RuleOutcome, UNINSPECTED_CONTAINER_ID,
+};
 pub use scan::{
     scan_context, scan_embedded_bytes, scan_file, scan_file_with_rules, ENGINE_VERSION,
 };

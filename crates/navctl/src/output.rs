@@ -16,6 +16,7 @@ use std::process::ExitCode;
 use nav_core::{
     scan_target, with_schema_version, BudgetLimit, BudgetOutcome, EvidenceConfidence,
     Recommendation, ScanCompleteness, ScanResult, TargetKind, TargetScan, SCAN_JSON_SCHEMA_VERSION,
+    UNINSPECTED_CONTAINER_ID,
 };
 
 use crate::exit;
@@ -60,6 +61,11 @@ pub fn run_scan(path: &Path, recursive: bool, json: bool, verbose: bool) -> Exit
             budget_limit_label(limit),
             path.display()
         );
+    }
+    if !json {
+        for note in uninspected_notes(&scan.results) {
+            eprintln!("{note}");
+        }
     }
     if let Some(note) = unreadable_note(&scan) {
         eprintln!("{note}");
@@ -159,19 +165,24 @@ fn summary_line(
         score,
         confidence_str(confidence),
         completeness_str(completeness),
-        recommendation_str(recommendation),
+        recommendation_str(recommendation, completeness),
     )
 }
 
-/// One line for a bundle: the worst file's verdict plus a file-count suffix.
-/// Completeness is `Partial` when the worst file was `Complete` but the
-/// target's coverage was not. Precondition: `scan.results` is non-empty.
-fn bundle_summary_line(scan: &TargetScan) -> String {
-    let worst = scan.worst().expect("non-empty results");
-    let completeness = match worst.completeness {
+/// `worst`'s completeness, raised to `Partial` when it was `Complete` but
+/// `scan`'s coverage was not. `worst` must be `scan.worst()`.
+fn target_completeness(scan: &TargetScan, worst: &ScanResult) -> ScanCompleteness {
+    match worst.completeness {
         ScanCompleteness::Complete if !scan.coverage_complete() => ScanCompleteness::Partial,
         c => c,
-    };
+    }
+}
+
+/// One line for a bundle: the worst file's verdict plus a file-count suffix.
+/// Precondition: `scan.results` is non-empty.
+fn bundle_summary_line(scan: &TargetScan) -> String {
+    let worst = scan.worst().expect("non-empty results");
+    let completeness = target_completeness(scan, worst);
     let line = summary_line(
         &scan.root.display().to_string(),
         worst.score,
@@ -218,7 +229,7 @@ fn print_rules_test(result: &ScanResult) {
     println!();
     println!(
         "Recommendation: {}",
-        recommendation_str(result.recommendation)
+        recommendation_str(result.recommendation, result.completeness)
     );
 }
 
@@ -288,7 +299,7 @@ fn print_rules_test_multi(scan: &TargetScan) {
             display_relative(&scan.root, &result.path),
             result.score,
             completeness_str(result.completeness),
-            recommendation_str(result.recommendation),
+            recommendation_str(result.recommendation, result.completeness),
         );
     }
     if scan.primary.is_some() {
@@ -297,7 +308,7 @@ fn print_rules_test_multi(scan: &TargetScan) {
     println!();
     println!(
         "Recommendation: {}",
-        recommendation_str(scan.recommendation())
+        recommendation_str(worst.recommendation, target_completeness(scan, worst))
     );
 }
 
@@ -379,6 +390,20 @@ fn unreadable_note(scan: &TargetScan) -> Option<String> {
     ))
 }
 
+/// One stderr line per result carrying the `uninspected-container` signal
+/// (§10, §11.8), so a human sees why a clean-looking score exits 3.
+fn uninspected_notes(results: &[ScanResult]) -> Vec<String> {
+    results
+        .iter()
+        .flat_map(|r| {
+            r.signals
+                .iter()
+                .filter(|s| s.id == UNINSPECTED_CONTAINER_ID)
+                .map(|s| format!("navctl: {}: {}", r.path.display(), s.description))
+        })
+        .collect()
+}
+
 /// Human-output counterpart to [`unreadable_note`], formatted like
 /// [`budget_note`] for `rules test`'s multi-file breakdown.
 fn unreadable_coverage_note(scan: &TargetScan) -> Option<String> {
@@ -439,9 +464,13 @@ fn completeness_str(c: ScanCompleteness) -> &'static str {
     }
 }
 
-fn recommendation_str(r: Recommendation) -> &'static str {
+/// `NoAction` reads "clean" only when the scan was `Complete` (§10, §11.8).
+fn recommendation_str(r: Recommendation, completeness: ScanCompleteness) -> &'static str {
     match r {
-        Recommendation::NoAction => "no action (clean)",
+        Recommendation::NoAction if completeness == ScanCompleteness::Complete => {
+            "no action (clean)"
+        }
+        Recommendation::NoAction => "no action (not fully checked)",
         Recommendation::Notify => "notify",
         Recommendation::NotifyAndSuggestQuarantine => {
             "notify + suggest quarantine (no auto-action without opt-in)"
@@ -466,6 +495,22 @@ mod tests {
             engine_version: "test".to_string(),
             evaluated_at: SystemTime::UNIX_EPOCH,
         }
+    }
+
+    #[test]
+    fn uninspected_notes_name_only_results_with_the_signal() {
+        let mut flagged = sample_result();
+        flagged.signals.push(nav_core::model::MatchedSignal {
+            id: UNINSPECTED_CONTAINER_ID.to_string(),
+            weight: 0,
+            description: "disk image not inspected".to_string(),
+            category: nav_core::model::SignalCategory::Informational,
+        });
+        let notes = uninspected_notes(&[sample_result(), flagged]);
+        assert_eq!(
+            notes,
+            vec!["navctl: /tmp/sample: disk image not inspected".to_string()]
+        );
     }
 
     #[test]
@@ -617,6 +662,51 @@ mod tests {
 
     const MAIN: &str = "/Apps/X.app/Contents/MacOS/X";
     const EVIL: &str = "/Apps/X.app/Contents/Resources/evil.sh";
+
+    #[test]
+    fn no_action_is_clean_only_when_complete() {
+        let label = |c| recommendation_str(Recommendation::NoAction, c);
+        assert_eq!(label(ScanCompleteness::Complete), "no action (clean)");
+        for c in [ScanCompleteness::Partial, ScanCompleteness::Indeterminate] {
+            assert_eq!(label(c), "no action (not fully checked)");
+        }
+        assert_eq!(
+            recommendation_str(Recommendation::Notify, ScanCompleteness::Partial),
+            "notify"
+        );
+    }
+
+    #[test]
+    fn partial_and_indeterminate_summary_lines_are_not_clean() {
+        for c in [ScanCompleteness::Partial, ScanCompleteness::Indeterminate] {
+            let line = summary_line(
+                "/tmp/x",
+                0,
+                EvidenceConfidence::Low,
+                c,
+                Recommendation::NoAction,
+            );
+            assert!(line.ends_with("-> no action (not fully checked)"), "{line}");
+            assert!(!line.contains("(clean)"), "{line}");
+        }
+    }
+
+    #[test]
+    fn bundle_line_with_incomplete_coverage_is_not_clean() {
+        let scan = bundle(
+            vec![member(MAIN, 0, ScanCompleteness::Complete)],
+            BudgetOutcome::Exhausted(BudgetLimit::Files),
+        );
+        let line = bundle_summary_line(&scan);
+        assert!(line.contains("not fully checked"), "{line}");
+        assert!(!line.contains("(clean)"), "{line}");
+        let worst = scan.worst().unwrap();
+        assert_eq!(target_completeness(&scan, worst), ScanCompleteness::Partial);
+        assert_eq!(
+            recommendation_str(worst.recommendation, target_completeness(&scan, worst)),
+            "no action (not fully checked)"
+        );
+    }
 
     #[test]
     fn bundle_line_clean_and_complete_has_no_worst() {
