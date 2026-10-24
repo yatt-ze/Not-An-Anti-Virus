@@ -141,7 +141,8 @@ git config core.hooksPath .githooks
 Before merging a change that can move scores, check it against real
 software on your machine. This builds `origin/main` and your working tree,
 scans `/usr/bin`, `/Applications`, Homebrew's Cellar, `~/.cargo/bin` and
-Steam with both, and fails if any file's verdict got worse or went missing:
+Steam with both, and exits 2 if any file's verdict or coverage got worse, or
+a file went missing:
 
 ```sh
 cargo xtask corpus compare            # or pass your own roots

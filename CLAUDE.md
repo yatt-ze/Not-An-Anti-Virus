@@ -113,8 +113,9 @@ it with `--no-verify` — fix the failure instead.
   untested rule.
 - Before calling a score-moving change merge-ready, run
   `cargo xtask corpus compare` (real-machine benign corpus vs `origin/main`)
-  and put the summary in the PR. A nonzero exit means a file's verdict got
-  worse or went missing — explain or fix it.
+  and put the summary in the PR. Exit 2 means a file's recommendation or
+  completeness got worse, or a file went missing — explain or fix it
+  (exit 1 is the tool itself failing).
 
 ## Scope discipline
 
