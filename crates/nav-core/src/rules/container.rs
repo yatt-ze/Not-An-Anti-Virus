@@ -2,7 +2,11 @@
 
 use super::{Rule, RuleOutcome};
 use crate::context::ScanContext;
+use crate::macho::ByteSource;
 use crate::model::{MatchedSignal, SignalCategory};
+
+/// Id of the signal [`UninspectedContainerRule`] emits.
+pub const UNINSPECTED_CONTAINER_ID: &str = "uninspected-container";
 
 /// Where a disk-image magic sits.
 #[derive(Clone, Copy)]
@@ -55,7 +59,7 @@ fn disk_image_format(ctx: &ScanContext) -> Option<Option<&'static str>> {
 
 impl Rule for UninspectedContainerRule {
     fn id(&self) -> &'static str {
-        "uninspected-container"
+        UNINSPECTED_CONTAINER_ID
     }
 
     fn category(&self) -> SignalCategory {
@@ -64,6 +68,10 @@ impl Rule for UninspectedContainerRule {
 
     fn evaluate(&self, ctx: &ScanContext) -> Result<Option<MatchedSignal>, RuleOutcome> {
         if ctx.content.is_none() {
+            return Err(RuleOutcome::NotApplicable);
+        }
+        // Truncated embedded content has no real end to probe.
+        if ctx.truncated && !ctx.source_len_is_authoritative() {
             return Err(RuleOutcome::NotApplicable);
         }
         match disk_image_format(ctx) {
@@ -119,6 +127,17 @@ mod tests {
 
     fn format_of(ctx: &ScanContext) -> Option<&'static str> {
         disk_image_format(ctx).expect("readable")
+    }
+
+    #[test]
+    fn truncated_embedded_content_is_not_applicable() {
+        let mut buf = vec![0u8; 1024];
+        buf[512..516].copy_from_slice(b"koly");
+        let ctx = ScanContext::from_embedded_bytes("x.dmg", buf, true);
+        assert_eq!(
+            UninspectedContainerRule.evaluate(&ctx).unwrap_err(),
+            RuleOutcome::NotApplicable
+        );
     }
 
     #[test]

@@ -16,6 +16,7 @@ use std::process::ExitCode;
 use nav_core::{
     scan_target, with_schema_version, BudgetLimit, BudgetOutcome, EvidenceConfidence,
     Recommendation, ScanCompleteness, ScanResult, TargetKind, TargetScan, SCAN_JSON_SCHEMA_VERSION,
+    UNINSPECTED_CONTAINER_ID,
 };
 
 use crate::exit;
@@ -168,21 +169,20 @@ fn summary_line(
     )
 }
 
-/// One line for a bundle: the worst file's verdict plus a file-count suffix.
-/// The worst file's completeness, raised to `Partial` when that file was
-/// `Complete` but the target's coverage was not. Precondition: `scan.results`
-/// is non-empty.
-fn target_completeness(scan: &TargetScan) -> ScanCompleteness {
-    let worst = scan.worst().expect("non-empty results");
+/// `worst`'s completeness, raised to `Partial` when it was `Complete` but
+/// `scan`'s coverage was not. `worst` must be `scan.worst()`.
+fn target_completeness(scan: &TargetScan, worst: &ScanResult) -> ScanCompleteness {
     match worst.completeness {
         ScanCompleteness::Complete if !scan.coverage_complete() => ScanCompleteness::Partial,
         c => c,
     }
 }
 
+/// One line for a bundle: the worst file's verdict plus a file-count suffix.
+/// Precondition: `scan.results` is non-empty.
 fn bundle_summary_line(scan: &TargetScan) -> String {
     let worst = scan.worst().expect("non-empty results");
-    let completeness = target_completeness(scan);
+    let completeness = target_completeness(scan, worst);
     let line = summary_line(
         &scan.root.display().to_string(),
         worst.score,
@@ -308,7 +308,7 @@ fn print_rules_test_multi(scan: &TargetScan) {
     println!();
     println!(
         "Recommendation: {}",
-        recommendation_str(scan.recommendation(), target_completeness(scan))
+        recommendation_str(worst.recommendation, target_completeness(scan, worst))
     );
 }
 
@@ -398,7 +398,7 @@ fn uninspected_notes(results: &[ScanResult]) -> Vec<String> {
         .flat_map(|r| {
             r.signals
                 .iter()
-                .filter(|s| s.id == "uninspected-container")
+                .filter(|s| s.id == UNINSPECTED_CONTAINER_ID)
                 .map(|s| format!("navctl: {}: {}", r.path.display(), s.description))
         })
         .collect()
@@ -501,7 +501,7 @@ mod tests {
     fn uninspected_notes_name_only_results_with_the_signal() {
         let mut flagged = sample_result();
         flagged.signals.push(nav_core::model::MatchedSignal {
-            id: "uninspected-container".to_string(),
+            id: UNINSPECTED_CONTAINER_ID.to_string(),
             weight: 0,
             description: "disk image not inspected".to_string(),
             category: nav_core::model::SignalCategory::Informational,
@@ -700,9 +700,10 @@ mod tests {
         let line = bundle_summary_line(&scan);
         assert!(line.contains("not fully checked"), "{line}");
         assert!(!line.contains("(clean)"), "{line}");
-        assert_eq!(target_completeness(&scan), ScanCompleteness::Partial);
+        let worst = scan.worst().unwrap();
+        assert_eq!(target_completeness(&scan, worst), ScanCompleteness::Partial);
         assert_eq!(
-            recommendation_str(scan.recommendation(), target_completeness(&scan)),
+            recommendation_str(worst.recommendation, target_completeness(&scan, worst)),
             "no action (not fully checked)"
         );
     }
