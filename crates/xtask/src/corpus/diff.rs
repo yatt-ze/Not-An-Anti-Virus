@@ -65,6 +65,9 @@ pub struct DiffReport {
     pub new_files: usize,
     /// Paths NEW never reported (a crash, a skipped chunk); fails the gate.
     pub only_base: Vec<PathBuf>,
+    /// Paths missing from NEW under a target the walk budget cut short in
+    /// both runs, as `(target, count)`; reported, but not a failure.
+    pub budget_cutoff: Vec<(PathBuf, usize)>,
     pub only_new: usize,
     pub duplicates_base: usize,
     pub duplicates_new: usize,
@@ -92,7 +95,7 @@ impl DiffReport {
     }
 
     /// Whether the gate passes: something was scanned, nothing regressed,
-    /// nothing went missing.
+    /// nothing went missing outside [`Self::budget_cutoff`].
     pub fn passed(&self) -> bool {
         self.base_files > 0 && self.regressions() == 0 && self.only_base.is_empty()
     }
@@ -230,6 +233,23 @@ pub fn diff(base: &[ScanResult], new: &[ScanResult]) -> DiffReport {
     report
 }
 
+/// Moves `only_base` paths under any of `stopped` (targets the walk budget
+/// cut short in **both** runs) into `budget_cutoff`: there the set of files
+/// reached depends on bytes read per file, so a missing file is not lost
+/// coverage. Every other missing path still fails the gate.
+pub fn excuse_budget_cutoffs(r: &mut DiffReport, stopped: &BTreeSet<PathBuf>) {
+    let mut counts: BTreeMap<PathBuf, usize> = BTreeMap::new();
+    r.only_base
+        .retain(|p| match stopped.iter().find(|t| p.starts_with(t)) {
+            Some(t) => {
+                *counts.entry(t.clone()).or_insert(0) += 1;
+                false
+            }
+            None => true,
+        });
+    r.budget_cutoff = counts.into_iter().collect();
+}
+
 /// Human-readable report; the changed-file list is capped at 200 lines
 /// unless `all`.
 pub fn render(r: &DiffReport, all: bool) -> String {
@@ -271,6 +291,17 @@ pub fn render(r: &DiffReport, all: bool) -> String {
         r.regressions()
     );
     let cap = if all { usize::MAX } else { DEFAULT_LIST_CAP };
+    if !r.budget_cutoff.is_empty() {
+        let n: usize = r.budget_cutoff.iter().map(|(_, c)| c).sum();
+        let _ = writeln!(
+            s,
+            "\nbudget cutoff moved: {n} file(s) not reached in new, under targets \
+             the scan budget stopped in both runs (not a failure):"
+        );
+        for (t, c) in &r.budget_cutoff {
+            let _ = writeln!(s, "  {c:>6}  {}", t.display());
+        }
+    }
     if !r.only_base.is_empty() {
         let _ = writeln!(
             s,
@@ -433,6 +464,28 @@ mod tests {
         assert_eq!(r.regressions(), 1);
         assert!(!r.passed());
         assert_eq!(r.comp_counts[1], (0, 1));
+    }
+
+    #[test]
+    fn missing_files_under_a_budget_stopped_target_do_not_fail_the_gate() {
+        let base = [clean("/A/X.app/a", 0), clean("/A/X.app/b", 0)];
+        let mut r = diff(&base, &[clean("/A/X.app/a", 0)]);
+        assert!(!r.passed());
+        excuse_budget_cutoffs(&mut r, &BTreeSet::from([PathBuf::from("/A/X.app")]));
+        assert!(r.passed());
+        assert_eq!(r.budget_cutoff, vec![(PathBuf::from("/A/X.app"), 1)]);
+        assert!(render(&r, false).contains("budget cutoff moved: 1 file(s)"));
+    }
+
+    #[test]
+    fn missing_files_elsewhere_still_fail_the_gate() {
+        // `/A/X.app2` only shares a string prefix with the stopped target.
+        let base = [clean("/A/X.app2/a", 0), clean("/B/c", 0)];
+        let mut r = diff(&base, &[]);
+        excuse_budget_cutoffs(&mut r, &BTreeSet::from([PathBuf::from("/A/X.app")]));
+        assert!(!r.passed());
+        assert_eq!(r.only_base.len(), 2);
+        assert!(r.budget_cutoff.is_empty());
     }
 
     #[test]

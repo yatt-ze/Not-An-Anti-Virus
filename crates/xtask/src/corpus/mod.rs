@@ -8,6 +8,7 @@ mod parse;
 mod plan;
 mod scan;
 
+use std::collections::BTreeSet;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
@@ -52,7 +53,9 @@ pub struct ScanArgs {
 
 #[derive(Args)]
 pub struct DiffArgs {
+    /// Base JSONL; its `<base>.err` (if any) names budget-stopped targets.
     base: PathBuf,
+    /// New JSONL; likewise `<new>.err`.
     new: PathBuf,
     /// Print every changed file instead of the first 200.
     #[arg(long)]
@@ -85,12 +88,20 @@ pub fn run(cmd: CorpusCommand) -> Result<ExitCode> {
         CorpusCommand::Diff(a) => {
             let base = parse::load(&a.base)?;
             let new = parse::load(&a.new)?;
-            let report = diff::diff(&base, &new);
+            let mut report = diff::diff(&base, &new);
+            diff::excuse_budget_cutoffs(&mut report, &stopped_in_both(&a.base, &a.new)?);
             print!("{}", diff::render(&report, a.all));
             Ok(report.exit_code())
         }
         CorpusCommand::Compare(a) => compare::run(a),
     }
+}
+
+/// Targets the walk budget stopped in both scans, from their `.err` files.
+pub fn stopped_in_both(base: &std::path::Path, new: &std::path::Path) -> Result<BTreeSet<PathBuf>> {
+    let b = parse::load_budget_stopped(base)?;
+    let n = parse::load_budget_stopped(new)?;
+    Ok(b.intersection(&n).cloned().collect())
 }
 
 /// `path` joined onto the current directory if relative (no symlink

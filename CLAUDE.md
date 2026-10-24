@@ -115,7 +115,9 @@ it with `--no-verify` — fix the failure instead.
   `cargo xtask corpus compare` (real-machine benign corpus vs `origin/main`)
   and put the summary in the PR. Exit 2 means a file's recommendation or
   completeness got worse, or a file went missing — explain or fix it
-  (exit 1 is the tool itself failing).
+  (exit 1 is the tool itself failing). Files missing under a target the
+  walk budget stopped in both runs (e.g. Xcode.app) are listed as
+  "budget cutoff moved" and don't fail it.
 
 ## Scope discipline
 

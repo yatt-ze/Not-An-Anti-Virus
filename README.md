@@ -142,7 +142,9 @@ Before merging a change that can move scores, check it against real
 software on your machine. This builds `origin/main` and your working tree,
 scans `/usr/bin`, `/Applications`, Homebrew's Cellar, `~/.cargo/bin` and
 Steam with both, and exits 2 if any file's verdict or coverage got worse, or
-a file went missing:
+a file went missing. (A bundle too big for the scan budget, such as
+Xcode.app, is cut short in both runs; files it reaches in one run but not
+the other are listed under "budget cutoff moved" and don't fail.)
 
 ```sh
 cargo xtask corpus compare            # or pass your own roots
