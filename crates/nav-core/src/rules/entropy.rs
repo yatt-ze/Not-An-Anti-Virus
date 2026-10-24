@@ -431,7 +431,9 @@ fn budgeted_ranges(ctx: &ScanContext, images: &[macho::MachOImage]) -> (Vec<Cand
 impl HighEntropyRule {
     /// `evaluate` with the Apple-anchor check injected; `anchored` runs at
     /// most once, and only when it could change the result (see
-    /// [`Self::eval_macho_images_with`]).
+    /// [`Self::eval_macho_images_with`]). A Mach-O with no walkable slice is
+    /// `NotApplicable`; skipped slices go to `eval_macho_images_with` as
+    /// `all_walked = false`.
     fn evaluate_with(
         &self,
         ctx: &ScanContext,
@@ -442,11 +444,14 @@ impl HighEntropyRule {
             return Ok(None);
         }
 
-        // `images` empty (whether or not `is_macho`): a non-Mach-O or
-        // unwalkable file, judged by the non-Mach-O path below.
-        let images = &ctx.macho().images;
-        if !images.is_empty() {
-            return self.eval_macho_images_with(ctx, content, images, anchored);
+        let scan = ctx.macho();
+        if !scan.images.is_empty() {
+            let all_walked = scan.skipped_slices == 0;
+            return self.eval_macho_images_with(ctx, content, &scan.images, all_walked, anchored);
+        }
+        if scan.is_macho {
+            // Mach-O, but no slice could be walked: nothing was scored.
+            return Err(RuleOutcome::NotApplicable);
         }
 
         if let TextClass::Text { container_evidence } = classify_text(content, &ctx.path) {
@@ -461,8 +466,9 @@ impl HighEntropyRule {
     /// can hide a packed slice behind a clean one, §5.2) and report the
     /// single strongest — highest weight, then highest entropy. Returns
     /// `NotApplicable` when a range was left unscored (budget), scored
-    /// prefix-only (failed stream) or an image's segment list is incomplete,
-    /// and there is no weight-15 match (§10/§11.8).
+    /// prefix-only (failed stream), an image's segment list is incomplete or
+    /// `all_walked` is false (a declared slice wasn't walked), and there is
+    /// no weight-15 match (§10/§11.8).
     #[cfg(test)]
     fn eval_macho_images(
         &self,
@@ -470,7 +476,7 @@ impl HighEntropyRule {
         content: &[u8],
         images: &[macho::MachOImage],
     ) -> Result<Option<MatchedSignal>, RuleOutcome> {
-        self.eval_macho_images_with(ctx, content, images, || false)
+        self.eval_macho_images_with(ctx, content, images, true, || false)
     }
 
     /// [`Self::eval_macho_images`] with the Apple-anchor check injected. A
@@ -483,10 +489,12 @@ impl HighEntropyRule {
         ctx: &ScanContext,
         content: &[u8],
         images: &[macho::MachOImage],
+        all_walked: bool,
         anchored: impl FnOnce() -> bool,
     ) -> Result<Option<MatchedSignal>, RuleOutcome> {
         let (included, all_scored) = budgeted_ranges(ctx, images);
-        let mut whole = all_scored && images.iter().all(|image| image.segments_complete);
+        let mut whole =
+            all_walked && all_scored && images.iter().all(|image| image.segments_complete);
         // (entropy, signal, reaches 15 only via name + small text)
         let mut scored_all: Vec<(f64, MatchedSignal, bool)> = Vec::new();
         for (region, range) in included {
@@ -1285,6 +1293,64 @@ mod tests {
         );
     }
 
+    /// A Mach-O whose only slice can't be walked (a duplicate
+    /// `LC_CODE_SIGNATURE`) is "couldn't check", not clean (§11.8).
+    #[test]
+    fn unwalkable_macho_is_not_applicable() {
+        let bad = crate::macho::tests_support::synth_macho_64_duplicate_code_signature(
+            b"code", None, None,
+        );
+        let ctx = make_ctx("/x/thin", bad);
+        assert!(ctx.macho().is_macho && ctx.macho().images.is_empty());
+        assert!(matches!(
+            HighEntropyRule.evaluate_with(&ctx, || false),
+            Err(RuleOutcome::NotApplicable)
+        ));
+    }
+
+    /// A skipped slice makes the rule `NotApplicable` unless a walked slice
+    /// has a weight-15 match: neither a clean slice nor a corroboration-only
+    /// one vouches for it (§5.2, §11.8).
+    #[test]
+    fn fat_with_a_skipped_slice_needs_a_weight_15_match() {
+        let bad = crate::macho::tests_support::synth_macho_64_duplicate_code_signature(
+            b"code", None, None,
+        );
+        let (clean, _) = crate::macho::tests_support::synth_macho_64(b"plain code");
+        let ctx = make_ctx(
+            "/x/fat",
+            crate::macho::tests_support::synth_fat(&[&clean, &bad]),
+        );
+        assert_eq!(ctx.macho().skipped_slices, 1);
+        assert!(matches!(
+            HighEntropyRule.evaluate_with(&ctx, || false),
+            Err(RuleOutcome::NotApplicable)
+        ));
+
+        // A corroboration-only (weight 4) match doesn't vouch for it either.
+        let (elevated, _) =
+            crate::macho::tests_support::synth_macho_64(&uniform_over(147, 147 * 40));
+        let ctx = make_ctx(
+            "/x/fat-elevated",
+            crate::macho::tests_support::synth_fat(&[&elevated, &bad]),
+        );
+        assert!(matches!(
+            HighEntropyRule.evaluate_with(&ctx, || false),
+            Err(RuleOutcome::NotApplicable)
+        ));
+
+        let (packed, _) = crate::macho::tests_support::synth_macho_64(&high_entropy_blob(65536));
+        let ctx = make_ctx(
+            "/x/fat2",
+            crate::macho::tests_support::synth_fat(&[&packed, &bad]),
+        );
+        let signal = HighEntropyRule
+            .evaluate_with(&ctx, || false)
+            .unwrap()
+            .unwrap();
+        assert_eq!(signal.weight, TEXT_PACKED_WEIGHT);
+    }
+
     #[test]
     fn fat_binary_best_slice_decides_the_text_tier() {
         let (elevated, _) =
@@ -1605,7 +1671,11 @@ mod tests {
             .set_len(8)
             .unwrap();
 
-        let _ = HighEntropyRule.evaluate(&ctx).unwrap();
+        // The unread slice is "couldn't check", not clean or scored (§11.8).
+        assert!(matches!(
+            HighEntropyRule.evaluate(&ctx),
+            Err(RuleOutcome::NotApplicable)
+        ));
         assert!(!HighEntropyRule.covers_truncation(&ctx));
 
         let _ = std::fs::remove_file(&path);
