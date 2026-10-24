@@ -26,8 +26,8 @@ pub(crate) enum TextClass {
     /// Opaque binary blob.
     NotText,
     /// Script or text. `container_evidence` is set only for the
-    /// printable-prefix fallback, when the prefix has a C0 control byte other
-    /// than tab, LF, CR, FF or ESC (NUL included), or a known binary magic;
+    /// printable-prefix fallback, when the prefix has a byte that
+    /// [`is_serialization_control`] accepts or a known binary magic;
     /// shebang and script-extension files never carry it.
     Text { container_evidence: bool },
 }
