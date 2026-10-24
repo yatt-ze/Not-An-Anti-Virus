@@ -225,6 +225,110 @@ impl Rule for AdHocSignedRule {
     }
 }
 
+/// Weight for a signature whose certificate does not chain to Apple.
+/// Corroboration-only: above ad-hoc (3) and unsigned (4) because it claims an
+/// identity no Apple anchor vouches for; never enough alone to reach Notify (§5.1).
+const UNANCHORED_IDENTITY_WEIGHT: i32 = 5;
+
+/// Notes a real-identity signature that does not chain to an Apple anchor
+/// (self-signed or private CA).
+pub struct UnanchoredIdentityRule;
+
+impl Default for UnanchoredIdentityRule {
+    fn default() -> Self {
+        UnanchoredIdentityRule
+    }
+}
+
+impl Rule for UnanchoredIdentityRule {
+    fn id(&self) -> &'static str {
+        "unanchored-signing-identity"
+    }
+
+    fn category(&self) -> SignalCategory {
+        SignalCategory::ProvenanceConcern
+    }
+
+    fn evaluate(&self, ctx: &ScanContext) -> Result<Option<MatchedSignal>, RuleOutcome> {
+        if !ctx.is_file_backed() {
+            return Err(RuleOutcome::NotApplicable);
+        }
+        if ctx.content.is_none() {
+            return Err(RuleOutcome::NotApplicable);
+        }
+        if !ctx.macho().is_macho {
+            return Ok(None);
+        }
+        if run_codesign_dv(ctx)? != DvStatus::Signed {
+            return Ok(None);
+        }
+
+        if run_anchor_requirement(ctx)? {
+            Ok(None)
+        } else {
+            Ok(Some(MatchedSignal {
+                id: "unanchored-signing-identity".to_string(),
+                weight: UNANCHORED_IDENTITY_WEIGHT,
+                description:
+                    "binary is signed with a certificate that does not chain to Apple (self-signed or private CA)"
+                        .to_string(),
+                category: SignalCategory::ProvenanceConcern,
+            }))
+        }
+    }
+
+    /// Same as `UnsignedBinaryRule`: `ctx.macho()` only gates.
+    fn covers_truncation(&self, _ctx: &ScanContext) -> bool {
+        true
+    }
+}
+
+/// Maps `codesign --verify -R=...` exit status to an outcome: `Ok(true)` if the
+/// requirement is satisfied (0), `Ok(false)` if validly signed but failing it
+/// (3), `NotApplicable` for verification failure (1), bad arguments (2), a
+/// signal, or a spawn failure.
+fn classify_anchor_exit(code: Option<i32>) -> Result<bool, RuleOutcome> {
+    match code {
+        Some(0) => Ok(true),
+        Some(3) => Ok(false),
+        _ => Err(RuleOutcome::NotApplicable),
+    }
+}
+
+/// Asks whether the scanned file's signature chains to an Apple anchor.
+/// Object-bound like the other external checks (§11.7).
+fn run_anchor_requirement(ctx: &ScanContext) -> Result<bool, RuleOutcome> {
+    if !path_is_line_safe(&ctx.path) {
+        return Err(RuleOutcome::NotApplicable);
+    }
+    classify_anchor_exit(ctx.run_object_bound(|| spawn_anchor_requirement(&ctx.path)))
+}
+
+/// Exit code of `codesign --verify` against `anchor apple generic`; `None` if
+/// it was killed by a signal or failed to spawn.
+#[cfg(target_os = "macos")]
+fn spawn_anchor_requirement(path: &std::path::Path) -> Option<i32> {
+    // `--ignore-resources`: asks who signed the code, not whether the bundle
+    // seal is intact, so a broken seal doesn't become "couldn't check".
+    // `--all-architectures`: every slice must be anchored (fat binaries can mix signers).
+    std::process::Command::new("codesign")
+        .arg("--verify")
+        .arg("--ignore-resources")
+        .arg("--all-architectures")
+        .arg("-R=anchor apple generic")
+        .arg(path)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .ok()?
+        .code()
+}
+
+#[cfg(not(target_os = "macos"))]
+fn spawn_anchor_requirement(_path: &std::path::Path) -> Option<i32> {
+    None
+}
+
 /// Weight for a revoked code-signing certificate. Apple revokes Developer ID
 /// certs almost exclusively in response to confirmed abuse, so — unlike a
 /// bare `unsigned-binary` — this is a narrow, high-specificity signal (§5.1)
@@ -563,7 +667,7 @@ fn spawn_spctl_assess(_path: &std::path::Path) -> Result<String, RuleOutcome> {
 /// Runs `codesign -dv` and classifies the result. The classification logic
 /// (`classify_dv`) is platform-independent and unit-tested directly; only the
 /// process spawn is behind the platform gate. The spawn itself is cached on
-/// `ctx` (§5.2) so the five rules sharing a scan spawn `codesign` once, not
+/// `ctx` (§5.2) so the six rules sharing a scan spawn `codesign` once, not
 /// once each.
 fn run_codesign_dv(ctx: &ScanContext) -> Result<DvStatus, RuleOutcome> {
     if !path_is_line_safe(&ctx.path) {
@@ -627,13 +731,14 @@ mod tests {
         }
     }
 
-    /// All five rules' verdicts come from `codesign`/`spctl` on the whole
+    /// All six rules' verdicts come from `codesign`/`spctl` on the whole
     /// file, not the truncated prefix — see the module-level doc comments.
     #[test]
     fn all_codesign_rules_cover_truncation_on_a_truncated_macho_context() {
         let c = truncated_ctx("app", b"\xfe\xed\xfa\xcf");
         assert!(UnsignedBinaryRule.covers_truncation(&c));
         assert!(AdHocSignedRule.covers_truncation(&c));
+        assert!(UnanchoredIdentityRule.covers_truncation(&c));
         assert!(RevokedSignatureRule.covers_truncation(&c));
         assert!(UnnotarizedSignedRule.covers_truncation(&c));
         assert!(NotarizedRule.covers_truncation(&c));
@@ -661,7 +766,7 @@ mod tests {
     /// A >8 MiB file with a `CAFEBABE` header whose sole arch-table entry
     /// points past the 8 MiB prefix at bytes that aren't a thin Mach-O
     /// magic: `ctx.macho()` reads the real offset and correctly says this
-    /// isn't Mach-O, so none of the five rules should even ask `codesign`
+    /// isn't Mach-O, so none of the six rules should even ask `codesign`
     /// (§5.2, #45).
     #[test]
     fn codesign_rules_do_not_treat_an_out_of_bounds_fat_offset_as_macho() {
@@ -692,6 +797,7 @@ mod tests {
 
         assert!(matches!(UnsignedBinaryRule.evaluate(&ctx), Ok(None)));
         assert!(matches!(AdHocSignedRule.evaluate(&ctx), Ok(None)));
+        assert!(matches!(UnanchoredIdentityRule.evaluate(&ctx), Ok(None)));
         assert!(matches!(RevokedSignatureRule.evaluate(&ctx), Ok(None)));
         assert!(matches!(UnnotarizedSignedRule.evaluate(&ctx), Ok(None)));
         assert!(matches!(NotarizedRule.evaluate(&ctx), Ok(None)));
@@ -709,6 +815,10 @@ mod tests {
         );
         assert!(matches!(
             UnsignedBinaryRule.evaluate(&c),
+            Err(RuleOutcome::NotApplicable)
+        ));
+        assert!(matches!(
+            UnanchoredIdentityRule.evaluate(&c),
             Err(RuleOutcome::NotApplicable)
         ));
     }
@@ -751,6 +861,51 @@ mod tests {
             AdHocSignedRule.evaluate(&ctx("readme.txt", b"just some notes\n")),
             Ok(None)
         ));
+    }
+
+    #[test]
+    fn things_that_are_not_code_objects_are_not_unanchored() {
+        assert!(matches!(
+            UnanchoredIdentityRule.evaluate(&ctx("readme.txt", b"just some notes\n")),
+            Ok(None)
+        ));
+    }
+
+    #[test]
+    fn classify_anchor_exit_maps_codesign_exit_codes() {
+        assert_eq!(classify_anchor_exit(Some(0)), Ok(true));
+        assert_eq!(classify_anchor_exit(Some(3)), Ok(false));
+        for code in [Some(1), Some(2), Some(127), None] {
+            assert_eq!(classify_anchor_exit(code), Err(RuleOutcome::NotApplicable));
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn unanchored_identity_fires_only_on_a_self_signed_binary() {
+        let fixtures = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures");
+        let signal = UnanchoredIdentityRule
+            .evaluate(&ScanContext::load(
+                &fixtures.join("suspicious/macho_self_signed_identity"),
+            ))
+            .expect("evaluates")
+            .expect("self-signed fixture fires");
+        assert_eq!(signal.id, "unanchored-signing-identity");
+        assert_eq!(signal.weight, 5);
+
+        let linker_signed = ScanContext::load(&fixtures.join("benign/tiny_hello_arm64"));
+        assert!(matches!(
+            UnanchoredIdentityRule.evaluate(&linker_signed),
+            Ok(None)
+        ));
+
+        let ls = std::path::Path::new("/bin/ls");
+        if ls.exists() {
+            assert!(matches!(
+                UnanchoredIdentityRule.evaluate(&ScanContext::load(ls)),
+                Ok(None)
+            ));
+        }
     }
 
     #[test]

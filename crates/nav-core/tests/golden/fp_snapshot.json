@@ -554,6 +554,14 @@
     ],
     "completeness": "complete"
   },
+  "suspicious/macho_self_signed_identity": {
+    "score": 5,
+    "recommendation": "no-action",
+    "rule_ids": [
+      "unanchored-signing-identity"
+    ],
+    "completeness": "complete"
+  },
   "suspicious/macho_tmp_rpath_disable_lib_validation": {
     "score": 29,
     "recommendation": "notify",
