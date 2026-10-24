@@ -131,7 +131,25 @@ no code changes needed.
 ## Contributing
 
 `cargo fmt`, `cargo clippy --workspace --all-targets -- -D warnings`, and
-`cargo test --workspace` must all pass before a commit.
+`cargo test --workspace` must all pass before a commit. To run them
+automatically on every commit:
+
+```sh
+git config core.hooksPath .githooks
+```
+
+Before merging a change that can move scores, check it against real
+software on your machine. This builds `origin/main` and your working tree,
+scans `/usr/bin`, `/Applications`, Homebrew's Cellar, `~/.cargo/bin` and
+Steam with both, and exits 2 if any file's verdict or coverage got worse, or
+a file went missing:
+
+```sh
+cargo xtask corpus compare            # or pass your own roots
+```
+
+`cargo xtask corpus scan` and `cargo xtask corpus diff` run the two halves
+separately.
 
 The design rationale and longer-term roadmap live in
 [`docs/design.md`](docs/design.md) — worth reading before proposing

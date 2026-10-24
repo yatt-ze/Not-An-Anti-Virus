@@ -89,6 +89,10 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 ```
 
+`.githooks/pre-commit` runs the same checks on every commit once enabled
+(`git config core.hooksPath .githooks`; worktrees share it). Don't bypass
+it with `--no-verify` — fix the failure instead.
+
 ## Adding or changing a heuristic rule in `nav-core`
 
 - A rule reports `Ok(None)` when it ran and found nothing, `Ok(Some(signal))`
@@ -107,6 +111,11 @@ cargo test --workspace
   `crates/nav-core/tests/fp_harness.rs` picks up new fixtures automatically
   — no code changes needed, but a rule with zero fixture coverage is an
   untested rule.
+- Before calling a score-moving change merge-ready, run
+  `cargo xtask corpus compare` (real-machine benign corpus vs `origin/main`)
+  and put the summary in the PR. Exit 2 means a file's recommendation or
+  completeness got worse, or a file went missing — explain or fix it
+  (exit 1 is the tool itself failing).
 
 ## Scope discipline
 

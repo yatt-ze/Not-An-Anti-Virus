@@ -1,0 +1,30 @@
+#!/bin/sh
+# Runs the CLAUDE.md "Before every commit" checks, the same ones CI runs.
+# Enable once per clone: git config core.hooksPath .githooks
+# Checks exactly what is staged. Skip with --no-verify.
+set -e
+
+top=$(git rev-parse --show-toplevel)
+cd "$top"
+
+# Fast path: the working tree is the staged snapshot. Otherwise check a
+# copy of the index, so unstaged or untracked files can't mask a break.
+if ! git diff --quiet || [ -n "$(git ls-files --others --exclude-standard)" ]; then
+    snap=$(mktemp -d "${TMPDIR:-/tmp}/nav-pre-commit.XXXXXX")
+    trap 'rm -rf "$snap"' EXIT
+    git checkout-index --all --prefix="$snap/"
+    export CARGO_TARGET_DIR="$top/target/pre-commit"
+    cd "$snap"
+    echo "pre-commit: checking the staged snapshot (working tree differs)" >&2
+fi
+
+if ! cargo fmt --all -- --check >/dev/null 2>&1; then
+    echo "pre-commit: code is not formatted; run: cargo fmt --all" >&2
+    exit 1
+fi
+cargo clippy --quiet --workspace --all-targets -- -D warnings
+if ! out=$(cargo test --quiet --workspace 2>&1); then
+    printf '%s\n' "$out" | tail -n 40 >&2
+    echo "pre-commit: cargo test --workspace failed" >&2
+    exit 1
+fi

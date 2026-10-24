@@ -1,0 +1,16 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(./target/debug/navctl scan *)",
+      "Bash(./target/release/navctl scan *)",
+      "Bash(./target/debug/navctl rules test *)",
+      "Bash(./target/release/navctl rules test *)",
+      "Bash(cargo test --workspace)",
+      "Bash(cargo clippy --workspace --all-targets -- -D warnings)",
+      "Bash(cargo fmt --all -- --check)",
+      "Bash(otool *)",
+      "Bash(spctl -a *)",
+      "Bash(spctl --assess *)"
+    ]
+  }
+}
