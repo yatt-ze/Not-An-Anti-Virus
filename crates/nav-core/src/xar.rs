@@ -132,8 +132,9 @@ pub enum XarHalt {
     /// The TOC's byte range lies outside the data we hold (lying header, or a
     /// bounded read that stopped short).
     TocOutOfRange,
-    /// The TOC declares, or inflates to, more than `max_toc_bytes`. Not a
-    /// maliciousness finding on its own (§6.2).
+    /// The TOC declares, or inflates to, more than `max_toc_bytes`, or its
+    /// inflation exceeds inflate's work cap. Not a maliciousness finding on
+    /// its own (§6.2).
     TocTooLarge,
     /// The TOC is not a valid zlib stream.
     TocUndecodable,
@@ -199,7 +200,7 @@ pub enum XarEntryError {
     OutOfRange,
     /// The entry's bytes are not a compression format we recognize.
     UnknownEncoding,
-    /// Decompression failed or exceeded `max_entry_bytes`.
+    /// Decompression failed or exceeded `max_entry_bytes` or inflate's work cap.
     Undecodable(DecodeError),
 }
 
@@ -791,14 +792,21 @@ pub(crate) fn toc_xar_bytes(toc_body: &str) -> Vec<u8> {
     z.extend_from_slice(&(!len).to_le_bytes());
     z.extend_from_slice(toc.as_bytes());
     z.extend_from_slice(&inflate::adler32(toc.as_bytes()).to_be_bytes());
+    xar_from_zlib_toc(&z, toc.len() as u64)
+}
+
+#[cfg(test)]
+/// A version-1 xar whose TOC is the zlib stream `z`, declaring
+/// `toc_len_uncompressed` bytes once inflated.
+pub(crate) fn xar_from_zlib_toc(z: &[u8], toc_len_uncompressed: u64) -> Vec<u8> {
     let mut v = Vec::new();
     v.extend_from_slice(b"xar!");
     v.extend_from_slice(&28u16.to_be_bytes());
     v.extend_from_slice(&1u16.to_be_bytes());
     v.extend_from_slice(&(z.len() as u64).to_be_bytes());
-    v.extend_from_slice(&(toc.len() as u64).to_be_bytes());
+    v.extend_from_slice(&toc_len_uncompressed.to_be_bytes());
     v.extend_from_slice(&1u32.to_be_bytes());
-    v.extend_from_slice(&z);
+    v.extend_from_slice(z);
     v
 }
 
@@ -1028,18 +1036,11 @@ mod tests {
             ..XarLimits::default()
         };
         let blocks = inflate::work_cap(limits.max_toc_bytes) / inflate::DYNAMIC_BLOCK_WORK * 2;
-        let raw = inflate::tests::empty_dynamic_blocks(blocks);
+        let raw = inflate::empty_dynamic_blocks(blocks);
         let mut z = vec![0x78, 0x9c];
         z.extend_from_slice(&raw);
         z.extend_from_slice(&1u32.to_be_bytes());
-        let mut v = Vec::new();
-        v.extend_from_slice(b"xar!");
-        v.extend_from_slice(&28u16.to_be_bytes());
-        v.extend_from_slice(&1u16.to_be_bytes());
-        v.extend_from_slice(&(z.len() as u64).to_be_bytes());
-        v.extend_from_slice(&1u64.to_be_bytes());
-        v.extend_from_slice(&1u32.to_be_bytes());
-        v.extend_from_slice(&z);
+        let v = xar_from_zlib_toc(&z, 1);
         let a = parse(&v, &limits).expect("xar");
         assert_eq!(a.halted, Some(XarHalt::TocTooLarge));
         assert!(!a.is_complete());
