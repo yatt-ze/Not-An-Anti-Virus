@@ -1022,6 +1022,30 @@ mod tests {
     }
 
     #[test]
+    fn toc_of_empty_dynamic_blocks_halts_as_too_large() {
+        let limits = XarLimits {
+            max_toc_bytes: 64 * 1024,
+            ..XarLimits::default()
+        };
+        let blocks = inflate::work_cap(limits.max_toc_bytes) / inflate::DYNAMIC_BLOCK_WORK * 2;
+        let raw = inflate::tests::empty_dynamic_blocks(blocks);
+        let mut z = vec![0x78, 0x9c];
+        z.extend_from_slice(&raw);
+        z.extend_from_slice(&1u32.to_be_bytes());
+        let mut v = Vec::new();
+        v.extend_from_slice(b"xar!");
+        v.extend_from_slice(&28u16.to_be_bytes());
+        v.extend_from_slice(&1u16.to_be_bytes());
+        v.extend_from_slice(&(z.len() as u64).to_be_bytes());
+        v.extend_from_slice(&1u64.to_be_bytes());
+        v.extend_from_slice(&1u32.to_be_bytes());
+        v.extend_from_slice(&z);
+        let a = parse(&v, &limits).expect("xar");
+        assert_eq!(a.halted, Some(XarHalt::TocTooLarge));
+        assert!(!a.is_complete());
+    }
+
+    #[test]
     fn an_unknown_xar_version_is_not_parsed_as_version_one() {
         let a = parse(adversarial!("version_absurd"), &XarLimits::default()).expect("xar");
         assert_eq!(a.halted, Some(XarHalt::UnsupportedVersion));

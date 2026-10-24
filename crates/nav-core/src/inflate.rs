@@ -5,8 +5,11 @@
 //! Hand-written per §3 (no third-party code on the parse path). Contract:
 //! never panics, every offset bounds-checked, and output never exceeds
 //! `budget`: a write that would cross it is clamped, then the stream is
-//! refused with [`InflateError::BudgetExceeded`]. The strict entry points
-//! return no bytes on error; the `_partial` ones return the clamped output.
+//! refused with [`InflateError::BudgetExceeded`]. Decode work (input read,
+//! output written, plus a fixed charge per dynamic block) is likewise capped
+//! at a multiple of `budget`; exceeding it is also `BudgetExceeded`. The
+//! strict entry points return no bytes on error; the `_partial` ones return
+//! the clamped output.
 //! `BudgetExceeded` is a §6.2 policy stop, not evidence of malice — callers
 //! must keep it distinct from `Malformed`.
 
@@ -20,6 +23,20 @@ const MAX_BITS: usize = 15;
 /// Starting capacity. The buffer grows toward `budget` as bytes are produced,
 /// so a large budget is not allocated up front.
 const INITIAL_OUTPUT_CAPACITY: usize = 64 * 1024;
+
+/// Work charged per dynamic block, in output-byte terms: roughly one table build.
+pub(crate) const DYNAMIC_BLOCK_WORK: usize = 1024;
+
+/// Decode-work cap is `budget * WORK_PER_BUDGET_BYTE + WORK_SLACK`.
+const WORK_PER_BUDGET_BYTE: usize = 4;
+const WORK_SLACK: usize = 1 << 20;
+
+/// Decode-work cap for an output `budget`.
+pub(crate) fn work_cap(budget: usize) -> usize {
+    budget
+        .saturating_mul(WORK_PER_BUDGET_BYTE)
+        .saturating_add(WORK_SLACK)
+}
 
 /// Base lengths for length symbols 257..=285 (RFC 1951 §3.2.5).
 const LENGTH_BASE: [u16; 29] = [
@@ -216,8 +233,19 @@ fn gzip_into(data: &[u8], budget: usize, out: &mut Vec<u8>) -> Result<(), Inflat
 fn inflate_into(data: &[u8], budget: usize, out: &mut Vec<u8>) -> Result<usize, InflateError> {
     out.reserve(budget.min(INITIAL_OUTPUT_CAPACITY));
     let mut r = BitReader::new(data);
+    let work_cap = work_cap(budget);
+    let mut dynamic_blocks = 0usize;
+    // Input read + output written + the per-dynamic-block charge.
+    let work = |r: &BitReader, out: &[u8], dynamic_blocks: usize| {
+        r.byte_pos()
+            .saturating_add(out.len())
+            .saturating_add(DYNAMIC_BLOCK_WORK.saturating_mul(dynamic_blocks))
+    };
 
     loop {
+        if work(&r, out, dynamic_blocks) > work_cap {
+            return Err(InflateError::BudgetExceeded);
+        }
         let final_block = r.bits(1)? == 1;
         match r.bits(2)? {
             0 => stored_block(&mut r, out, budget)?,
@@ -226,6 +254,10 @@ fn inflate_into(data: &[u8], budget: usize, out: &mut Vec<u8>) -> Result<usize, 
                 compressed_block(&mut r, out, budget, lit, dist)?;
             }
             2 => {
+                dynamic_blocks = dynamic_blocks.saturating_add(1);
+                if work(&r, out, dynamic_blocks) > work_cap {
+                    return Err(InflateError::BudgetExceeded);
+                }
                 let (lit, dist) = dynamic_tables(&mut r)?;
                 compressed_block(&mut r, out, budget, &lit, &dist)?;
             }
@@ -660,7 +692,7 @@ pub(crate) fn adler32(data: &[u8]) -> u32 {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     /// Generous ceiling for the ordinary vectors; the budget is tested separately.
@@ -1514,5 +1546,83 @@ mod tests {
             (b"abc".to_vec(), Err(InflateError::Malformed))
         );
         assert_eq!(zlib_decompress(&wrapped, BIG), Err(InflateError::Malformed));
+    }
+
+    // --- decode-work cap (#96) ----------------------------------------------
+
+    /// `n` empty dynamic blocks (each only end-of-block); the last is BFINAL.
+    pub(crate) fn empty_dynamic_blocks(n: usize) -> Vec<u8> {
+        let mut lit = vec![0u8; 257];
+        lit[256] = 1;
+        let mut w = BitW::default();
+        for i in 0..n {
+            dynamic_header(&mut w, u32::from(i + 1 == n), &lit, &[0]);
+            w.code(0, 1);
+        }
+        w.finish()
+    }
+
+    #[test]
+    fn empty_dynamic_block_decodes_to_nothing() {
+        assert_eq!(inflate(&empty_dynamic_blocks(1), BIG), Ok(Vec::new()));
+        assert_eq!(inflate(&empty_dynamic_blocks(5), BIG), Ok(Vec::new()));
+    }
+
+    #[test]
+    fn empty_dynamic_blocks_hit_the_work_cap() {
+        let budget = 1024;
+        let cap = work_cap(budget);
+        let block_bytes = empty_dynamic_blocks(1).len();
+        let fit = cap / (DYNAMIC_BLOCK_WORK + block_bytes);
+
+        let under = empty_dynamic_blocks(fit / 2);
+        assert_eq!(inflate(&under, budget), Ok(Vec::new()));
+        let over = empty_dynamic_blocks(fit * 3);
+        assert_eq!(inflate(&over, budget), Err(InflateError::BudgetExceeded));
+    }
+
+    #[test]
+    fn work_cap_keeps_earlier_output_in_partial() {
+        let mut w = BitW::default();
+        w.lsb(0, 1);
+        w.lsb(0, 2);
+        w.align();
+        w.lsb(3, 16);
+        w.lsb(0xfffc, 16);
+        for b in *b"abc" {
+            w.lsb(u32::from(b), 8);
+        }
+        let mut raw = w.finish();
+        let budget = 1024;
+        let fit = work_cap(budget) / DYNAMIC_BLOCK_WORK;
+        raw.extend(empty_dynamic_blocks(fit * 3));
+        let wrapped = zlib_wrap(&raw, b"abc");
+        assert_eq!(
+            zlib_decompress_partial(&wrapped, budget),
+            (b"abc".to_vec(), Err(InflateError::BudgetExceeded))
+        );
+    }
+
+    /// Small dynamic blocks that each write 517 bytes (a literal, then two
+    /// length-258 matches) must decode with `budget` equal to the output.
+    #[test]
+    fn productive_dynamic_blocks_stay_under_the_work_cap() {
+        let mut lit = vec![0u8; 286];
+        for s in [97, 98, 256, 285] {
+            lit[s] = 2;
+        }
+        let blocks = 3000;
+        let mut w = BitW::default();
+        for i in 0..blocks {
+            dynamic_header(&mut w, u32::from(i + 1 == blocks), &lit, &[1]);
+            w.code(0, 2); // 'a'
+            for _ in 0..2 {
+                w.code(3, 2); // length 258
+                w.code(0, 1); // distance 1
+            }
+            w.code(2, 2); // end of block
+        }
+        let expected = vec![b'a'; blocks * 517];
+        assert_eq!(inflate(&w.finish(), expected.len()), Ok(expected));
     }
 }
