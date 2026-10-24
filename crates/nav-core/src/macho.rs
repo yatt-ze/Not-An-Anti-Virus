@@ -10,12 +10,10 @@
 //! SuperBlob it can bound, and returns `None`/empty for anything it can't
 //! recognize or bound.
 //!
-//! [`parse`]/[`parse_all`]/[`parse_all_slices`] work over an in-memory
-//! buffer (typically a capped prefix) and so lose slices/signatures past its
-//! end. [`scan_ranged`] instead reads exactly the regions it needs — headers,
-//! load commands, code signatures — from their real offsets via
-//! [`ByteSource`], so a file bigger than any in-memory capture is still fully
-//! examined (§5.2, #45).
+//! The entry point is [`scan_ranged`]: it reads exactly the regions it
+//! needs — headers, load commands, code signatures — from their real offsets
+//! via [`ByteSource`], so a file bigger than any in-memory capture is still
+//! fully examined (§5.2, #45).
 
 use std::borrow::Cow;
 use std::collections::HashMap;
@@ -283,89 +281,6 @@ impl ByteSource for [u8] {
     }
 }
 
-/// Parse `data` as a single Mach-O image: the thin image, or the **first**
-/// walkable slice of a fat/universal binary. `None` for non-Mach-O input,
-/// truncated stubs, or a Java `.class` (which shares fat's `0xCAFEBABE`).
-///
-/// For a fat binary this returns only one slice, which is fine for callers
-/// that need a single representative view (entropy's `__TEXT` sampling). A
-/// caller establishing a *verdict* on the binary must use [`parse_all`]
-/// instead — judging a universal binary on one slice lets a malicious slice
-/// hide behind a benign one (§5.2).
-pub fn parse(data: &[u8]) -> Option<MachOImage> {
-    match be_u32(data, 0) {
-        Some(FAT_MAGIC) | Some(FAT_MAGIC_64) => parse_first_fat_slice(data),
-        Some(magic) => {
-            let (is_64, be) = thin_kind(magic)?;
-            parse_thin(data, 0, is_64, be, false)
-        }
-        None => None,
-    }
-}
-
-/// The first walkable slice of a fat/universal binary's arch table, or
-/// `None` if none is — stops as soon as one is found, so a hostile table
-/// with many arches (up to `MAX_FAT_ARCHES`) costs one `parse_thin` call
-/// here, not one per declared arch.
-fn parse_first_fat_slice(data: &[u8]) -> Option<MachOImage> {
-    let (is_64, nfat) = plausible_fat_header(data, false)?;
-    (0..nfat as usize).find_map(|i| {
-        let obj_off = fat_arch_offset(data, is_64, i)?;
-        parse_fat_slice_at(data, obj_off)
-    })
-}
-
-/// Parse **every** Mach-O image in `data`: a single thin image, or all
-/// architecture slices of a fat/universal binary this parser can walk, in
-/// fat-table order. Empty for non-Mach-O input, a truncated stub, or a fat
-/// container with no walkable slice (incl. a Java `.class`). Structure rules
-/// iterate this so a fat binary is judged on all its slices, not just the
-/// first (§5.2). A thin wrapper over [`parse_all_slices`] for callers that
-/// don't need the skipped-arch count or a truncation-aware fat/non-fat call;
-/// treats `data` as a complete read.
-pub fn parse_all(data: &[u8]) -> Vec<MachOImage> {
-    parse_all_slices(data, false).0
-}
-
-/// As [`parse_all`], plus the number of *declared* fat-table arches that
-/// couldn't be walked (bad table entry, an offset past the bytes held, a
-/// non-Mach-O slice magic, or a `parse_thin` failure) — nonzero here means a
-/// slice's contents genuinely couldn't be judged, not that there was nothing
-/// to judge. Always `0` for thin input or non-Mach-O input, since neither
-/// declares a slice count to compare against. `truncated` must match what
-/// [`is_macho_magic`] was told for the same bytes — see there for why it
-/// matters for a fat header.
-pub fn parse_all_slices(data: &[u8], truncated: bool) -> (Vec<MachOImage>, usize) {
-    match be_u32(data, 0) {
-        Some(FAT_MAGIC) | Some(FAT_MAGIC_64) => parse_fat_all(data, truncated),
-        Some(magic) => match thin_kind(magic) {
-            Some((is_64, be)) => (
-                parse_thin(data, 0, is_64, be, false).into_iter().collect(),
-                0,
-            ),
-            None => (Vec::new(), 0),
-        },
-        None => (Vec::new(), 0),
-    }
-}
-
-/// Whether `data` begins with any Mach-O magic (thin, either word size/endian,
-/// or fat). Cheaper and broader than [`parse`] — answers "is this a code object
-/// at all", including images `parse` declines to walk.
-///
-/// `truncated` is whether `data` is a partial read of a larger file (§10/
-/// §11.8): for a fat header, a declared arch whose offset lands past `data`
-/// is only counted as a real slice when the read was truncated — otherwise a
-/// short, complete read (e.g. a whole Java `.class` file) correctly finds no
-/// evidence rather than being read as "couldn't check, assume Mach-O."
-pub fn is_macho_magic(data: &[u8], truncated: bool) -> bool {
-    match be_u32(data, 0) {
-        Some(FAT_MAGIC) | Some(FAT_MAGIC_64) => plausible_fat_header(data, truncated).is_some(),
-        Some(magic) => thin_kind(magic).is_some(),
-        None => false,
-    }
-}
-
 /// Map a first-word magic to `(is_64, big_endian)`, or `None` if it isn't a
 /// thin Mach-O magic.
 fn thin_kind(magic: u32) -> Option<(bool, bool)> {
@@ -376,94 +291,6 @@ fn thin_kind(magic: u32) -> Option<(bool, bool)> {
         MH_CIGAM_64 => Some((true, false)),
         _ => None,
     }
-}
-
-/// Recognize a plausible fat/universal Mach-O header: `FAT_MAGIC`/
-/// `FAT_MAGIC_64` with `0 < nfat_arch <= MAX_FAT_ARCHES`, and at least one
-/// declared arch that's real evidence of a Mach-O slice rather than a Java
-/// `.class` file's constant pool sharing `FAT_MAGIC` — see
-/// [`fat_references_real_slice`]. Returns `(is_64, nfat_arch)`.
-fn plausible_fat_header(data: &[u8], truncated: bool) -> Option<(bool, u32)> {
-    let is_64 = match be_u32(data, 0)? {
-        FAT_MAGIC => false,
-        FAT_MAGIC_64 => true,
-        _ => return None,
-    };
-    // fat_header (always big-endian): magic(4), nfat_arch(4).
-    let nfat = be_u32(data, 4).filter(|&n| n != 0 && n <= MAX_FAT_ARCHES)?;
-    fat_references_real_slice(data, is_64, nfat, truncated).then_some((is_64, nfat))
-}
-
-/// True if the fat table's `nfat` declared arches contain real evidence of a
-/// Mach-O slice: an entry whose offset field we can read points at a thin
-/// Mach-O magic within `data`, or — only when `truncated` — points past the
-/// bytes held (the slice may lie beyond what this capture holds; "couldn't
-/// check" must not become "not a Mach-O", §11.8). A Java `.class` file has
-/// constant-pool bytes sitting where the arch table would be, which won't
-/// point at a Mach-O magic, so a non-truncated read of one finds nothing
-/// here.
-fn fat_references_real_slice(data: &[u8], is_64: bool, nfat: u32, truncated: bool) -> bool {
-    for i in 0..nfat as usize {
-        let Some(obj_off) = fat_arch_offset(data, is_64, i) else {
-            continue; // entry's own bytes lie outside what we hold
-        };
-        match usize::try_from(obj_off) {
-            Ok(off) if off < data.len() => {
-                if be_u32(data, off).and_then(thin_kind).is_some() {
-                    return true;
-                }
-            }
-            _ if truncated => return true,
-            _ => {}
-        }
-    }
-    false
-}
-
-/// Walk every arch of a fat/universal binary, collecting the slices this
-/// parser can read (in fat-table order) plus how many declared arches
-/// couldn't be. `(empty, 0)` for an implausible fat header (incl. a Java
-/// `.class`, see [`plausible_fat_header`]) — there's no declared arch count
-/// to trust in that case, so it's "not a fat binary," not "every arch
-/// skipped."
-fn parse_fat_all(data: &[u8], truncated: bool) -> (Vec<MachOImage>, usize) {
-    let mut out = Vec::new();
-    let mut skipped = 0usize;
-    let Some((is_64, nfat)) = plausible_fat_header(data, truncated) else {
-        return (out, skipped);
-    };
-
-    // Distinct slice offsets walked so far: a hostile table can point
-    // MAX_FAT_ARCHES (1024) entries at one offset, and each `MachOImage`
-    // owns up to MAX_ENTITLEMENTS_BYTES — walking (and pushing) the same
-    // slice once per referring entry would be unbounded work for one file.
-    // Entries sharing an offset are one slice, not N: only the first is
-    // walked and pushed; later ones reuse that outcome, so a duplicate of a
-    // *walkable* slice is never counted in `skipped` (it's not unwalked —
-    // it just wasn't re-walked), while a duplicate of an offset that failed
-    // to walk still counts, once per declared arch, like any other failure.
-    let mut seen: HashMap<u64, bool> = HashMap::new(); // offset -> walked ok?
-    for i in 0..nfat as usize {
-        let Some(obj_off) = fat_arch_offset(data, is_64, i) else {
-            skipped += 1; // this entry's own bytes lie outside what we hold
-            continue;
-        };
-        match seen.get(&obj_off) {
-            Some(true) => {}
-            Some(false) => skipped += 1,
-            None => match parse_fat_slice_at(data, obj_off) {
-                Some(img) => {
-                    seen.insert(obj_off, true);
-                    out.push(img);
-                }
-                None => {
-                    seen.insert(obj_off, false);
-                    skipped += 1;
-                }
-            },
-        }
-    }
-    (out, skipped)
 }
 
 /// Read fat arch `i`'s declared object-file offset (the `fat_arch`/
@@ -479,21 +306,6 @@ fn fat_arch_offset(data: &[u8], is_64: bool, i: usize) -> Option<u64> {
     } else {
         be_u32(data, arch_off.checked_add(8)?).map(u64::from)
     }
-}
-
-/// Parse the fat/universal slice at absolute offset `obj_off` within `data`,
-/// or `None` if the offset lies outside the bytes held or doesn't begin with
-/// a thin Mach-O magic. Keyed only by offset (not by which arch-table entry
-/// pointed here) so callers can dedupe entries that share one offset.
-fn parse_fat_slice_at(data: &[u8], obj_off: u64) -> Option<MachOImage> {
-    // Slice must start within the bytes we hold (and not overflow usize).
-    let base = match usize::try_from(obj_off) {
-        Ok(b) if b < data.len() => b,
-        _ => return None,
-    };
-
-    let (is_64_thin, be) = be_u32(data, base).and_then(thin_kind)?;
-    parse_thin(data, base, is_64_thin, be, true)
 }
 
 /// Result of an offset-based scan ([`scan_ranged`]): every slice this parser
@@ -576,9 +388,8 @@ fn read_budgeted<'a>(
 
 /// Parse every Mach-O image in `src` by reading exactly the bytes needed from
 /// their real, absolute offsets — the header and load commands of each
-/// slice, and each slice's code signature (typically near EOF) — rather than
-/// [`parse_all_slices`]'s in-memory prefix, which loses both for a file
-/// bigger than the capture (§5.2, #45).
+/// slice, and each slice's code signature (typically near EOF) — so a file
+/// bigger than any in-memory capture loses neither (§5.2, #45).
 pub fn scan_ranged(src: &(impl ByteSource + ?Sized)) -> MachOScan {
     let source_len = src.source_len();
     let mut budget = RangeBudget {
@@ -741,9 +552,9 @@ fn scan_ranged_fat(
         };
     }
 
-    // Dedupe by offset exactly as `parse_fat_all` does: a duplicate of a
-    // walkable slice is one slice, not re-walked or counted as skipped; a
-    // duplicate of an offset that failed to walk counts again.
+    // Dedupe by offset: a hostile table can point every entry at one slice.
+    // A duplicate of a walkable slice is one slice, not re-walked or counted
+    // as skipped; a duplicate of an offset that failed to walk counts again.
     let mut images = Vec::new();
     let mut skipped = 0usize;
     let mut seen: HashMap<u64, bool> = HashMap::new();
@@ -2097,34 +1908,36 @@ mod tests {
     };
     use super::*;
 
+    /// Every slice `scan_ranged` walks, treating `data` as the whole file.
+    fn images(data: &[u8]) -> Vec<MachOImage> {
+        scan_ranged(data).images
+    }
+
+    /// The first walked slice, or `None` if none could be walked.
+    fn first_image(data: &[u8]) -> Option<MachOImage> {
+        images(data).into_iter().next()
+    }
+
+    fn images_and_skipped(data: &[u8]) -> (Vec<MachOImage>, usize) {
+        let scan = scan_ranged(data);
+        (scan.images, scan.skipped_slices)
+    }
+
+    fn is_macho(data: &[u8]) -> bool {
+        scan_ranged(data).is_macho
+    }
+
     #[test]
-    fn parse_all_walks_every_fat_slice() {
+    fn walks_every_fat_slice() {
         let (a, _, _) = synth_macho_64_full(b"aaaa", &["/usr/lib/a.dylib"], &[], false, None);
         let (b, _, _) = synth_macho_64_full(b"bbbb", &["/tmp/b.dylib"], &[], false, None);
         let fat = synth_fat(&[&a, &b]);
 
-        let imgs = parse_all(&fat);
+        let imgs = images(&fat);
         assert_eq!(imgs.len(), 2, "both slices must be walked");
         assert!(imgs[0].is_fat && imgs[1].is_fat);
         assert_eq!(imgs[0].dylibs, vec!["/usr/lib/a.dylib".to_string()]);
         assert_eq!(imgs[1].dylibs, vec!["/tmp/b.dylib".to_string()]);
-
-        // `parse` still yields the first slice for single-view callers.
-        assert_eq!(
-            parse(&fat).unwrap().dylibs,
-            vec!["/usr/lib/a.dylib".to_string()]
-        );
-    }
-
-    #[test]
-    fn parse_returns_only_the_first_walkable_fat_slice() {
-        let (a, _, _) = synth_macho_64_full(b"aaaa", &["/usr/lib/a.dylib"], &[], false, None);
-        let (b, _, _) = synth_macho_64_full(b"bbbb", &["/tmp/b.dylib"], &[], false, None);
-        let fat = synth_fat(&[&a, &b]);
-        assert_eq!(
-            parse(&fat).unwrap().dylibs,
-            vec!["/usr/lib/a.dylib".to_string()]
-        );
     }
 
     #[test]
@@ -2134,7 +1947,7 @@ mod tests {
         // walkable slice must not count toward `skipped`.
         let (member, _, _) = synth_macho_64_full(b"shared slice", &[], &[], false, None);
         let fat = synth_fat_with_duplicate_offsets(&member, 1024);
-        let (images, skipped) = parse_all_slices(&fat, false);
+        let (images, skipped) = images_and_skipped(&fat);
         assert_eq!(images.len(), 1);
         assert_eq!(skipped, 0);
     }
@@ -2143,7 +1956,7 @@ mod tests {
     fn parses_thin_64_and_locates_text() {
         let payload = b"\x00\x01\x02\x03some machine code here";
         let (image, expected) = synth_macho_64(payload);
-        let parsed = parse(&image).expect("should parse as Mach-O");
+        let parsed = first_image(&image).expect("should parse as Mach-O");
         assert!(parsed.is_64);
         assert!(!parsed.is_fat);
         assert_eq!(parsed.text_range, Some(expected));
@@ -2153,36 +1966,33 @@ mod tests {
     fn text_range_points_at_the_real_payload() {
         let payload: Vec<u8> = (0..=255u8).collect();
         let (image, _) = synth_macho_64(&payload);
-        let range = parse(&image).unwrap().text_range.unwrap();
+        let range = first_image(&image).unwrap().text_range.unwrap();
         let slice = &image[range.start as usize..range.end as usize];
         assert_eq!(slice, payload.as_slice());
     }
 
     #[test]
     fn rejects_non_macho() {
-        assert!(parse(b"#!/bin/sh\necho hi\n").is_none());
-        assert!(parse(b"").is_none());
-        assert!(parse(b"\x00\x01").is_none());
-        assert!(parse(&[0u8; 4096]).is_none());
+        assert!(first_image(b"#!/bin/sh\necho hi\n").is_none());
+        assert!(first_image(b"").is_none());
+        assert!(first_image(b"\x00\x01").is_none());
+        assert!(first_image(&[0u8; 4096]).is_none());
     }
 
     #[test]
     fn magic_detection_matches_what_parse_accepts() {
         let (image, _) = synth_macho_64(b"code");
-        assert!(is_macho_magic(&image, false));
+        assert!(is_macho(&image));
         // Fat magic alone, with no arch table entry pointing at a real slice,
         // is not enough (that's exactly what let a Java `.class` file through).
-        assert!(!is_macho_magic(
-            &[0xCA, 0xFE, 0xBA, 0xBE, 0, 0, 0, 1],
-            false
-        ));
+        assert!(!is_macho(&[0xCA, 0xFE, 0xBA, 0xBE, 0, 0, 0, 1]));
         // Everything that is plainly not a code object.
-        assert!(!is_macho_magic(b"#!/bin/sh\n", false));
-        assert!(!is_macho_magic(b"xar!", false));
-        assert!(!is_macho_magic(b"just some text", false));
-        assert!(!is_macho_magic(b"\x1f\x8b\x08\x00", false));
-        assert!(!is_macho_magic(b"", false));
-        assert!(!is_macho_magic(b"\xCF\xFA", false));
+        assert!(!is_macho(b"#!/bin/sh\n"));
+        assert!(!is_macho(b"xar!"));
+        assert!(!is_macho(b"just some text"));
+        assert!(!is_macho(b"\x1f\x8b\x08\x00"));
+        assert!(!is_macho(b""));
+        assert!(!is_macho(b"\xCF\xFA"));
     }
 
     #[test]
@@ -2192,7 +2002,7 @@ mod tests {
         let mut v = vec![0xCA, 0xFE, 0xBA, 0xBE];
         v.extend_from_slice(&0x0000_0034u32.to_be_bytes()); // minor=0, major=52
         v.extend_from_slice(&[0u8; 64]);
-        assert!(parse(&v).is_none());
+        assert!(first_image(&v).is_none());
     }
 
     #[test]
@@ -2207,29 +2017,49 @@ mod tests {
             let mut v = vec![0xCA, 0xFE, 0xBA, 0xBE];
             v.extend_from_slice(&major.to_be_bytes());
             v.extend_from_slice(&[0u8; 64]);
-            assert!(!is_macho_magic(&v, false), "major {major:#x}");
-            assert!(parse_all(&v).is_empty(), "major {major:#x}");
+            assert!(!is_macho(&v), "major {major:#x}");
+            assert!(images(&v).is_empty(), "major {major:#x}");
+        }
+    }
+
+    /// A capture that stopped short of the real object's end, so
+    /// `source_len` isn't authoritative (a truncated embedded member).
+    struct TruncatedCapture<'a>(&'a [u8]);
+
+    impl ByteSource for TruncatedCapture<'_> {
+        fn source_len(&self) -> u64 {
+            self.0.source_len()
+        }
+
+        fn held_len(&self) -> u64 {
+            self.0.held_len()
+        }
+
+        fn source_len_is_authoritative(&self) -> bool {
+            false
+        }
+
+        fn read_range(&self, off: u64, len: usize) -> Option<Cow<'_, [u8]>> {
+            self.0.read_range(off, len)
         }
     }
 
     #[test]
     fn truncated_java_like_header_with_offset_past_eof_is_lenient() {
-        // Same CAFEBABE + major=52 shape, but the first arch entry's offset
-        // field is set past the end of the (short) buffer. A non-truncated
-        // read of this shape can only mean "not a fat binary" (#46); a
-        // truncated one can't rule out a real slice lying past what was
-        // captured, so it must not be read as "not a Mach-O" (§10/§11.8).
+        // Java-shaped CAFEBABE header whose first arch offset lies past the
+        // end. A complete file can only be "not a fat binary" (#46); a
+        // truncated capture can't rule out a slice past it (§10/§11.8).
         let mut v = vec![0xCA, 0xFE, 0xBA, 0xBE];
         v.extend_from_slice(&0x0000_0034u32.to_be_bytes()); // minor=0, major=52
         v.extend_from_slice(&[0u8; 64]);
         // First fat_arch's offset field: bytes 16..20 (arch_off=8, +8).
         let past_eof = v.len() as u32 + 1000;
         v[16..20].copy_from_slice(&past_eof.to_be_bytes());
-        assert!(
-            !is_macho_magic(&v, false),
-            "complete read finds no evidence"
-        );
-        assert!(is_macho_magic(&v, true), "truncated read stays lenient");
+        assert!(!is_macho(&v), "complete read finds no evidence");
+        let scan = scan_ranged(&TruncatedCapture(&v));
+        assert!(scan.is_macho, "truncated read stays lenient");
+        assert!(scan.skipped_slices >= 1);
+        assert!(!scan.fully_examined());
     }
 
     #[test]
@@ -2240,8 +2070,8 @@ mod tests {
         v.extend_from_slice(&[0u8; 64]);
         let near_eof = v.len() as u32 - 2;
         v[16..20].copy_from_slice(&near_eof.to_be_bytes());
-        assert!(!is_macho_magic(&v, false));
-        assert!(parse_all(&v).is_empty());
+        assert!(!is_macho(&v));
+        assert!(images(&v).is_empty());
     }
 
     #[test]
@@ -2249,8 +2079,8 @@ mod tests {
         let (a, _, _) = synth_macho_64_full(b"aaaa", &[], &[], false, None);
         let (b, _, _) = synth_macho_64_full(b"bbbb", &[], &[], false, None);
         let fat = synth_fat(&[&a, &b]);
-        assert!(is_macho_magic(&fat, false));
-        assert_eq!(parse_all(&fat).len(), 2);
+        assert!(is_macho(&fat));
+        assert_eq!(images(&fat).len(), 2);
     }
 
     #[test]
@@ -2260,8 +2090,8 @@ mod tests {
         // arch-count cap alone must not be the discriminator.
         let (real, _, _) = synth_macho_64_full(b"real slice", &[], &[], false, None);
         let fat = synth_fat_with_bogus_arches(&real, 24);
-        assert!(is_macho_magic(&fat, false));
-        let (images, skipped) = parse_all_slices(&fat, false);
+        assert!(is_macho(&fat));
+        let (images, skipped) = images_and_skipped(&fat);
         assert_eq!(images.len(), 1);
         assert_eq!(skipped, 24);
     }
@@ -2273,7 +2103,7 @@ mod tests {
             let mut v = vec![0xCF, 0xFA, 0xED, 0xFE];
             v.truncate(len.min(4));
             v.resize(len, 0);
-            let _ = parse(&v); // must not panic
+            let _ = first_image(&v); // must not panic
         }
     }
 
@@ -2286,7 +2116,7 @@ mod tests {
             false,
             None,
         );
-        let parsed = parse(&image).unwrap();
+        let parsed = first_image(&image).unwrap();
         assert_eq!(
             parsed.dylibs,
             vec![
@@ -2308,7 +2138,7 @@ mod tests {
     #[test]
     fn detects_code_signature_without_entitlements() {
         let (image, _, _) = synth_macho_64_full(b"code", &[], &[], true, None);
-        let parsed = parse(&image).unwrap();
+        let parsed = first_image(&image).unwrap();
         assert!(parsed.has_code_signature);
         assert_eq!(parsed.entitlements, None);
     }
@@ -2319,7 +2149,7 @@ mod tests {
             <key>com.apple.security.cs.disable-library-validation</key><true/>
         </dict></plist>"#;
         let (image, _, _) = synth_macho_64_full(b"code", &[], &[], true, Some(xml));
-        let parsed = parse(&image).unwrap();
+        let parsed = first_image(&image).unwrap();
         assert!(parsed.has_code_signature);
         assert_eq!(parsed.entitlements.as_deref(), Some(&xml[..]));
     }
@@ -2331,7 +2161,7 @@ mod tests {
         // Chop the file off partway through the signature blob — a truncated
         // 8 MiB capture is exactly this shape.
         image.truncate(sig_off + 4);
-        let parsed = parse(&image).unwrap();
+        let parsed = first_image(&image).unwrap();
         assert!(parsed.has_code_signature); // the load command itself is intact
         assert_eq!(parsed.entitlements, None); // but the blob region is gone
     }
@@ -2347,7 +2177,7 @@ mod tests {
             .position(|w| w == LC_CODE_SIGNATURE.to_le_bytes())
             .expect("LC_CODE_SIGNATURE present");
         image[lc_off + 12..lc_off + 16].copy_from_slice(&u32::MAX.to_le_bytes());
-        let parsed = parse(&image); // must not panic
+        let parsed = first_image(&image); // must not panic
         if let Some(img) = parsed {
             assert_eq!(img.entitlements, None);
         }
@@ -2358,12 +2188,15 @@ mod tests {
     fn code_directory_flags_are_read_back() {
         let (adhoc, _, _) =
             synth_macho_64_full_with_cd_flags(b"code", &[], &[], true, None, Some(CS_ADHOC));
-        assert_eq!(parse(&adhoc).unwrap().code_directory_flags, Some(CS_ADHOC));
+        assert_eq!(
+            first_image(&adhoc).unwrap().code_directory_flags,
+            Some(CS_ADHOC)
+        );
 
         let (identity, _, _) =
             synth_macho_64_full_with_cd_flags(b"code", &[], &[], true, None, Some(0x10000));
         assert_eq!(
-            parse(&identity).unwrap().code_directory_flags,
+            first_image(&identity).unwrap().code_directory_flags,
             Some(0x10000)
         );
     }
@@ -2374,21 +2207,21 @@ mod tests {
 
         let (no_cms, _, _) =
             synth_macho_64_full_with_cds_and_cms(b"code", &[], &[], true, None, &cds, None);
-        assert!(!parse(&no_cms).unwrap().has_cms_signature);
+        assert!(!first_image(&no_cms).unwrap().has_cms_signature);
 
         let (empty_cms, _, _) =
             synth_macho_64_full_with_cds_and_cms(b"code", &[], &[], true, None, &cds, Some(0));
-        assert!(!parse(&empty_cms).unwrap().has_cms_signature);
+        assert!(!first_image(&empty_cms).unwrap().has_cms_signature);
 
         let (real_cms, _, _) =
             synth_macho_64_full_with_cds_and_cms(b"code", &[], &[], true, None, &cds, Some(4));
-        assert!(parse(&real_cms).unwrap().has_cms_signature);
+        assert!(first_image(&real_cms).unwrap().has_cms_signature);
     }
 
     #[test]
     fn no_code_directory_blob_is_none_not_zero() {
         let (image, _, _) = synth_macho_64_full(b"code", &[], &[], true, None);
-        assert_eq!(parse(&image).unwrap().code_directory_flags, None);
+        assert_eq!(first_image(&image).unwrap().code_directory_flags, None);
     }
 
     /// A second `LC_CODE_SIGNATURE` has no legal meaning — rather than guess
@@ -2402,7 +2235,7 @@ mod tests {
         let image =
             synth_macho_64_duplicate_code_signature(b"code", Some(entitlements), Some(CS_ADHOC));
         assert!(
-            parse(&image).is_none(),
+            first_image(&image).is_none(),
             "a duplicate LC_CODE_SIGNATURE must not silently keep or erase the first \
              signature's facts"
         );
@@ -2418,7 +2251,7 @@ mod tests {
         let bad = synth_macho_64_duplicate_code_signature(b"bad", None, Some(CS_ADHOC));
         let fat = synth_fat(&[&clean, &bad]);
 
-        let (images, skipped) = parse_all_slices(&fat, false);
+        let (images, skipped) = images_and_skipped(&fat);
         assert_eq!(images.len(), 1);
         assert_eq!(skipped, 1);
     }
@@ -2436,7 +2269,7 @@ mod tests {
             None,
             &[(CSSLOT_ALTERNATE_CODEDIRECTORIES, CS_ADHOC)],
         );
-        let flags = parse(&image).unwrap().code_directory_flags.unwrap();
+        let flags = first_image(&image).unwrap().code_directory_flags.unwrap();
         assert_ne!(flags & CS_ADHOC, 0);
     }
 
@@ -2455,7 +2288,7 @@ mod tests {
                 (CSSLOT_ALTERNATE_CODEDIRECTORIES, CS_ADHOC), // alternate: ad-hoc
             ],
         );
-        let flags = parse(&image).unwrap().code_directory_flags.unwrap();
+        let flags = first_image(&image).unwrap().code_directory_flags.unwrap();
         assert_ne!(
             flags & CS_ADHOC,
             0,
@@ -2479,7 +2312,7 @@ mod tests {
         // blob: sig_end lands inside the CD, short of the flags field.
         let new_datasize = 20u32 + 12;
         image[lc_off + 12..lc_off + 16].copy_from_slice(&new_datasize.to_le_bytes());
-        let parsed = parse(&image).expect("full header/load-commands still parse");
+        let parsed = first_image(&image).expect("full header/load-commands still parse");
         assert_eq!(parsed.code_directory_flags, None);
     }
 
@@ -2490,16 +2323,16 @@ mod tests {
         let many: Vec<String> = (0..300).map(|i| format!("/tmp/{i}")).collect();
         let refs: Vec<&str> = many.iter().map(String::as_str).collect();
         let (image, _, _) = synth_macho_64_full(b"code", &[], &refs, false, None);
-        let parsed = parse(&image).unwrap();
+        let parsed = first_image(&image).unwrap();
         assert!(parsed.rpaths.len() <= MAX_RPATHS);
     }
 
     #[test]
-    fn parse_all_slices_counts_unwalkable_arches() {
+    fn counts_unwalkable_fat_arches() {
         let (good, _, _) = synth_macho_64_full(b"good", &[], &[], false, None);
         let garbage: &[u8] = &[0xDE, 0xAD, 0xBE, 0xEF, 0, 0, 0, 0];
         let fat = synth_fat(&[&good, garbage]);
-        let (images, skipped) = parse_all_slices(&fat, false);
+        let (images, skipped) = images_and_skipped(&fat);
         assert_eq!(images.len(), 1);
         assert_eq!(skipped, 1);
     }
@@ -2507,12 +2340,12 @@ mod tests {
     #[test]
     fn thin_and_two_clean_slices_report_zero_skipped() {
         let (thin, _) = synth_macho_64(b"code");
-        assert_eq!(parse_all_slices(&thin, false), (parse_all(&thin), 0));
+        assert_eq!(images_and_skipped(&thin).1, 0);
 
         let (a, _, _) = synth_macho_64_full(b"aaaa", &[], &[], false, None);
         let (b, _, _) = synth_macho_64_full(b"bbbb", &[], &[], false, None);
         let fat = synth_fat(&[&a, &b]);
-        let (images, skipped) = parse_all_slices(&fat, false);
+        let (images, skipped) = images_and_skipped(&fat);
         assert_eq!(images.len(), 2);
         assert_eq!(skipped, 0);
     }
@@ -2524,7 +2357,7 @@ mod tests {
         let mut v = vec![0xCA, 0xFE, 0xBA, 0xBE];
         v.extend_from_slice(&0x0000_0034u32.to_be_bytes());
         v.extend_from_slice(&[0u8; 64]);
-        assert_eq!(parse_all_slices(&v, false), (Vec::new(), 0));
+        assert_eq!(images_and_skipped(&v), (Vec::new(), 0));
     }
 
     #[test]
@@ -2536,66 +2369,9 @@ mod tests {
         // second 20-byte fat_arch entry starts at 28, offset is its 3rd u32)
         // to point past EOF.
         fat[36..40].copy_from_slice(&(total_len + 1000).to_be_bytes());
-        let (images, skipped) = parse_all_slices(&fat, false);
+        let (images, skipped) = images_and_skipped(&fat);
         assert_eq!(images.len(), 1);
         assert_eq!(skipped, 1);
-    }
-
-    /// Strips the two fields that legitimately differ between a whole-buffer
-    /// prefix parse and an offset-based one (the latter actually reads the
-    /// signature by offset) so the rest of `MachOImage` can be compared.
-    fn strip_ranged_only_fields(img: &MachOImage) -> MachOImage {
-        let mut img = img.clone();
-        img.signature_region = SignatureRegion::Unread;
-        img.code_signature = None;
-        img
-    }
-
-    fn assert_scan_ranged_agrees(data: &[u8]) {
-        let (prefix_images, prefix_skipped) = parse_all_slices(data, false);
-        let ranged = scan_ranged(data);
-        assert_eq!(ranged.images.len(), prefix_images.len());
-        assert_eq!(ranged.skipped_slices, prefix_skipped);
-        let ranged_stripped: Vec<_> = ranged.images.iter().map(strip_ranged_only_fields).collect();
-        let prefix_stripped: Vec<_> = prefix_images.iter().map(strip_ranged_only_fields).collect();
-        assert_eq!(ranged_stripped, prefix_stripped);
-    }
-
-    /// `scan_ranged` must find the same slices, in the same shape, as the
-    /// existing in-memory prefix parse on every buffer small enough that the
-    /// two have nothing to disagree about (§5.2, #45).
-    #[test]
-    fn scan_ranged_agrees_with_parse_all_slices_on_existing_synthetic_images() {
-        let (thin, _) = synth_macho_64(b"code");
-        assert_scan_ranged_agrees(&thin);
-
-        let (a, _, _) = synth_macho_64_full(b"aaaa", &["/usr/lib/a.dylib"], &[], true, None);
-        let (b, _, _) = synth_macho_64_full(b"bbbb", &["/tmp/b.dylib"], &[], false, None);
-        assert_scan_ranged_agrees(&synth_fat(&[&a, &b]));
-
-        let (real, _, _) = synth_macho_64_full(
-            b"real slice",
-            &["/usr/lib/libSystem.B.dylib"],
-            &[],
-            false,
-            None,
-        );
-        assert_scan_ranged_agrees(&synth_fat_with_bogus_arches(&real, 24));
-
-        let garbage: &[u8] = &[0xDE, 0xAD, 0xBE, 0xEF, 0, 0, 0, 0];
-        assert_scan_ranged_agrees(&synth_fat(&[&real, garbage]));
-    }
-
-    /// A Java `.class`-shaped, complete (non-truncated) header must not be
-    /// read as Mach-O by the offset-based path either (#46).
-    #[test]
-    fn scan_ranged_java_class_like_fat_header_is_not_macho() {
-        let mut v = vec![0xCA, 0xFE, 0xBA, 0xBE];
-        v.extend_from_slice(&0x0000_0034u32.to_be_bytes()); // minor=0, major=52
-        v.extend_from_slice(&[0u8; 64]);
-        let scan = scan_ranged(&v[..]);
-        assert!(!scan.is_macho);
-        assert!(scan.images.is_empty());
     }
 
     /// A `ByteSource` that reports a `source_len` bigger than the bytes it
@@ -2951,7 +2727,7 @@ mod tests {
             SuperBlobFault::BlobOffsetOutside,
         ] {
             let image = synth_macho_64_bad_superblob(fault);
-            let parsed = parse(&image).expect("parses");
+            let parsed = first_image(&image).expect("parses");
             assert_eq!(
                 parsed.signature_region,
                 SignatureRegion::Malformed,
@@ -2974,7 +2750,7 @@ mod tests {
     fn valid_superblob_stays_read_on_both_parse_paths() {
         let (image, _, _) = synth_macho_64_full(b"code", &[], &[], true, None);
         assert_eq!(
-            parse(&image).unwrap().signature_region,
+            first_image(&image).unwrap().signature_region,
             SignatureRegion::Read
         );
         let scan = scan_ranged(&image[..]);
@@ -2985,9 +2761,9 @@ mod tests {
     #[test]
     fn filetype_is_read_from_the_header() {
         let bytes = build_segments(true, &multi_segment_specs(), &[], 0x5000);
-        assert_eq!(parse(&bytes).unwrap().filetype, 2);
+        assert_eq!(first_image(&bytes).unwrap().filetype, 2);
         let obj = tests_support::build_segments_typed(true, MH_OBJECT, &[], &[], 0x100);
-        assert_eq!(parse(&obj).unwrap().filetype, MH_OBJECT);
+        assert_eq!(first_image(&obj).unwrap().filetype, MH_OBJECT);
     }
 
     fn multi_segment_specs() -> Vec<SegSpec> {
@@ -3050,40 +2826,33 @@ mod tests {
     #[test]
     fn collects_every_segment_and_section_64() {
         let bytes = build_segments(true, &multi_segment_specs(), &[], 0x5000);
-        assert_multi_segment(&parse(&bytes).unwrap());
-        assert_multi_segment(&scan_ranged(&bytes[..]).images[0]);
+        assert_multi_segment(&first_image(&bytes).unwrap());
     }
 
     #[test]
     fn collects_every_segment_and_section_32() {
         let bytes = build_segments(false, &multi_segment_specs(), &[], 0x5000);
-        let img = parse(&bytes).unwrap();
+        let img = first_image(&bytes).unwrap();
         assert!(!img.is_64);
         assert_multi_segment(&img);
-        assert_multi_segment(&scan_ranged(&bytes[..]).images[0]);
     }
 
     #[test]
-    fn fat_second_slice_segments_agree_across_parse_paths() {
+    fn fat_second_slice_segments_are_absolute_and_distinct() {
         let first = build_segments(true, &multi_segment_specs(), &[], 0x5000);
         let mut specs = multi_segment_specs();
         specs[0].sects[0].1 = 0x40; // make the slices differ
         let second = build_segments(true, &specs, &[], 0x5000);
         let fat = synth_fat(&[&first, &second]);
 
-        let prefix = parse_all(&fat);
-        let (sliced, _) = parse_all_slices(&fat, false);
-        let ranged = scan_ranged(&fat[..]);
-        assert_eq!(prefix.len(), 2);
-        assert_eq!(prefix[1].segments, sliced[1].segments);
-        assert_eq!(prefix[1].segments, ranged.images[1].segments);
-        assert_ne!(prefix[0].segments, prefix[1].segments);
-        let off = prefix[1].segments[0].file_range.clone().unwrap().start;
+        let imgs = images(&fat);
+        assert_eq!(imgs.len(), 2);
+        assert_ne!(imgs[0].segments, imgs[1].segments);
+        let off = imgs[1].segments[0].file_range.clone().unwrap().start;
         assert!(off > 0x1000, "ranges must be absolute, not slice-relative");
-        assert_eq!(prefix[1].text_range, ranged.images[1].text_range);
         assert_eq!(
-            prefix[1].segments[0].sections[0].file_range,
-            prefix[1].text_range
+            imgs[1].segments[0].sections[0].file_range,
+            imgs[1].text_range
         );
     }
 
@@ -3098,7 +2867,7 @@ mod tests {
         sg.nsects = Some(0xFFFF);
         let dylib = tests_support::lc_str_command(LC_LOAD_DYLIB, "/usr/lib/after.dylib");
         let bytes = build_segments(true, &[sg], &[dylib], 0x2000);
-        let img = parse(&bytes).unwrap();
+        let img = first_image(&bytes).unwrap();
         assert!(!img.segments_complete);
         assert_eq!(img.segments.len(), 1);
         assert_eq!(img.segments[0].sections.len(), 2);
@@ -3114,7 +2883,7 @@ mod tests {
             .map(|_| seg(b"__S", 0, 0, vec![(b"__s", 1, 0x100, 0); per_seg]))
             .collect();
         let bytes = build_segments(true, &specs, &[], 0x200);
-        let img = parse(&bytes).unwrap();
+        let img = first_image(&bytes).unwrap();
         assert!(!img.segments_complete);
         let total: usize = img.segments.iter().map(|s| s.sections.len()).sum();
         assert_eq!(total, MAX_SECTIONS_PER_IMAGE);
@@ -3123,10 +2892,10 @@ mod tests {
     #[test]
     fn truncated_command_walk_marks_segments_incomplete() {
         let bytes = build_segments(true, &multi_segment_specs(), &[], 0x5000);
-        assert!(parse_all(&bytes)[0].segments_complete);
+        assert!(images(&bytes)[0].segments_complete);
         // Header (32) + __TEXT command (72 + 2*80 = 232) + part of __DATA's.
         let cut = 32 + 232 + 100;
-        let imgs = parse_all(&bytes[..cut]);
+        let imgs = images(&bytes[..cut]);
         assert_eq!(imgs.len(), 1);
         assert!(!imgs[0].segments_complete);
         assert_eq!(imgs[0].segments.len(), 1);
@@ -3140,7 +2909,7 @@ mod tests {
             .collect();
         let dylib = tests_support::lc_str_command(LC_LOAD_DYLIB, "/usr/lib/after.dylib");
         let bytes = build_segments(true, &specs, &[dylib], 0x10);
-        let img = parse(&bytes).unwrap();
+        let img = first_image(&bytes).unwrap();
         assert!(!img.segments_complete);
         assert_eq!(img.segments.len(), MAX_SEGMENTS);
         assert_eq!(img.dylibs.len(), 1);
@@ -3150,7 +2919,7 @@ mod tests {
     #[test]
     fn usr_bin_true_segments_match_text_range() {
         let bytes = std::fs::read("/usr/bin/true").unwrap();
-        let images = parse_all(&bytes);
+        let images = images(&bytes);
         assert!(!images.is_empty());
         for img in &images {
             let text = img

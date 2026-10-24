@@ -442,8 +442,8 @@ impl HighEntropyRule {
             return Ok(None);
         }
 
-        // `images` empty (whether or not `is_macho`) falls through exactly as
-        // a `macho::parse` miss did — a non-Mach-O or unwalkable file.
+        // `images` empty (whether or not `is_macho`): a non-Mach-O or
+        // unwalkable file, judged by the non-Mach-O path below.
         let images = &ctx.macho().images;
         if !images.is_empty() {
             return self.eval_macho_images_with(ctx, content, images, anchored);
