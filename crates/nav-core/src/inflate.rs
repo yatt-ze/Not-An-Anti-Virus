@@ -5,8 +5,11 @@
 //! Hand-written per §3 (no third-party code on the parse path). Contract:
 //! never panics, every offset bounds-checked, and output never exceeds
 //! `budget`: a write that would cross it is clamped, then the stream is
-//! refused with [`InflateError::BudgetExceeded`]. The strict entry points
-//! return no bytes on error; the `_partial` ones return the clamped output.
+//! refused with [`InflateError::BudgetExceeded`]. Decode work (input read,
+//! output written, plus a fixed charge per block) is likewise capped
+//! at a multiple of `budget`; exceeding it is also `BudgetExceeded`. The
+//! strict entry points return no bytes on error; the `_partial` ones return
+//! the clamped output.
 //! `BudgetExceeded` is a §6.2 policy stop, not evidence of malice — callers
 //! must keep it distinct from `Malformed`.
 
@@ -20,6 +23,22 @@ const MAX_BITS: usize = 15;
 /// Starting capacity. The buffer grows toward `budget` as bytes are produced,
 /// so a large budget is not allocated up front.
 const INITIAL_OUTPUT_CAPACITY: usize = 64 * 1024;
+
+/// Work charged per stored or fixed block, in output-byte terms.
+const BLOCK_WORK: usize = 64;
+
+/// Work charged per dynamic block: roughly one table build.
+pub(crate) const DYNAMIC_BLOCK_WORK: usize = 1024;
+
+const WORK_PER_BUDGET_BYTE: usize = 4;
+const WORK_SLACK: usize = 1 << 20;
+
+/// `budget * 4 + 1 MiB`: the most decode work one stream may cost.
+pub(crate) fn work_cap(budget: usize) -> usize {
+    budget
+        .saturating_mul(WORK_PER_BUDGET_BYTE)
+        .saturating_add(WORK_SLACK)
+}
 
 /// Base lengths for length symbols 257..=285 (RFC 1951 §3.2.5).
 const LENGTH_BASE: [u16; 29] = [
@@ -216,10 +235,31 @@ fn gzip_into(data: &[u8], budget: usize, out: &mut Vec<u8>) -> Result<(), Inflat
 fn inflate_into(data: &[u8], budget: usize, out: &mut Vec<u8>) -> Result<usize, InflateError> {
     out.reserve(budget.min(INITIAL_OUTPUT_CAPACITY));
     let mut r = BitReader::new(data);
+    let work_cap = work_cap(budget);
+    let mut block_work = 0usize;
+    // Input read + output written + the per-block charges.
+    let work = |r: &BitReader, out: &[u8], block_work: usize| {
+        r.byte_pos()
+            .saturating_add(out.len())
+            .saturating_add(block_work)
+    };
 
     loop {
+        if work(&r, out, block_work) > work_cap {
+            return Err(InflateError::BudgetExceeded);
+        }
         let final_block = r.bits(1)? == 1;
-        match r.bits(2)? {
+        let btype = r.bits(2)?;
+        let charge = if btype == 2 {
+            DYNAMIC_BLOCK_WORK
+        } else {
+            BLOCK_WORK
+        };
+        block_work = block_work.saturating_add(charge);
+        if work(&r, out, block_work) > work_cap {
+            return Err(InflateError::BudgetExceeded);
+        }
+        match btype {
             0 => stored_block(&mut r, out, budget)?,
             1 => {
                 let (lit, dist) = fixed_tables()?;
@@ -659,6 +699,76 @@ pub(crate) fn adler32(data: &[u8]) -> u32 {
     (b << 16) | a
 }
 
+/// Bits in one empty dynamic block built by [`empty_dynamic_blocks`].
+#[cfg(test)]
+const EMPTY_DYNAMIC_BITS: usize = 588;
+/// Bits in one empty fixed block: BFINAL, BTYPE, 7-bit end-of-block.
+#[cfg(test)]
+const EMPTY_FIXED_BITS: usize = 10;
+
+/// Sets bit `i` (LSB-first) of `v`, which must be long enough.
+#[cfg(test)]
+fn set_bit(v: &mut [u8], i: usize) {
+    v[i / 8] |= 1 << (i % 8);
+}
+
+/// `n` empty dynamic blocks (end-of-block only); the last is BFINAL.
+#[cfg(test)]
+pub(crate) fn empty_dynamic_blocks(n: usize) -> Vec<u8> {
+    let mut v = vec![0u8; (n * EMPTY_DYNAMIC_BITS).div_ceil(8)];
+    for blk in 0..n {
+        let mut p = blk * EMPTY_DYNAMIC_BITS;
+        if blk + 1 == n {
+            set_bit(&mut v, p); // BFINAL
+        }
+        p += 1;
+        set_bit(&mut v, p + 1); // BTYPE = 2 (bits 0,1)
+        p += 2;
+        p += 5; // HLIT = 0: 257 lit/len lengths
+        p += 5; // HDIST = 0: 1 distance length
+                // HCLEN = 14: 18 code-length-code entries.
+        for b in 1..3 {
+            set_bit(&mut v, p + b); // 14 = 0b1110
+        }
+        set_bit(&mut v, p + 3);
+        p += 4;
+        // Code-length code: symbols 0..=3 get length 2 (3-bit fields, LSB-first).
+        for sym in CLEN_ORDER.iter().take(18) {
+            if *sym <= 3 {
+                set_bit(&mut v, p + 1);
+            }
+            p += 3;
+        }
+        // 257 lit/len lengths, then 1 distance length; each symbol is a
+        // 2-bit Huffman code, MSB-first. Lit/len 256 has length 1 (symbol 1 =
+        // code 01); every other symbol has length 0 (symbol 0 = code 00).
+        for sym in 0..258 {
+            if sym == 256 {
+                set_bit(&mut v, p + 1);
+            }
+            p += 2;
+        }
+        // End-of-block: the lone 1-bit code 0.
+        p += 1;
+        debug_assert_eq!(p - blk * EMPTY_DYNAMIC_BITS, EMPTY_DYNAMIC_BITS);
+    }
+    v
+}
+
+/// `n` empty fixed blocks (end-of-block only); the last is BFINAL.
+#[cfg(test)]
+fn empty_fixed_blocks(n: usize) -> Vec<u8> {
+    let mut v = vec![0u8; (n * EMPTY_FIXED_BITS).div_ceil(8)];
+    for blk in 0..n {
+        let p = blk * EMPTY_FIXED_BITS;
+        if blk + 1 == n {
+            set_bit(&mut v, p);
+        }
+        set_bit(&mut v, p + 1); // BTYPE = 1
+    }
+    v
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -861,10 +971,11 @@ mod tests {
                 stream[i / 8] |= b << (i % 8);
             }
         }
-        assert_eq!(inflate(&stream, BIG), Ok(vec![]));
+        let budget = 1 << 24; // keeps 100k blocks under the work cap
+        assert_eq!(inflate(&stream, budget), Ok(vec![]));
         // Dropping the last byte loses the final block's bits.
         assert_eq!(
-            inflate(&stream[..stream.len() - 1], BIG),
+            inflate(&stream[..stream.len() - 1], budget),
             Err(InflateError::Truncated)
         );
         // One build total, however many fixed blocks were decoded.
@@ -1514,5 +1625,91 @@ mod tests {
             (b"abc".to_vec(), Err(InflateError::Malformed))
         );
         assert_eq!(zlib_decompress(&wrapped, BIG), Err(InflateError::Malformed));
+    }
+
+    // --- decode-work cap (#96) ----------------------------------------------
+
+    #[test]
+    fn empty_dynamic_block_decodes_to_nothing() {
+        assert_eq!(inflate(&empty_dynamic_blocks(1), BIG), Ok(Vec::new()));
+        assert_eq!(inflate(&empty_dynamic_blocks(5), BIG), Ok(Vec::new()));
+    }
+
+    /// Largest `n` for which `n` empty blocks of `block_bits` bits, each
+    /// charged `charge`, stay within the cap: the check after block `n`'s
+    /// BTYPE sees `ceil((block_bits * (n - 1) + 3) / 8)` bytes read.
+    fn max_blocks_under_cap(budget: usize, block_bits: usize, charge: usize) -> usize {
+        let cap = work_cap(budget);
+        (1..)
+            .take_while(|&n| (block_bits * (n - 1) + 3).div_ceil(8) + n * charge <= cap)
+            .last()
+            .unwrap()
+    }
+
+    #[test]
+    fn empty_dynamic_blocks_hit_the_work_cap_exactly() {
+        let budget = 1024;
+        let n = max_blocks_under_cap(budget, EMPTY_DYNAMIC_BITS, DYNAMIC_BLOCK_WORK);
+        assert_eq!(inflate(&empty_dynamic_blocks(n), budget), Ok(Vec::new()));
+        assert_eq!(
+            inflate(&empty_dynamic_blocks(n + 1), budget),
+            Err(InflateError::BudgetExceeded)
+        );
+    }
+
+    #[test]
+    fn empty_fixed_blocks_hit_the_work_cap_exactly() {
+        let budget = 1024;
+        let n = max_blocks_under_cap(budget, EMPTY_FIXED_BITS, BLOCK_WORK);
+        assert_eq!(inflate(&empty_fixed_blocks(n), budget), Ok(Vec::new()));
+        assert_eq!(
+            inflate(&empty_fixed_blocks(n + 1), budget),
+            Err(InflateError::BudgetExceeded)
+        );
+    }
+
+    #[test]
+    fn work_cap_keeps_earlier_output_in_partial() {
+        let mut w = BitW::default();
+        w.lsb(0, 1);
+        w.lsb(0, 2);
+        w.align();
+        w.lsb(3, 16);
+        w.lsb(0xfffc, 16);
+        for b in *b"abc" {
+            w.lsb(u32::from(b), 8);
+        }
+        let mut raw = w.finish();
+        let budget = 1024;
+        let fit = work_cap(budget) / DYNAMIC_BLOCK_WORK;
+        raw.extend(empty_dynamic_blocks(fit * 3));
+        let wrapped = zlib_wrap(&raw, b"abc");
+        assert_eq!(
+            zlib_decompress_partial(&wrapped, budget),
+            (b"abc".to_vec(), Err(InflateError::BudgetExceeded))
+        );
+    }
+
+    /// Small dynamic blocks that each write 517 bytes (a literal, then two
+    /// length-258 matches) must decode with `budget` equal to the output.
+    #[test]
+    fn productive_dynamic_blocks_stay_under_the_work_cap() {
+        let mut lit = vec![0u8; 286];
+        for s in [97, 98, 256, 285] {
+            lit[s] = 2;
+        }
+        let blocks = 3000;
+        let mut w = BitW::default();
+        for i in 0..blocks {
+            dynamic_header(&mut w, u32::from(i + 1 == blocks), &lit, &[1]);
+            w.code(0, 2); // 'a'
+            for _ in 0..2 {
+                w.code(3, 2); // length 258
+                w.code(0, 1); // distance 1
+            }
+            w.code(2, 2); // end of block
+        }
+        let expected = vec![b'a'; blocks * 517];
+        assert_eq!(inflate(&w.finish(), expected.len()), Ok(expected));
     }
 }

@@ -132,8 +132,9 @@ pub enum XarHalt {
     /// The TOC's byte range lies outside the data we hold (lying header, or a
     /// bounded read that stopped short).
     TocOutOfRange,
-    /// The TOC declares, or inflates to, more than `max_toc_bytes`. Not a
-    /// maliciousness finding on its own (§6.2).
+    /// The TOC declares more than `max_toc_bytes`, inflates to more than it
+    /// declares, or exceeds inflate's work cap. Not a maliciousness finding
+    /// on its own (§6.2).
     TocTooLarge,
     /// The TOC is not a valid zlib stream.
     TocUndecodable,
@@ -199,7 +200,7 @@ pub enum XarEntryError {
     OutOfRange,
     /// The entry's bytes are not a compression format we recognize.
     UnknownEncoding,
-    /// Decompression failed or exceeded `max_entry_bytes`.
+    /// Decompression failed or exceeded `max_entry_bytes` or inflate's work cap.
     Undecodable(DecodeError),
 }
 
@@ -278,7 +279,11 @@ pub fn parse(data: &[u8], limits: &XarLimits) -> Option<XarArchive> {
         return Some(archive);
     }
 
-    let toc = match inflate::zlib_decompress(toc_compressed, limits.max_toc_bytes) {
+    // The declared size, already within `max_toc_bytes`, is the output ceiling.
+    let toc_budget = usize::try_from(header.toc_len_uncompressed)
+        .unwrap_or(limits.max_toc_bytes)
+        .min(limits.max_toc_bytes);
+    let toc = match inflate::zlib_decompress(toc_compressed, toc_budget) {
         Ok(t) => t,
         Err(DecodeError::BudgetExceeded) => {
             archive.halted = Some(XarHalt::TocTooLarge);
@@ -791,14 +796,21 @@ pub(crate) fn toc_xar_bytes(toc_body: &str) -> Vec<u8> {
     z.extend_from_slice(&(!len).to_le_bytes());
     z.extend_from_slice(toc.as_bytes());
     z.extend_from_slice(&inflate::adler32(toc.as_bytes()).to_be_bytes());
+    xar_from_zlib_toc(&z, toc.len() as u64)
+}
+
+#[cfg(test)]
+/// A version-1 xar whose TOC is the zlib stream `z`, declaring
+/// `toc_len_uncompressed` bytes once inflated.
+pub(crate) fn xar_from_zlib_toc(z: &[u8], toc_len_uncompressed: u64) -> Vec<u8> {
     let mut v = Vec::new();
     v.extend_from_slice(b"xar!");
     v.extend_from_slice(&28u16.to_be_bytes());
     v.extend_from_slice(&1u16.to_be_bytes());
     v.extend_from_slice(&(z.len() as u64).to_be_bytes());
-    v.extend_from_slice(&(toc.len() as u64).to_be_bytes());
+    v.extend_from_slice(&toc_len_uncompressed.to_be_bytes());
     v.extend_from_slice(&1u32.to_be_bytes());
-    v.extend_from_slice(&z);
+    v.extend_from_slice(z);
     v
 }
 
@@ -1019,6 +1031,54 @@ mod tests {
     fn declared_toc_size_bomb_is_refused_without_inflating() {
         let a = parse(adversarial!("toc_u_absurd"), &XarLimits::default()).expect("xar");
         assert_eq!(a.halted, Some(XarHalt::TocTooLarge));
+    }
+
+    /// A zlib stream holding `toc` as one stored block.
+    fn stored_zlib(toc: &[u8]) -> Vec<u8> {
+        let len = toc.len() as u16;
+        let mut z = vec![0x78, 0x01, 0x01];
+        z.extend_from_slice(&len.to_le_bytes());
+        z.extend_from_slice(&(!len).to_le_bytes());
+        z.extend_from_slice(toc);
+        z.extend_from_slice(&inflate::adler32(toc).to_be_bytes());
+        z
+    }
+
+    #[test]
+    fn toc_declared_length_is_the_inflate_ceiling() {
+        let toc = b"<?xml version=\"1.0\"?><xar><toc></toc></xar>";
+        let z = stored_zlib(toc);
+        let real = toc.len() as u64;
+        let limits = XarLimits::default();
+
+        let exact = parse(&xar_from_zlib_toc(&z, real), &limits).expect("xar");
+        assert_eq!(exact.halted, None);
+        assert!(exact.is_complete());
+
+        let short = parse(&xar_from_zlib_toc(&z, real - 1), &limits).expect("xar");
+        assert_eq!(short.halted, Some(XarHalt::TocTooLarge));
+        assert!(!short.is_complete());
+
+        let larger = parse(&xar_from_zlib_toc(&z, real + 100), &limits).expect("xar");
+        assert_eq!(larger.halted, None);
+        assert!(larger.is_complete());
+    }
+
+    #[test]
+    fn toc_of_empty_dynamic_blocks_halts_as_too_large() {
+        let limits = XarLimits {
+            max_toc_bytes: 64 * 1024,
+            ..XarLimits::default()
+        };
+        let blocks = inflate::work_cap(limits.max_toc_bytes) / inflate::DYNAMIC_BLOCK_WORK * 2;
+        let raw = inflate::empty_dynamic_blocks(blocks);
+        let mut z = vec![0x78, 0x9c];
+        z.extend_from_slice(&raw);
+        z.extend_from_slice(&1u32.to_be_bytes());
+        let v = xar_from_zlib_toc(&z, 1);
+        let a = parse(&v, &limits).expect("xar");
+        assert_eq!(a.halted, Some(XarHalt::TocTooLarge));
+        assert!(!a.is_complete());
     }
 
     #[test]

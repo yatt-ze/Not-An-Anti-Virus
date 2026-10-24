@@ -9,7 +9,8 @@ pub enum DecodeError {
     Truncated,
     /// Structurally invalid: a field, table or symbol the format forbids.
     Malformed,
-    /// Output would exceed the caller's budget. Not a maliciousness finding (§6.2).
+    /// Output, or inflate's decode work, would exceed the caller's budget.
+    /// Not a maliciousness finding (§6.2).
     BudgetExceeded,
     /// The stream's header or magic is invalid or unsupported.
     BadHeader,
