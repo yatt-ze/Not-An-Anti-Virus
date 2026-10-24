@@ -91,3 +91,76 @@ fn an_oversized_clean_file_alone_is_indeterminate() {
         String::from_utf8_lossy(&out.stderr)
     );
 }
+
+fn navctl(args: &[&str], path: &Path) -> Output {
+    Command::new(env!("CARGO_BIN_EXE_navctl"))
+        .args(args)
+        .arg(path)
+        .output()
+        .expect("navctl spawns")
+}
+
+/// `--max-files` lowers the walk budget for both commands, and a larger
+/// value lets the same directory finish (§11.12).
+#[test]
+fn max_files_flag_sets_the_walk_budget() {
+    let dir = TempDir::new("max-files");
+    std::fs::write(dir.path().join("a.txt"), "hello\n").unwrap();
+    std::fs::write(dir.path().join("b.txt"), "world\n").unwrap();
+
+    for cmd in [&["scan"][..], &["rules", "test"][..]] {
+        let cut = navctl(&[cmd, &["--max-files", "1"]].concat(), dir.path());
+        assert_eq!(cut.status.code(), Some(3), "{cmd:?}");
+        // `scan` warns on stderr; `rules test` in its stdout report.
+        let text = format!(
+            "{}{}",
+            String::from_utf8_lossy(&cut.stdout),
+            String::from_utf8_lossy(&cut.stderr)
+        );
+        assert!(text.contains("max-files"), "{cmd:?}: {text}");
+
+        // Enough budget: no warning, and the same exit as no flags (not
+        // always 0: off macOS some rules can't run, so files scan Partial).
+        let ok = navctl(&[cmd, &["--max-files", "10"]].concat(), dir.path());
+        let plain = navctl(cmd, dir.path());
+        assert_eq!(ok.status.code(), plain.status.code(), "{cmd:?}");
+        let text = format!(
+            "{}{}",
+            String::from_utf8_lossy(&ok.stdout),
+            String::from_utf8_lossy(&ok.stderr)
+        );
+        assert!(!text.contains("scan budget reached"), "{cmd:?}: {text}");
+    }
+}
+
+/// `--max-total-bytes` below the first file still scans that file, then
+/// stops (the first file is always admitted).
+#[test]
+fn max_total_bytes_flag_sets_the_byte_budget() {
+    let dir = TempDir::new("max-bytes");
+    std::fs::write(dir.path().join("a.txt"), "hello\n").unwrap();
+    std::fs::write(dir.path().join("b.txt"), "world\n").unwrap();
+
+    let cut = navctl(&["scan", "--max-total-bytes", "1"], dir.path());
+    assert_eq!(cut.status.code(), Some(3));
+    assert!(String::from_utf8_lossy(&cut.stderr).contains("max-total-bytes"));
+}
+
+/// A budget that admits no file is partial coverage (exit 3, with the
+/// budget warning), not "no files found" (exit 4).
+#[test]
+fn a_budget_that_admits_no_file_is_indeterminate() {
+    let dir = TempDir::new("max-files-0");
+    std::fs::write(dir.path().join("a.txt"), "hello\n").unwrap();
+    for cmd in [&["scan"][..], &["rules", "test"][..]] {
+        let out = navctl(&[cmd, &["--max-files", "0"]].concat(), dir.path());
+        assert_eq!(out.status.code(), Some(3), "{cmd:?}");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr.contains("scan budget reached (max-files)"),
+            "{cmd:?}: {stderr}"
+        );
+    }
+    let json = navctl(&["rules", "test", "--json", "--max-files", "0"], dir.path());
+    assert!(String::from_utf8_lossy(&json.stdout).contains("\"coverage_complete\": false"));
+}
