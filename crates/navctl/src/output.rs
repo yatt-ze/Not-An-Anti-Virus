@@ -164,19 +164,25 @@ fn summary_line(
         score,
         confidence_str(confidence),
         completeness_str(completeness),
-        recommendation_str(recommendation),
+        recommendation_str(recommendation, completeness),
     )
 }
 
 /// One line for a bundle: the worst file's verdict plus a file-count suffix.
-/// Completeness is `Partial` when the worst file was `Complete` but the
-/// target's coverage was not. Precondition: `scan.results` is non-empty.
-fn bundle_summary_line(scan: &TargetScan) -> String {
+/// The worst file's completeness, raised to `Partial` when that file was
+/// `Complete` but the target's coverage was not. Precondition: `scan.results`
+/// is non-empty.
+fn target_completeness(scan: &TargetScan) -> ScanCompleteness {
     let worst = scan.worst().expect("non-empty results");
-    let completeness = match worst.completeness {
+    match worst.completeness {
         ScanCompleteness::Complete if !scan.coverage_complete() => ScanCompleteness::Partial,
         c => c,
-    };
+    }
+}
+
+fn bundle_summary_line(scan: &TargetScan) -> String {
+    let worst = scan.worst().expect("non-empty results");
+    let completeness = target_completeness(scan);
     let line = summary_line(
         &scan.root.display().to_string(),
         worst.score,
@@ -223,7 +229,7 @@ fn print_rules_test(result: &ScanResult) {
     println!();
     println!(
         "Recommendation: {}",
-        recommendation_str(result.recommendation)
+        recommendation_str(result.recommendation, result.completeness)
     );
 }
 
@@ -293,7 +299,7 @@ fn print_rules_test_multi(scan: &TargetScan) {
             display_relative(&scan.root, &result.path),
             result.score,
             completeness_str(result.completeness),
-            recommendation_str(result.recommendation),
+            recommendation_str(result.recommendation, result.completeness),
         );
     }
     if scan.primary.is_some() {
@@ -302,7 +308,7 @@ fn print_rules_test_multi(scan: &TargetScan) {
     println!();
     println!(
         "Recommendation: {}",
-        recommendation_str(scan.recommendation())
+        recommendation_str(scan.recommendation(), target_completeness(scan))
     );
 }
 
@@ -458,9 +464,13 @@ fn completeness_str(c: ScanCompleteness) -> &'static str {
     }
 }
 
-fn recommendation_str(r: Recommendation) -> &'static str {
+/// `NoAction` reads "clean" only when the scan was `Complete` (§10, §11.8).
+fn recommendation_str(r: Recommendation, completeness: ScanCompleteness) -> &'static str {
     match r {
-        Recommendation::NoAction => "no action (clean)",
+        Recommendation::NoAction if completeness == ScanCompleteness::Complete => {
+            "no action (clean)"
+        }
+        Recommendation::NoAction => "no action (not fully checked)",
         Recommendation::Notify => "notify",
         Recommendation::NotifyAndSuggestQuarantine => {
             "notify + suggest quarantine (no auto-action without opt-in)"
@@ -652,6 +662,50 @@ mod tests {
 
     const MAIN: &str = "/Apps/X.app/Contents/MacOS/X";
     const EVIL: &str = "/Apps/X.app/Contents/Resources/evil.sh";
+
+    #[test]
+    fn no_action_is_clean_only_when_complete() {
+        let label = |c| recommendation_str(Recommendation::NoAction, c);
+        assert_eq!(label(ScanCompleteness::Complete), "no action (clean)");
+        for c in [ScanCompleteness::Partial, ScanCompleteness::Indeterminate] {
+            assert_eq!(label(c), "no action (not fully checked)");
+        }
+        assert_eq!(
+            recommendation_str(Recommendation::Notify, ScanCompleteness::Partial),
+            "notify"
+        );
+    }
+
+    #[test]
+    fn partial_and_indeterminate_summary_lines_are_not_clean() {
+        for c in [ScanCompleteness::Partial, ScanCompleteness::Indeterminate] {
+            let line = summary_line(
+                "/tmp/x",
+                0,
+                EvidenceConfidence::Low,
+                c,
+                Recommendation::NoAction,
+            );
+            assert!(line.ends_with("-> no action (not fully checked)"), "{line}");
+            assert!(!line.contains("(clean)"), "{line}");
+        }
+    }
+
+    #[test]
+    fn bundle_line_with_incomplete_coverage_is_not_clean() {
+        let scan = bundle(
+            vec![member(MAIN, 0, ScanCompleteness::Complete)],
+            BudgetOutcome::Exhausted(BudgetLimit::Files),
+        );
+        let line = bundle_summary_line(&scan);
+        assert!(line.contains("not fully checked"), "{line}");
+        assert!(!line.contains("(clean)"), "{line}");
+        assert_eq!(target_completeness(&scan), ScanCompleteness::Partial);
+        assert_eq!(
+            recommendation_str(scan.recommendation(), target_completeness(&scan)),
+            "no action (not fully checked)"
+        );
+    }
 
     #[test]
     fn bundle_line_clean_and_complete_has_no_worst() {
