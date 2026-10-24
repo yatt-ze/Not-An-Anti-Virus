@@ -78,19 +78,31 @@ pub struct DiffReport {
     pub changes: Vec<Change>,
 }
 
+/// Exit status for a failed gate; 1 is left for tool errors (`anyhow`).
+pub const REGRESSION_EXIT: u8 = 2;
+
 impl DiffReport {
-    /// Number of paths whose recommendation got worse, including new-only
-    /// paths above no-action.
+    /// Paths whose recommendation or completeness got worse, including
+    /// new-only paths above no-action.
     pub fn regressions(&self) -> usize {
-        self.changes.iter().filter(|c| c.rec_worse).count()
+        self.changes
+            .iter()
+            .filter(|c| c.rec_worse || c.comp_worse)
+            .count()
     }
 
-    /// Nonzero on any regression or any path missing from NEW.
+    /// Whether the gate passes: something was scanned, nothing regressed,
+    /// nothing went missing.
+    pub fn passed(&self) -> bool {
+        self.base_files > 0 && self.regressions() == 0 && self.only_base.is_empty()
+    }
+
+    /// [`REGRESSION_EXIT`] unless [`passed`](Self::passed).
     pub fn exit_code(&self) -> ExitCode {
-        if self.regressions() > 0 || !self.only_base.is_empty() {
-            ExitCode::from(1)
-        } else {
+        if self.passed() {
             ExitCode::SUCCESS
+        } else {
+            ExitCode::from(REGRESSION_EXIT)
         }
     }
 }
@@ -188,7 +200,7 @@ pub fn diff(base: &[ScanResult], new: &[ScanResult]) -> DiffReport {
                 base: Some(bv.clone()),
                 new: nv.clone(),
                 rec_worse: rec_rank(nv.recommendation) > rec_rank(bv.recommendation),
-                comp_worse: comp_rank(nv.completeness) > comp_rank(bv.completeness),
+                comp_worse: nv.completeness > bv.completeness,
             }),
             None => {
                 report.only_new += 1;
@@ -222,6 +234,9 @@ pub fn diff(base: &[ScanResult], new: &[ScanResult]) -> DiffReport {
 /// unless `all`.
 pub fn render(r: &DiffReport, all: bool) -> String {
     let mut s = String::new();
+    if r.base_files == 0 {
+        let _ = writeln!(s, "FAIL: the base scan has no files; nothing was compared");
+    }
     let _ = writeln!(
         s,
         "files: base {} new {} (only in base {}, only in new {})",
@@ -251,7 +266,7 @@ pub fn render(r: &DiffReport, all: bool) -> String {
     }
     let _ = writeln!(
         s,
-        "\nchanged files: {} ({} recommendation regression(s))",
+        "\nchanged files: {} ({} regression(s): recommendation or completeness worse)",
         r.changes.len(),
         r.regressions()
     );
@@ -357,7 +372,7 @@ mod tests {
         );
         let r = diff(&[clean("/a", 1)], &[n]);
         assert_eq!(r.regressions(), 1);
-        assert_eq!(r.exit_code(), ExitCode::from(1));
+        assert_eq!(r.exit_code(), ExitCode::from(REGRESSION_EXIT));
         assert_eq!(r.rec_counts[1], (0, 1));
     }
 
@@ -399,7 +414,7 @@ mod tests {
         );
         assert_eq!(r.only_base, vec![PathBuf::from("/gone")]);
         assert_eq!(r.regressions(), 0);
-        assert_eq!(r.exit_code(), ExitCode::from(1));
+        assert_eq!(r.exit_code(), ExitCode::from(REGRESSION_EXIT));
         assert!(render(&r, false).contains("missing from new: 1"));
     }
 
@@ -415,8 +430,16 @@ mod tests {
         let r = diff(&[clean("/a", 1)], &[n]);
         assert_eq!(r.changes.len(), 1);
         assert!(r.changes[0].comp_worse);
-        assert_eq!(r.regressions(), 0);
+        assert_eq!(r.regressions(), 1);
+        assert!(!r.passed());
         assert_eq!(r.comp_counts[1], (0, 1));
+    }
+
+    #[test]
+    fn empty_base_fails_the_gate() {
+        let r = diff(&[], &[]);
+        assert!(!r.passed());
+        assert!(render(&r, false).contains("no files"));
     }
 
     #[test]
