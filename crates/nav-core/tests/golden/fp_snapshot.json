@@ -256,6 +256,14 @@
     ],
     "completeness": "complete"
   },
+  "benign/protobuf_model_header.onnx": {
+    "score": 5,
+    "recommendation": "no-action",
+    "rule_ids": [
+      "high-entropy-content"
+    ],
+    "completeness": "complete"
+  },
   "benign/readme.txt": {
     "score": 0,
     "recommendation": "no-action",
