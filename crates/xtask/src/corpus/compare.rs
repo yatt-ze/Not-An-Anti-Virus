@@ -45,6 +45,21 @@ fn git(repo: &Path, args: &[&str]) -> Result<String> {
     capture(Command::new("git").current_dir(repo).args(args))
 }
 
+/// Removes base worktrees an interrupted run (Ctrl-C skips `Drop`) left
+/// under `<repo>/target/xtask-corpus/`, then prunes stale registrations.
+fn remove_stale_worktrees(repo: &Path) -> Result<()> {
+    let ours = repo.join("target/xtask-corpus");
+    let list = git(repo, &["worktree", "list", "--porcelain"])?;
+    for path in list.lines().filter_map(|l| l.strip_prefix("worktree ")) {
+        if Path::new(path).starts_with(&ours) {
+            println!("note: removing stale worktree {path}");
+            git(repo, &["worktree", "remove", "--force", path])?;
+        }
+    }
+    git(repo, &["worktree", "prune"])?;
+    Ok(())
+}
+
 /// `cargo build --release --locked -p navctl` in `dir` with `target_dir`;
 /// returns the built binary's path.
 fn build_navctl(dir: &Path, target_dir: &Path) -> Result<PathBuf> {
@@ -84,6 +99,7 @@ pub fn run(args: CompareArgs) -> Result<ExitCode> {
     let navctl_new = out_dir.join("navctl-new");
     std::fs::copy(&built, &navctl_new).context("copying new navctl")?;
 
+    remove_stale_worktrees(&repo)?;
     if args.base.starts_with("origin/") {
         git(&repo, &["fetch", "origin"])?;
     }
@@ -111,10 +127,18 @@ pub fn run(args: CompareArgs) -> Result<ExitCode> {
 
     let base_jsonl = out_dir.join("base.jsonl");
     let new_jsonl = out_dir.join("new.jsonl");
-    println!("scanning with base...");
-    scan::run(&navctl_base, &base_jsonl, &args.tuning)?;
-    println!("scanning with new...");
-    scan::run(&navctl_new, &new_jsonl, &args.tuning)?;
+    let planned = scan::plan_roots(&args.tuning)?;
+    let targets = [
+        scan::Target {
+            navctl: &navctl_base,
+            out: &base_jsonl,
+        },
+        scan::Target {
+            navctl: &navctl_new,
+            out: &new_jsonl,
+        },
+    ];
+    scan::run(&targets, &planned, args.tuning.jobs)?;
 
     let report = diff::diff(&parse::load(&base_jsonl)?, &parse::load(&new_jsonl)?);
     let text = diff::render(&report, false);

@@ -10,7 +10,7 @@ use std::time::Instant;
 
 use anyhow::{bail, Context, Result};
 
-use super::plan::{plan, Chunk};
+use super::plan::{plan, Chunk, Plan};
 use super::Tuning;
 
 /// Default scan roots on macOS.
@@ -39,61 +39,80 @@ pub fn resolve_roots(tuning: &Tuning) -> Result<Vec<PathBuf>> {
     }
 }
 
-#[derive(Debug, Default)]
-pub struct Summary {
-    pub files: usize,
-    pub chunks: usize,
-    pub exit4: usize,
-    pub with_stderr: usize,
-}
-
-struct Sinks {
-    out: BufWriter<File>,
-    err: BufWriter<File>,
-    done: usize,
-    summary: Summary,
-}
-
-/// Scans `tuning`'s roots with `navctl`, appending each chunk's stdout to
-/// `out` and error records to `<out>.err`. Chunk output is written whole, so
-/// lines never interleave.
-pub fn run(navctl: &Path, out: &Path, tuning: &Tuning) -> Result<Summary> {
-    let start = Instant::now();
-    let navctl = super::absolute(navctl)?;
-    let out = super::absolute(out)?;
-    let roots = resolve_roots(tuning)?;
-    let planned = plan(&roots, tuning.split_at);
+/// Plans `tuning`'s roots, printing the planner's notes. Errors if nothing
+/// is left to scan.
+pub fn plan_roots(tuning: &Tuning) -> Result<Plan> {
+    let planned = plan(&resolve_roots(tuning)?, tuning.split_at);
     for note in &planned.notes {
         println!("note: {note}");
     }
-    let chunks = planned.chunks;
+    if planned.chunks.is_empty() {
+        bail!("nothing to scan: every root is missing or empty");
+    }
+    Ok(planned)
+}
+
+/// One navctl build and where its results go.
+pub struct Target<'a> {
+    pub navctl: &'a Path,
+    pub out: &'a Path,
+}
+
+#[derive(Debug, Default)]
+pub struct Summary {
+    pub files: usize,
+    /// Chunks that exited outside 0–3 (including death by signal).
+    pub failed: usize,
+    pub with_stderr: usize,
+}
+
+struct Sink {
+    out: BufWriter<File>,
+    err: BufWriter<File>,
+    err_path: PathBuf,
+    summary: Summary,
+}
+
+/// Runs every chunk of `planned` with each target's navctl, back to back per
+/// chunk so the builds see the same files. Appends each run's stdout to the
+/// target's `out` and failure/stderr records to `<out>.err`.
+pub fn run(targets: &[Target], planned: &Plan, jobs: Option<usize>) -> Result<Vec<Summary>> {
+    let start = Instant::now();
+    let chunks = &planned.chunks;
     let total = chunks.len();
-    let jobs = match tuning.jobs {
+    let jobs = match jobs {
         Some(0) => bail!("--jobs must be at least 1"),
         Some(n) => n,
         None => std::thread::available_parallelism().map_or(1, |n| n.get()),
     }
     .min(total.max(1));
 
-    if let Some(parent) = out.parent() {
-        std::fs::create_dir_all(parent)
-            .with_context(|| format!("creating {}", parent.display()))?;
+    let mut sinks = Vec::new();
+    let mut navctls = Vec::new();
+    for t in targets {
+        navctls.push(super::absolute(t.navctl)?);
+        let out = super::absolute(t.out)?;
+        if let Some(parent) = out.parent() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("creating {}", parent.display()))?;
+        }
+        let err_path = PathBuf::from(format!("{}.err", out.display()));
+        sinks.push(Mutex::new(Sink {
+            out: BufWriter::new(File::create(&out).with_context(|| out.display().to_string())?),
+            err: BufWriter::new(
+                File::create(&err_path).with_context(|| err_path.display().to_string())?,
+            ),
+            err_path,
+            summary: Summary::default(),
+        }));
     }
-    let err_path = PathBuf::from(format!("{}.err", out.display()));
-    let sinks = Mutex::new(Sinks {
-        out: BufWriter::new(File::create(&out).with_context(|| out.display().to_string())?),
-        err: BufWriter::new(
-            File::create(&err_path).with_context(|| err_path.display().to_string())?,
-        ),
-        done: 0,
-        summary: Summary {
-            chunks: total,
-            ..Default::default()
-        },
-    });
-    println!("{total} chunk(s) on {jobs} worker(s)");
+    println!(
+        "{total} chunk(s) x {} build(s) on {jobs} worker(s)",
+        targets.len()
+    );
 
     let next = AtomicUsize::new(0);
+    let done = AtomicUsize::new(0);
     let failure: Mutex<Option<anyhow::Error>> = Mutex::new(None);
     let step = (total / 20).max(1);
     std::thread::scope(|scope| {
@@ -104,9 +123,15 @@ pub fn run(navctl: &Path, out: &Path, tuning: &Tuning) -> Result<Summary> {
                 if failure.lock().unwrap().is_some() {
                     break;
                 }
-                if let Err(e) = run_chunk(&navctl, chunk, &sinks, total, step) {
-                    failure.lock().unwrap().get_or_insert(e);
-                    break;
+                for (navctl, sink) in navctls.iter().zip(&sinks) {
+                    if let Err(e) = run_chunk(navctl, chunk, sink) {
+                        failure.lock().unwrap().get_or_insert(e);
+                        return;
+                    }
+                }
+                let d = done.fetch_add(1, Ordering::Relaxed) + 1;
+                if d % step == 0 || d == total {
+                    println!("{d}/{total} chunks");
                 }
             });
         }
@@ -115,31 +140,29 @@ pub fn run(navctl: &Path, out: &Path, tuning: &Tuning) -> Result<Summary> {
         return Err(e);
     }
 
-    let mut sinks = sinks.into_inner().unwrap();
-    sinks.out.flush()?;
-    sinks.err.flush()?;
-    let s = sinks.summary;
-    println!(
-        "scanned {} file(s) in {} chunk(s); {} chunk(s) exited 4, {} with stderr (see {}); {:.1?}",
-        s.files,
-        s.chunks,
-        s.exit4,
-        s.with_stderr,
-        err_path.display(),
-        start.elapsed()
-    );
-    Ok(s)
+    let mut summaries = Vec::new();
+    for (t, sink) in targets.iter().zip(sinks) {
+        let mut sink = sink.into_inner().unwrap();
+        sink.out.flush()?;
+        sink.err.flush()?;
+        let s = sink.summary;
+        println!(
+            "{}: {} file(s); {} chunk(s) failed, {} with stderr (see {})",
+            t.navctl.display(),
+            s.files,
+            s.failed,
+            s.with_stderr,
+            sink.err_path.display(),
+        );
+        summaries.push(s);
+    }
+    println!("elapsed {:.1?}", start.elapsed());
+    Ok(summaries)
 }
 
 /// Runs navctl on one chunk and records its output. Errors only if navctl
 /// can't be spawned or a sink can't be written.
-fn run_chunk(
-    navctl: &Path,
-    chunk: &Chunk,
-    sinks: &Mutex<Sinks>,
-    total: usize,
-    step: usize,
-) -> Result<()> {
+fn run_chunk(navctl: &Path, chunk: &Chunk, sink: &Mutex<Sink>) -> Result<()> {
     let mut cmd = Command::new(navctl);
     cmd.arg("scan");
     if chunk.recursive {
@@ -157,15 +180,17 @@ fn run_chunk(
         .filter(|l| l.first() == Some(&b'{'))
         .count();
 
-    let mut s = sinks.lock().unwrap();
+    let mut s = sink.lock().unwrap();
     s.out.write_all(&output.stdout)?;
     if !output.stdout.is_empty() && !output.stdout.ends_with(b"\n") {
         s.out.write_all(b"\n")?;
     }
     s.summary.files += files;
+    // 0–3 are verdicts; 4, other codes and signals mean navctl itself failed.
+    let failed = !matches!(code, Some(0..=3));
     let has_stderr = !stderr.trim().is_empty();
-    if code == Some(4) || has_stderr {
-        s.summary.exit4 += usize::from(code == Some(4));
+    if failed || has_stderr {
+        s.summary.failed += usize::from(failed);
         s.summary.with_stderr += usize::from(has_stderr);
         let code = code.map_or_else(|| "signal".to_string(), |c| c.to_string());
         writeln!(
@@ -174,10 +199,6 @@ fn run_chunk(
             chunk.path.display(),
             stderr.trim_end()
         )?;
-    }
-    s.done += 1;
-    if s.done % step == 0 || s.done == total {
-        println!("{}/{total} chunks", s.done);
     }
     Ok(())
 }

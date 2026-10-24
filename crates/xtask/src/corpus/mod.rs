@@ -1,5 +1,6 @@
 //! `cargo xtask corpus`: scan a large set of real files with navctl builds
 //! and diff the verdicts, as the benign false-positive regression gate.
+//! Exit status: 0 gate passed, 2 gate failed (see `diff`), 1 tool error.
 
 mod compare;
 mod diff;
@@ -17,7 +18,7 @@ use clap::{Args, Subcommand};
 pub enum CorpusCommand {
     /// Scan roots with one navctl build into a JSONL file.
     Scan(ScanArgs),
-    /// Diff two JSONL scans; nonzero exit on a regression or a missing file.
+    /// Diff two JSONL scans; exit 2 on a regression, a missing file or an empty base.
     Diff(DiffArgs),
     /// Build base and new navctl, scan both, diff.
     Compare(CompareArgs),
@@ -73,7 +74,12 @@ pub struct CompareArgs {
 pub fn run(cmd: CorpusCommand) -> Result<ExitCode> {
     match cmd {
         CorpusCommand::Scan(a) => {
-            scan::run(&a.navctl, &a.out, &a.tuning)?;
+            let planned = scan::plan_roots(&a.tuning)?;
+            let target = scan::Target {
+                navctl: &a.navctl,
+                out: &a.out,
+            };
+            scan::run(&[target], &planned, a.tuning.jobs)?;
             Ok(ExitCode::SUCCESS)
         }
         CorpusCommand::Diff(a) => {

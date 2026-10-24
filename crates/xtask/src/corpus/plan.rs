@@ -1,14 +1,18 @@
-//! Splitting scan roots into navctl invocations that fit its 50,000-file
-//! walk budget, mirroring navctl's own traversal rules (target.rs).
+//! Splitting scan roots into navctl invocations that fit its walk budget
+//! (file count and bytes read), mirroring navctl's traversal rules (target.rs).
 
 use std::fs;
 use std::path::{Path, PathBuf};
+
+use nav_core::context::MAX_STREAM_BYTES;
+use nav_core::{BundleLayout, ScanBudget};
 
 /// One navctl invocation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Chunk {
     pub path: PathBuf,
-    /// `scan --recursive` over a directory (or `.app` bundle) vs a single file.
+    /// `scan --recursive` over a directory or bundle; otherwise one file, or
+    /// a directory's top-level files only.
     pub recursive: bool,
 }
 
@@ -19,11 +23,47 @@ pub struct Plan {
     pub notes: Vec<String>,
 }
 
+/// Files and budget-charged bytes under a directory, possibly stopped early.
+#[derive(Debug, Clone, Copy, Default)]
+struct Size {
+    files: usize,
+    bytes: u64,
+}
+
+/// Split thresholds: `split_at` files, or 7/8 of navctl's byte budget.
+#[derive(Debug, Clone, Copy)]
+struct Limits {
+    files: usize,
+    bytes: u64,
+}
+
+impl Limits {
+    fn new(split_at: usize) -> Self {
+        Self {
+            files: split_at,
+            bytes: ScanBudget::default().max_total_bytes / 8 * 7,
+        }
+    }
+
+    fn fits(&self, s: Size) -> bool {
+        s.files < self.files && s.bytes < self.bytes
+    }
+}
+
+/// Bytes navctl charges a file against its budget (its length, clipped).
+fn charged(len: u64) -> u64 {
+    len.min(MAX_STREAM_BYTES)
+}
+
 /// Plans scans for `roots`. A root is followed even if it is a symlink
 /// (navctl follows the named target); symlinks met while walking are skipped.
-/// Directories with `split_at` files or more are split into their children;
-/// an `.app` bundle is never split.
+/// Directories over `split_at` files or the byte limit are split into their
+/// children; an `.app` bundle is never split.
 pub fn plan(roots: &[PathBuf], split_at: usize) -> Plan {
+    plan_with(roots, Limits::new(split_at))
+}
+
+fn plan_with(roots: &[PathBuf], limits: Limits) -> Plan {
     let mut plan = Plan::default();
     for root in roots {
         match fs::metadata(root) {
@@ -31,7 +71,7 @@ pub fn plan(roots: &[PathBuf], split_at: usize) -> Plan {
                 path: root.clone(),
                 recursive: false,
             }),
-            Ok(m) if m.is_dir() => plan_dir(root, split_at, &mut plan),
+            Ok(m) if m.is_dir() => plan_dir(root, limits, &mut plan),
             Ok(_) => plan.notes.push(format!(
                 "skipped {}: not a file or directory",
                 root.display()
@@ -42,12 +82,12 @@ pub fn plan(roots: &[PathBuf], split_at: usize) -> Plan {
     plan
 }
 
-fn plan_dir(dir: &Path, split_at: usize, plan: &mut Plan) {
-    let count = count_files(dir, split_at);
-    if is_bundle(dir) {
-        if count >= split_at {
+fn plan_dir(dir: &Path, limits: Limits, plan: &mut Plan) {
+    let size = measure(dir, limits);
+    if BundleLayout::detect(dir).is_some() {
+        if !limits.fits(size) {
             plan.notes.push(format!(
-                "{} is a bundle with at least {split_at} files; scanned whole",
+                "{} is a bundle over the split limit; scanned whole",
                 dir.display()
             ));
         }
@@ -57,12 +97,12 @@ fn plan_dir(dir: &Path, split_at: usize, plan: &mut Plan) {
         });
         return;
     }
-    if count == 0 {
+    if size.files == 0 {
         plan.notes
             .push(format!("skipped {}: no files", dir.display()));
         return;
     }
-    if count < split_at {
+    if limits.fits(size) {
         plan.chunks.push(Chunk {
             path: dir.to_path_buf(),
             recursive: true,
@@ -77,48 +117,56 @@ fn plan_dir(dir: &Path, split_at: usize, plan: &mut Plan) {
         }
     };
     children.sort_by_key(|e| e.file_name());
+    let mut loose = Vec::new();
+    let mut loose_size = Size::default();
     for child in children {
         let Ok(ft) = child.file_type() else { continue };
         if ft.is_file() {
-            plan.chunks.push(Chunk {
-                path: child.path(),
-                recursive: false,
-            });
+            loose_size.files += 1;
+            loose_size.bytes += child.metadata().map_or(0, |m| charged(m.len()));
+            loose.push(child.path());
         } else if ft.is_dir() {
-            plan_dir(&child.path(), split_at, plan);
+            plan_dir(&child.path(), limits, plan);
         }
+    }
+    if loose.is_empty() {
+        return;
+    }
+    if limits.fits(loose_size) {
+        // A non-recursive directory scan covers just its top-level files.
+        plan.chunks.push(Chunk {
+            path: dir.to_path_buf(),
+            recursive: false,
+        });
+    } else {
+        plan.chunks.extend(loose.into_iter().map(|path| Chunk {
+            path,
+            recursive: false,
+        }));
     }
 }
 
-/// Mirrors `BundleLayout::detect`: a directory named `*.app` with a
-/// `Contents/` directory.
-fn is_bundle(dir: &Path) -> bool {
-    dir.file_name()
-        .and_then(|n| n.to_str())
-        .is_some_and(|n| n.to_ascii_lowercase().ends_with(".app"))
-        && dir.join("Contents").is_dir()
-}
-
-/// Regular files under `dir` (symlinks not followed), counting stops once
-/// `limit` is reached.
-fn count_files(dir: &Path, limit: usize) -> usize {
-    let mut count = 0;
+/// Regular files under `dir` and their charged bytes (symlinks not
+/// followed); stops early once `limits` no longer fit.
+fn measure(dir: &Path, limits: Limits) -> Size {
+    let mut size = Size::default();
     let mut stack = vec![dir.to_path_buf()];
     while let Some(d) = stack.pop() {
         let Ok(rd) = fs::read_dir(&d) else { continue };
         for entry in rd.filter_map(Result::ok) {
             let Ok(ft) = entry.file_type() else { continue };
             if ft.is_file() {
-                count += 1;
-                if count >= limit {
-                    return count;
+                size.files += 1;
+                size.bytes += entry.metadata().map_or(0, |m| charged(m.len()));
+                if !limits.fits(size) {
+                    return size;
                 }
             } else if ft.is_dir() {
                 stack.push(entry.path());
             }
         }
     }
-    count
+    size
 }
 
 #[cfg(test)]
@@ -179,11 +227,14 @@ mod tests {
         t.files("big/b/deep", 1);
         let p = plan(&[t.0.join("big")], 3);
         let got = paths(&p);
-        assert!(got.contains(&(t.0.join("big/f0"), false)));
-        assert!(got.contains(&(t.0.join("big/f1"), false)));
+        // big's 2 loose files fit: one top-level-only scan of big.
+        assert!(got.contains(&(t.0.join("big"), false)));
+        assert!(!got.contains(&(t.0.join("big/f0"), false)));
         assert!(got.contains(&(t.0.join("big/a"), true)));
-        // b itself has 6 files (>= 3): split again.
+        // b has 6 files (>= 3): split again; its 5 loose files don't fit
+        // one chunk, so each is scanned alone.
         assert!(!got.contains(&(t.0.join("big/b"), true)));
+        assert!(!got.contains(&(t.0.join("big/b"), false)));
         assert!(got.contains(&(t.0.join("big/b/deep"), true)));
         assert!(got.contains(&(t.0.join("big/b/f4"), false)));
         assert!(!got.contains(&(t.0.join("big"), true)));
@@ -224,7 +275,11 @@ mod tests {
         symlink(&real, top.join("dirlink")).unwrap();
         symlink(top.join("f0"), top.join("filelink")).unwrap();
         // Links don't count toward the threshold nor become chunks.
-        assert_eq!(count_files(&top, 100), 1);
+        let roomy = Limits {
+            files: 100,
+            bytes: u64::MAX,
+        };
+        assert_eq!(measure(&top, roomy).files, 1);
         let p = plan(std::slice::from_ref(&top), 100);
         assert_eq!(paths(&p), vec![(top.clone(), true)]);
         let split = plan(std::slice::from_ref(&top), 1);
@@ -235,6 +290,24 @@ mod tests {
         symlink(&real, &root_link).unwrap();
         let p = plan(std::slice::from_ref(&root_link), 100);
         assert_eq!(paths(&p), vec![(root_link, true)]);
+    }
+
+    #[test]
+    fn byte_limit_splits_a_dir_under_the_file_limit() {
+        let t = Tmp::new();
+        for sub in ["d/a", "d/b"] {
+            fs::create_dir_all(t.0.join(sub)).unwrap();
+            fs::write(t.0.join(sub).join("blob"), [0u8; 6]).unwrap();
+        }
+        let limits = Limits {
+            files: 100,
+            bytes: 10,
+        };
+        let p = plan_with(&[t.0.join("d")], limits);
+        assert_eq!(
+            paths(&p),
+            vec![(t.0.join("d/a"), true), (t.0.join("d/b"), true)]
+        );
     }
 
     #[test]
