@@ -89,7 +89,8 @@ pub fn run(cmd: CorpusCommand) -> Result<ExitCode> {
             let base = parse::load(&a.base)?;
             let new = parse::load(&a.new)?;
             let mut report = diff::diff(&base, &new);
-            diff::excuse_budget_cutoffs(&mut report, &stopped_in_both(&a.base, &a.new)?);
+            let stopped = stopped_in_both(&a.base, &a.new)?;
+            diff::excuse_budget_cutoffs(&mut report, &base, &stopped);
             print!("{}", diff::render(&report, a.all));
             Ok(report.exit_code())
         }

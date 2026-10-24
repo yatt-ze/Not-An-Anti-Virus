@@ -140,11 +140,10 @@ pub fn run(args: CompareArgs) -> Result<ExitCode> {
     ];
     scan::run(&targets, &planned, args.tuning.jobs)?;
 
-    let mut report = diff::diff(&parse::load(&base_jsonl)?, &parse::load(&new_jsonl)?);
-    diff::excuse_budget_cutoffs(
-        &mut report,
-        &super::stopped_in_both(&base_jsonl, &new_jsonl)?,
-    );
+    let base = parse::load(&base_jsonl)?;
+    let mut report = diff::diff(&base, &parse::load(&new_jsonl)?);
+    let stopped = super::stopped_in_both(&base_jsonl, &new_jsonl)?;
+    diff::excuse_budget_cutoffs(&mut report, &base, &stopped);
     let text = diff::render(&report, false);
     let report_path = out_dir.join("diff.txt");
     std::fs::write(&report_path, &text).with_context(|| report_path.display().to_string())?;

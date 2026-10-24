@@ -65,9 +65,9 @@ pub struct DiffReport {
     pub new_files: usize,
     /// Paths NEW never reported (a crash, a skipped chunk); fails the gate.
     pub only_base: Vec<PathBuf>,
-    /// Paths missing from NEW under a target the walk budget cut short in
-    /// both runs, as `(target, count)`; reported, but not a failure.
-    pub budget_cutoff: Vec<(PathBuf, usize)>,
+    /// Per target the walk budget cut short in both runs: `(target, paths
+    /// missing from NEW, paths BASE scanned under it)`. Reported, not a failure.
+    pub budget_cutoff: Vec<(PathBuf, usize, usize)>,
     pub only_new: usize,
     pub duplicates_base: usize,
     pub duplicates_new: usize,
@@ -237,17 +237,31 @@ pub fn diff(base: &[ScanResult], new: &[ScanResult]) -> DiffReport {
 /// cut short in **both** runs) into `budget_cutoff`: there the set of files
 /// reached depends on bytes read per file, so a missing file is not lost
 /// coverage. Every other missing path still fails the gate.
-pub fn excuse_budget_cutoffs(r: &mut DiffReport, stopped: &BTreeSet<PathBuf>) {
-    let mut counts: BTreeMap<PathBuf, usize> = BTreeMap::new();
-    r.only_base
-        .retain(|p| match stopped.iter().find(|t| p.starts_with(t)) {
-            Some(t) => {
-                *counts.entry(t.clone()).or_insert(0) += 1;
-                false
+pub fn excuse_budget_cutoffs(r: &mut DiffReport, base: &[ScanResult], stopped: &BTreeSet<PathBuf>) {
+    let target_of = |p: &PathBuf| stopped.iter().find(|t| p.starts_with(t)).cloned();
+    let mut missing: BTreeMap<PathBuf, usize> = BTreeMap::new();
+    r.only_base.retain(|p| match target_of(p) {
+        Some(t) => {
+            *missing.entry(t).or_insert(0) += 1;
+            false
+        }
+        None => true,
+    });
+    let mut scanned: BTreeMap<PathBuf, usize> = BTreeMap::new();
+    for res in base {
+        if let Some(t) = target_of(&res.path) {
+            if missing.contains_key(&t) {
+                *scanned.entry(t).or_insert(0) += 1;
             }
-            None => true,
-        });
-    r.budget_cutoff = counts.into_iter().collect();
+        }
+    }
+    r.budget_cutoff = missing
+        .into_iter()
+        .map(|(t, m)| {
+            let of = scanned.get(&t).copied().unwrap_or(0);
+            (t, m, of)
+        })
+        .collect();
 }
 
 /// Human-readable report; the changed-file list is capped at 200 lines
@@ -292,14 +306,14 @@ pub fn render(r: &DiffReport, all: bool) -> String {
     );
     let cap = if all { usize::MAX } else { DEFAULT_LIST_CAP };
     if !r.budget_cutoff.is_empty() {
-        let n: usize = r.budget_cutoff.iter().map(|(_, c)| c).sum();
+        let n: usize = r.budget_cutoff.iter().map(|(_, m, _)| m).sum();
         let _ = writeln!(
             s,
             "\nbudget cutoff moved: {n} file(s) not reached in new, under targets \
              the scan budget stopped in both runs (not a failure):"
         );
-        for (t, c) in &r.budget_cutoff {
-            let _ = writeln!(s, "  {c:>6}  {}", t.display());
+        for (t, m, of) in &r.budget_cutoff {
+            let _ = writeln!(s, "  {m:>6} of {of:<6}  {}", t.display());
         }
     }
     if !r.only_base.is_empty() {
@@ -471,10 +485,12 @@ mod tests {
         let base = [clean("/A/X.app/a", 0), clean("/A/X.app/b", 0)];
         let mut r = diff(&base, &[clean("/A/X.app/a", 0)]);
         assert!(!r.passed());
-        excuse_budget_cutoffs(&mut r, &BTreeSet::from([PathBuf::from("/A/X.app")]));
+        excuse_budget_cutoffs(&mut r, &base, &BTreeSet::from([PathBuf::from("/A/X.app")]));
         assert!(r.passed());
-        assert_eq!(r.budget_cutoff, vec![(PathBuf::from("/A/X.app"), 1)]);
-        assert!(render(&r, false).contains("budget cutoff moved: 1 file(s)"));
+        assert_eq!(r.budget_cutoff, vec![(PathBuf::from("/A/X.app"), 1, 2)]);
+        let text = render(&r, false);
+        assert!(text.contains("budget cutoff moved: 1 file(s)"), "{text}");
+        assert!(text.contains("1 of 2"), "{text}");
     }
 
     #[test]
@@ -482,7 +498,7 @@ mod tests {
         // `/A/X.app2` only shares a string prefix with the stopped target.
         let base = [clean("/A/X.app2/a", 0), clean("/B/c", 0)];
         let mut r = diff(&base, &[]);
-        excuse_budget_cutoffs(&mut r, &BTreeSet::from([PathBuf::from("/A/X.app")]));
+        excuse_budget_cutoffs(&mut r, &base, &BTreeSet::from([PathBuf::from("/A/X.app")]));
         assert!(!r.passed());
         assert_eq!(r.only_base.len(), 2);
         assert!(r.budget_cutoff.is_empty());
