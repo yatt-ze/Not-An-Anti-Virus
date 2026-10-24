@@ -1,5 +1,7 @@
-//! Splitting scan roots into navctl invocations that fit its walk budget
-//! (file count and bytes read), mirroring navctl's traversal rules (target.rs).
+//! Splitting scan roots into navctl invocations of a manageable size (file
+//! count and approximate bytes), mirroring navctl's traversal rules
+//! (target.rs). Corpus runs lift navctl's budget, so splits only keep chunks
+//! parallel; a navctl without the budget flags may still stop a chunk.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -23,14 +25,15 @@ pub struct Plan {
     pub notes: Vec<String>,
 }
 
-/// Files and budget-charged bytes under a directory, possibly stopped early.
+/// Files and approximate bytes (see [`charged`]) under a directory, possibly
+/// stopped early.
 #[derive(Debug, Clone, Copy, Default)]
 struct Size {
     files: usize,
     bytes: u64,
 }
 
-/// Split thresholds: `split_at` files, or 7/8 of navctl's byte budget.
+/// Split thresholds: `split_at` files, or 7/8 of navctl's default byte budget.
 #[derive(Debug, Clone, Copy)]
 struct Limits {
     files: usize,
@@ -50,7 +53,8 @@ impl Limits {
     }
 }
 
-/// Bytes navctl charges a file against its budget (its length, clipped).
+/// A file's size for splitting: its length, clipped to `MAX_STREAM_BYTES`.
+/// navctl's real charge is bytes read (§11.12) and can be more.
 fn charged(len: u64) -> u64 {
     len.min(MAX_STREAM_BYTES)
 }

@@ -7,6 +7,7 @@
 use std::borrow::Cow;
 use std::io::Read;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::OnceLock;
 
 /// Cap on how much of a file is read into memory for content rules. Static
@@ -127,45 +128,53 @@ pub struct ScanContext {
     /// have this scan (§10/§11.8). Keyed per rule so one rule's gap can't
     /// clobber another's.
     pub(crate) incomplete_rules: std::sync::Mutex<Vec<&'static str>>,
+    /// Bytes this scan read from disk; see [`Self::bytes_read`].
+    pub(crate) bytes_read: AtomicU64,
 }
 
 impl ScanContext {
     pub fn load(path: &Path) -> Self {
-        // Open first, then derive identity and length from the *opened* file
-        // (fstat on the handle) and read the bytes through that same handle, so
-        // the captured identity describes the object whose bytes were actually
-        // scanned — not a separate pre-open `stat` an attacker could race in
-        // the gap before the read (§11.7). A path swapped before the open is
-        // simply a different object opened, read, and identified consistently.
-        let opened = std::fs::File::open(path).ok().and_then(|mut f| {
-            let md = f.metadata().ok()?;
-            let identity = ObjectIdentity::from_metadata(&md);
-            let mut buf = Vec::new();
-            (&mut f)
-                .take(MAX_CONTENT_BYTES as u64)
-                .read_to_end(&mut buf)
-                .ok()?;
-            Some((f, buf, identity, md.len()))
-        });
+        Self::load_if(path, |_| true).expect("admit always accepts")
+    }
 
-        let (file, content, identity, file_len) = match opened {
-            Some((f, buf, identity, len)) => (Some(f), Some(buf), Some(identity), Some(len)),
-            None => (None, None, None, None),
+    /// Like [`Self::load`], but calls `admit` with the opened file's length
+    /// before reading anything, and returns `None` without reading if it
+    /// refuses. A file that can't be opened or stat'd is never refused.
+    pub(crate) fn load_if(path: &Path, admit: impl FnOnce(u64) -> bool) -> Option<Self> {
+        let unreadable = || Self::empty(path.to_path_buf(), ContentSource::File);
+        // Identity and length come from the *opened* handle, and the bytes are
+        // read through it, so a pre-open `stat` can't be raced (§11.7).
+        let Ok(mut f) = std::fs::File::open(path) else {
+            return Some(unreadable());
         };
-
-        let truncated = match (&content, file_len) {
-            (Some(c), Some(len)) => (c.len() as u64) < len,
-            _ => false,
+        let Ok(md) = f.metadata() else {
+            return Some(unreadable());
         };
-
-        ScanContext {
-            content,
-            truncated,
-            file_len,
-            identity,
-            file,
-            ..Self::empty(path.to_path_buf(), ContentSource::File)
+        if !admit(md.len()) {
+            return None;
         }
+        let mut buf = Vec::new();
+        let read = (&mut f)
+            .take(MAX_CONTENT_BYTES as u64)
+            .read_to_end(&mut buf);
+        // On error `buf` still holds what was read before it; charge that.
+        let loaded = AtomicU64::new(buf.len() as u64);
+        if read.is_err() {
+            return Some(ScanContext {
+                bytes_read: loaded,
+                ..unreadable()
+            });
+        }
+        let file_len = md.len();
+        Some(ScanContext {
+            truncated: (buf.len() as u64) < file_len,
+            content: Some(buf),
+            file_len: Some(file_len),
+            identity: Some(ObjectIdentity::from_metadata(&md)),
+            file: Some(f),
+            bytes_read: loaded,
+            ..unreadable()
+        })
     }
 
     /// Build a context over bytes that never existed as a file — how container
@@ -201,6 +210,7 @@ impl ScanContext {
             spctl_cache: OnceLock::new(),
             macho_cache: OnceLock::new(),
             incomplete_rules: std::sync::Mutex::new(Vec::new()),
+            bytes_read: AtomicU64::new(0),
         }
     }
 
@@ -264,6 +274,8 @@ impl ScanContext {
         use std::os::unix::fs::FileExt;
         let file = self.file.as_ref()?;
         let mut buf = vec![0u8; len];
+        // Charged on attempt: a read that fails partway may still have read.
+        self.bytes_read.fetch_add(len as u64, Ordering::Relaxed);
         file.read_exact_at(&mut buf, offset).ok()?;
         Some(buf)
     }
@@ -397,6 +409,14 @@ impl ScanContext {
         if !marked.contains(&rule_id) {
             marked.push(rule_id);
         }
+    }
+
+    /// Bytes this scan read from disk itself, for the target byte budget
+    /// (§11.12): the prefix load and every read past it (counted when
+    /// attempted, re-reads again). Reads served from `content` are free;
+    /// external tools (`codesign`, `spctl`) are not counted.
+    pub fn bytes_read(&self) -> u64 {
+        self.bytes_read.load(Ordering::Relaxed)
     }
 
     /// Number of distinct rules marked incomplete this scan.
@@ -713,5 +733,32 @@ mod tests {
         });
         assert!(!ok);
         assert_eq!(calls, 0);
+    }
+
+    #[test]
+    fn bytes_read_counts_disk_reads_but_not_reads_served_from_content() {
+        let len = (MAX_CONTENT_BYTES + 4096) as u64;
+        let path = sparse_temp_file("bytes-read", len);
+        let ctx = ScanContext::load(&path);
+        assert_eq!(ctx.bytes_read(), MAX_CONTENT_BYTES as u64);
+        ctx.read_at(0, 100).unwrap();
+        assert_eq!(ctx.bytes_read(), MAX_CONTENT_BYTES as u64);
+        ctx.read_at(len - 100, 100).unwrap();
+        ctx.read_at(len - 100, 100).unwrap();
+        assert_eq!(ctx.bytes_read(), MAX_CONTENT_BYTES as u64 + 200);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn load_if_offers_the_opened_length_and_a_refusal_returns_none() {
+        let path = write_temp_file("load-if", &[7u8; 1000]);
+        let mut offered = None;
+        let refused = ScanContext::load_if(&path, |len| {
+            offered = Some(len);
+            false
+        });
+        assert!(refused.is_none());
+        assert_eq!(offered, Some(1000));
+        let _ = std::fs::remove_file(&path);
     }
 }
