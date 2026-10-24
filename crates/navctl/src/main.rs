@@ -12,13 +12,39 @@ mod service;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-use clap::{Parser, Subcommand};
+use clap::{Args, Parser, Subcommand};
+use nav_core::ScanBudget;
 
 #[derive(Parser)]
 #[command(name = "navctl", version, about = "NAV — Not an Anti-Virus")]
 struct Cli {
     #[command(subcommand)]
     command: Command,
+}
+
+/// Overrides for the whole-target scan budget (§11.12). Unset fields keep
+/// the default; a single-file target ignores the budget.
+#[derive(Args)]
+struct BudgetArgs {
+    /// Most files collected in one directory or bundle scan, including
+    /// bundle resources that are then skipped.
+    #[arg(long, value_name = "N")]
+    max_files: Option<usize>,
+    /// Byte budget for one directory or bundle scan (§11.12). The first
+    /// file is always scanned.
+    #[arg(long, value_name = "BYTES")]
+    max_total_bytes: Option<u64>,
+}
+
+impl BudgetArgs {
+    fn budget(&self) -> ScanBudget {
+        let default = ScanBudget::default();
+        ScanBudget {
+            max_files: self.max_files.unwrap_or(default.max_files),
+            max_total_bytes: self.max_total_bytes.unwrap_or(default.max_total_bytes),
+            ..default
+        }
+    }
 }
 
 #[derive(Subcommand)]
@@ -49,6 +75,8 @@ enum Command {
         quick: bool,
         #[arg(long)]
         full: bool,
+        #[command(flatten)]
+        budget: BudgetArgs,
     },
     /// Ruleset inspection and testing.
     Rules {
@@ -107,6 +135,8 @@ enum RulesCommand {
         recursive: bool,
         #[arg(long)]
         json: bool,
+        #[command(flatten)]
+        budget: BudgetArgs,
     },
     /// List the active ruleset.
     List,
@@ -166,14 +196,16 @@ fn main() -> ExitCode {
             verbose,
             quick: _,
             full: _,
-        } => output::run_scan(&path, recursive, json, verbose),
+            budget,
+        } => output::run_scan(&path, recursive, json, verbose, &budget.budget()),
 
         Command::Rules { command } => match command {
             RulesCommand::Test {
                 path,
                 recursive,
                 json,
-            } => output::run_rules_test(&path, recursive, json),
+                budget,
+            } => output::run_rules_test(&path, recursive, json, &budget.budget()),
             RulesCommand::List => output::run_rules_list(),
             RulesCommand::Reload => not_yet_implemented("rules reload", "Phase 3"),
             RulesCommand::Rollback => not_yet_implemented("rules rollback", "Phase 3"),

@@ -14,15 +14,21 @@ use nav_core::model::lossy_path;
 use std::process::ExitCode;
 
 use nav_core::{
-    scan_target, with_schema_version, BudgetLimit, BudgetOutcome, EvidenceConfidence,
-    Recommendation, ScanCompleteness, ScanResult, TargetKind, TargetScan, SCAN_JSON_SCHEMA_VERSION,
-    UNINSPECTED_CONTAINER_ID,
+    scan_target_with_budget, with_schema_version, BudgetLimit, BudgetOutcome, EvidenceConfidence,
+    Recommendation, ScanBudget, ScanCompleteness, ScanResult, TargetKind, TargetScan,
+    SCAN_JSON_SCHEMA_VERSION, UNINSPECTED_CONTAINER_ID,
 };
 
 use crate::exit;
 
-pub fn run_scan(path: &Path, recursive: bool, json: bool, verbose: bool) -> ExitCode {
-    let scan = match scan_target(path, recursive) {
+pub fn run_scan(
+    path: &Path,
+    recursive: bool,
+    json: bool,
+    verbose: bool,
+    budget: &ScanBudget,
+) -> ExitCode {
+    let scan = match scan_target_with_budget(path, recursive, budget) {
         Ok(s) => s,
         Err(e) => {
             eprintln!("navctl: {}: {e}", path.display());
@@ -32,6 +38,9 @@ pub fn run_scan(path: &Path, recursive: bool, json: bool, verbose: bool) -> Exit
 
     if scan.results.is_empty() {
         if let Some(note) = unreadable_note(&scan) {
+            eprintln!("{note}");
+        }
+        if let Some(note) = budget_warning(&scan, path) {
             eprintln!("{note}");
         }
         eprintln!("navctl: no files found under {}", path.display());
@@ -55,12 +64,8 @@ pub fn run_scan(path: &Path, recursive: bool, json: bool, verbose: bool) -> Exit
     // Budget-exhausted coverage goes to stderr (keeping the --json stream on
     // stdout parseable as one object per file) and is folded into the exit
     // code below — a target cut short is not a clean target (§8, §11.8/§11.12).
-    if let BudgetOutcome::Exhausted(limit) = scan.budget {
-        eprintln!(
-            "navctl: partial coverage — scan budget reached ({}); more of {} was not scanned",
-            budget_limit_label(limit),
-            path.display()
-        );
+    if let Some(note) = budget_warning(&scan, path) {
+        eprintln!("{note}");
     }
     if !json {
         for note in uninspected_notes(&scan.results) {
@@ -73,13 +78,13 @@ pub fn run_scan(path: &Path, recursive: bool, json: bool, verbose: bool) -> Exit
     exit::code(exit::for_target(&scan))
 }
 
-pub fn run_rules_test(path: &Path, recursive: bool, json: bool) -> ExitCode {
+pub fn run_rules_test(path: &Path, recursive: bool, json: bool, budget: &ScanBudget) -> ExitCode {
     if !path.exists() {
         eprintln!("navctl: {} does not exist", path.display());
         return exit::code(exit::OPERATIONAL_ERROR);
     }
 
-    let scan = match scan_target(path, recursive) {
+    let scan = match scan_target_with_budget(path, recursive, budget) {
         Ok(s) => s,
         Err(e) => {
             eprintln!("navctl: {}: {e}", path.display());
@@ -103,20 +108,22 @@ pub fn run_rules_test(path: &Path, recursive: bool, json: bool) -> ExitCode {
 
     if scan.results.is_empty() {
         // Nothing readable — "couldn't check", not "clean" (§10, §11.8).
-        if let Some(note) = unreadable_note(&scan) {
+        let notes: Vec<String> = unreadable_note(&scan)
+            .into_iter()
+            .chain(budget_warning(&scan, path))
+            .collect();
+        for note in &notes {
             eprintln!("{note}");
-            // Unreadable subdirectories are structured data (§11.12), so a
-            // `--json` caller gets the multi-target envelope — empty
-            // `results`, `coverage_complete: false`, the `unreadable` array —
-            // rather than only a stderr note. `print_rules_test_multi` isn't
-            // usable here: it expects a non-empty `results` to pick a worst
-            // file from.
-            if json {
-                return match print_multi_json(&scan) {
-                    Ok(()) => exit::code(exit::INDETERMINATE),
-                    Err(e) => json_error(&e),
-                };
-            }
+        }
+        // Unreadable directories and a budget stop are structured data
+        // (§11.12), so `--json` gets the multi-target envelope (empty
+        // `results`, `coverage_complete: false`). `print_rules_test_multi`
+        // needs a non-empty `results` to pick a worst file from.
+        if json && !notes.is_empty() {
+            return match print_multi_json(&scan) {
+                Ok(()) => exit::code(exit::INDETERMINATE),
+                Err(e) => json_error(&e),
+            };
         }
         eprintln!("navctl: no files to scan under {}", path.display());
         return exit::code(exit::INDETERMINATE);
@@ -357,14 +364,26 @@ fn budget_note(scan: &TargetScan) -> Option<String> {
 }
 
 /// Exit code for a `scan` target that scored no files: `INDETERMINATE` when
-/// unreadable directories explain the emptiness — "couldn't check," not a
-/// tool failure (§10/§11.8) — `OPERATIONAL_ERROR` otherwise (issue #29,
-/// unchanged).
+/// unreadable directories or a budget stop explain the emptiness ("couldn't
+/// check", §10/§11.8), `OPERATIONAL_ERROR` otherwise (issue #29).
 fn empty_scan_exit_code(scan: &TargetScan) -> u8 {
-    if scan.unreadable.is_empty() {
+    if scan.coverage_complete() {
         exit::OPERATIONAL_ERROR
     } else {
         exit::INDETERMINATE
+    }
+}
+
+/// The stderr partial-coverage warning for a budget stop, or `None` if the
+/// scan fit its budget (§11.12).
+fn budget_warning(scan: &TargetScan, path: &Path) -> Option<String> {
+    match scan.budget {
+        BudgetOutcome::Exhausted(limit) => Some(format!(
+            "navctl: partial coverage — scan budget reached ({}); more of {} was not scanned",
+            budget_limit_label(limit),
+            path.display()
+        )),
+        BudgetOutcome::Within => None,
     }
 }
 
@@ -588,6 +607,13 @@ mod tests {
             empty_scan_exit_code(&empty_scan(vec![PathBuf::from("/tmp/locked")])),
             exit::INDETERMINATE,
             "unreadable subdirectories explain the emptiness — couldn't check, not a failure"
+        );
+        let mut stopped = empty_scan(Vec::new());
+        stopped.budget = nav_core::BudgetOutcome::Exhausted(BudgetLimit::Files);
+        assert_eq!(
+            empty_scan_exit_code(&stopped),
+            exit::INDETERMINATE,
+            "a budget stop before any file is partial coverage, not a failure (§11.12)"
         );
     }
 
