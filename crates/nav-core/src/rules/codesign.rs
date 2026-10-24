@@ -299,32 +299,9 @@ fn run_anchor_requirement(ctx: &ScanContext) -> Result<bool, RuleOutcome> {
     if !path_is_line_safe(&ctx.path) {
         return Err(RuleOutcome::NotApplicable);
     }
-    classify_anchor_exit(ctx.run_object_bound(|| spawn_anchor_requirement(&ctx.path)))
-}
-
-/// Exit code of `codesign --verify` against `anchor apple generic`; `None` if
-/// it was killed by a signal or failed to spawn.
-#[cfg(target_os = "macos")]
-fn spawn_anchor_requirement(path: &std::path::Path) -> Option<i32> {
-    // `--ignore-resources`: asks who signed the code, not whether the bundle
-    // seal is intact, so a broken seal doesn't become "couldn't check".
-    // `--all-architectures`: every slice must be anchored (fat binaries can mix signers).
-    std::process::Command::new("codesign")
-        .arg("--verify")
-        .arg("--ignore-resources")
-        .arg("--all-architectures")
-        .arg("-R=anchor apple generic")
-        .arg(path)
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .ok()?
-        .code()
-}
-
-#[cfg(not(target_os = "macos"))]
-fn spawn_anchor_requirement(_path: &std::path::Path) -> Option<i32> {
-    None
+    classify_anchor_exit(
+        ctx.run_object_bound(|| spawn_apple_anchor_check(&ctx.path, SIGNER_ANCHOR_FLAGS)),
+    )
 }
 
 /// Weight for a revoked code-signing certificate. Apple revokes Developer ID
@@ -464,27 +441,35 @@ fn spawn_codesign_verify(_path: &std::path::Path) -> Result<String, RuleOutcome>
 /// callers treat that as "not verified," never as an error (§5.2).
 pub(super) fn verifies_apple_anchor(ctx: &ScanContext) -> bool {
     ctx.source == crate::context::ContentSource::File
-        && ctx
-            .run_object_bound(|| spawn_verify_apple_anchor(&ctx.path))
-            .unwrap_or(false)
+        && ctx.run_object_bound(|| spawn_apple_anchor_check(&ctx.path, STRICT_ANCHOR_FLAGS))
+            == Some(0)
 }
 
+/// Whole signature, including the bundle seal, must verify. Used only to lower weights.
+const STRICT_ANCHOR_FLAGS: &[&str] = &["--strict"];
+
+/// Who signed every slice. `--ignore-resources`: a broken bundle seal must not
+/// become "couldn't check". `--all-architectures`: fat binaries can mix signers.
+const SIGNER_ANCHOR_FLAGS: &[&str] = &["--ignore-resources", "--all-architectures"];
+
+/// Exit code of `codesign --verify <extra> -R="anchor apple generic" <path>`;
+/// `None` if it was killed by a signal or failed to spawn.
 #[cfg(target_os = "macos")]
-fn spawn_verify_apple_anchor(path: &std::path::Path) -> Option<bool> {
-    let status = std::process::Command::new("codesign")
+fn spawn_apple_anchor_check(path: &std::path::Path, extra: &[&str]) -> Option<i32> {
+    std::process::Command::new("codesign")
         .arg("--verify")
-        .arg("--strict")
+        .args(extra)
         .arg("-R=anchor apple generic")
         .arg(path)
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .status()
-        .ok()?;
-    Some(status.success())
+        .ok()?
+        .code()
 }
 
 #[cfg(not(target_os = "macos"))]
-fn spawn_verify_apple_anchor(_path: &std::path::Path) -> Option<bool> {
+fn spawn_apple_anchor_check(_path: &std::path::Path, _extra: &[&str]) -> Option<i32> {
     None
 }
 
@@ -867,6 +852,15 @@ mod tests {
             UnanchoredIdentityRule.evaluate(&ctx("readme.txt", b"just some notes\n")),
             Ok(None)
         ));
+    }
+
+    /// The two anchor checks ask different questions; don't unify the flags.
+    #[test]
+    fn anchor_flag_sets_differ_as_intended() {
+        assert!(STRICT_ANCHOR_FLAGS.contains(&"--strict"));
+        assert!(SIGNER_ANCHOR_FLAGS.contains(&"--ignore-resources"));
+        assert!(SIGNER_ANCHOR_FLAGS.contains(&"--all-architectures"));
+        assert!(!SIGNER_ANCHOR_FLAGS.contains(&"--strict"));
     }
 
     #[test]
