@@ -177,12 +177,16 @@ mod tests {
 
     impl Tmp {
         fn new() -> Self {
+            // Parallel tests can read the same clock tick (macOS has µs
+            // resolution), so a per-process counter keeps the names apart.
+            static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+            let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             let nanos = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_nanos())
                 .unwrap_or_default();
-            let p =
-                std::env::temp_dir().join(format!("nav-xtask-plan-{}-{nanos}", std::process::id()));
+            let p = std::env::temp_dir()
+                .join(format!("nav-xtask-plan-{}-{nanos}-{n}", std::process::id()));
             fs::create_dir_all(&p).unwrap();
             Self(p)
         }
