@@ -10,6 +10,8 @@
 //! `BudgetExceeded` is a §6.2 policy stop, not evidence of malice — callers
 //! must keep it distinct from `Malformed`.
 
+use std::sync::OnceLock;
+
 use crate::decode::DecodeError;
 
 /// Longest Huffman code permitted by RFC 1951 §3.2.7.
@@ -221,7 +223,7 @@ fn inflate_into(data: &[u8], budget: usize, out: &mut Vec<u8>) -> Result<usize, 
             0 => stored_block(&mut r, out, budget)?,
             1 => {
                 let (lit, dist) = fixed_tables()?;
-                compressed_block(&mut r, out, budget, &lit, &dist)?;
+                compressed_block(&mut r, out, budget, lit, dist)?;
             }
             2 => {
                 let (lit, dist) = dynamic_tables(&mut r)?;
@@ -316,8 +318,17 @@ fn compressed_block(
     }
 }
 
-/// The fixed literal/length and distance tables of RFC 1951 §3.2.6.
-fn fixed_tables() -> Result<(Huffman, Huffman), InflateError> {
+/// The fixed literal/length and distance tables of RFC 1951 §3.2.6, built
+/// once per process.
+fn fixed_tables() -> Result<&'static (Huffman, Huffman), InflateError> {
+    static FIXED: OnceLock<Option<(Huffman, Huffman)>> = OnceLock::new();
+    FIXED
+        .get_or_init(|| build_fixed_tables().ok())
+        .as_ref()
+        .ok_or(InflateError::Malformed)
+}
+
+fn build_fixed_tables() -> Result<(Huffman, Huffman), InflateError> {
     let mut lit = [0u8; 288];
     for (i, l) in lit.iter_mut().enumerate() {
         *l = if i < 144 {
@@ -824,6 +835,35 @@ mod tests {
                 "dynamic header truncated to {n} bytes should not decode"
             );
         }
+    }
+
+    #[test]
+    fn fixed_tables_are_built_once() {
+        assert!(std::ptr::eq(
+            fixed_tables().unwrap(),
+            fixed_tables().unwrap()
+        ));
+    }
+
+    #[test]
+    fn long_run_of_empty_fixed_blocks_decodes_to_nothing() {
+        const N: usize = 100_000;
+        let mut stream = vec![0u8; N * 10 / 8];
+        for blk in 0..N {
+            // Per block: BFINAL, BTYPE=1 (bits 1,0), then 7 zero bits for EOB.
+            let base = blk * 10;
+            let bits = [(blk == N - 1) as u8, 1, 0];
+            for (k, b) in bits.iter().enumerate() {
+                let i = base + k;
+                stream[i / 8] |= b << (i % 8);
+            }
+        }
+        assert_eq!(inflate(&stream, BIG), Ok(vec![]));
+        // Dropping the last byte loses the final block's bits.
+        assert_eq!(
+            inflate(&stream[..stream.len() - 1], BIG),
+            Err(InflateError::Truncated)
+        );
     }
 
     #[test]
