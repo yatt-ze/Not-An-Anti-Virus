@@ -8,12 +8,9 @@
       "Bash(cargo test --workspace)",
       "Bash(cargo clippy --workspace --all-targets -- -D warnings)",
       "Bash(cargo fmt --all -- --check)",
-      "Bash(codesign --verify *)",
-      "Bash(codesign -dv *)",
       "Bash(otool *)",
       "Bash(spctl -a *)",
-      "Bash(spctl --assess *)",
-      "Bash(xattr -l *)"
+      "Bash(spctl --assess *)"
     ]
   }
 }
