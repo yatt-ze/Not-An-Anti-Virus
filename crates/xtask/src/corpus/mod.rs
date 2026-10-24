@@ -31,7 +31,8 @@ pub struct Tuning {
     #[arg(long)]
     pub jobs: Option<usize>,
     /// Directories with this many files or more are split into children
-    /// (navctl's walk stops at 50,000 files).
+    /// (keeps chunks parallel, and under the 50,000-file default for a base
+    /// navctl without budget flags).
     #[arg(long, default_value_t = 45_000)]
     pub split_at: usize,
     /// Files or directories to scan (default on macOS: system and app dirs).

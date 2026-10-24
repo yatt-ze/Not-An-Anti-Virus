@@ -90,7 +90,15 @@ pub fn run(targets: &[Target], planned: &Plan, jobs: Option<usize>) -> Result<Ve
     let mut sinks = Vec::new();
     let mut navctls = Vec::new();
     for t in targets {
-        navctls.push(super::absolute(t.navctl)?);
+        let navctl = super::absolute(t.navctl)?;
+        let budget = unlimited_budget_args(&navctl)?;
+        if budget.is_empty() {
+            println!(
+                "note: {} has no budget flags; large bundles may stop at its default budget",
+                navctl.display()
+            );
+        }
+        navctls.push((navctl, budget));
         let out = super::absolute(t.out)?;
         if let Some(parent) = out.parent() {
             std::fs::create_dir_all(parent)
@@ -123,8 +131,8 @@ pub fn run(targets: &[Target], planned: &Plan, jobs: Option<usize>) -> Result<Ve
                 if failure.lock().unwrap().is_some() {
                     break;
                 }
-                for (navctl, sink) in navctls.iter().zip(&sinks) {
-                    if let Err(e) = run_chunk(navctl, chunk, sink) {
+                for ((navctl, budget), sink) in navctls.iter().zip(&sinks) {
+                    if let Err(e) = run_chunk(navctl, budget, chunk, sink) {
                         failure.lock().unwrap().get_or_insert(e);
                         return;
                     }
@@ -160,11 +168,34 @@ pub fn run(targets: &[Target], planned: &Plan, jobs: Option<usize>) -> Result<Ve
     Ok(summaries)
 }
 
+/// Flags lifting navctl's walk budget so no corpus target is cut short and a
+/// missing file is always a real loss (§11.12). Empty for an older navctl
+/// without the flags (e.g. a base revision that predates them).
+fn unlimited_budget_args(navctl: &Path) -> Result<Vec<String>> {
+    let help = Command::new(navctl)
+        .args(["scan", "--help"])
+        .output()
+        .with_context(|| format!("running {} scan --help", navctl.display()))?;
+    let text = String::from_utf8_lossy(&help.stdout);
+    let supported =
+        help.status.success() && text.contains("--max-files") && text.contains("--max-total-bytes");
+    Ok(if supported {
+        vec![
+            "--max-files".into(),
+            usize::MAX.to_string(),
+            "--max-total-bytes".into(),
+            u64::MAX.to_string(),
+        ]
+    } else {
+        Vec::new()
+    })
+}
+
 /// Runs navctl on one chunk and records its output. Errors only if navctl
 /// can't be spawned or a sink can't be written.
-fn run_chunk(navctl: &Path, chunk: &Chunk, sink: &Mutex<Sink>) -> Result<()> {
+fn run_chunk(navctl: &Path, budget: &[String], chunk: &Chunk, sink: &Mutex<Sink>) -> Result<()> {
     let mut cmd = Command::new(navctl);
-    cmd.arg("scan");
+    cmd.arg("scan").args(budget);
     if chunk.recursive {
         cmd.arg("--recursive");
     }
