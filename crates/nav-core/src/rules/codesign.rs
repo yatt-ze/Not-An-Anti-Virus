@@ -225,13 +225,11 @@ impl Rule for AdHocSignedRule {
     }
 }
 
-/// Weight for a signature whose certificate does not chain to Apple.
-/// Corroboration-only: above ad-hoc (3) and unsigned (4) because it claims an
-/// identity no Apple anchor vouches for; never enough alone to reach Notify (§5.1).
+/// Weight for a signature that does not chain to an Apple anchor. Corroboration-only (§5.1, §5.2).
 const UNANCHORED_IDENTITY_WEIGHT: i32 = 5;
 
-/// Notes a real-identity signature that does not chain to an Apple anchor
-/// (self-signed or private CA).
+/// Notes a signature in any slice that does not chain to an Apple anchor.
+/// Runs only when the native slice is a real (non-ad-hoc) identity.
 pub struct UnanchoredIdentityRule;
 
 impl Default for UnanchoredIdentityRule {
@@ -270,7 +268,7 @@ impl Rule for UnanchoredIdentityRule {
                 id: "unanchored-signing-identity".to_string(),
                 weight: UNANCHORED_IDENTITY_WEIGHT,
                 description:
-                    "binary is signed with a certificate that does not chain to Apple (self-signed or private CA)"
+                    "binary carries a signature that does not chain to an Apple anchor (self-signed, private CA, or a mixed-signer slice)"
                         .to_string(),
                 category: SignalCategory::ProvenanceConcern,
             }))
