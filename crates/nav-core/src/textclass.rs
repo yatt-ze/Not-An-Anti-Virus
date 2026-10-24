@@ -26,8 +26,9 @@ pub(crate) enum TextClass {
     /// Opaque binary blob.
     NotText,
     /// Script or text. `container_evidence` is set only for the
-    /// printable-prefix fallback, when the prefix has a NUL or a known
-    /// binary magic; shebang and script-extension files never carry it.
+    /// printable-prefix fallback, when the prefix has a byte that
+    /// [`is_serialization_control`] accepts or a known binary magic;
+    /// shebang and script-extension files never carry it.
     Text { container_evidence: bool },
 }
 
@@ -37,6 +38,12 @@ pub(crate) fn starts_with_binary_magic(prefix: &[u8]) -> bool {
         || prefix.starts_with(b"II*\0")
         || prefix.starts_with(b"MM\0*")
         || prefix.get(4..8) == Some(b"ftyp")
+}
+
+/// C0 control bytes that are rare in text but frame serialized formats
+/// (protobuf tags, lengths); tab, LF, CR, FF and ESC occur in ordinary text.
+fn is_serialization_control(b: u8) -> bool {
+    b < 0x20 && !matches!(b, b'\t' | b'\n' | b'\r' | 0x0C | 0x1B)
 }
 
 /// Extensions that mark a file as a script regardless of content.
@@ -84,6 +91,84 @@ pub(crate) fn classify_text(content: &[u8], path: &Path) -> TextClass {
         return TextClass::NotText;
     }
     TextClass::Text {
-        container_evidence: prefix.contains(&0) || starts_with_binary_magic(prefix),
+        container_evidence: prefix.iter().any(|&b| is_serialization_control(b))
+            || starts_with_binary_magic(prefix),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn prefix_with(at: usize, byte: u8) -> Vec<u8> {
+        let mut v = vec![b'a'; 512];
+        for i in (63..512).step_by(64) {
+            v[i] = b'\n';
+        }
+        v[at] = byte;
+        v
+    }
+
+    fn evidence(content: &[u8], path: &str) -> Option<bool> {
+        match classify_text(content, Path::new(path)) {
+            TextClass::Text { container_evidence } => Some(container_evidence),
+            TextClass::NotText => None,
+        }
+    }
+
+    #[test]
+    fn serialization_controls_are_evidence() {
+        for b in 0u8..0x20 {
+            if matches!(b, 0x09 | 0x0A | 0x0C | 0x0D | 0x1B) {
+                continue;
+            }
+            assert_eq!(
+                evidence(&prefix_with(100, b), "model"),
+                Some(true),
+                "byte {b:#04x}"
+            );
+        }
+    }
+
+    #[test]
+    fn ordinary_text_bytes_are_not_evidence() {
+        for b in [0x09u8, 0x0A, 0x0C, 0x0D, 0x1B, 0x7F, 0x80] {
+            assert_eq!(
+                evidence(&prefix_with(100, b), "model"),
+                Some(false),
+                "byte {b:#04x}"
+            );
+        }
+    }
+
+    #[test]
+    fn protobuf_header_is_evidence() {
+        let mut v = b"\x08\x08\x12\x07pytorch\x1a\x052.1.0:".to_vec();
+        for i in 0.. {
+            let n = format!("/encoder/layer.{i}/attention/self/query/MatMul");
+            v.extend([0x0a, n.len() as u8]);
+            v.extend(n.as_bytes());
+            if v.len() >= 512 {
+                break;
+            }
+        }
+        assert_eq!(evidence(&v, "model"), Some(true));
+    }
+
+    #[test]
+    fn shebang_and_script_extension_never_carry_evidence() {
+        let mut sh = b"#!/bin/sh\n".to_vec();
+        sh.resize(512, b'a');
+        sh[100] = 0x08;
+        assert_eq!(evidence(&sh, "model"), Some(false));
+        assert_eq!(evidence(&prefix_with(100, 0x08), "run.sh"), Some(false));
+    }
+
+    #[test]
+    fn control_byte_after_prefix_is_ignored() {
+        let mut v = prefix_with(100, b'a');
+        v.extend([b'a'; 100]);
+        v.push(0x08);
+        assert_eq!(evidence(&v, "model"), Some(false));
     }
 }
