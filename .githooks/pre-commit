@@ -1,0 +1,16 @@
+#!/bin/sh
+# Runs the CLAUDE.md "Before every commit" checks, the same ones CI runs.
+# Enable once per clone: git config core.hooksPath .githooks
+# Checks the working tree, not just what's staged. Skip with --no-verify.
+set -e
+
+if ! cargo fmt --all -- --check >/dev/null 2>&1; then
+    echo "pre-commit: code is not formatted; run: cargo fmt --all" >&2
+    exit 1
+fi
+cargo clippy --quiet --workspace --all-targets -- -D warnings
+if ! out=$(cargo test --quiet --workspace 2>&1); then
+    printf '%s\n' "$out" | tail -n 40 >&2
+    echo "pre-commit: cargo test --workspace failed" >&2
+    exit 1
+fi

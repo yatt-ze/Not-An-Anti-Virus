@@ -131,7 +131,12 @@ no code changes needed.
 ## Contributing
 
 `cargo fmt`, `cargo clippy --workspace --all-targets -- -D warnings`, and
-`cargo test --workspace` must all pass before a commit.
+`cargo test --workspace` must all pass before a commit. To run them
+automatically on every commit:
+
+```sh
+git config core.hooksPath .githooks
+```
 
 The design rationale and longer-term roadmap live in
 [`docs/design.md`](docs/design.md) — worth reading before proposing

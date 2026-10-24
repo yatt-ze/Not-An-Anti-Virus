@@ -89,6 +89,10 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 ```
 
+`.githooks/pre-commit` runs the same checks on every commit once enabled
+(`git config core.hooksPath .githooks`; worktrees share it). Don't bypass
+it with `--no-verify` — fix the failure instead.
+
 ## Adding or changing a heuristic rule in `nav-core`
 
 - A rule reports `Ok(None)` when it ran and found nothing, `Ok(Some(signal))`
