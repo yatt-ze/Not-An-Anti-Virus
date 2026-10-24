@@ -328,7 +328,13 @@ fn fixed_tables() -> Result<&'static (Huffman, Huffman), InflateError> {
         .ok_or(InflateError::Malformed)
 }
 
+/// Times `build_fixed_tables` has run; tests check it stays at one.
+#[cfg(test)]
+static FIXED_BUILDS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
 fn build_fixed_tables() -> Result<(Huffman, Huffman), InflateError> {
+    #[cfg(test)]
+    FIXED_BUILDS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let mut lit = [0u8; 288];
     for (i, l) in lit.iter_mut().enumerate() {
         *l = if i < 144 {
@@ -838,17 +844,14 @@ mod tests {
     }
 
     #[test]
-    fn fixed_tables_are_built_once() {
-        assert!(std::ptr::eq(
-            fixed_tables().unwrap(),
-            fixed_tables().unwrap()
-        ));
+    fn fixed_tables_build_from_the_rfc_lengths() {
+        assert!(fixed_tables().is_ok());
     }
 
     #[test]
-    fn long_run_of_empty_fixed_blocks_decodes_to_nothing() {
+    fn empty_fixed_blocks_reuse_one_table_build() {
         const N: usize = 100_000;
-        let mut stream = vec![0u8; N * 10 / 8];
+        let mut stream = vec![0u8; (N * 10).div_ceil(8)];
         for blk in 0..N {
             // Per block: BFINAL, BTYPE=1 (bits 1,0), then 7 zero bits for EOB.
             let base = blk * 10;
@@ -864,6 +867,8 @@ mod tests {
             inflate(&stream[..stream.len() - 1], BIG),
             Err(InflateError::Truncated)
         );
+        // One build total, however many fixed blocks were decoded.
+        assert_eq!(FIXED_BUILDS.load(std::sync::atomic::Ordering::Relaxed), 1);
     }
 
     #[test]
