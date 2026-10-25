@@ -293,15 +293,16 @@ fn classify_anchor_exit(code: Option<i32>) -> Result<bool, RuleOutcome> {
     }
 }
 
-/// Asks whether the scanned file's signature chains to an Apple anchor.
-/// Object-bound like the other external checks (§11.7).
+/// Asks whether every slice's signature chains to an Apple anchor. The spawn
+/// is cached on `ctx` and object-bound (§11.7).
 fn run_anchor_requirement(ctx: &ScanContext) -> Result<bool, RuleOutcome> {
     if !path_is_line_safe(&ctx.path) {
         return Err(RuleOutcome::NotApplicable);
     }
-    classify_anchor_exit(
-        ctx.run_object_bound(|| spawn_apple_anchor_check(&ctx.path, SIGNER_ANCHOR_FLAGS)),
-    )
+    let (code, _stderr) = ctx
+        .signer_check(|| spawn_signer_check(&ctx.path))
+        .ok_or(RuleOutcome::NotApplicable)?;
+    classify_anchor_exit(code)
 }
 
 /// Weight for a revoked code-signing certificate. Apple revokes Developer ID
@@ -441,24 +442,25 @@ fn spawn_codesign_verify(_path: &std::path::Path) -> Result<String, RuleOutcome>
 /// callers treat that as "not verified," never as an error (§5.2).
 pub(super) fn verifies_apple_anchor(ctx: &ScanContext) -> bool {
     ctx.source == crate::context::ContentSource::File
-        && ctx.run_object_bound(|| spawn_apple_anchor_check(&ctx.path, STRICT_ANCHOR_FLAGS))
-            == Some(0)
+        && ctx.run_object_bound(|| spawn_strict_anchor_check(&ctx.path)) == Some(0)
 }
 
 /// Whole signature, including the bundle seal, must verify. Used only to lower weights.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))] // only the macOS spawns use it
 const STRICT_ANCHOR_FLAGS: &[&str] = &["--strict"];
 
 /// Who signed every slice. `--ignore-resources`: a broken bundle seal must not
 /// become "couldn't check". `--all-architectures`: fat binaries can mix signers.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))] // only the macOS spawns use it
 const SIGNER_ANCHOR_FLAGS: &[&str] = &["--ignore-resources", "--all-architectures"];
 
-/// Exit code of `codesign --verify <extra> -R="anchor apple generic" <path>`;
+/// Exit code of `codesign --verify --strict -R="anchor apple generic" <path>`;
 /// `None` if it was killed by a signal or failed to spawn.
 #[cfg(target_os = "macos")]
-fn spawn_apple_anchor_check(path: &std::path::Path, extra: &[&str]) -> Option<i32> {
+fn spawn_strict_anchor_check(path: &std::path::Path) -> Option<i32> {
     std::process::Command::new("codesign")
         .arg("--verify")
-        .args(extra)
+        .args(STRICT_ANCHOR_FLAGS)
         .arg("-R=anchor apple generic")
         .arg(path)
         .stdout(std::process::Stdio::null())
@@ -469,7 +471,31 @@ fn spawn_apple_anchor_check(path: &std::path::Path, extra: &[&str]) -> Option<i3
 }
 
 #[cfg(not(target_os = "macos"))]
-fn spawn_apple_anchor_check(_path: &std::path::Path, _extra: &[&str]) -> Option<i32> {
+fn spawn_strict_anchor_check(_path: &std::path::Path) -> Option<i32> {
+    None
+}
+
+/// Exit code of `codesign --verify` with [`SIGNER_ANCHOR_FLAGS`] and the Apple
+/// anchor requirement (`None` if killed by a signal), plus its stderr. `None`
+/// if it failed to spawn.
+#[cfg(target_os = "macos")]
+fn spawn_signer_check(path: &std::path::Path) -> Option<(Option<i32>, String)> {
+    let output = std::process::Command::new("codesign")
+        .arg("--verify")
+        .args(SIGNER_ANCHOR_FLAGS)
+        .arg("-R=anchor apple generic")
+        .arg(path)
+        .stdout(std::process::Stdio::null())
+        .output()
+        .ok()?;
+    Some((
+        output.status.code(),
+        String::from_utf8_lossy(&output.stderr).into_owned(),
+    ))
+}
+
+#[cfg(not(target_os = "macos"))]
+fn spawn_signer_check(_path: &std::path::Path) -> Option<(Option<i32>, String)> {
     None
 }
 

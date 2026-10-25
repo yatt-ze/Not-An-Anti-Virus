@@ -120,6 +120,9 @@ pub struct ScanContext {
     pub(crate) codesign_dv_cache: OnceLock<Option<(bool, String)>>,
     /// Memoized `spctl` assessment spawn (§5.2), same reasoning as above.
     pub(crate) spctl_cache: OnceLock<Option<String>>,
+    /// Memoized signer check (`codesign --verify --all-architectures
+    /// -R=...`, §5.2): exit code and stderr. `None` as for the caches above.
+    pub(crate) signer_check_cache: OnceLock<Option<(Option<i32>, String)>>,
     /// Memoized offset-based Mach-O scan (§5.2, #45) — several rules ask
     /// about the same file. `pub(crate)` for the same reason as the caches
     /// above; use [`ScanContext::macho`] to read it.
@@ -208,6 +211,7 @@ impl ScanContext {
             file: None,
             codesign_dv_cache: OnceLock::new(),
             spctl_cache: OnceLock::new(),
+            signer_check_cache: OnceLock::new(),
             macho_cache: OnceLock::new(),
             incomplete_rules: std::sync::Mutex::new(Vec::new()),
             bytes_read: AtomicU64::new(0),
@@ -362,6 +366,18 @@ impl ScanContext {
     /// this platform, or the object changed under the path (§11.7).
     pub fn spctl_assessment(&self, spawn: impl FnOnce() -> Option<String>) -> Option<String> {
         self.spctl_cache
+            .get_or_init(|| self.spawn_if_object_stable(spawn))
+            .clone()
+    }
+
+    /// Runs `spawn` at most once per scan and returns the cached signer check:
+    /// `codesign`'s exit code (`None` if killed by a signal) and its stderr.
+    /// `None` on the same terms as [`Self::codesign_dv`].
+    pub fn signer_check(
+        &self,
+        spawn: impl FnOnce() -> Option<(Option<i32>, String)>,
+    ) -> Option<(Option<i32>, String)> {
+        self.signer_check_cache
             .get_or_init(|| self.spawn_if_object_stable(spawn))
             .clone()
     }
