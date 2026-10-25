@@ -88,6 +88,17 @@ pub(crate) fn could_be_plist(bytes: &[u8]) -> bool {
     bytes.starts_with(b"bplist00") || skip_bom_and_ws(bytes).first() == Some(&b'<')
 }
 
+/// False only if `bytes` can't be a plist `launchctl` loads: not binary, not
+/// XML, and not possibly UTF-16 (a UTF-16 BOM, or a NUL in the first 8 bytes).
+/// OpenStep, JSON and text before the `<` were measured as refused (§5.2).
+pub(crate) fn could_be_launchd_plist(bytes: &[u8]) -> bool {
+    bytes.starts_with(b"bplist")
+        || could_be_plist(bytes)
+        || bytes.starts_with(&[0xFF, 0xFE])
+        || bytes.starts_with(&[0xFE, 0xFF])
+        || bytes.iter().take(8).any(|&b| b == 0)
+}
+
 /// Parse `bytes` as a binary (`bplist00`) or XML property list.
 ///
 /// Returns `None` for anything that isn't a plist this reader recognizes, or
