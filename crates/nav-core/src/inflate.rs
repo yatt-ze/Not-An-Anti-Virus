@@ -230,10 +230,11 @@ fn gzip_into(
     consumed: &mut usize,
 ) -> Result<(), InflateError> {
     let off = gzip_header_len(data)?;
-    *consumed = off;
-    let body = data.get(off..).ok_or(InflateError::Truncated)?;
-    let mut used = 0;
-    let result = inflate_counted(body, budget, out, &mut used);
+    // gzip_header_len guarantees `off <= data.len()`.
+    let body = data.get(off..).unwrap_or_default();
+    let mut r = BitReader::new(body);
+    let result = inflate_blocks(&mut r, budget, out);
+    let used = r.bytes_consumed();
     *consumed = off.saturating_add(used);
     result?;
 
@@ -264,22 +265,9 @@ fn gzip_into(
 /// Decode a DEFLATE stream into `out` (empty on entry), returning how many
 /// bytes of `data` were consumed. On error `out` holds whatever was written.
 fn inflate_into(data: &[u8], budget: usize, out: &mut Vec<u8>) -> Result<usize, InflateError> {
-    let mut used = 0;
-    inflate_counted(data, budget, out, &mut used).map(|()| used)
-}
-
-/// [`inflate_into`] that also records in `used` the bytes consumed when it
-/// fails (rounded up to a byte).
-fn inflate_counted(
-    data: &[u8],
-    budget: usize,
-    out: &mut Vec<u8>,
-    used: &mut usize,
-) -> Result<(), InflateError> {
     let mut r = BitReader::new(data);
-    let result = inflate_blocks(&mut r, budget, out);
-    *used = r.bytes_consumed();
-    result
+    inflate_blocks(&mut r, budget, out)?;
+    Ok(r.bytes_consumed())
 }
 
 /// The DEFLATE block loop over `r`; see [`inflate_into`].

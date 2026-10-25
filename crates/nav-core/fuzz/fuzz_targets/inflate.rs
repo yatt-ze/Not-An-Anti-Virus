@@ -51,6 +51,15 @@ fuzz_target!(|data: &[u8]| {
         );
     }
 
+    // Callers slice the unread rest at `consumed`.
+    let (out, consumed, _) = nav_core::inflate::gzip_decompress_consumed(data, BUDGET);
+    assert!(out.len() <= BUDGET, "gzip consumed exceeded the budget");
+    assert!(
+        consumed <= data.len(),
+        "gzip consumed {consumed} of {} input bytes",
+        data.len()
+    );
+
     // A zero budget must never yield output — the clamp-to-budget boundary.
     for r in [
         nav_core::inflate::inflate(data, 0),
