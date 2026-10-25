@@ -361,9 +361,11 @@ impl Rule for InvalidSignatureRule {
                 category: SignalCategory::ProvenanceConcern,
             })),
             SignerCheck::Anchored | SignerCheck::Unanchored => Ok(None),
-            // A universal build often leaves its non-native slice unsigned;
-            // `codesign` checks the native slice before reporting it.
-            SignerCheck::UnsignedSlice if has_unsigned_fat_slice(ctx) => Ok(None),
+            // A universal build often leaves one slice unsigned. With one
+            // signed slice, the native one (`-dv` saw it), `codesign` reports
+            // that slice's failure ahead of the unsigned one; with more, it
+            // may stop before checking them all.
+            SignerCheck::UnsignedSlice if is_one_signed_slice_beside_unsigned(ctx) => Ok(None),
             SignerCheck::UnsignedSlice => Err(RuleOutcome::NotApplicable),
         }
     }
@@ -389,12 +391,13 @@ enum SignerCheck {
     UnsignedSlice,
 }
 
-/// True if `ctx` is a fat Mach-O with a slice that has no `LC_CODE_SIGNATURE`.
-fn has_unsigned_fat_slice(ctx: &ScanContext) -> bool {
-    ctx.macho()
-        .images
-        .iter()
-        .any(|image| image.is_fat && !image.has_code_signature)
+/// True if `ctx` is a fat Mach-O with exactly one slice carrying an
+/// `LC_CODE_SIGNATURE`, at least one without, and no slice the parser skipped.
+fn is_one_signed_slice_beside_unsigned(ctx: &ScanContext) -> bool {
+    let macho = ctx.macho();
+    let fat: Vec<_> = macho.images.iter().filter(|image| image.is_fat).collect();
+    let signed = fat.iter().filter(|image| image.has_code_signature).count();
+    macho.skipped_slices == 0 && signed == 1 && fat.len() > signed
 }
 
 /// `codesign` diagnostics, after the `<path>: ` prefix, that mean the
@@ -1190,6 +1193,23 @@ mod tests {
         assert_eq!(slice_status(&image), Some(DvStatus::AdHocManual));
         image.has_cms_signature = true;
         assert_eq!(slice_status(&image), Some(DvStatus::Signed));
+    }
+
+    /// "not signed at all" is trusted only with one signed slice beside the
+    /// unsigned ones; with two, `codesign` may not have checked both.
+    #[test]
+    fn one_signed_slice_beside_unsigned_is_recognised() {
+        let fixtures = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures");
+        let load = |name: &str| ScanContext::load(&fixtures.join(name));
+        assert!(is_one_signed_slice_beside_unsigned(&load(
+            "benign/macho_universal_unsigned_x86_slice"
+        )));
+        assert!(!is_one_signed_slice_beside_unsigned(&load(
+            "suspicious/macho_fat_adhoc_native_self_signed_slice"
+        )));
+        assert!(!is_one_signed_slice_beside_unsigned(&load(
+            "benign/tiny_hello_arm64"
+        )));
     }
 
     #[test]
