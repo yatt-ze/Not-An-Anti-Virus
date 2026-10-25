@@ -891,7 +891,7 @@ mod tests {
         }
     }
 
-    /// All six rules' verdicts come from `codesign`/`spctl` on the whole
+    /// All seven rules' verdicts come from `codesign`/`spctl` on the whole
     /// file, not the truncated prefix — see the module-level doc comments.
     #[test]
     fn all_codesign_rules_cover_truncation_on_a_truncated_macho_context() {
@@ -927,7 +927,7 @@ mod tests {
     /// A >8 MiB file with a `CAFEBABE` header whose sole arch-table entry
     /// points past the 8 MiB prefix at bytes that aren't a thin Mach-O
     /// magic: `ctx.macho()` reads the real offset and correctly says this
-    /// isn't Mach-O, so none of the six rules should even ask `codesign`
+    /// isn't Mach-O, so none of the seven rules should even ask `codesign`
     /// (§5.2, #45).
     #[test]
     fn codesign_rules_do_not_treat_an_out_of_bounds_fat_offset_as_macho() {
@@ -959,6 +959,7 @@ mod tests {
         assert!(matches!(UnsignedBinaryRule.evaluate(&ctx), Ok(None)));
         assert!(matches!(AdHocSignedRule.evaluate(&ctx), Ok(None)));
         assert!(matches!(UnanchoredIdentityRule.evaluate(&ctx), Ok(None)));
+        assert!(matches!(InvalidSignatureRule.evaluate(&ctx), Ok(None)));
         assert!(matches!(RevokedSignatureRule.evaluate(&ctx), Ok(None)));
         assert!(matches!(UnnotarizedSignedRule.evaluate(&ctx), Ok(None)));
         assert!(matches!(NotarizedRule.evaluate(&ctx), Ok(None)));
@@ -980,6 +981,10 @@ mod tests {
         ));
         assert!(matches!(
             UnanchoredIdentityRule.evaluate(&c),
+            Err(RuleOutcome::NotApplicable)
+        ));
+        assert!(matches!(
+            InvalidSignatureRule.evaluate(&c),
             Err(RuleOutcome::NotApplicable)
         ));
     }
