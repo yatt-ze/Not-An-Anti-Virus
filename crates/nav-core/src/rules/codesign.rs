@@ -356,7 +356,7 @@ impl Rule for InvalidSignatureRule {
                 id: "invalid-code-signature".to_string(),
                 weight: INVALID_SIGNATURE_WEIGHT,
                 description:
-                    "binary's code signature does not verify (modified after signing, or a corrupt signature)"
+                    "binary's code signature does not verify (modified after signing, corrupt, or its certificate chain is not trusted)"
                         .to_string(),
                 category: SignalCategory::ProvenanceConcern,
             })),
