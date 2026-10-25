@@ -404,6 +404,8 @@ fn has_unsigned_fat_slice(ctx: &ScanContext) -> bool {
 const BROKEN_SIGNATURE_DIAGNOSTICS: &[&str] = &[
     "invalid signature (code or signature have been modified)",
     "invalid or unsupported format for signature",
+    // The CMS blob doesn't decode (a corrupt header, or an empty wrapper).
+    "Unknown format in import.",
     "invalid Info.plist (plist or signature have been modified)",
     "main executable failed strict validation",
     "CSSMERR_TP_NOT_TRUSTED",
@@ -1121,6 +1123,7 @@ mod tests {
         for name in [
             "suspicious/macho_adhoc_modified_after_signing",
             "suspicious/macho_self_signed_corrupt_cms",
+            "suspicious/macho_self_signed_corrupt_cms_header",
         ] {
             let signal = InvalidSignatureRule
                 .evaluate(&ScanContext::load(&fixtures.join(name)))

@@ -611,6 +611,14 @@
     ],
     "completeness": "complete"
   },
+  "suspicious/macho_self_signed_corrupt_cms_header": {
+    "score": 5,
+    "recommendation": "no-action",
+    "rule_ids": [
+      "invalid-code-signature"
+    ],
+    "completeness": "complete"
+  },
   "suspicious/macho_self_signed_identity": {
     "score": 5,
     "recommendation": "no-action",
