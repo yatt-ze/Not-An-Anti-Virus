@@ -175,7 +175,7 @@ fn scan_scripts_entry(
     // An entry we can't reach (bounded read stopped short) is
     // unreadable, not absent. A partial read is scanned, then reported
     // unreadable below.
-    let (raw, mut gap) = budget
+    let (mut raw, mut gap) = budget
         .read_entry_partial(content, archive, entry)
         .map_err(|_| RuleOutcome::NotApplicable)?;
 
@@ -200,7 +200,8 @@ fn scan_scripts_entry(
             Ok(()) => v,
             Err(e) => {
                 gap.get_or_insert(xar::XarEntryError::Undecodable(e));
-                let unread = raw.get(used..).unwrap_or_default().to_vec();
+                raw.drain(..used.min(raw.len()));
+                let unread = raw;
                 if v.is_empty() {
                     unread // not cpio: scanned raw below
                 } else {
@@ -1440,13 +1441,20 @@ mod tests {
         bytes
     }
 
-    /// A complete (stored-block) zlib stream holding `inner`.
+    /// A complete zlib stream of stored blocks holding `inner`.
     fn zlib_stored(inner: &[u8]) -> Vec<u8> {
-        let n = u16::try_from(inner.len()).expect("small blob");
-        let mut v = vec![0x78, 0x01, 0x01];
-        v.extend_from_slice(&n.to_le_bytes());
-        v.extend_from_slice(&(!n).to_le_bytes());
-        v.extend_from_slice(inner);
+        let mut chunks: Vec<&[u8]> = inner.chunks(u16::MAX as usize).collect();
+        if chunks.is_empty() {
+            chunks.push(&[]);
+        }
+        let mut v = vec![0x78, 0x01];
+        for (i, chunk) in chunks.iter().enumerate() {
+            let n = u16::try_from(chunk.len()).expect("chunked");
+            v.push(u8::from(i + 1 == chunks.len()));
+            v.extend_from_slice(&n.to_le_bytes());
+            v.extend_from_slice(&(!n).to_le_bytes());
+            v.extend_from_slice(chunk);
+        }
         v.extend_from_slice(&crate::inflate::adler32(inner).to_be_bytes());
         v
     }
@@ -2241,24 +2249,9 @@ mod tests {
     /// Evaluates `Scripts` = zlib(`gz`) under `limits`; returns the signal
     /// description (empty if none) and whether the rule marked a gap.
     fn scripts_description(gz: &[u8], limits: &xar::XarLimits) -> (String, bool) {
-        let (r, c) = evaluate_small(&pkg_with_scripts(&zlib_stored_many(gz)), limits);
+        let (r, c) = evaluate_small(&pkg_with_scripts(&zlib_stored(gz)), limits);
         let found = r.ok().flatten().map(|s| s.description).unwrap_or_default();
         (found, c.marked_incomplete("installer-script-suspicious"))
-    }
-
-    /// A zlib stream of stored blocks holding `inner`, of any length.
-    fn zlib_stored_many(inner: &[u8]) -> Vec<u8> {
-        let mut v = vec![0x78, 0x01];
-        let chunks: Vec<&[u8]> = inner.chunks(u16::MAX as usize).collect();
-        for (i, chunk) in chunks.iter().enumerate() {
-            let n = u16::try_from(chunk.len()).expect("chunked");
-            v.push(u8::from(i + 1 == chunks.len()));
-            v.extend_from_slice(&n.to_le_bytes());
-            v.extend_from_slice(&(!n).to_le_bytes());
-            v.extend_from_slice(chunk);
-        }
-        v.extend_from_slice(&crate::inflate::adler32(inner).to_be_bytes());
-        v
     }
 
     /// An inner gzip cut short by the outer entry cap leaves no unread input:
