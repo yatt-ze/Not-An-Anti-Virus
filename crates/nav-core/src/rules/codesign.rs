@@ -84,9 +84,7 @@ fn classify_dv(success: bool, stderr: &str) -> Result<DvStatus, RuleOutcome> {
         return Ok(match code_directory_flags(cd_line) {
             // Numeric flags parsed: ad-hoc/linker-signed come straight from
             // the bits — the `Signature=adhoc` line is not consulted.
-            Some(flags) if flags & CS_ADHOC == 0 => DvStatus::Signed,
-            Some(flags) if flags & CS_LINKER_SIGNED != 0 => DvStatus::AdHocLinkerSigned,
-            Some(_) => DvStatus::AdHocManual,
+            Some(flags) => status_from_flags(flags),
             // Flags token missing or malformed: fall back to the textual
             // markers, as before #31's hardening.
             None => {
@@ -166,6 +164,18 @@ impl Rule for UnsignedBinaryRule {
     }
 }
 
+/// The status a CodeDirectory's `flags` give, for `classify_dv` and
+/// [`slice_status`] alike.
+fn status_from_flags(flags: u32) -> DvStatus {
+    if flags & CS_ADHOC == 0 {
+        DvStatus::Signed
+    } else if flags & CS_LINKER_SIGNED != 0 {
+        DvStatus::AdHocLinkerSigned
+    } else {
+        DvStatus::AdHocManual
+    }
+}
+
 /// One slice's signing status from the parser's CodeDirectory facts, classed
 /// as `macho-loader-anomaly` does (no non-empty CMS blob counts as ad-hoc).
 /// `None` if the slice's CodeDirectory couldn't be read.
@@ -173,13 +183,9 @@ fn slice_status(image: &MachOImage) -> Option<DvStatus> {
     if !image.has_code_signature {
         return Some(DvStatus::Unsigned);
     }
-    let flags = image.code_directory_flags?;
-    Some(if flags & CS_ADHOC != 0 && flags & CS_LINKER_SIGNED != 0 {
-        DvStatus::AdHocLinkerSigned
-    } else if flags & CS_ADHOC != 0 || !image.has_cms_signature {
-        DvStatus::AdHocManual
-    } else {
-        DvStatus::Signed
+    Some(match status_from_flags(image.code_directory_flags?) {
+        DvStatus::Signed if !image.has_cms_signature => DvStatus::AdHocManual,
+        status => status,
     })
 }
 
@@ -195,6 +201,21 @@ fn any_slice_is(ctx: &ScanContext, native: DvStatus, status: DvStatus) -> bool {
                 .images
                 .iter()
                 .any(|image| image.is_fat && slice_status(image) == Some(status)))
+}
+
+/// Whether `unanchored-signing-identity` fires: some slice carries a real
+/// identity and the signer check exits 3. Shared so `adhoc-signed-binary` can
+/// stand down for it.
+fn unanchored_fires(ctx: &ScanContext, native: DvStatus) -> Result<bool, RuleOutcome> {
+    if !any_slice_is(ctx, native, DvStatus::Signed) {
+        return Ok(false);
+    }
+    match run_signer_check(ctx)? {
+        SignerCheck::Unanchored => Ok(true),
+        // A signature that doesn't verify is `invalid-code-signature`'s finding.
+        SignerCheck::Anchored | SignerCheck::Invalid => Ok(false),
+        SignerCheck::UnsignedSlice => Err(RuleOutcome::NotApplicable),
+    }
 }
 
 /// Weight for a binary carrying a hand-applied ad-hoc signature — no real
@@ -236,10 +257,8 @@ impl Rule for AdHocSignedRule {
         if !any_slice_is(ctx, native, DvStatus::AdHocManual) {
             return Ok(None);
         }
-        // One provenance signal per file: an unanchored slice outranks ad-hoc.
-        if any_slice_is(ctx, native, DvStatus::Signed)
-            && run_signer_check(ctx) == Ok(SignerCheck::Unanchored)
-        {
+        // One provenance signal per file: an unanchored finding replaces ad-hoc.
+        if unanchored_fires(ctx, native) == Ok(true) {
             return Ok(None);
         }
         Ok(Some(MatchedSignal {
@@ -250,7 +269,8 @@ impl Rule for AdHocSignedRule {
         }))
     }
 
-    /// Same as `UnsignedBinaryRule`: `ctx.macho()` only gates.
+    /// `codesign` reads the whole file, and `ctx.macho()` reads each slice
+    /// from the file by offset, not from the held prefix.
     fn covers_truncation(&self, _ctx: &ScanContext) -> bool {
         true
     }
@@ -289,26 +309,20 @@ impl Rule for UnanchoredIdentityRule {
             return Ok(None);
         }
         let native = run_codesign_dv(ctx)?;
-        if !any_slice_is(ctx, native, DvStatus::Signed) {
+        if !unanchored_fires(ctx, native)? {
             return Ok(None);
         }
-
-        match run_signer_check(ctx)? {
-            // A signature that doesn't verify is `invalid-code-signature`'s finding.
-            SignerCheck::Anchored | SignerCheck::Invalid => Ok(None),
-            SignerCheck::UnsignedSlice => Err(RuleOutcome::NotApplicable),
-            SignerCheck::Unanchored => Ok(Some(MatchedSignal {
-                id: "unanchored-signing-identity".to_string(),
-                weight: UNANCHORED_IDENTITY_WEIGHT,
-                description:
-                    "binary carries a signature that does not chain to an Apple anchor (self-signed, private CA, or a mixed-signer slice)"
-                        .to_string(),
-                category: SignalCategory::ProvenanceConcern,
-            })),
-        }
+        Ok(Some(MatchedSignal {
+            id: "unanchored-signing-identity".to_string(),
+            weight: UNANCHORED_IDENTITY_WEIGHT,
+            description:
+                "binary carries a signature that does not chain to an Apple anchor (self-signed, private CA, or a mixed-signer slice)"
+                    .to_string(),
+            category: SignalCategory::ProvenanceConcern,
+        }))
     }
 
-    /// Same as `UnsignedBinaryRule`: `ctx.macho()` only gates.
+    /// As for `AdHocSignedRule`.
     fn covers_truncation(&self, _ctx: &ScanContext) -> bool {
         true
     }
