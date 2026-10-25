@@ -202,12 +202,40 @@ fn any_slice_is(ctx: &ScanContext, native: DvStatus, status: DvStatus) -> bool {
                 .any(|image| image.is_fat && slice_status(image) == Some(status)))
 }
 
+/// True if `native` is not unsigned and some slice of a fat file couldn't be
+/// classified: the parser skipped it, or [`slice_status`] is `None`. A rule
+/// that found nothing then reports `NotApplicable`, not clean (§11.8). A thin
+/// file's only slice is the native one, which `codesign -dv` has read.
+fn has_unclassified_fat_slice(ctx: &ScanContext, native: DvStatus) -> bool {
+    let macho = ctx.macho();
+    native != DvStatus::Unsigned
+        && is_fat_file(ctx)
+        && (macho.skipped_slices > 0
+            || macho
+                .images
+                .iter()
+                .any(|image| image.is_fat && slice_status(image).is_none()))
+}
+
+/// True if the held bytes start with fat (universal) magic. Unlike
+/// `MachOImage::is_fat`, this holds when every slice was skipped.
+fn is_fat_file(ctx: &ScanContext) -> bool {
+    ctx.content
+        .as_deref()
+        .and_then(|bytes| bytes.get(..4))
+        .is_some_and(|magic| magic == [0xca, 0xfe, 0xba, 0xbe] || magic == [0xca, 0xfe, 0xba, 0xbf])
+}
+
 /// Whether `unanchored-signing-identity` fires: some slice carries a real
 /// identity and the signer check exits 3. Shared so `adhoc-signed-binary` can
 /// stand down for it.
 fn unanchored_fires(ctx: &ScanContext, native: DvStatus) -> Result<bool, RuleOutcome> {
     if !any_slice_is(ctx, native, DvStatus::Signed) {
-        return Ok(false);
+        return if has_unclassified_fat_slice(ctx, native) {
+            Err(RuleOutcome::NotApplicable)
+        } else {
+            Ok(false)
+        };
     }
     match run_signer_check(ctx)? {
         SignerCheck::Unanchored => Ok(true),
@@ -254,7 +282,11 @@ impl Rule for AdHocSignedRule {
 
         let native = run_codesign_dv(ctx)?;
         if !any_slice_is(ctx, native, DvStatus::AdHocManual) {
-            return Ok(None);
+            return if has_unclassified_fat_slice(ctx, native) {
+                Err(RuleOutcome::NotApplicable)
+            } else {
+                Ok(None)
+            };
         }
         // One provenance signal per file: an unanchored finding replaces ad-hoc.
         if unanchored_fires(ctx, native) == Ok(true) {
@@ -1229,6 +1261,32 @@ mod tests {
         assert!(!is_one_signed_slice_beside_unsigned(&load(
             "benign/tiny_hello_arm64"
         )));
+    }
+
+    /// A fat slice the parser couldn't walk leaves the per-slice rules unsure.
+    #[test]
+    fn a_skipped_fat_slice_is_unclassified() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("fixtures/suspicious/macho_fat_malformed_slice");
+        let fat = ScanContext::load(&path);
+        assert!(fat.macho().skipped_slices > 0);
+        assert!(has_unclassified_fat_slice(&fat, DvStatus::AdHocManual));
+        assert!(!has_unclassified_fat_slice(&fat, DvStatus::Unsigned));
+        let thin = ScanContext::load(
+            &std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("fixtures/benign/tiny_hello_arm64"),
+        );
+        assert!(!has_unclassified_fat_slice(
+            &thin,
+            DvStatus::AdHocLinkerSigned
+        ));
+        // A thin file the parser couldn't walk also reports a skipped slice.
+        let unwalkable = ctx("thin", &[0xcf, 0xfa, 0xed, 0xfe, 0, 0, 0, 0]);
+        assert!(unwalkable.macho().skipped_slices > 0);
+        assert!(!has_unclassified_fat_slice(
+            &unwalkable,
+            DvStatus::AdHocManual
+        ));
     }
 
     #[test]
