@@ -146,9 +146,21 @@ pub fn gzip_decompress(data: &[u8], budget: usize) -> Result<Vec<u8>, InflateErr
 /// before the failure (at most `budget`), unverified by the trailer. A header
 /// failure, including `BadHeader`, yields an empty `Vec`.
 pub fn gzip_decompress_partial(data: &[u8], budget: usize) -> (Vec<u8>, Result<(), InflateError>) {
-    let mut out = Vec::new();
-    let result = gzip_into(data, budget, &mut out);
+    let (out, _, result) = gzip_decompress_consumed(data, budget);
     (out, result)
+}
+
+/// Like [`gzip_decompress_partial`], also returning how many bytes of `data`
+/// the decoder consumed before it stopped: 0 on a header failure, and never
+/// more than `data.len()`. Input past that point was never decoded.
+pub fn gzip_decompress_consumed(
+    data: &[u8],
+    budget: usize,
+) -> (Vec<u8>, usize, Result<(), InflateError>) {
+    let mut out = Vec::new();
+    let mut used = 0;
+    let result = gzip_into(data, budget, &mut out, &mut used);
+    (out, used, result)
 }
 
 /// Length of the RFC 1952 header that opens `data`. `BadHeader` if it is not
@@ -209,11 +221,21 @@ fn gzip_header_len(data: &[u8]) -> Result<usize, InflateError> {
     Ok(off)
 }
 
-/// Decode a gzip stream into `out`. On error `out` holds whatever was written.
-fn gzip_into(data: &[u8], budget: usize, out: &mut Vec<u8>) -> Result<(), InflateError> {
+/// Decode a gzip stream into `out`, recording in `consumed` how much of `data`
+/// was read. On error `out` holds whatever was written.
+fn gzip_into(
+    data: &[u8],
+    budget: usize,
+    out: &mut Vec<u8>,
+    consumed: &mut usize,
+) -> Result<(), InflateError> {
     let off = gzip_header_len(data)?;
+    *consumed = off;
     let body = data.get(off..).ok_or(InflateError::Truncated)?;
-    let used = inflate_into(body, budget, out)?;
+    let mut used = 0;
+    let result = inflate_counted(body, budget, out, &mut used);
+    *consumed = off.saturating_add(used);
+    result?;
 
     let end = used.checked_add(8).ok_or(InflateError::Malformed)?;
     let trailer = body.get(used..end).ok_or(InflateError::Truncated)?;
@@ -242,8 +264,27 @@ fn gzip_into(data: &[u8], budget: usize, out: &mut Vec<u8>) -> Result<(), Inflat
 /// Decode a DEFLATE stream into `out` (empty on entry), returning how many
 /// bytes of `data` were consumed. On error `out` holds whatever was written.
 fn inflate_into(data: &[u8], budget: usize, out: &mut Vec<u8>) -> Result<usize, InflateError> {
-    out.reserve(budget.min(INITIAL_OUTPUT_CAPACITY));
+    let mut used = 0;
+    inflate_counted(data, budget, out, &mut used).map(|()| used)
+}
+
+/// [`inflate_into`] that also records in `used` the bytes consumed when it
+/// fails (rounded up to a byte).
+fn inflate_counted(
+    data: &[u8],
+    budget: usize,
+    out: &mut Vec<u8>,
+    used: &mut usize,
+) -> Result<(), InflateError> {
     let mut r = BitReader::new(data);
+    let result = inflate_blocks(&mut r, budget, out);
+    *used = r.bytes_consumed();
+    result
+}
+
+/// The DEFLATE block loop over `r`; see [`inflate_into`].
+fn inflate_blocks(r: &mut BitReader, budget: usize, out: &mut Vec<u8>) -> Result<(), InflateError> {
+    out.reserve(budget.min(INITIAL_OUTPUT_CAPACITY));
     let work_cap = work_cap(budget);
     let mut block_work = 0usize;
     // Input read + output written + the per-block charges.
@@ -254,7 +295,7 @@ fn inflate_into(data: &[u8], budget: usize, out: &mut Vec<u8>) -> Result<usize, 
     };
 
     loop {
-        if work(&r, out, block_work) > work_cap {
+        if work(r, out, block_work) > work_cap {
             return Err(InflateError::BudgetExceeded);
         }
         let final_block = r.bits(1)? == 1;
@@ -265,18 +306,18 @@ fn inflate_into(data: &[u8], budget: usize, out: &mut Vec<u8>) -> Result<usize, 
             BLOCK_WORK
         };
         block_work = block_work.saturating_add(charge);
-        if work(&r, out, block_work) > work_cap {
+        if work(r, out, block_work) > work_cap {
             return Err(InflateError::BudgetExceeded);
         }
         match btype {
-            0 => stored_block(&mut r, out, budget)?,
+            0 => stored_block(r, out, budget)?,
             1 => {
                 let (lit, dist) = fixed_tables()?;
-                compressed_block(&mut r, out, budget, lit, dist)?;
+                compressed_block(r, out, budget, lit, dist)?;
             }
             2 => {
-                let (lit, dist) = dynamic_tables(&mut r)?;
-                compressed_block(&mut r, out, budget, &lit, &dist)?;
+                let (lit, dist) = dynamic_tables(r)?;
+                compressed_block(r, out, budget, &lit, &dist)?;
             }
             // BTYPE=11 is reserved.
             _ => return Err(InflateError::Malformed),
@@ -286,7 +327,7 @@ fn inflate_into(data: &[u8], budget: usize, out: &mut Vec<u8>) -> Result<usize, 
         }
     }
 
-    Ok(r.bytes_consumed())
+    Ok(())
 }
 
 /// An uncompressed block: byte-aligned, with a length and its ones-complement.
@@ -1187,6 +1228,46 @@ mod tests {
         let mut v = vec![0x1f, 0x8b, 8, 0x08, 0, 0, 0, 0, 0, 3];
         v.extend_from_slice(b"unterminated-name");
         assert_eq!(gzip_decompress(&v, BIG), Err(InflateError::Truncated));
+    }
+
+    /// A gzip header plus one stored block of `body`, then `trailer`.
+    fn gzip_stored_one(body: &[u8], trailer: &[u8]) -> Vec<u8> {
+        let n = u16::try_from(body.len()).expect("small");
+        let mut v = vec![0x1f, 0x8b, 8, 0, 0, 0, 0, 0, 0, 3, 1];
+        v.extend_from_slice(&n.to_le_bytes());
+        v.extend_from_slice(&(!n).to_le_bytes());
+        v.extend_from_slice(body);
+        v.extend_from_slice(trailer);
+        v
+    }
+
+    #[test]
+    fn gzip_reports_the_input_it_consumed() {
+        let body = b"#!/bin/sh\necho hi\n";
+        let mut trailer = crc32(body).to_le_bytes().to_vec();
+        trailer.extend_from_slice(&(body.len() as u32).to_le_bytes());
+        let whole = gzip_stored_one(body, &trailer);
+        let body_end = whole.len() - 8;
+
+        // Complete: everything up to the trailer.
+        let (out, used, r) = gzip_decompress_consumed(&whole, BIG);
+        assert_eq!((out.as_slice(), used, r), (&body[..], body_end, Ok(())));
+        // A bad header consumes nothing; a damaged trailer stops before it.
+        assert_eq!(gzip_decompress_consumed(&[0x1f, 0x8b, 7], BIG).1, 0);
+        let mut bad = whole.clone();
+        bad[body_end] ^= 0xff;
+        let (_, used, r) = gzip_decompress_consumed(&bad, BIG);
+        assert_eq!((used, r), (body_end, Err(InflateError::ChecksumMismatch)));
+        // Cut inside the stored block: all of the input was read.
+        let cut = &whole[..20];
+        let (out, used, r) = gzip_decompress_consumed(cut, BIG);
+        assert_eq!((out.len(), used, r), (5, 20, Err(InflateError::Truncated)));
+        // Out of output budget: the rest of the block is still unread.
+        let (out, used, r) = gzip_decompress_consumed(&whole, 4);
+        assert_eq!(
+            (out.len(), used, r),
+            (4, 19, Err(InflateError::BudgetExceeded))
+        );
     }
 
     #[test]
