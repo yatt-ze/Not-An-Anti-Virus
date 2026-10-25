@@ -151,8 +151,9 @@ pub fn gzip_decompress_partial(data: &[u8], budget: usize) -> (Vec<u8>, Result<(
     (out, result)
 }
 
-/// Decode a gzip stream into `out`. On error `out` holds whatever was written.
-fn gzip_into(data: &[u8], budget: usize, out: &mut Vec<u8>) -> Result<(), InflateError> {
+/// Length of the RFC 1952 header that opens `data`. `BadHeader` if it is not
+/// one [`gzip_decompress`] accepts, `Truncated` if `data` ends inside it.
+fn gzip_header_len(data: &[u8]) -> Result<usize, InflateError> {
     const FHCRC: u8 = 1 << 1;
     const FEXTRA: u8 = 1 << 2;
     const FNAME: u8 = 1 << 3;
@@ -202,7 +203,15 @@ fn gzip_into(data: &[u8], budget: usize, out: &mut Vec<u8>) -> Result<(), Inflat
         // 16-bit header CRC; skipped, since the payload CRC below covers us.
         off = off.checked_add(2).ok_or(InflateError::Malformed)?;
     }
+    if off > data.len() {
+        return Err(InflateError::Truncated);
+    }
+    Ok(off)
+}
 
+/// Decode a gzip stream into `out`. On error `out` holds whatever was written.
+fn gzip_into(data: &[u8], budget: usize, out: &mut Vec<u8>) -> Result<(), InflateError> {
+    let off = gzip_header_len(data)?;
     let body = data.get(off..).ok_or(InflateError::Truncated)?;
     let used = inflate_into(body, budget, out)?;
 
