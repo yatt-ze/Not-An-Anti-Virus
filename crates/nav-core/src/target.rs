@@ -224,10 +224,15 @@ pub fn scan_target_with_budget(
     })
 }
 
-/// Fold the collection-time and scan-time budget limits into one outcome,
-/// reporting the byte limit when both tripped (§11.12).
+/// Fold the collection-time and scan-time budget limits into one outcome.
+/// When both tripped, the byte limit is reported over `Files` but not over
+/// `Depth`/`Entries`, which no flag can raise (§11.12).
 fn outcome(collect_limit: Option<BudgetLimit>, byte_limit: Option<BudgetLimit>) -> BudgetOutcome {
-    match byte_limit.or(collect_limit) {
+    let reported = match collect_limit {
+        Some(BudgetLimit::Files) | None => byte_limit.or(collect_limit),
+        Some(_) => collect_limit,
+    };
+    match reported {
         Some(limit) => BudgetOutcome::Exhausted(limit),
         None => BudgetOutcome::Within,
     }
@@ -590,6 +595,14 @@ mod tests {
             scan.budget,
             BudgetOutcome::Exhausted(BudgetLimit::TotalBytes)
         );
+    }
+
+    #[test]
+    fn a_fixed_collection_limit_is_reported_over_a_byte_stop() {
+        let both = outcome(Some(BudgetLimit::Depth), Some(BudgetLimit::TotalBytes));
+        assert_eq!(both, BudgetOutcome::Exhausted(BudgetLimit::Depth));
+        let both = outcome(Some(BudgetLimit::Entries), Some(BudgetLimit::TotalBytes));
+        assert_eq!(both, BudgetOutcome::Exhausted(BudgetLimit::Entries));
     }
 
     #[test]
