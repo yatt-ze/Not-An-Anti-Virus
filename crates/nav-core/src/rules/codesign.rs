@@ -415,7 +415,7 @@ impl Rule for InvalidSignatureRule {
         }
     }
 
-    /// Same as `UnsignedBinaryRule`: `ctx.macho()` only gates.
+    /// As for `AdHocSignedRule`.
     fn covers_truncation(&self, _ctx: &ScanContext) -> bool {
         true
     }
@@ -440,9 +440,12 @@ enum SignerCheck {
 /// `LC_CODE_SIGNATURE`, at least one without, and no slice the parser skipped.
 fn is_one_signed_slice_beside_unsigned(ctx: &ScanContext) -> bool {
     let macho = ctx.macho();
-    let fat: Vec<_> = macho.images.iter().filter(|image| image.is_fat).collect();
-    let signed = fat.iter().filter(|image| image.has_code_signature).count();
-    macho.skipped_slices == 0 && signed == 1 && fat.len() > signed
+    let (mut fat, mut signed) = (0, 0);
+    for image in macho.images.iter().filter(|image| image.is_fat) {
+        fat += 1;
+        signed += usize::from(image.has_code_signature);
+    }
+    macho.skipped_slices == 0 && signed == 1 && fat > signed
 }
 
 /// `codesign` diagnostics, after the `<path>: ` prefix, that mean the
