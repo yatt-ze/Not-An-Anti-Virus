@@ -224,11 +224,10 @@ pub fn scan_target_with_budget(
     })
 }
 
-/// Fold the collection-time and scan-time budget limits into one outcome. A
-/// structural limit (files/depth) is reported ahead of a byte limit, since it
-/// bounds what was even discovered.
+/// Fold the collection-time and scan-time budget limits into one outcome,
+/// reporting the byte limit when both tripped (§11.12).
 fn outcome(collect_limit: Option<BudgetLimit>, byte_limit: Option<BudgetLimit>) -> BudgetOutcome {
-    match collect_limit.or(byte_limit) {
+    match byte_limit.or(collect_limit) {
         Some(limit) => BudgetOutcome::Exhausted(limit),
         None => BudgetOutcome::Within,
     }
@@ -570,6 +569,27 @@ mod tests {
             .unwrap();
         let read = bytes_read_scanning(&big);
         assert!(read < 16 * 1024 * 1024, "{read}");
+    }
+
+    /// Both limits hit: the byte limit is reported, since it stopped scoring
+    /// before the collected files ran out.
+    #[test]
+    fn a_byte_stop_is_reported_over_a_file_limit() {
+        let dir = TempDir::new("budget-both");
+        for name in ["a.bin", "b.bin", "c.bin"] {
+            fs::write(dir.path().join(name), vec![0u8; 4096]).unwrap();
+        }
+        let budget = ScanBudget {
+            max_files: 2,
+            max_total_bytes: 100,
+            ..ScanBudget::default()
+        };
+        let scan = scan_target_with_budget(dir.path(), true, &budget).unwrap();
+        assert_eq!(scan.results.len(), 1);
+        assert_eq!(
+            scan.budget,
+            BudgetOutcome::Exhausted(BudgetLimit::TotalBytes)
+        );
     }
 
     #[test]
