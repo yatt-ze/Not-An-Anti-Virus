@@ -14,6 +14,7 @@
 
 use super::{embedded_content_ruleset, Rule, RuleOutcome};
 use crate::context::ScanContext;
+use crate::decode::DecodeError;
 use crate::macho::ByteSource;
 use crate::model::{MatchedSignal, SignalCategory};
 use crate::scan::scan_embedded_bytes;
@@ -174,43 +175,40 @@ fn scan_scripts_entry(
     // An entry we can't reach (bounded read stopped short) is
     // unreadable, not absent. A partial read is scanned, then reported
     // unreadable below.
-    let (raw, mut gap) = budget
+    let (mut raw, mut gap) = budget
         .read_entry_partial(content, archive, entry)
         .map_err(|_| RuleOutcome::NotApplicable)?;
 
     let label = format!("{}!{}", ctx.path.display(), entry.path);
     // Scripts is normally gzip-wrapped cpio; if not gzip, the heap read
-    // already undid the entry's encoding. A damaged inner gzip is scanned as
-    // far as it decoded, and the raw bytes are scanned too unless the stream
-    // was merely over budget (valid DEFLATE has nothing to find).
+    // already undid the entry's encoding. A gzip stream that stops early is
+    // scanned as far as it decoded, plus, raw, the input it never reached
+    // (stored-block text past a limit, plaintext behind a broken header).
     let archive_bytes = if !crate::inflate::has_gzip_magic(&raw) {
         raw
     } else {
         // The inner layer reads all of `raw` as input, then writes its output.
         budget.charge(raw.len());
         let cap = budget.entry_cap();
-        if cap == 0 {
-            gap.get_or_insert(xar::XarEntryError::BUDGET_EXCEEDED);
-            raw
+        let (v, used, result) = if cap == 0 {
+            (Vec::new(), 0, Err(DecodeError::BudgetExceeded))
         } else {
-            match crate::inflate::gzip_decompress_partial(&raw, cap) {
-                (v, Ok(())) => {
-                    budget.charge(v.len());
-                    v
-                }
-                (v, Err(e)) if !v.is_empty() => {
-                    budget.charge(v.len());
-                    if e != crate::decode::DecodeError::BudgetExceeded {
-                        findings.scan(label.clone(), raw, "install scripts (unparsed)");
+            crate::inflate::gzip_decompress_consumed(&raw, cap)
+        };
+        budget.charge(v.len());
+        match result {
+            Ok(()) => v,
+            Err(e) => {
+                gap.get_or_insert(xar::XarEntryError::Undecodable(e));
+                raw.drain(..used.min(raw.len()));
+                let unread = raw;
+                if v.is_empty() {
+                    unread // not cpio: scanned raw below
+                } else {
+                    if !unread.is_empty() {
+                        findings.scan(label.clone(), unread, "install scripts (unparsed)");
                     }
-                    gap.get_or_insert(xar::XarEntryError::Undecodable(e));
                     v
-                }
-                (_, Err(e)) => {
-                    if e == crate::decode::DecodeError::BudgetExceeded {
-                        gap.get_or_insert(xar::XarEntryError::BUDGET_EXCEEDED);
-                    }
-                    raw
                 }
             }
         }
@@ -1443,13 +1441,20 @@ mod tests {
         bytes
     }
 
-    /// A complete (stored-block) zlib stream holding `inner`.
+    /// A complete zlib stream of stored blocks holding `inner`.
     fn zlib_stored(inner: &[u8]) -> Vec<u8> {
-        let n = u16::try_from(inner.len()).expect("small blob");
-        let mut v = vec![0x78, 0x01, 0x01];
-        v.extend_from_slice(&n.to_le_bytes());
-        v.extend_from_slice(&(!n).to_le_bytes());
-        v.extend_from_slice(inner);
+        let mut chunks: Vec<&[u8]> = inner.chunks(u16::MAX as usize).collect();
+        if chunks.is_empty() {
+            chunks.push(&[]);
+        }
+        let mut v = vec![0x78, 0x01];
+        for (i, chunk) in chunks.iter().enumerate() {
+            let n = u16::try_from(chunk.len()).expect("chunked");
+            v.push(u8::from(i + 1 == chunks.len()));
+            v.extend_from_slice(&n.to_le_bytes());
+            v.extend_from_slice(&(!n).to_le_bytes());
+            v.extend_from_slice(chunk);
+        }
         v.extend_from_slice(&crate::inflate::adler32(inner).to_be_bytes());
         v
     }
@@ -2239,6 +2244,77 @@ mod tests {
         };
         let (r, _) = evaluate_small(&bytes, &roomy);
         assert!(r.expect("evaluates").is_some());
+    }
+
+    /// Evaluates `Scripts` = zlib(`gz`) under `limits`; returns the signal
+    /// description (empty if none) and whether the rule marked a gap.
+    fn scripts_description(gz: &[u8], limits: &xar::XarLimits) -> (String, bool) {
+        let (r, c) = evaluate_small(&pkg_with_scripts(&zlib_stored(gz)), limits);
+        let found = r.ok().flatten().map(|s| s.description).unwrap_or_default();
+        (found, c.marked_incomplete("installer-script-suspicious"))
+    }
+
+    /// An inner gzip cut short by the outer entry cap leaves no unread input:
+    /// the cut member is scanned, the compressed bytes are not again (#81).
+    #[test]
+    fn a_limit_cut_inner_gzip_is_not_scanned_raw() {
+        let limits = xar::XarLimits {
+            max_entry_bytes: 300,
+            ..xar::XarLimits::default()
+        };
+        let (found, gap) = scripts_description(&gzip_stored(&scoring_cpio()), &limits);
+        assert!(
+            found.contains("install script preinstall (cut short)"),
+            "{found}"
+        );
+        assert!(!found.contains("unparsed"), "{found}");
+        assert!(gap);
+    }
+
+    /// A damaged trailer: the decoded members are scanned once, not again as
+    /// raw stored-block text.
+    #[test]
+    fn a_damaged_inner_gzip_is_not_counted_twice() {
+        let (found, gap) =
+            scripts_description(&gzip_stored(&scoring_cpio()), &xar::XarLimits::default());
+        assert!(found.contains("install script preinstall"), "{found}");
+        assert!(!found.contains("unparsed"), "{found}");
+        assert!(gap);
+    }
+
+    /// A gzip of `n` empty fixed-Huffman blocks, then a final stored block of
+    /// `tail`: valid, but past inflate's work cap before the tail.
+    fn gzip_padded_with_empty_blocks(n: usize, tail: &[u8]) -> Vec<u8> {
+        let mut gz = vec![0x1f, 0x8b, 0x08, 0, 0, 0, 0, 0, 0, 3];
+        // Each block is BFINAL=0, BTYPE=01, end-of-block (7 zero bits).
+        let mut bits = Vec::with_capacity(n * 10 + 3);
+        for _ in 0..n {
+            bits.extend_from_slice(&[0, 1, 0, 0, 0, 0, 0, 0, 0, 0]);
+        }
+        bits.extend_from_slice(&[1, 0, 0]); // final stored block
+        for byte in bits.chunks(8) {
+            gz.push(byte.iter().enumerate().map(|(i, b)| b << i).sum());
+        }
+        let len = u16::try_from(tail.len()).expect("small");
+        gz.extend_from_slice(&len.to_le_bytes());
+        gz.extend_from_slice(&(!len).to_le_bytes());
+        gz.extend_from_slice(tail);
+        gz.extend_from_slice(&[0; 8]);
+        gz
+    }
+
+    /// The work cap stops the inner gzip before its stored block: that unread
+    /// text is still scanned raw.
+    #[test]
+    fn script_text_past_the_inner_work_cap_is_scanned_raw() {
+        let gz = gzip_padded_with_empty_blocks(400_000, &scoring_cpio());
+        assert_eq!(
+            crate::inflate::gzip_decompress_partial(&gz, 4 << 20).1,
+            Err(DecodeError::BudgetExceeded)
+        );
+        let (found, gap) = scripts_description(&gz, &xar::XarLimits::default());
+        assert!(found.contains("install scripts (unparsed)"), "{found}");
+        assert!(gap);
     }
 
     /// A zlib `Scripts` entry that decodes to `1f 8b` plus a non-gzip header

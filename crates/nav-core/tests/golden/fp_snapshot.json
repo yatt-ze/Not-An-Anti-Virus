@@ -483,6 +483,15 @@
     ],
     "completeness": "partial"
   },
+  "suspicious/installer_scripts_inner_gzip_past_work_cap.pkg": {
+    "score": 21,
+    "recommendation": "notify",
+    "rule_ids": [
+      "installer-script-suspicious",
+      "unsigned-installer-package"
+    ],
+    "completeness": "partial"
+  },
   "suspicious/installer_scripts_zlib_inner_gzip_trailerless.pkg": {
     "score": 25,
     "recommendation": "notify",
