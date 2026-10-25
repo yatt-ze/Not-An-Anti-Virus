@@ -132,6 +132,14 @@ const SUB_THRESHOLD_ALLOWLIST: &[(&str, &str)] = &[
         "an unanchored signing identity is corroboration-only by design (§5.1, #89); needs a second signal",
     ),
     (
+        "suspicious/macho_adhoc_modified_after_signing",
+        "a signature that fails verification is corroboration-only by design (§5.1, #92); needs a second signal",
+    ),
+    (
+        "suspicious/macho_self_signed_corrupt_cms",
+        "a signature that fails verification is corroboration-only by design (§5.1, #92); needs a second signal",
+    ),
+    (
         "suspicious/macho_duplicate_code_signature",
         "exercises a parser edge case, not a complete malicious sample",
     ),

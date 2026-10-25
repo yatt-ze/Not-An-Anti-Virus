@@ -220,6 +220,12 @@
     ],
     "completeness": "complete"
   },
+  "benign/macho_universal_unsigned_x86_slice": {
+    "score": 0,
+    "recommendation": "no-action",
+    "rule_ids": [],
+    "completeness": "complete"
+  },
   "benign/pdf_with_binary_stream.pdf": {
     "score": 5,
     "recommendation": "no-action",
@@ -277,10 +283,11 @@
     "completeness": "complete"
   },
   "suspicious/adhoc_named_flags=0x20000": {
-    "score": 3,
+    "score": 8,
     "recommendation": "no-action",
     "rule_ids": [
-      "adhoc-signed-binary"
+      "adhoc-signed-binary",
+      "invalid-code-signature"
     ],
     "completeness": "complete"
   },
@@ -519,6 +526,15 @@
     ],
     "completeness": "complete"
   },
+  "suspicious/macho_adhoc_modified_after_signing": {
+    "score": 8,
+    "recommendation": "no-action",
+    "rule_ids": [
+      "adhoc-signed-binary",
+      "invalid-code-signature"
+    ],
+    "completeness": "complete"
+  },
   "suspicious/macho_custom_segment_payload": {
     "score": 19,
     "recommendation": "notify",
@@ -576,6 +592,14 @@
     "rule_ids": [
       "high-entropy-content",
       "unsigned-binary"
+    ],
+    "completeness": "complete"
+  },
+  "suspicious/macho_self_signed_corrupt_cms": {
+    "score": 5,
+    "recommendation": "no-action",
+    "rule_ids": [
+      "invalid-code-signature"
     ],
     "completeness": "complete"
   },

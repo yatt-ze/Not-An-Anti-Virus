@@ -103,12 +103,7 @@ fn classify_dv(success: bool, stderr: &str) -> Result<DvStatus, RuleOutcome> {
     }
     // `codesign -dv` exits non-zero for unsigned binaries *and* for genuine
     // errors, so match the specific "not signed" message, not the exit code.
-    let is_unsigned = stderr.lines().any(|line| {
-        let line = line.trim();
-        line == "code object is not signed at all"
-            || line.ends_with(": code object is not signed at all")
-    });
-    if is_unsigned {
+    if reports_unsigned_slice(stderr) {
         Ok(DvStatus::Unsigned)
     } else {
         // codesign missing or some other inconclusive error — don't claim
@@ -261,17 +256,18 @@ impl Rule for UnanchoredIdentityRule {
             return Ok(None);
         }
 
-        if run_anchor_requirement(ctx)? {
-            Ok(None)
-        } else {
-            Ok(Some(MatchedSignal {
+        match run_signer_check(ctx)? {
+            // A signature that doesn't verify is `invalid-code-signature`'s finding.
+            SignerCheck::Anchored | SignerCheck::Invalid => Ok(None),
+            SignerCheck::UnsignedSlice => Err(RuleOutcome::NotApplicable),
+            SignerCheck::Unanchored => Ok(Some(MatchedSignal {
                 id: "unanchored-signing-identity".to_string(),
                 weight: UNANCHORED_IDENTITY_WEIGHT,
                 description:
                     "binary carries a signature that does not chain to an Apple anchor (self-signed, private CA, or a mixed-signer slice)"
                         .to_string(),
                 category: SignalCategory::ProvenanceConcern,
-            }))
+            })),
         }
     }
 
@@ -281,28 +277,148 @@ impl Rule for UnanchoredIdentityRule {
     }
 }
 
-/// Maps `codesign --verify -R=...` exit status to an outcome: `Ok(true)` if the
-/// requirement is satisfied (0), `Ok(false)` if validly signed but failing it
-/// (3), `NotApplicable` for verification failure (1), bad arguments (2), a
-/// signal, or a spawn failure.
-fn classify_anchor_exit(code: Option<i32>) -> Result<bool, RuleOutcome> {
+/// Weight for a signature that fails verification. Corroboration-only (§5.1, §5.2).
+const INVALID_SIGNATURE_WEIGHT: i32 = 5;
+
+/// Notes a binary that carries a signature (ad-hoc or real) that fails
+/// verification in some slice: code patched after signing, or a corrupt
+/// signature blob.
+pub struct InvalidSignatureRule;
+
+impl Default for InvalidSignatureRule {
+    fn default() -> Self {
+        InvalidSignatureRule
+    }
+}
+
+impl Rule for InvalidSignatureRule {
+    fn id(&self) -> &'static str {
+        "invalid-code-signature"
+    }
+
+    fn category(&self) -> SignalCategory {
+        SignalCategory::ProvenanceConcern
+    }
+
+    fn evaluate(&self, ctx: &ScanContext) -> Result<Option<MatchedSignal>, RuleOutcome> {
+        if !ctx.is_file_backed() {
+            return Err(RuleOutcome::NotApplicable);
+        }
+        if ctx.content.is_none() {
+            return Err(RuleOutcome::NotApplicable);
+        }
+        if !ctx.macho().is_macho {
+            return Ok(None);
+        }
+        if run_codesign_dv(ctx)? == DvStatus::Unsigned {
+            return Ok(None);
+        }
+
+        match run_signer_check(ctx)? {
+            SignerCheck::Invalid => Ok(Some(MatchedSignal {
+                id: "invalid-code-signature".to_string(),
+                weight: INVALID_SIGNATURE_WEIGHT,
+                description:
+                    "binary's code signature does not verify (modified after signing, or a corrupt signature)"
+                        .to_string(),
+                category: SignalCategory::ProvenanceConcern,
+            })),
+            SignerCheck::Anchored | SignerCheck::Unanchored => Ok(None),
+            // A universal build often leaves its non-native slice unsigned;
+            // `codesign` checks the native slice before reporting it.
+            SignerCheck::UnsignedSlice if has_unsigned_fat_slice(ctx) => Ok(None),
+            SignerCheck::UnsignedSlice => Err(RuleOutcome::NotApplicable),
+        }
+    }
+
+    /// Same as `UnsignedBinaryRule`: `ctx.macho()` only gates.
+    fn covers_truncation(&self, _ctx: &ScanContext) -> bool {
+        true
+    }
+}
+
+/// What the signer check (`codesign --verify` with [`SIGNER_ANCHOR_FLAGS`] and
+/// the Apple anchor requirement) found.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SignerCheck {
+    /// Every slice verifies and chains to an Apple anchor (exit 0).
+    Anchored,
+    /// Every slice verifies; some slice doesn't chain to an Apple anchor (exit 3).
+    Unanchored,
+    /// A signature fails verification (exit 1 with a known diagnostic).
+    Invalid,
+    /// Some slice has no signature (exit 1, "not signed at all"); the rest
+    /// may not have been checked.
+    UnsignedSlice,
+}
+
+/// True if `ctx` is a fat Mach-O with a slice that has no `LC_CODE_SIGNATURE`.
+fn has_unsigned_fat_slice(ctx: &ScanContext) -> bool {
+    ctx.macho()
+        .images
+        .iter()
+        .any(|image| image.is_fat && !image.has_code_signature)
+}
+
+/// `codesign` diagnostics, after the `<path>: ` prefix, that mean the
+/// signature itself failed verification rather than the tool failing.
+/// `errSecInternalComponent` is left out: it is also a generic Security
+/// framework failure.
+const BROKEN_SIGNATURE_DIAGNOSTICS: &[&str] = &[
+    "invalid signature (code or signature have been modified)",
+    "invalid or unsupported format for signature",
+    "invalid Info.plist (plist or signature have been modified)",
+    "main executable failed strict validation",
+    "CSSMERR_TP_NOT_TRUSTED",
+];
+
+/// Maps the signer check's exit code and stderr to a [`SignerCheck`]. Exit 1
+/// with neither a known diagnostic nor an unsigned slice (internal error,
+/// revoked certificate), bad arguments (2), a signal, or anything else is
+/// `NotApplicable` (§11.8).
+fn classify_signer_check(code: Option<i32>, stderr: &str) -> Result<SignerCheck, RuleOutcome> {
     match code {
-        Some(0) => Ok(true),
-        Some(3) => Ok(false),
+        Some(0) => Ok(SignerCheck::Anchored),
+        Some(3) => Ok(SignerCheck::Unanchored),
+        Some(1) if indicates_broken_signature(stderr) => Ok(SignerCheck::Invalid),
+        Some(1) if reports_unsigned_slice(stderr) => Ok(SignerCheck::UnsignedSlice),
         _ => Err(RuleOutcome::NotApplicable),
     }
 }
 
-/// Asks whether every slice's signature chains to an Apple anchor. The spawn
-/// is cached on `ctx` and object-bound (§11.7).
-fn run_anchor_requirement(ctx: &ScanContext) -> Result<bool, RuleOutcome> {
+/// True if a line of `stderr` is exactly a [`BROKEN_SIGNATURE_DIAGNOSTICS`]
+/// entry, bare or as the trailing `: <diagnostic>` after the echoed path.
+fn indicates_broken_signature(stderr: &str) -> bool {
+    stderr.lines().any(|line| {
+        let line = line.trim_end();
+        BROKEN_SIGNATURE_DIAGNOSTICS.iter().any(|diag| {
+            line == *diag
+                || line
+                    .strip_suffix(diag)
+                    .is_some_and(|prefix| prefix.ends_with(": "))
+        })
+    })
+}
+
+/// True if a line of `stderr` is exactly `codesign`'s "not signed at all"
+/// diagnostic, bare or after the echoed path (`-dv` and `--verify` both).
+fn reports_unsigned_slice(stderr: &str) -> bool {
+    stderr.lines().any(|line| {
+        let line = line.trim();
+        line == "code object is not signed at all"
+            || line.ends_with(": code object is not signed at all")
+    })
+}
+
+/// Runs the signer check. The spawn is cached on `ctx` and object-bound (§11.7).
+fn run_signer_check(ctx: &ScanContext) -> Result<SignerCheck, RuleOutcome> {
     if !path_is_line_safe(&ctx.path) {
         return Err(RuleOutcome::NotApplicable);
     }
-    let (code, _stderr) = ctx
+    let (code, stderr) = ctx
         .signer_check(|| spawn_signer_check(&ctx.path))
         .ok_or(RuleOutcome::NotApplicable)?;
-    classify_anchor_exit(code)
+    classify_signer_check(code, &stderr)
 }
 
 /// Weight for a revoked code-signing certificate. Apple revokes Developer ID
@@ -676,7 +792,7 @@ fn spawn_spctl_assess(_path: &std::path::Path) -> Result<String, RuleOutcome> {
 /// Runs `codesign -dv` and classifies the result. The classification logic
 /// (`classify_dv`) is platform-independent and unit-tested directly; only the
 /// process spawn is behind the platform gate. The spawn itself is cached on
-/// `ctx` (§5.2) so the six rules sharing a scan spawn `codesign` once, not
+/// `ctx` (§5.2) so the seven rules sharing a scan spawn `codesign` once, not
 /// once each.
 fn run_codesign_dv(ctx: &ScanContext) -> Result<DvStatus, RuleOutcome> {
     if !path_is_line_safe(&ctx.path) {
@@ -741,6 +857,7 @@ mod tests {
         assert!(UnsignedBinaryRule.covers_truncation(&c));
         assert!(AdHocSignedRule.covers_truncation(&c));
         assert!(UnanchoredIdentityRule.covers_truncation(&c));
+        assert!(InvalidSignatureRule.covers_truncation(&c));
         assert!(RevokedSignatureRule.covers_truncation(&c));
         assert!(UnnotarizedSignedRule.covers_truncation(&c));
         assert!(NotarizedRule.covers_truncation(&c));
@@ -883,12 +1000,126 @@ mod tests {
     }
 
     #[test]
-    fn classify_anchor_exit_maps_codesign_exit_codes() {
-        assert_eq!(classify_anchor_exit(Some(0)), Ok(true));
-        assert_eq!(classify_anchor_exit(Some(3)), Ok(false));
-        for code in [Some(1), Some(2), Some(127), None] {
-            assert_eq!(classify_anchor_exit(code), Err(RuleOutcome::NotApplicable));
+    fn classify_signer_check_maps_codesign_exit_codes() {
+        assert_eq!(
+            classify_signer_check(Some(0), ""),
+            Ok(SignerCheck::Anchored)
+        );
+        let unmet = "test-requirement: code failed to satisfy specified code requirement(s)\n";
+        assert_eq!(
+            classify_signer_check(Some(3), unmet),
+            Ok(SignerCheck::Unanchored)
+        );
+        let modified = "/tmp/x: invalid signature (code or signature have been modified)\nIn architecture: arm64\n";
+        assert_eq!(
+            classify_signer_check(Some(1), modified),
+            Ok(SignerCheck::Invalid)
+        );
+        // A broken-signature message only counts on a verification failure.
+        for code in [Some(2), Some(127), None] {
+            assert_eq!(
+                classify_signer_check(code, modified),
+                Err(RuleOutcome::NotApplicable)
+            );
         }
+    }
+
+    #[test]
+    fn every_known_diagnostic_is_a_broken_signature() {
+        for diag in BROKEN_SIGNATURE_DIAGNOSTICS {
+            assert!(
+                indicates_broken_signature(&format!("/a/b: {diag}\n")),
+                "{diag}"
+            );
+            assert!(indicates_broken_signature(&format!("{diag}\n")), "{diag}");
+        }
+    }
+
+    /// Tool failures and other exit-1 causes stay "couldn't check" (§11.8).
+    #[test]
+    fn other_verify_failures_are_not_a_broken_signature() {
+        for stderr in [
+            "/a/b: An internal error has occurred.\n",
+            "/a/b: errSecInternalComponent\nIn architecture: arm64\n",
+            "/a/b: CSSMERR_TP_CERT_REVOKED\n",
+            "",
+        ] {
+            assert!(!indicates_broken_signature(stderr), "{stderr:?}");
+            assert_eq!(
+                classify_signer_check(Some(1), stderr),
+                Err(RuleOutcome::NotApplicable)
+            );
+        }
+    }
+
+    /// A broken signature outranks an unsigned slice in the same report.
+    #[test]
+    fn classify_signer_check_separates_an_unsigned_slice() {
+        let unsigned = "/a/b: code object is not signed at all\n";
+        assert!(!indicates_broken_signature(unsigned));
+        assert_eq!(
+            classify_signer_check(Some(1), unsigned),
+            Ok(SignerCheck::UnsignedSlice)
+        );
+        let both = "/a/b: code object is not signed at all\n/a/b: invalid signature (code or signature have been modified)\n";
+        assert_eq!(
+            classify_signer_check(Some(1), both),
+            Ok(SignerCheck::Invalid)
+        );
+    }
+
+    /// The diagnostic must be the whole tail after `: `, not a suffix of a word.
+    #[test]
+    fn a_diagnostic_glued_to_other_text_does_not_match() {
+        assert!(!indicates_broken_signature("/a/bXCSSMERR_TP_NOT_TRUSTED\n"));
+        assert!(!indicates_broken_signature(
+            "/a/b: CSSMERR_TP_NOT_TRUSTED (and more)\n"
+        ));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn invalid_signature_fires_on_broken_signatures_only() {
+        let fixtures = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures");
+        for name in [
+            "suspicious/macho_adhoc_modified_after_signing",
+            "suspicious/macho_self_signed_corrupt_cms",
+        ] {
+            let signal = InvalidSignatureRule
+                .evaluate(&ScanContext::load(&fixtures.join(name)))
+                .expect("evaluates")
+                .unwrap_or_else(|| panic!("{name} fires"));
+            assert_eq!(signal.id, "invalid-code-signature");
+            assert_eq!(signal.weight, 5);
+        }
+        for name in [
+            "suspicious/macho_self_signed_identity",
+            "benign/tiny_hello_arm64",
+            "benign/macho_universal_unsigned_x86_slice",
+        ] {
+            assert!(
+                matches!(
+                    InvalidSignatureRule.evaluate(&ScanContext::load(&fixtures.join(name))),
+                    Ok(None)
+                ),
+                "{name}"
+            );
+        }
+        // The corrupt self-signed blob is scored here, not as unanchored.
+        assert!(matches!(
+            UnanchoredIdentityRule.evaluate(&ScanContext::load(
+                &fixtures.join("suspicious/macho_self_signed_corrupt_cms")
+            )),
+            Ok(None)
+        ));
+    }
+
+    #[test]
+    fn things_that_are_not_code_objects_have_no_invalid_signature() {
+        assert!(matches!(
+            InvalidSignatureRule.evaluate(&ctx("readme.txt", b"just some notes\n")),
+            Ok(None)
+        ));
     }
 
     #[cfg(target_os = "macos")]
