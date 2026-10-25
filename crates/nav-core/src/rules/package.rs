@@ -81,13 +81,16 @@ impl InstallerScriptRule {
         // Cheapest to read first: small real entries are read in full before
         // large or padded ones, and their unused allowance carries forward.
         // Ties keep shallower, then TOC, order (the sort is stable). An entry
-        // that cannot be read at all takes no share.
+        // that cannot be read at all takes no share, and neither does a repeat
+        // of a heap range already queued.
         let mut work = Vec::new();
+        let mut seen = std::collections::HashSet::new();
         let wanted = archive
             .metadata_entries()
             .filter(|e| matches!(e.name.as_str(), "Scripts" | "Distribution"));
         for (toc_index, entry) in wanted.enumerate() {
             match xar::entry_cost(content, &archive, entry) {
+                Ok(_) if !seen.insert(range_key(entry)) => {}
                 Ok(cost) => work.push((toc_index, cost, entry, ScriptFindings::default())),
                 Err(_) => unreadable = true,
             }
@@ -134,6 +137,11 @@ impl InstallerScriptRule {
             category: self.category(),
         }))
     }
+}
+
+/// Identity of an entry's heap bytes: entries sharing one are read once.
+fn range_key(entry: &xar::XarFile) -> (bool, Option<u64>, Option<u64>) {
+    (entry.name == "Scripts", entry.offset, entry.length)
 }
 
 /// Signal descriptions and summed weight collected across scanned script text.
@@ -1914,6 +1922,24 @@ mod tests {
         distribution_at(ZLIB_ORDINARY.len(), ZLIB_DROPPER.len(), depth)
     }
 
+    /// `n` padding `Distribution`s at `depth`, each over its own copy of the
+    /// benign blob, then (if `dropper_depth` is set) the dropper.
+    fn distinct_padding_archive(n: usize, depth: usize, dropper_depth: Option<usize>) -> Vec<u8> {
+        let len = ZLIB_ORDINARY.len();
+        let mut toc: String = (0..n)
+            .map(|i| distribution_at(i * len, len, depth))
+            .collect();
+        if let Some(d) = dropper_depth {
+            toc += &distribution_at(n * len, ZLIB_DROPPER.len(), d);
+        }
+        let mut bytes = xar::toc_xar_bytes(&toc);
+        for _ in 0..n {
+            bytes.extend_from_slice(ZLIB_ORDINARY);
+        }
+        bytes.extend_from_slice(ZLIB_DROPPER);
+        bytes
+    }
+
     fn evaluate_small(
         bytes: &[u8],
         limits: &xar::XarLimits,
@@ -1928,7 +1954,7 @@ mod tests {
         let one = budget_archive(&benign(0));
         assert!(matches!(evaluate_small(&one, &limits).0, Ok(None)));
 
-        let many = budget_archive(&benign(0).repeat(50));
+        let many = distinct_padding_archive(50, 0, None);
         let (r, _) = evaluate_small(&many, &limits);
         assert!(matches!(r, Err(RuleOutcome::NotApplicable)), "{r:?}");
 
@@ -1951,8 +1977,7 @@ mod tests {
     #[test]
     fn a_small_dropper_is_read_despite_nested_padding() {
         let limits = small_limits();
-        let toc = format!("{}{}", benign(1).repeat(50), dropper(0));
-        let (r, c) = evaluate_small(&budget_archive(&toc), &limits);
+        let (r, c) = evaluate_small(&distinct_padding_archive(50, 1, Some(0)), &limits);
         let signal = r.expect("evaluates").expect("the dropper scores");
         assert!(
             signal.description.contains("launches an interpreter"),
@@ -2088,8 +2113,7 @@ mod tests {
             max_read_back_bytes: 64 * 1024,
             ..xar::XarLimits::default()
         };
-        let toc = format!("{}{}", benign(0).repeat(200), dropper(0));
-        let (r, c) = evaluate_small(&budget_archive(&toc), &limits);
+        let (r, c) = evaluate_small(&distinct_padding_archive(200, 0, Some(0)), &limits);
         let signal = r.expect("evaluates").expect("the dropper scores");
         assert!(signal.description.contains("launches an interpreter"));
         assert!(c.marked_incomplete("installer-script-suspicious"));
@@ -2445,5 +2469,21 @@ mod tests {
         // Through the rule, the same archive is never reported clean.
         let (r, _) = evaluate_small(&bytes, &limits);
         assert!(matches!(r, Err(RuleOutcome::NotApplicable)), "{r:?}");
+    }
+
+    #[test]
+    fn a_repeated_heap_range_is_read_once() {
+        let limits = small_limits();
+        let many = budget_archive(&benign(0).repeat(300));
+        assert!(matches!(evaluate_small(&many, &limits).0, Ok(None)));
+
+        let (once, _) = evaluate_small(&budget_archive(&dropper(0)), &limits);
+        let (many, c) = evaluate_small(&budget_archive(&dropper(0).repeat(300)), &limits);
+        let (once, many) = (once.unwrap().unwrap(), many.unwrap().unwrap());
+        assert_eq!(
+            (once.weight, once.description),
+            (many.weight, many.description)
+        );
+        assert!(!c.marked_incomplete("installer-script-suspicious"));
     }
 }
