@@ -61,7 +61,6 @@ fn has_quarantine_xattr(_path: &std::path::Path) -> Result<Option<MatchedSignal>
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::context::ContentSource;
     use std::path::PathBuf;
 
     /// Reads an xattr, so a truncated content prefix has nothing to miss.
@@ -72,13 +71,7 @@ mod tests {
             content: Some(b"anything".to_vec()),
             truncated: true,
             file_len: Some(8),
-            identity: None,
-            source: ContentSource::File,
-            file: None,
-            codesign_dv_cache: std::sync::OnceLock::new(),
-            spctl_cache: std::sync::OnceLock::new(),
-            macho_cache: std::sync::OnceLock::new(),
-            incomplete_rules: std::sync::Mutex::new(Vec::new()),
+            ..Default::default()
         };
         assert!(QuarantineXattrRule.covers_truncation(&c));
     }

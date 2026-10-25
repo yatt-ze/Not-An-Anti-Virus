@@ -688,22 +688,15 @@ fn spawn_codesign_dv(_path: &std::path::Path) -> Result<(bool, String), RuleOutc
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::context::{ContentSource, ScanContext};
+    use crate::context::ScanContext;
     use std::path::PathBuf;
 
     fn ctx(name: &str, body: &[u8]) -> ScanContext {
         ScanContext {
             path: PathBuf::from(name),
             content: Some(body.to_vec()),
-            truncated: false,
             file_len: Some(body.len() as u64),
-            identity: None,
-            source: ContentSource::File,
-            file: None,
-            codesign_dv_cache: std::sync::OnceLock::new(),
-            spctl_cache: std::sync::OnceLock::new(),
-            macho_cache: std::sync::OnceLock::new(),
-            incomplete_rules: std::sync::Mutex::new(Vec::new()),
+            ..Default::default()
         }
     }
 

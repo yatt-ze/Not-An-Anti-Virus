@@ -10,9 +10,10 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 use crate::bundle::{self, BundleLayout};
-use crate::context::MAX_STREAM_BYTES;
+use crate::context::{ScanContext, MAX_STREAM_BYTES};
 use crate::model::{Recommendation, ScanCompleteness, ScanResult};
-use crate::scan::scan_file;
+use crate::rules::default_ruleset;
+use crate::scan::{scan_context, scan_file};
 
 /// What the named target turned out to be.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -34,10 +35,9 @@ pub enum TargetKind {
 pub struct ScanBudget {
     /// Maximum number of files scored in one target scan.
     pub max_files: usize,
-    /// Maximum summed input across the target, each file counted at the most
-    /// a rule may stream from it (its length clipped to `MAX_STREAM_BYTES`,
-    /// §11.12) — not the smaller §3 in-memory prefix, since rules can stream
-    /// past it (#45).
+    /// Maximum bytes the scan reads from disk across the target, re-reads
+    /// included; `codesign`/`spctl` reads are not counted (§11.12). One file
+    /// can overshoot it.
     pub max_total_bytes: u64,
     /// Maximum directory-recursion depth below the named target.
     pub max_depth: usize,
@@ -224,36 +224,44 @@ pub fn scan_target_with_budget(
     })
 }
 
-/// Fold the collection-time and scan-time budget limits into one outcome. A
-/// structural limit (files/depth) is reported ahead of a byte limit, since it
-/// bounds what was even discovered.
+/// Fold the collection-time and scan-time budget limits into one outcome.
+/// When both tripped, the byte limit is reported over `Files` but not over
+/// `Depth`/`Entries`, which no flag can raise (§11.12).
 fn outcome(collect_limit: Option<BudgetLimit>, byte_limit: Option<BudgetLimit>) -> BudgetOutcome {
-    match collect_limit.or(byte_limit) {
+    let reported = match collect_limit {
+        Some(BudgetLimit::Files) | None => byte_limit.or(collect_limit),
+        Some(_) => collect_limit,
+    };
+    match reported {
         Some(limit) => BudgetOutcome::Exhausted(limit),
         None => BudgetOutcome::Within,
     }
 }
 
-/// Scan `files` in order until the summed read (each file's length clipped to
-/// `MAX_STREAM_BYTES`, the most a rule streams from one file) would exceed
-/// `max_total_bytes`. Returns the results
-/// scored and `Some(TotalBytes)` if the cap stopped it short.
+/// Scan `files` in order, charging each the bytes its scan read from disk
+/// ([`ScanContext::bytes_read`]). After the first file, a file is started only if its
+/// length, clipped to `MAX_STREAM_BYTES`, still fits under `max_total_bytes`;
+/// a file can read more than that, so the ceiling can be overshot by one
+/// file's reads (§11.12). Returns the results scored and `Some(TotalBytes)`
+/// if the cap stopped it short.
 fn scan_within_bytes(
     files: &[PathBuf],
     budget: &ScanBudget,
 ) -> (Vec<ScanResult>, Option<BudgetLimit>) {
+    let rules = default_ruleset();
     let mut results = Vec::new();
     let mut used: u64 = 0;
     for f in files {
-        let read_len = std::fs::metadata(f)
-            .map(|m| m.len().min(MAX_STREAM_BYTES))
-            .unwrap_or(0);
         // Always allow the first file through, so one large file still scans.
-        if !results.is_empty() && used.saturating_add(read_len) > budget.max_total_bytes {
+        let first = results.is_empty();
+        let admit = |len: u64| {
+            first || used.saturating_add(len.min(MAX_STREAM_BYTES)) <= budget.max_total_bytes
+        };
+        let Some(ctx) = ScanContext::load_if(f, admit) else {
             return (results, Some(BudgetLimit::TotalBytes));
-        }
-        used = used.saturating_add(read_len);
-        results.push(scan_file(f));
+        };
+        results.push(scan_context(&ctx, &rules));
+        used = used.saturating_add(ctx.bytes_read());
     }
     (results, None)
 }
@@ -516,6 +524,85 @@ mod tests {
             .iter()
             .any(|r| r.path.ends_with("sub/deep.txt")));
         assert_eq!(scan.budget, BudgetOutcome::Exhausted(BudgetLimit::Depth));
+    }
+
+    fn bytes_read_scanning(path: &Path) -> u64 {
+        let ctx = ScanContext::load(path);
+        scan_context(&ctx, &default_ruleset());
+        ctx.bytes_read()
+    }
+
+    /// A Mach-O whose `__text` runs past the 8 MiB prefix is read twice past
+    /// it (strings streams the file, entropy streams `__text`); the budget
+    /// is charged both reads, not the file's length once (#53).
+    #[test]
+    fn total_bytes_charges_re_reads_not_file_length() {
+        const MIB: usize = 1024 * 1024;
+        let payload: Vec<u8> = (0..12 * MIB).map(|i| (i % 251) as u8).collect();
+        let (image, _) = crate::macho::tests_support::synth_macho_64(&payload);
+        let dir = TempDir::new("budget-reread");
+        fs::write(dir.path().join("a"), &image).unwrap();
+        fs::write(dir.path().join("b"), &image).unwrap();
+
+        let len = image.len() as u64;
+        let read = bytes_read_scanning(&dir.path().join("a"));
+        assert!(read > len + 3 * MIB as u64, "{read}");
+
+        // Both files fit when each is charged its length; the re-reads don't.
+        let budget = ScanBudget {
+            max_total_bytes: 2 * len + MIB as u64,
+            ..ScanBudget::default()
+        };
+        let scan = scan_target_with_budget(dir.path(), true, &budget).unwrap();
+        assert_eq!(scan.results.len(), 1);
+        assert_eq!(
+            scan.budget,
+            BudgetOutcome::Exhausted(BudgetLimit::TotalBytes)
+        );
+    }
+
+    /// A non-Mach-O file over `MAX_STREAM_BYTES` is read only in its prefix:
+    /// too big for suspicious-strings to stream, so it is charged that, not
+    /// its length.
+    #[test]
+    fn a_large_non_macho_file_is_charged_only_what_was_read() {
+        let dir = TempDir::new("budget-large-blob");
+        let big = dir.path().join("a.bin");
+        fs::File::create(&big)
+            .unwrap()
+            .set_len(MAX_STREAM_BYTES + 4096)
+            .unwrap();
+        let read = bytes_read_scanning(&big);
+        assert!(read < 16 * 1024 * 1024, "{read}");
+    }
+
+    /// Both limits hit: the byte limit is reported, since it stopped scoring
+    /// before the collected files ran out.
+    #[test]
+    fn a_byte_stop_is_reported_over_a_file_limit() {
+        let dir = TempDir::new("budget-both");
+        for name in ["a.bin", "b.bin", "c.bin"] {
+            fs::write(dir.path().join(name), vec![0u8; 4096]).unwrap();
+        }
+        let budget = ScanBudget {
+            max_files: 2,
+            max_total_bytes: 100,
+            ..ScanBudget::default()
+        };
+        let scan = scan_target_with_budget(dir.path(), true, &budget).unwrap();
+        assert_eq!(scan.results.len(), 1);
+        assert_eq!(
+            scan.budget,
+            BudgetOutcome::Exhausted(BudgetLimit::TotalBytes)
+        );
+    }
+
+    #[test]
+    fn a_fixed_collection_limit_is_reported_over_a_byte_stop() {
+        let both = outcome(Some(BudgetLimit::Depth), Some(BudgetLimit::TotalBytes));
+        assert_eq!(both, BudgetOutcome::Exhausted(BudgetLimit::Depth));
+        let both = outcome(Some(BudgetLimit::Entries), Some(BudgetLimit::TotalBytes));
+        assert_eq!(both, BudgetOutcome::Exhausted(BudgetLimit::Entries));
     }
 
     #[test]

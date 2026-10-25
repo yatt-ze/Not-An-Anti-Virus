@@ -1523,13 +1523,7 @@ mod tests {
             content: Some(b"benign".to_vec()),
             truncated: true,
             file_len: Some(6),
-            identity: None,
-            source: crate::context::ContentSource::File,
-            file: None,
-            codesign_dv_cache: std::sync::OnceLock::new(),
-            spctl_cache: std::sync::OnceLock::new(),
-            macho_cache: std::sync::OnceLock::new(),
-            incomplete_rules: std::sync::Mutex::new(Vec::new()),
+            ..Default::default()
         };
         assert!(!SuspiciousStringsRule.covers_truncation(&ctx));
     }

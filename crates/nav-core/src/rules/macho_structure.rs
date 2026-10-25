@@ -440,7 +440,7 @@ fn normalize_load_path(path: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::context::{ContentSource, ScanContext, MAX_CONTENT_BYTES};
+    use crate::context::{ScanContext, MAX_CONTENT_BYTES};
     use crate::macho::tests_support::{
         synth_fat, synth_fat_with_bogus_arches, synth_macho_64_full,
         synth_macho_64_full_with_cd_flags, synth_macho_64_full_with_cds_and_cms,
@@ -468,13 +468,7 @@ mod tests {
             content: Some(content),
             truncated,
             file_len,
-            identity: None,
-            source: ContentSource::File,
-            file: None,
-            codesign_dv_cache: std::sync::OnceLock::new(),
-            spctl_cache: std::sync::OnceLock::new(),
-            macho_cache: std::sync::OnceLock::new(),
-            incomplete_rules: std::sync::Mutex::new(Vec::new()),
+            ..Default::default()
         }
     }
 
@@ -491,15 +485,8 @@ mod tests {
         let c = ScanContext {
             path: PathBuf::from("x"),
             content: None,
-            truncated: false,
             file_len: None,
-            identity: None,
-            source: ContentSource::File,
-            file: None,
-            codesign_dv_cache: std::sync::OnceLock::new(),
-            spctl_cache: std::sync::OnceLock::new(),
-            macho_cache: std::sync::OnceLock::new(),
-            incomplete_rules: std::sync::Mutex::new(Vec::new()),
+            ..Default::default()
         };
         assert!(matches!(
             MachOStructureRule.evaluate(&c),
@@ -519,13 +506,7 @@ mod tests {
             content: Some(b"\xfe\xed\xfa\xcf".to_vec()), // MH_MAGIC_64
             truncated: true,
             file_len: Some(u64::MAX),
-            identity: None,
-            source: ContentSource::File,
-            file: None,
-            codesign_dv_cache: std::sync::OnceLock::new(),
-            spctl_cache: std::sync::OnceLock::new(),
-            macho_cache: std::sync::OnceLock::new(),
-            incomplete_rules: std::sync::Mutex::new(Vec::new()),
+            ..Default::default()
         };
         assert!(
             c.macho().is_macho,
