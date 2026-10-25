@@ -176,17 +176,16 @@ fn status_from_flags(flags: u32) -> DvStatus {
     }
 }
 
-/// One slice's signing status from the parser's CodeDirectory facts, classed
-/// as `macho-loader-anomaly` does (no non-empty CMS blob counts as ad-hoc).
-/// `None` if the slice's CodeDirectory couldn't be read.
+/// One slice's signing status from the parser's CodeDirectory flags, read as
+/// `codesign -dv` reads them. `None` if the CodeDirectory couldn't be read, or
+/// it claims an identity with no CMS blob behind it (`-dv` calls that signed,
+/// `macho-loader-anomaly` ad-hoc).
 fn slice_status(image: &MachOImage) -> Option<DvStatus> {
     if !image.has_code_signature {
         return Some(DvStatus::Unsigned);
     }
-    Some(match status_from_flags(image.code_directory_flags?) {
-        DvStatus::Signed if !image.has_cms_signature => DvStatus::AdHocManual,
-        status => status,
-    })
+    let status = status_from_flags(image.code_directory_flags?);
+    (status != DvStatus::Signed || image.has_cms_signature).then_some(status)
 }
 
 /// True if the native slice (`codesign -dv`'s `native`) has `status`, or, in
@@ -1207,9 +1206,10 @@ mod tests {
         assert_eq!(slice_status(&image), Some(DvStatus::AdHocLinkerSigned));
         image.code_directory_flags = Some(CS_ADHOC);
         assert_eq!(slice_status(&image), Some(DvStatus::AdHocManual));
-        // An identity claim with no CMS blob behind it is ad-hoc.
+        // An identity claim with no CMS blob behind it: `-dv` and the parser
+        // disagree, so the slice is left unclassified.
         image.code_directory_flags = Some(0);
-        assert_eq!(slice_status(&image), Some(DvStatus::AdHocManual));
+        assert_eq!(slice_status(&image), None);
         image.has_cms_signature = true;
         assert_eq!(slice_status(&image), Some(DvStatus::Signed));
     }
