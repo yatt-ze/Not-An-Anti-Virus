@@ -437,15 +437,18 @@ enum SignerCheck {
 }
 
 /// True if `ctx` is a fat Mach-O with exactly one slice carrying an
-/// `LC_CODE_SIGNATURE`, at least one without, and no slice the parser skipped.
+/// `LC_CODE_SIGNATURE`, at least one without, no slice the parser skipped,
+/// and every slice's load commands walked in full (a cut-short walk can miss
+/// the command).
 fn is_one_signed_slice_beside_unsigned(ctx: &ScanContext) -> bool {
     let macho = ctx.macho();
-    let (mut fat, mut signed) = (0, 0);
+    let (mut fat, mut signed, mut complete) = (0, 0, true);
     for image in macho.images.iter().filter(|image| image.is_fat) {
         fat += 1;
         signed += usize::from(image.has_code_signature);
+        complete &= image.segments_complete;
     }
-    macho.skipped_slices == 0 && signed == 1 && fat > signed
+    macho.skipped_slices == 0 && complete && signed == 1 && fat > signed
 }
 
 /// `codesign` diagnostics, after the `<path>: ` prefix, that mean the
