@@ -561,6 +561,14 @@
     ],
     "completeness": "partial"
   },
+  "suspicious/macho_fat_adhoc_native_self_signed_slice": {
+    "score": 5,
+    "recommendation": "no-action",
+    "rule_ids": [
+      "unanchored-signing-identity"
+    ],
+    "completeness": "complete"
+  },
   "suspicious/macho_fat_malformed_slice": {
     "score": 4,
     "recommendation": "no-action",

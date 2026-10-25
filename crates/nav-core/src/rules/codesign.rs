@@ -7,7 +7,7 @@
 
 use super::{Rule, RuleOutcome};
 use crate::context::ScanContext;
-use crate::macho::{CS_ADHOC, CS_LINKER_SIGNED};
+use crate::macho::{MachOImage, CS_ADHOC, CS_LINKER_SIGNED};
 use crate::model::{MatchedSignal, SignalCategory};
 
 /// What `codesign -dv` says about a code object's signature. Doesn't yet say
@@ -166,6 +166,37 @@ impl Rule for UnsignedBinaryRule {
     }
 }
 
+/// One slice's signing status from the parser's CodeDirectory facts, classed
+/// as `macho-loader-anomaly` does (no non-empty CMS blob counts as ad-hoc).
+/// `None` if the slice's CodeDirectory couldn't be read.
+fn slice_status(image: &MachOImage) -> Option<DvStatus> {
+    if !image.has_code_signature {
+        return Some(DvStatus::Unsigned);
+    }
+    let flags = image.code_directory_flags?;
+    Some(if flags & CS_ADHOC != 0 && flags & CS_LINKER_SIGNED != 0 {
+        DvStatus::AdHocLinkerSigned
+    } else if flags & CS_ADHOC != 0 || !image.has_cms_signature {
+        DvStatus::AdHocManual
+    } else {
+        DvStatus::Signed
+    })
+}
+
+/// True if the native slice (`codesign -dv`'s `native`) has `status`, or, in
+/// a fat binary whose native slice `codesign` reads as signed, any slice the
+/// parser walked does. `codesign -dv` reads only the native slice (§5.2, #92);
+/// a thin file's only slice is the native one.
+fn any_slice_is(ctx: &ScanContext, native: DvStatus, status: DvStatus) -> bool {
+    native == status
+        || (native != DvStatus::Unsigned
+            && ctx
+                .macho()
+                .images
+                .iter()
+                .any(|image| image.is_fat && slice_status(image) == Some(status)))
+}
+
 /// Weight for a binary carrying a hand-applied ad-hoc signature — no real
 /// identity, but not as bare as `unsigned-binary`'s "no signature at all".
 const ADHOC_MANUAL_WEIGHT: i32 = 3;
@@ -201,17 +232,22 @@ impl Rule for AdHocSignedRule {
             return Ok(None);
         }
 
-        if run_codesign_dv(ctx)? == DvStatus::AdHocManual {
-            Ok(Some(MatchedSignal {
-                id: "adhoc-signed-binary".to_string(),
-                weight: ADHOC_MANUAL_WEIGHT,
-                description: "binary carries a hand-applied ad-hoc signature (no identity)"
-                    .to_string(),
-                category: SignalCategory::ProvenanceConcern,
-            }))
-        } else {
-            Ok(None)
+        let native = run_codesign_dv(ctx)?;
+        if !any_slice_is(ctx, native, DvStatus::AdHocManual) {
+            return Ok(None);
         }
+        // One provenance signal per file: an unanchored slice outranks ad-hoc.
+        if any_slice_is(ctx, native, DvStatus::Signed)
+            && run_signer_check(ctx) == Ok(SignerCheck::Unanchored)
+        {
+            return Ok(None);
+        }
+        Ok(Some(MatchedSignal {
+            id: "adhoc-signed-binary".to_string(),
+            weight: ADHOC_MANUAL_WEIGHT,
+            description: "binary carries a hand-applied ad-hoc signature (no identity)".to_string(),
+            category: SignalCategory::ProvenanceConcern,
+        }))
     }
 
     /// Same as `UnsignedBinaryRule`: `ctx.macho()` only gates.
@@ -224,7 +260,7 @@ impl Rule for AdHocSignedRule {
 const UNANCHORED_IDENTITY_WEIGHT: i32 = 5;
 
 /// Notes a signature in any slice that does not chain to an Apple anchor.
-/// Runs only when the native slice is a real (non-ad-hoc) identity.
+/// Runs only when some slice carries a real (non-ad-hoc) identity.
 pub struct UnanchoredIdentityRule;
 
 impl Default for UnanchoredIdentityRule {
@@ -252,7 +288,8 @@ impl Rule for UnanchoredIdentityRule {
         if !ctx.macho().is_macho {
             return Ok(None);
         }
-        if run_codesign_dv(ctx)? != DvStatus::Signed {
+        let native = run_codesign_dv(ctx)?;
+        if !any_slice_is(ctx, native, DvStatus::Signed) {
             return Ok(None);
         }
 
@@ -1112,6 +1149,44 @@ mod tests {
             )),
             Ok(None)
         ));
+    }
+
+    /// `codesign -dv` sees only the native (ad-hoc) slice; the self-signed
+    /// x86_64 slice must still reach the anchor check, and win over ad-hoc.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_self_signed_non_native_slice_is_scored_as_unanchored() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("fixtures/suspicious/macho_fat_adhoc_native_self_signed_slice");
+        let ctx = ScanContext::load(&path);
+        let signal = UnanchoredIdentityRule
+            .evaluate(&ctx)
+            .expect("evaluates")
+            .expect("self-signed slice fires");
+        assert_eq!(signal.id, "unanchored-signing-identity");
+        assert!(matches!(AdHocSignedRule.evaluate(&ctx), Ok(None)));
+    }
+
+    #[test]
+    fn slice_status_reads_codedirectory_facts() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("fixtures/benign/tiny_hello_arm64");
+        let mut image = ScanContext::load(&path).macho().images[0].clone();
+        image.has_code_signature = false;
+        image.code_directory_flags = None;
+        image.has_cms_signature = false;
+        assert_eq!(slice_status(&image), Some(DvStatus::Unsigned));
+        image.has_code_signature = true;
+        assert_eq!(slice_status(&image), None);
+        image.code_directory_flags = Some(CS_ADHOC | CS_LINKER_SIGNED);
+        assert_eq!(slice_status(&image), Some(DvStatus::AdHocLinkerSigned));
+        image.code_directory_flags = Some(CS_ADHOC);
+        assert_eq!(slice_status(&image), Some(DvStatus::AdHocManual));
+        // An identity claim with no CMS blob behind it is ad-hoc.
+        image.code_directory_flags = Some(0);
+        assert_eq!(slice_status(&image), Some(DvStatus::AdHocManual));
+        image.has_cms_signature = true;
+        assert_eq!(slice_status(&image), Some(DvStatus::Signed));
     }
 
     #[test]
