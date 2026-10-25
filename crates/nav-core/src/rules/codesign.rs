@@ -7,7 +7,7 @@
 
 use super::{Rule, RuleOutcome};
 use crate::context::ScanContext;
-use crate::macho::{CS_ADHOC, CS_LINKER_SIGNED};
+use crate::macho::{MachOImage, CS_ADHOC, CS_LINKER_SIGNED};
 use crate::model::{MatchedSignal, SignalCategory};
 
 /// What `codesign -dv` says about a code object's signature. Doesn't yet say
@@ -84,9 +84,7 @@ fn classify_dv(success: bool, stderr: &str) -> Result<DvStatus, RuleOutcome> {
         return Ok(match code_directory_flags(cd_line) {
             // Numeric flags parsed: ad-hoc/linker-signed come straight from
             // the bits — the `Signature=adhoc` line is not consulted.
-            Some(flags) if flags & CS_ADHOC == 0 => DvStatus::Signed,
-            Some(flags) if flags & CS_LINKER_SIGNED != 0 => DvStatus::AdHocLinkerSigned,
-            Some(_) => DvStatus::AdHocManual,
+            Some(flags) => status_from_flags(flags),
             // Flags token missing or malformed: fall back to the textual
             // markers, as before #31's hardening.
             None => {
@@ -103,12 +101,7 @@ fn classify_dv(success: bool, stderr: &str) -> Result<DvStatus, RuleOutcome> {
     }
     // `codesign -dv` exits non-zero for unsigned binaries *and* for genuine
     // errors, so match the specific "not signed" message, not the exit code.
-    let is_unsigned = stderr.lines().any(|line| {
-        let line = line.trim();
-        line == "code object is not signed at all"
-            || line.ends_with(": code object is not signed at all")
-    });
-    if is_unsigned {
+    if reports_unsigned_slice(stderr) {
         Ok(DvStatus::Unsigned)
     } else {
         // codesign missing or some other inconclusive error — don't claim
@@ -171,6 +164,87 @@ impl Rule for UnsignedBinaryRule {
     }
 }
 
+/// The status a CodeDirectory's `flags` give, for `classify_dv` and
+/// [`slice_status`] alike.
+fn status_from_flags(flags: u32) -> DvStatus {
+    if flags & CS_ADHOC == 0 {
+        DvStatus::Signed
+    } else if flags & CS_LINKER_SIGNED != 0 {
+        DvStatus::AdHocLinkerSigned
+    } else {
+        DvStatus::AdHocManual
+    }
+}
+
+/// One slice's signing status from the parser's CodeDirectory flags, read as
+/// `codesign -dv` reads them. `None` if the CodeDirectory couldn't be read, or
+/// it claims an identity with no CMS blob behind it (`-dv` calls that signed,
+/// `macho-loader-anomaly` ad-hoc).
+fn slice_status(image: &MachOImage) -> Option<DvStatus> {
+    if !image.has_code_signature {
+        return Some(DvStatus::Unsigned);
+    }
+    let status = status_from_flags(image.code_directory_flags?);
+    (status != DvStatus::Signed || image.has_cms_signature).then_some(status)
+}
+
+/// True if the native slice (`codesign -dv`'s `native`) has `status`, or, in
+/// a fat binary whose native slice `codesign` reads as signed, any slice the
+/// parser walked does. `codesign -dv` reads only the native slice (§5.2, #92);
+/// a thin file's only slice is the native one.
+fn any_slice_is(ctx: &ScanContext, native: DvStatus, status: DvStatus) -> bool {
+    native == status
+        || (native != DvStatus::Unsigned
+            && ctx
+                .macho()
+                .images
+                .iter()
+                .any(|image| image.is_fat && slice_status(image) == Some(status)))
+}
+
+/// True if `native` is not unsigned and some slice of a fat file couldn't be
+/// classified: the parser skipped it, or [`slice_status`] is `None`. A rule
+/// that found nothing then reports `NotApplicable`, not clean (§11.8). A thin
+/// file's only slice is the native one, which `codesign -dv` has read.
+fn has_unclassified_fat_slice(ctx: &ScanContext, native: DvStatus) -> bool {
+    let macho = ctx.macho();
+    native != DvStatus::Unsigned
+        && is_fat_file(ctx)
+        && (macho.skipped_slices > 0
+            || macho
+                .images
+                .iter()
+                .any(|image| image.is_fat && slice_status(image).is_none()))
+}
+
+/// True if the held bytes start with fat (universal) magic. Unlike
+/// `MachOImage::is_fat`, this holds when every slice was skipped.
+fn is_fat_file(ctx: &ScanContext) -> bool {
+    ctx.content
+        .as_deref()
+        .and_then(|bytes| bytes.get(..4))
+        .is_some_and(|magic| magic == [0xca, 0xfe, 0xba, 0xbe] || magic == [0xca, 0xfe, 0xba, 0xbf])
+}
+
+/// Whether `unanchored-signing-identity` fires: some slice carries a real
+/// identity and the signer check exits 3. Shared so `adhoc-signed-binary` can
+/// stand down for it.
+fn unanchored_fires(ctx: &ScanContext, native: DvStatus) -> Result<bool, RuleOutcome> {
+    if !any_slice_is(ctx, native, DvStatus::Signed) {
+        return if has_unclassified_fat_slice(ctx, native) {
+            Err(RuleOutcome::NotApplicable)
+        } else {
+            Ok(false)
+        };
+    }
+    match run_signer_check(ctx)? {
+        SignerCheck::Unanchored => Ok(true),
+        // A signature that doesn't verify is `invalid-code-signature`'s finding.
+        SignerCheck::Anchored | SignerCheck::Invalid => Ok(false),
+        SignerCheck::UnsignedSlice => Err(RuleOutcome::NotApplicable),
+    }
+}
+
 /// Weight for a binary carrying a hand-applied ad-hoc signature — no real
 /// identity, but not as bare as `unsigned-binary`'s "no signature at all".
 const ADHOC_MANUAL_WEIGHT: i32 = 3;
@@ -206,20 +280,28 @@ impl Rule for AdHocSignedRule {
             return Ok(None);
         }
 
-        if run_codesign_dv(ctx)? == DvStatus::AdHocManual {
-            Ok(Some(MatchedSignal {
-                id: "adhoc-signed-binary".to_string(),
-                weight: ADHOC_MANUAL_WEIGHT,
-                description: "binary carries a hand-applied ad-hoc signature (no identity)"
-                    .to_string(),
-                category: SignalCategory::ProvenanceConcern,
-            }))
-        } else {
-            Ok(None)
+        let native = run_codesign_dv(ctx)?;
+        if !any_slice_is(ctx, native, DvStatus::AdHocManual) {
+            return if has_unclassified_fat_slice(ctx, native) {
+                Err(RuleOutcome::NotApplicable)
+            } else {
+                Ok(None)
+            };
         }
+        // One provenance signal per file: an unanchored finding replaces ad-hoc.
+        if unanchored_fires(ctx, native) == Ok(true) {
+            return Ok(None);
+        }
+        Ok(Some(MatchedSignal {
+            id: "adhoc-signed-binary".to_string(),
+            weight: ADHOC_MANUAL_WEIGHT,
+            description: "binary carries a hand-applied ad-hoc signature (no identity)".to_string(),
+            category: SignalCategory::ProvenanceConcern,
+        }))
     }
 
-    /// Same as `UnsignedBinaryRule`: `ctx.macho()` only gates.
+    /// `codesign` reads the whole file, and `ctx.macho()` reads each slice
+    /// from the file by offset, not from the held prefix.
     fn covers_truncation(&self, _ctx: &ScanContext) -> bool {
         true
     }
@@ -229,7 +311,7 @@ impl Rule for AdHocSignedRule {
 const UNANCHORED_IDENTITY_WEIGHT: i32 = 5;
 
 /// Notes a signature in any slice that does not chain to an Apple anchor.
-/// Runs only when the native slice is a real (non-ad-hoc) identity.
+/// Runs only when some slice carries a real (non-ad-hoc) identity.
 pub struct UnanchoredIdentityRule;
 
 impl Default for UnanchoredIdentityRule {
@@ -257,51 +339,179 @@ impl Rule for UnanchoredIdentityRule {
         if !ctx.macho().is_macho {
             return Ok(None);
         }
-        if run_codesign_dv(ctx)? != DvStatus::Signed {
+        let native = run_codesign_dv(ctx)?;
+        if !unanchored_fires(ctx, native)? {
             return Ok(None);
         }
-
-        if run_anchor_requirement(ctx)? {
-            Ok(None)
-        } else {
-            Ok(Some(MatchedSignal {
-                id: "unanchored-signing-identity".to_string(),
-                weight: UNANCHORED_IDENTITY_WEIGHT,
-                description:
-                    "binary carries a signature that does not chain to an Apple anchor (self-signed, private CA, or a mixed-signer slice)"
-                        .to_string(),
-                category: SignalCategory::ProvenanceConcern,
-            }))
-        }
+        Ok(Some(MatchedSignal {
+            id: "unanchored-signing-identity".to_string(),
+            weight: UNANCHORED_IDENTITY_WEIGHT,
+            description:
+                "binary carries a signature that does not chain to an Apple anchor (self-signed, private CA, or a mixed-signer slice)"
+                    .to_string(),
+            category: SignalCategory::ProvenanceConcern,
+        }))
     }
 
-    /// Same as `UnsignedBinaryRule`: `ctx.macho()` only gates.
+    /// As for `AdHocSignedRule`.
     fn covers_truncation(&self, _ctx: &ScanContext) -> bool {
         true
     }
 }
 
-/// Maps `codesign --verify -R=...` exit status to an outcome: `Ok(true)` if the
-/// requirement is satisfied (0), `Ok(false)` if validly signed but failing it
-/// (3), `NotApplicable` for verification failure (1), bad arguments (2), a
-/// signal, or a spawn failure.
-fn classify_anchor_exit(code: Option<i32>) -> Result<bool, RuleOutcome> {
+/// Weight for a signature that fails verification. Corroboration-only (§5.1, §5.2).
+const INVALID_SIGNATURE_WEIGHT: i32 = 5;
+
+/// Notes a binary that carries a signature (ad-hoc or real) that fails
+/// verification in some slice: code patched after signing, or a corrupt
+/// signature blob.
+pub struct InvalidSignatureRule;
+
+impl Default for InvalidSignatureRule {
+    fn default() -> Self {
+        InvalidSignatureRule
+    }
+}
+
+impl Rule for InvalidSignatureRule {
+    fn id(&self) -> &'static str {
+        "invalid-code-signature"
+    }
+
+    fn category(&self) -> SignalCategory {
+        SignalCategory::ProvenanceConcern
+    }
+
+    fn evaluate(&self, ctx: &ScanContext) -> Result<Option<MatchedSignal>, RuleOutcome> {
+        if !ctx.is_file_backed() {
+            return Err(RuleOutcome::NotApplicable);
+        }
+        if ctx.content.is_none() {
+            return Err(RuleOutcome::NotApplicable);
+        }
+        if !ctx.macho().is_macho {
+            return Ok(None);
+        }
+        if run_codesign_dv(ctx)? == DvStatus::Unsigned {
+            return Ok(None);
+        }
+
+        match run_signer_check(ctx)? {
+            SignerCheck::Invalid => Ok(Some(MatchedSignal {
+                id: "invalid-code-signature".to_string(),
+                weight: INVALID_SIGNATURE_WEIGHT,
+                description:
+                    "binary's code signature does not verify (modified after signing, corrupt, or its certificate chain is not trusted)"
+                        .to_string(),
+                category: SignalCategory::ProvenanceConcern,
+            })),
+            SignerCheck::Anchored | SignerCheck::Unanchored => Ok(None),
+            // A universal build often leaves one slice unsigned. With one
+            // signed slice, the native one (`-dv` saw it), `codesign` reports
+            // that slice's failure ahead of the unsigned one; with more, it
+            // may stop before checking them all.
+            SignerCheck::UnsignedSlice if is_one_signed_slice_beside_unsigned(ctx) => Ok(None),
+            SignerCheck::UnsignedSlice => Err(RuleOutcome::NotApplicable),
+        }
+    }
+
+    /// As for `AdHocSignedRule`.
+    fn covers_truncation(&self, _ctx: &ScanContext) -> bool {
+        true
+    }
+}
+
+/// What the signer check (`codesign --verify` with [`SIGNER_ANCHOR_FLAGS`] and
+/// the Apple anchor requirement) found.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SignerCheck {
+    /// Every slice verifies and chains to an Apple anchor (exit 0).
+    Anchored,
+    /// Every slice verifies; some slice doesn't chain to an Apple anchor (exit 3).
+    Unanchored,
+    /// A signature fails verification (exit 1 with a known diagnostic).
+    Invalid,
+    /// Some slice has no signature (exit 1, "not signed at all"); the rest
+    /// may not have been checked.
+    UnsignedSlice,
+}
+
+/// True if `ctx` is a fat Mach-O with exactly one slice carrying an
+/// `LC_CODE_SIGNATURE`, at least one without, no slice the parser skipped,
+/// and every slice's load commands walked in full (a cut-short walk can miss
+/// the command).
+fn is_one_signed_slice_beside_unsigned(ctx: &ScanContext) -> bool {
+    let macho = ctx.macho();
+    let (mut fat, mut signed, mut complete) = (0, 0, true);
+    for image in macho.images.iter().filter(|image| image.is_fat) {
+        fat += 1;
+        signed += usize::from(image.has_code_signature);
+        complete &= image.segments_complete;
+    }
+    macho.skipped_slices == 0 && complete && signed == 1 && fat > signed
+}
+
+/// `codesign` diagnostics, after the `<path>: ` prefix, that mean the
+/// signature itself failed verification rather than the tool failing.
+/// `errSecInternalComponent` is left out: it is also a generic Security
+/// framework failure.
+const BROKEN_SIGNATURE_DIAGNOSTICS: &[&str] = &[
+    "invalid signature (code or signature have been modified)",
+    "invalid or unsupported format for signature",
+    // The CMS blob doesn't decode (a corrupt header, or an empty wrapper).
+    "Unknown format in import.",
+    "invalid Info.plist (plist or signature have been modified)",
+    "main executable failed strict validation",
+    "CSSMERR_TP_NOT_TRUSTED",
+];
+
+/// Maps the signer check's exit code and stderr to a [`SignerCheck`]. Exit 1
+/// with neither a known diagnostic nor an unsigned slice (internal error,
+/// revoked certificate), bad arguments (2), a signal, or anything else is
+/// `NotApplicable` (§11.8).
+fn classify_signer_check(code: Option<i32>, stderr: &str) -> Result<SignerCheck, RuleOutcome> {
     match code {
-        Some(0) => Ok(true),
-        Some(3) => Ok(false),
+        Some(0) => Ok(SignerCheck::Anchored),
+        Some(3) => Ok(SignerCheck::Unanchored),
+        Some(1) if indicates_broken_signature(stderr) => Ok(SignerCheck::Invalid),
+        Some(1) if reports_unsigned_slice(stderr) => Ok(SignerCheck::UnsignedSlice),
         _ => Err(RuleOutcome::NotApplicable),
     }
 }
 
-/// Asks whether the scanned file's signature chains to an Apple anchor.
-/// Object-bound like the other external checks (§11.7).
-fn run_anchor_requirement(ctx: &ScanContext) -> Result<bool, RuleOutcome> {
+/// True if a line of `stderr` is exactly a [`BROKEN_SIGNATURE_DIAGNOSTICS`]
+/// entry, bare or as the trailing `: <diagnostic>` after the echoed path.
+fn indicates_broken_signature(stderr: &str) -> bool {
+    stderr.lines().any(|line| {
+        let line = line.trim_end();
+        BROKEN_SIGNATURE_DIAGNOSTICS.iter().any(|diag| {
+            line == *diag
+                || line
+                    .strip_suffix(diag)
+                    .is_some_and(|prefix| prefix.ends_with(": "))
+        })
+    })
+}
+
+/// True if a line of `stderr` is exactly `codesign`'s "not signed at all"
+/// diagnostic, bare or after the echoed path (`-dv` and `--verify` both).
+fn reports_unsigned_slice(stderr: &str) -> bool {
+    stderr.lines().any(|line| {
+        let line = line.trim();
+        line == "code object is not signed at all"
+            || line.ends_with(": code object is not signed at all")
+    })
+}
+
+/// Runs the signer check. The spawn is cached on `ctx` and object-bound (§11.7).
+fn run_signer_check(ctx: &ScanContext) -> Result<SignerCheck, RuleOutcome> {
     if !path_is_line_safe(&ctx.path) {
         return Err(RuleOutcome::NotApplicable);
     }
-    classify_anchor_exit(
-        ctx.run_object_bound(|| spawn_apple_anchor_check(&ctx.path, SIGNER_ANCHOR_FLAGS)),
-    )
+    let (code, stderr) = ctx
+        .signer_check(|| spawn_signer_check(&ctx.path))
+        .ok_or(RuleOutcome::NotApplicable)?;
+    classify_signer_check(code, &stderr)
 }
 
 /// Weight for a revoked code-signing certificate. Apple revokes Developer ID
@@ -441,24 +651,25 @@ fn spawn_codesign_verify(_path: &std::path::Path) -> Result<String, RuleOutcome>
 /// callers treat that as "not verified," never as an error (§5.2).
 pub(super) fn verifies_apple_anchor(ctx: &ScanContext) -> bool {
     ctx.source == crate::context::ContentSource::File
-        && ctx.run_object_bound(|| spawn_apple_anchor_check(&ctx.path, STRICT_ANCHOR_FLAGS))
-            == Some(0)
+        && ctx.run_object_bound(|| spawn_strict_anchor_check(&ctx.path)) == Some(0)
 }
 
 /// Whole signature, including the bundle seal, must verify. Used only to lower weights.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))] // only the macOS spawns use it
 const STRICT_ANCHOR_FLAGS: &[&str] = &["--strict"];
 
 /// Who signed every slice. `--ignore-resources`: a broken bundle seal must not
 /// become "couldn't check". `--all-architectures`: fat binaries can mix signers.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))] // only the macOS spawns use it
 const SIGNER_ANCHOR_FLAGS: &[&str] = &["--ignore-resources", "--all-architectures"];
 
-/// Exit code of `codesign --verify <extra> -R="anchor apple generic" <path>`;
+/// Exit code of `codesign --verify --strict -R="anchor apple generic" <path>`;
 /// `None` if it was killed by a signal or failed to spawn.
 #[cfg(target_os = "macos")]
-fn spawn_apple_anchor_check(path: &std::path::Path, extra: &[&str]) -> Option<i32> {
+fn spawn_strict_anchor_check(path: &std::path::Path) -> Option<i32> {
     std::process::Command::new("codesign")
         .arg("--verify")
-        .args(extra)
+        .args(STRICT_ANCHOR_FLAGS)
         .arg("-R=anchor apple generic")
         .arg(path)
         .stdout(std::process::Stdio::null())
@@ -469,7 +680,31 @@ fn spawn_apple_anchor_check(path: &std::path::Path, extra: &[&str]) -> Option<i3
 }
 
 #[cfg(not(target_os = "macos"))]
-fn spawn_apple_anchor_check(_path: &std::path::Path, _extra: &[&str]) -> Option<i32> {
+fn spawn_strict_anchor_check(_path: &std::path::Path) -> Option<i32> {
+    None
+}
+
+/// Exit code of `codesign --verify` with [`SIGNER_ANCHOR_FLAGS`] and the Apple
+/// anchor requirement (`None` if killed by a signal), plus its stderr. `None`
+/// if it failed to spawn.
+#[cfg(target_os = "macos")]
+fn spawn_signer_check(path: &std::path::Path) -> Option<(Option<i32>, String)> {
+    let output = std::process::Command::new("codesign")
+        .arg("--verify")
+        .args(SIGNER_ANCHOR_FLAGS)
+        .arg("-R=anchor apple generic")
+        .arg(path)
+        .stdout(std::process::Stdio::null())
+        .output()
+        .ok()?;
+    Some((
+        output.status.code(),
+        String::from_utf8_lossy(&output.stderr).into_owned(),
+    ))
+}
+
+#[cfg(not(target_os = "macos"))]
+fn spawn_signer_check(_path: &std::path::Path) -> Option<(Option<i32>, String)> {
     None
 }
 
@@ -650,7 +885,7 @@ fn spawn_spctl_assess(_path: &std::path::Path) -> Result<String, RuleOutcome> {
 /// Runs `codesign -dv` and classifies the result. The classification logic
 /// (`classify_dv`) is platform-independent and unit-tested directly; only the
 /// process spawn is behind the platform gate. The spawn itself is cached on
-/// `ctx` (§5.2) so the six rules sharing a scan spawn `codesign` once, not
+/// `ctx` (§5.2) so the seven rules sharing a scan spawn `codesign` once, not
 /// once each.
 fn run_codesign_dv(ctx: &ScanContext) -> Result<DvStatus, RuleOutcome> {
     if !path_is_line_safe(&ctx.path) {
@@ -707,7 +942,7 @@ mod tests {
         }
     }
 
-    /// All six rules' verdicts come from `codesign`/`spctl` on the whole
+    /// All seven rules' verdicts come from `codesign`/`spctl` on the whole
     /// file, not the truncated prefix — see the module-level doc comments.
     #[test]
     fn all_codesign_rules_cover_truncation_on_a_truncated_macho_context() {
@@ -715,6 +950,7 @@ mod tests {
         assert!(UnsignedBinaryRule.covers_truncation(&c));
         assert!(AdHocSignedRule.covers_truncation(&c));
         assert!(UnanchoredIdentityRule.covers_truncation(&c));
+        assert!(InvalidSignatureRule.covers_truncation(&c));
         assert!(RevokedSignatureRule.covers_truncation(&c));
         assert!(UnnotarizedSignedRule.covers_truncation(&c));
         assert!(NotarizedRule.covers_truncation(&c));
@@ -742,7 +978,7 @@ mod tests {
     /// A >8 MiB file with a `CAFEBABE` header whose sole arch-table entry
     /// points past the 8 MiB prefix at bytes that aren't a thin Mach-O
     /// magic: `ctx.macho()` reads the real offset and correctly says this
-    /// isn't Mach-O, so none of the six rules should even ask `codesign`
+    /// isn't Mach-O, so none of the seven rules should even ask `codesign`
     /// (§5.2, #45).
     #[test]
     fn codesign_rules_do_not_treat_an_out_of_bounds_fat_offset_as_macho() {
@@ -774,6 +1010,7 @@ mod tests {
         assert!(matches!(UnsignedBinaryRule.evaluate(&ctx), Ok(None)));
         assert!(matches!(AdHocSignedRule.evaluate(&ctx), Ok(None)));
         assert!(matches!(UnanchoredIdentityRule.evaluate(&ctx), Ok(None)));
+        assert!(matches!(InvalidSignatureRule.evaluate(&ctx), Ok(None)));
         assert!(matches!(RevokedSignatureRule.evaluate(&ctx), Ok(None)));
         assert!(matches!(UnnotarizedSignedRule.evaluate(&ctx), Ok(None)));
         assert!(matches!(NotarizedRule.evaluate(&ctx), Ok(None)));
@@ -795,6 +1032,10 @@ mod tests {
         ));
         assert!(matches!(
             UnanchoredIdentityRule.evaluate(&c),
+            Err(RuleOutcome::NotApplicable)
+        ));
+        assert!(matches!(
+            InvalidSignatureRule.evaluate(&c),
             Err(RuleOutcome::NotApplicable)
         ));
     }
@@ -857,12 +1098,209 @@ mod tests {
     }
 
     #[test]
-    fn classify_anchor_exit_maps_codesign_exit_codes() {
-        assert_eq!(classify_anchor_exit(Some(0)), Ok(true));
-        assert_eq!(classify_anchor_exit(Some(3)), Ok(false));
-        for code in [Some(1), Some(2), Some(127), None] {
-            assert_eq!(classify_anchor_exit(code), Err(RuleOutcome::NotApplicable));
+    fn classify_signer_check_maps_codesign_exit_codes() {
+        assert_eq!(
+            classify_signer_check(Some(0), ""),
+            Ok(SignerCheck::Anchored)
+        );
+        let unmet = "test-requirement: code failed to satisfy specified code requirement(s)\n";
+        assert_eq!(
+            classify_signer_check(Some(3), unmet),
+            Ok(SignerCheck::Unanchored)
+        );
+        let modified = "/tmp/x: invalid signature (code or signature have been modified)\nIn architecture: arm64\n";
+        assert_eq!(
+            classify_signer_check(Some(1), modified),
+            Ok(SignerCheck::Invalid)
+        );
+        // A broken-signature message only counts on a verification failure.
+        for code in [Some(2), Some(127), None] {
+            assert_eq!(
+                classify_signer_check(code, modified),
+                Err(RuleOutcome::NotApplicable)
+            );
         }
+    }
+
+    #[test]
+    fn every_known_diagnostic_is_a_broken_signature() {
+        for diag in BROKEN_SIGNATURE_DIAGNOSTICS {
+            assert!(
+                indicates_broken_signature(&format!("/a/b: {diag}\n")),
+                "{diag}"
+            );
+            assert!(indicates_broken_signature(&format!("{diag}\n")), "{diag}");
+        }
+    }
+
+    /// Tool failures and other exit-1 causes stay "couldn't check" (§11.8).
+    #[test]
+    fn other_verify_failures_are_not_a_broken_signature() {
+        for stderr in [
+            "/a/b: An internal error has occurred.\n",
+            "/a/b: errSecInternalComponent\nIn architecture: arm64\n",
+            "/a/b: CSSMERR_TP_CERT_REVOKED\n",
+            "",
+        ] {
+            assert!(!indicates_broken_signature(stderr), "{stderr:?}");
+            assert_eq!(
+                classify_signer_check(Some(1), stderr),
+                Err(RuleOutcome::NotApplicable)
+            );
+        }
+    }
+
+    /// A broken signature outranks an unsigned slice in the same report.
+    #[test]
+    fn classify_signer_check_separates_an_unsigned_slice() {
+        let unsigned = "/a/b: code object is not signed at all\n";
+        assert!(!indicates_broken_signature(unsigned));
+        assert_eq!(
+            classify_signer_check(Some(1), unsigned),
+            Ok(SignerCheck::UnsignedSlice)
+        );
+        let both = "/a/b: code object is not signed at all\n/a/b: invalid signature (code or signature have been modified)\n";
+        assert_eq!(
+            classify_signer_check(Some(1), both),
+            Ok(SignerCheck::Invalid)
+        );
+    }
+
+    /// The diagnostic must be the whole tail after `: `, not a suffix of a word.
+    #[test]
+    fn a_diagnostic_glued_to_other_text_does_not_match() {
+        assert!(!indicates_broken_signature("/a/bXCSSMERR_TP_NOT_TRUSTED\n"));
+        assert!(!indicates_broken_signature(
+            "/a/b: CSSMERR_TP_NOT_TRUSTED (and more)\n"
+        ));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn invalid_signature_fires_on_broken_signatures_only() {
+        let fixtures = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures");
+        for name in [
+            "suspicious/macho_adhoc_modified_after_signing",
+            "suspicious/macho_self_signed_corrupt_cms",
+            "suspicious/macho_self_signed_corrupt_cms_header",
+        ] {
+            let signal = InvalidSignatureRule
+                .evaluate(&ScanContext::load(&fixtures.join(name)))
+                .expect("evaluates")
+                .unwrap_or_else(|| panic!("{name} fires"));
+            assert_eq!(signal.id, "invalid-code-signature");
+            assert_eq!(signal.weight, 5);
+        }
+        for name in [
+            "suspicious/macho_self_signed_identity",
+            "benign/tiny_hello_arm64",
+            "benign/macho_universal_unsigned_x86_slice",
+        ] {
+            assert!(
+                matches!(
+                    InvalidSignatureRule.evaluate(&ScanContext::load(&fixtures.join(name))),
+                    Ok(None)
+                ),
+                "{name}"
+            );
+        }
+        // The corrupt self-signed blob is scored here, not as unanchored.
+        assert!(matches!(
+            UnanchoredIdentityRule.evaluate(&ScanContext::load(
+                &fixtures.join("suspicious/macho_self_signed_corrupt_cms")
+            )),
+            Ok(None)
+        ));
+    }
+
+    /// `codesign -dv` sees only the native (ad-hoc) slice; the self-signed
+    /// x86_64 slice must still reach the anchor check, and win over ad-hoc.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_self_signed_non_native_slice_is_scored_as_unanchored() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("fixtures/suspicious/macho_fat_adhoc_native_self_signed_slice");
+        let ctx = ScanContext::load(&path);
+        let signal = UnanchoredIdentityRule
+            .evaluate(&ctx)
+            .expect("evaluates")
+            .expect("self-signed slice fires");
+        assert_eq!(signal.id, "unanchored-signing-identity");
+        assert!(matches!(AdHocSignedRule.evaluate(&ctx), Ok(None)));
+    }
+
+    #[test]
+    fn slice_status_reads_codedirectory_facts() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("fixtures/benign/tiny_hello_arm64");
+        let mut image = ScanContext::load(&path).macho().images[0].clone();
+        image.has_code_signature = false;
+        image.code_directory_flags = None;
+        image.has_cms_signature = false;
+        assert_eq!(slice_status(&image), Some(DvStatus::Unsigned));
+        image.has_code_signature = true;
+        assert_eq!(slice_status(&image), None);
+        image.code_directory_flags = Some(CS_ADHOC | CS_LINKER_SIGNED);
+        assert_eq!(slice_status(&image), Some(DvStatus::AdHocLinkerSigned));
+        image.code_directory_flags = Some(CS_ADHOC);
+        assert_eq!(slice_status(&image), Some(DvStatus::AdHocManual));
+        // An identity claim with no CMS blob behind it: `-dv` and the parser
+        // disagree, so the slice is left unclassified.
+        image.code_directory_flags = Some(0);
+        assert_eq!(slice_status(&image), None);
+        image.has_cms_signature = true;
+        assert_eq!(slice_status(&image), Some(DvStatus::Signed));
+    }
+
+    /// "not signed at all" is trusted only with one signed slice beside the
+    /// unsigned ones; with two, `codesign` may not have checked both.
+    #[test]
+    fn one_signed_slice_beside_unsigned_is_recognised() {
+        let fixtures = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures");
+        let load = |name: &str| ScanContext::load(&fixtures.join(name));
+        assert!(is_one_signed_slice_beside_unsigned(&load(
+            "benign/macho_universal_unsigned_x86_slice"
+        )));
+        assert!(!is_one_signed_slice_beside_unsigned(&load(
+            "suspicious/macho_fat_adhoc_native_self_signed_slice"
+        )));
+        assert!(!is_one_signed_slice_beside_unsigned(&load(
+            "benign/tiny_hello_arm64"
+        )));
+    }
+
+    /// A fat slice the parser couldn't walk leaves the per-slice rules unsure.
+    #[test]
+    fn a_skipped_fat_slice_is_unclassified() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("fixtures/suspicious/macho_fat_malformed_slice");
+        let fat = ScanContext::load(&path);
+        assert!(fat.macho().skipped_slices > 0);
+        assert!(has_unclassified_fat_slice(&fat, DvStatus::AdHocManual));
+        assert!(!has_unclassified_fat_slice(&fat, DvStatus::Unsigned));
+        let thin = ScanContext::load(
+            &std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("fixtures/benign/tiny_hello_arm64"),
+        );
+        assert!(!has_unclassified_fat_slice(
+            &thin,
+            DvStatus::AdHocLinkerSigned
+        ));
+        // A thin file the parser couldn't walk also reports a skipped slice.
+        let unwalkable = ctx("thin", &[0xcf, 0xfa, 0xed, 0xfe, 0, 0, 0, 0]);
+        assert!(unwalkable.macho().skipped_slices > 0);
+        assert!(!has_unclassified_fat_slice(
+            &unwalkable,
+            DvStatus::AdHocManual
+        ));
+    }
+
+    #[test]
+    fn things_that_are_not_code_objects_have_no_invalid_signature() {
+        assert!(matches!(
+            InvalidSignatureRule.evaluate(&ctx("readme.txt", b"just some notes\n")),
+            Ok(None)
+        ));
     }
 
     #[cfg(target_os = "macos")]

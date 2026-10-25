@@ -16,8 +16,8 @@ mod quarantine_xattr;
 mod strings;
 
 pub use codesign::{
-    AdHocSignedRule, NotarizedRule, RevokedSignatureRule, UnanchoredIdentityRule,
-    UnnotarizedSignedRule, UnsignedBinaryRule,
+    AdHocSignedRule, InvalidSignatureRule, NotarizedRule, RevokedSignatureRule,
+    UnanchoredIdentityRule, UnnotarizedSignedRule, UnsignedBinaryRule,
 };
 pub use container::{UninspectedContainerRule, UNINSPECTED_CONTAINER_ID};
 pub use entropy::HighEntropyRule;
@@ -88,6 +88,7 @@ pub fn default_ruleset() -> Vec<Box<dyn Rule>> {
         Box::new(UnsignedBinaryRule),
         Box::new(AdHocSignedRule),
         Box::new(UnanchoredIdentityRule),
+        Box::new(InvalidSignatureRule),
         Box::new(RevokedSignatureRule),
         Box::new(UnnotarizedSignedRule),
         Box::new(NotarizedRule),
