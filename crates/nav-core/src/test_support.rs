@@ -1,5 +1,5 @@
-//! Shared temp-file helpers for tests that need bytes on a real file, not
-//! just in-memory content — a range past `context::MAX_CONTENT_BYTES` only
+//! Shared test helpers: a UTF-16 encoder, and temp files for tests that need
+//! bytes on a real file, not just in-memory content — a range past `context::MAX_CONTENT_BYTES` only
 //! reaches a rule through `ScanContext`'s file handle. Mirrors the
 //! `macho::tests_support` pattern for non-Mach-O fixtures.
 

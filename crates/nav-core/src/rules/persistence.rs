@@ -62,7 +62,7 @@ impl Rule for LaunchdPersistenceRule {
             return Err(RuleOutcome::NotApplicable);
         }
 
-        let parsed = match plist::parse(content) {
+        let parsed = match plist::parse_launchd(content) {
             Some(v) => v,
             None => {
                 // A file that should be a plist but won't parse is "couldn't
@@ -311,6 +311,7 @@ fn staged_location(path: &Path) -> Option<&'static str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::utf16;
     use std::path::PathBuf;
 
     fn ctx(path: &str, body: &[u8]) -> ScanContext {
@@ -400,6 +401,58 @@ mod tests {
                 "{body:?}"
             );
         }
+    }
+
+    #[test]
+    fn a_truncated_utf16_blank_prefix_stays_unchecked() {
+        let path = "/Applications/G.app/Contents/Resources/x.plist";
+        let mut odd = utf16(" \n", true, true);
+        odd.push(0);
+        for body in [
+            utf16("  \n\t", false, true),
+            utf16("\u{FEFF} ", true, true),
+            odd,
+        ] {
+            let mut cut = ctx(path, &body);
+            cut.truncated = true;
+            assert!(
+                matches!(
+                    LaunchdPersistenceRule.evaluate(&cut),
+                    Err(RuleOutcome::NotApplicable)
+                ),
+                "{body:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn utf16_launch_agent_is_scored() {
+        let xml = r#"<?xml version="1.0" encoding="UTF-16"?><plist version="1.0"><dict>
+            <key>Label</key><string>com.example.x</string>
+            <key>Program</key><string>/Users/x/Library/.cache/update</string>
+            <key>RunAtLoad</key><true/>
+            <key>KeepAlive</key><true/>
+        </dict></plist>"#;
+        let path = "/Users/x/Library/LaunchAgents/com.example.x.plist";
+        for be in [false, true] {
+            assert!(matches!(eval(path, &utf16(xml, be, true)), Ok(Some(_))));
+        }
+    }
+
+    #[test]
+    fn utf16_openstep_is_clean_outside_launchd_dirs_only() {
+        let body = utf16(
+            "{ Label = com.example.x; ProgramArguments = ( /tmp/a ); }",
+            false,
+            true,
+        );
+        let outside = "/Applications/G.app/Contents/Resources/x.plist";
+        assert!(matches!(eval(outside, &body), Ok(None)));
+        let inside = "/Library/LaunchAgents/x.plist";
+        assert!(matches!(
+            eval(inside, &body),
+            Err(RuleOutcome::NotApplicable)
+        ));
     }
 
     #[test]
@@ -588,6 +641,14 @@ mod tests {
     fn covers_truncation_true_for_non_plist_prefixes() {
         assert!(LaunchdPersistenceRule.covers_truncation(&truncated_ctx("x", b"\xfe\xed\xfa\xcf")));
         assert!(LaunchdPersistenceRule.covers_truncation(&truncated_ctx("x", b"plain text\n")));
+        let strings = utf16("\"key\" = \"value\";\n", false, true);
+        assert!(LaunchdPersistenceRule.covers_truncation(&truncated_ctx("x", &strings)));
+    }
+
+    #[test]
+    fn covers_truncation_false_for_a_utf16_xml_prefix() {
+        let xml = utf16("<?xml version=\"1.0\"?><plist>", true, true);
+        assert!(!LaunchdPersistenceRule.covers_truncation(&truncated_ctx("x", &xml)));
     }
 
     /// A truncated prefix that does look like a plist (any of the forms

@@ -712,6 +712,14 @@
     ],
     "completeness": "complete"
   },
+  "suspicious/persistence_beacon_utf16le.plist": {
+    "score": 26,
+    "recommendation": "notify",
+    "rule_ids": [
+      "launchd-persistence-plist"
+    ],
+    "completeness": "complete"
+  },
   "suspicious/tcc_keychain_exfil.sh": {
     "score": 24,
     "recommendation": "notify",
