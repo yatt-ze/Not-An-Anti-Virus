@@ -385,6 +385,24 @@ mod tests {
     }
 
     #[test]
+    fn bomless_utf16_and_utf32_are_clean_outside_launchd_dirs() {
+        let bodies = [
+            &b"\0<\0?\0x\0m"[..],
+            b"\0\n\0<\0?\0x",
+            b"\0\0\xFE\xFF\0\0\0<\0\0\0?",
+        ];
+        for body in bodies {
+            let outside = "/Applications/G.app/Contents/Resources/x.plist";
+            assert!(matches!(eval(outside, body), Ok(None)), "{body:?}");
+            let inside = "/Library/LaunchDaemons/x.plist";
+            assert!(
+                matches!(eval(inside, body), Err(RuleOutcome::NotApplicable)),
+                "{body:?}"
+            );
+        }
+    }
+
+    #[test]
     fn possibly_utf16_plists_stay_unchecked() {
         let path = "/Applications/G.app/Contents/Resources/x.plist";
         for body in [&b"\xFF\xFE<\0p\0"[..], b"\xFE\xFF\0<\0p", b"<\0?\0x\0m\0"] {
