@@ -148,8 +148,10 @@ a file went missing:
 cargo xtask corpus compare            # or pass your own roots
 ```
 
-`cargo xtask corpus scan` and `cargo xtask corpus diff` run the two halves
-separately.
+The full run takes minutes and uses every core. For a narrow change, pass
+only the directories it can affect, and use `--jobs 4` to leave the machine
+usable. `cargo xtask corpus scan` and `cargo xtask corpus diff` run the two
+halves separately.
 
 The design rationale and longer-term roadmap live in
 [`docs/design.md`](docs/design.md) — worth reading before proposing

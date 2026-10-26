@@ -116,6 +116,17 @@ it with `--no-verify` — fix the failure instead.
   and put the summary in the PR. Exit 2 means a file's recommendation or
   completeness got worse, or a file went missing — explain or fix it
   (exit 1 is the tool itself failing).
+- The full run takes minutes and loads every core, so keep it rare:
+  - Run it **once per PR**, on the final diff. Re-run after a review fix
+    only if the fix itself can move a score.
+  - Don't re-run after a rebase unless the commits it brought in touch the
+    same rules or shared scoring/parsing paths.
+  - Skip it for changes that can't move a score: docs, tests, fixtures,
+    CI, xtask, pure refactors.
+  - Pass only the roots the change can affect (e.g. the launchd plist
+    directories for a plist rule). Keep the default full run for broad
+    changes: Mach-O, codesign, scoring, the walker, budgets.
+  - Pass `--jobs 4` (or fewer) when the machine is in use.
 
 ## Scope discipline
 
