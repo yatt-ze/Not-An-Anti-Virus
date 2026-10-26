@@ -58,3 +58,23 @@ pub(crate) fn xorshift_bytes(len: usize) -> Vec<u8> {
         })
         .collect()
 }
+
+/// `s` encoded as UTF-16 in the given byte order, with a BOM if `bom`.
+pub(crate) fn utf16(s: &str, big_endian: bool, bom: bool) -> Vec<u8> {
+    let mut out = Vec::new();
+    if bom {
+        out.extend(if big_endian {
+            [0xFE, 0xFF]
+        } else {
+            [0xFF, 0xFE]
+        });
+    }
+    for u in s.encode_utf16() {
+        out.extend(if big_endian {
+            u.to_be_bytes()
+        } else {
+            u.to_le_bytes()
+        });
+    }
+    out
+}

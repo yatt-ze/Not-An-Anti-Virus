@@ -441,17 +441,7 @@ fn utf16_to_utf8(b: &[u8]) -> Option<Vec<u8>> {
         [0, b'<', ..] => (true, b),
         _ => return None,
     };
-    let units: Vec<u16> = body
-        .chunks_exact(2)
-        .map(|c| {
-            let pair = [c[0], c[1]];
-            if big_endian {
-                u16::from_be_bytes(pair)
-            } else {
-                u16::from_le_bytes(pair)
-            }
-        })
-        .collect();
+    let units: Vec<u16> = xml::utf16_units(body, big_endian).collect();
     Some(String::from_utf16_lossy(&units).into_bytes())
 }
 
@@ -935,6 +925,7 @@ impl Rule for UnsignedPackageRule {
 mod tests {
     use super::*;
     use crate::context::{ContentSource, ScanContext};
+    use crate::test_support::utf16;
     use std::path::PathBuf;
 
     macro_rules! pkg {
@@ -1291,25 +1282,6 @@ mod tests {
                 "{blob:?}"
             );
         }
-    }
-
-    fn utf16(s: &str, big_endian: bool, bom: bool) -> Vec<u8> {
-        let mut out = Vec::new();
-        if bom {
-            out.extend(if big_endian {
-                [0xFE, 0xFF]
-            } else {
-                [0xFF, 0xFE]
-            });
-        }
-        for u in s.encode_utf16() {
-            out.extend(if big_endian {
-                u.to_be_bytes()
-            } else {
-                u.to_le_bytes()
-            });
-        }
-        out
     }
 
     #[test]
