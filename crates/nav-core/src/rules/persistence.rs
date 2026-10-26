@@ -44,6 +44,17 @@ impl Rule for LaunchdPersistenceRule {
     fn evaluate(&self, ctx: &ScanContext) -> Result<Option<MatchedSignal>, RuleOutcome> {
         let content = ctx.content.as_ref().ok_or(RuleOutcome::NotApplicable)?;
 
+        // `launchctl` refuses anything but XML or binary, so outside a
+        // LaunchAgents/LaunchDaemons directory (whose login-time scan was not
+        // measured) this is checked, not unchecked, even truncated (§5.2).
+        // A cut-off prefix of only whitespace could still be XML past the cap.
+        if !in_launchd_dir(&ctx.path)
+            && !plist::could_be_launchd_plist(content)
+            && !(ctx.truncated && plist::is_blank(content))
+        {
+            return Ok(None);
+        }
+
         // A prefix of a plist can't be judged — the deciding keys may be past
         // the cap, and XML still parses from a prefix. "Couldn't check", not
         // "clean" (§10, §11.8). Scoped to plist-looking targets.
@@ -259,12 +270,13 @@ fn truthy(v: Option<&PlistValue>) -> bool {
 /// Is `path` something we'd expect to *be* a plist — so a parse failure is a
 /// coverage gap rather than a non-match?
 fn looks_like_plist_target(path: &Path) -> bool {
-    if path
-        .extension()
+    path.extension()
         .is_some_and(|e| e.eq_ignore_ascii_case("plist"))
-    {
-        return true;
-    }
+        || in_launchd_dir(path)
+}
+
+/// True if any component of `path` is `LaunchAgents` or `LaunchDaemons`.
+fn in_launchd_dir(path: &Path) -> bool {
     path.components().any(|c| {
         let s = c.as_os_str().to_string_lossy();
         s == "LaunchAgents" || s == "LaunchDaemons"
@@ -320,6 +332,65 @@ mod tests {
         <array><string>/usr/local/bin/example-helper</string><string>--foreground</string></array>
         <key>RunAtLoad</key><true/>
     </dict></plist>"#;
+
+    const UNLOADABLE: [&[u8]; 5] = [
+        b"{ Label = com.example.x; ProgramArguments = ( \"/tmp/.x/agent\" ); }",
+        b"\xEF\xBB\xBF\n { StoreVersion = 2; Regions = ( US, GB ); }",
+        b"/* c */ ( a, b",
+        b"\"Label\" = \"com.example.x\";",
+        b"junk <plist/>",
+    ];
+
+    #[test]
+    fn unloadable_plists_outside_launchd_dirs_are_checked_and_clean() {
+        let path = "/Applications/G.app/Contents/Resources/StoreInit.plist";
+        for body in UNLOADABLE {
+            assert!(matches!(eval(path, body), Ok(None)), "{body:?}");
+            let mut cut = ctx(path, body);
+            cut.truncated = true;
+            assert!(matches!(LaunchdPersistenceRule.evaluate(&cut), Ok(None)));
+        }
+    }
+
+    #[test]
+    fn unparsed_plists_in_launchd_dirs_stay_unchecked() {
+        for path in [
+            "/Users/u/Library/LaunchAgents/com.example.x.plist",
+            "/Library/LaunchDaemons/x.plist",
+            "/Applications/A.app/Contents/Library/LaunchAgents/x.plist",
+        ] {
+            for body in UNLOADABLE {
+                assert!(
+                    matches!(eval(path, body), Err(RuleOutcome::NotApplicable)),
+                    "{path} {body:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_truncated_blank_prefix_stays_unchecked() {
+        let path = "/Applications/G.app/Contents/Resources/x.plist";
+        for body in [&b"   \n\t  "[..], b"\xEF\xBB\xBF \n"] {
+            let mut cut = ctx(path, body);
+            cut.truncated = true;
+            assert!(
+                matches!(
+                    LaunchdPersistenceRule.evaluate(&cut),
+                    Err(RuleOutcome::NotApplicable)
+                ),
+                "{body:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn possibly_utf16_plists_stay_unchecked() {
+        let path = "/Applications/G.app/Contents/Resources/x.plist";
+        for body in [&b"\xFF\xFE<\0p\0"[..], b"\xFE\xFF\0<\0p", b"<\0?\0x\0m\0"] {
+            assert!(matches!(eval(path, body), Err(RuleOutcome::NotApplicable)));
+        }
+    }
 
     #[test]
     fn ordinary_launch_agent_scores_nothing() {
