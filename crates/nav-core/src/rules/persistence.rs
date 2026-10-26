@@ -47,7 +47,11 @@ impl Rule for LaunchdPersistenceRule {
         // `launchctl` refuses anything but XML or binary, so outside a
         // LaunchAgents/LaunchDaemons directory (whose login-time scan was not
         // measured) this is checked, not unchecked, even truncated (§5.2).
-        if !in_launchd_dir(&ctx.path) && !plist::could_be_launchd_plist(content) {
+        // A cut-off prefix of only whitespace could still be XML past the cap.
+        if !in_launchd_dir(&ctx.path)
+            && !plist::could_be_launchd_plist(content)
+            && !(ctx.truncated && plist::is_blank(content))
+        {
             return Ok(None);
         }
 
@@ -361,6 +365,22 @@ mod tests {
                     "{path} {body:?}"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn a_truncated_blank_prefix_stays_unchecked() {
+        let path = "/Applications/G.app/Contents/Resources/x.plist";
+        for body in [&b"   \n\t  "[..], b"\xEF\xBB\xBF \n"] {
+            let mut cut = ctx(path, body);
+            cut.truncated = true;
+            assert!(
+                matches!(
+                    LaunchdPersistenceRule.evaluate(&cut),
+                    Err(RuleOutcome::NotApplicable)
+                ),
+                "{body:?}"
+            );
         }
     }
 

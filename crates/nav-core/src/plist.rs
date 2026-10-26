@@ -99,6 +99,11 @@ pub(crate) fn could_be_launchd_plist(bytes: &[u8]) -> bool {
         || bytes.iter().take(8).any(|&b| b == 0)
 }
 
+/// True if `bytes` is only a UTF-8 BOM and ASCII whitespace (or empty).
+pub(crate) fn is_blank(bytes: &[u8]) -> bool {
+    skip_bom_and_ws(bytes).is_empty()
+}
+
 /// Parse `bytes` as a binary (`bplist00`) or XML property list.
 ///
 /// Returns `None` for anything that isn't a plist this reader recognizes, or
