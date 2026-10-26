@@ -81,30 +81,41 @@ impl PlistValue {
     }
 }
 
-/// True if `bytes` opens with either recognized plist form (binary or XML,
-/// after a BOM/whitespace prefix). [`parse`] uses this same check to dispatch,
-/// so the two can't drift.
+/// True if `bytes` opens with a recognized plist form: binary, or XML (`<`
+/// after a BOM and whitespace) in UTF-8 or BOM-prefixed UTF-16. [`parse`] and
+/// [`parse_launchd`] use this same check to dispatch, so they can't drift.
 pub(crate) fn could_be_plist(bytes: &[u8]) -> bool {
-    bytes.starts_with(b"bplist00") || skip_bom_and_ws(bytes).first() == Some(&b'<')
+    if bytes.starts_with(b"bplist00") {
+        return true;
+    }
+    match utf16_bom(bytes) {
+        Some((big_endian, body)) => utf16_starts_xml(body, big_endian),
+        None => skip_bom_and_ws(bytes).first() == Some(&b'<'),
+    }
 }
 
-/// False only if `bytes` can't be a plist `launchctl` loads: not binary, not
-/// XML, and not possibly UTF-16 (a UTF-16 BOM, or a NUL in the first 8 bytes).
-/// OpenStep, JSON and text before the `<` were measured as refused (§5.2).
+/// False only if `bytes` can't be a plist `launchctl` loads: not binary and
+/// not XML. OpenStep (UTF-8 or UTF-16), JSON, text before the `<`, BOM-less
+/// UTF-16 and UTF-32 were measured as refused (§5.2).
 pub(crate) fn could_be_launchd_plist(bytes: &[u8]) -> bool {
-    bytes.starts_with(b"bplist")
-        || could_be_plist(bytes)
-        || bytes.starts_with(&[0xFF, 0xFE])
-        || bytes.starts_with(&[0xFE, 0xFF])
-        || bytes.iter().take(8).any(|&b| b == 0)
+    bytes.starts_with(b"bplist") || could_be_plist(bytes)
 }
 
-/// True if `bytes` is only a UTF-8 BOM and ASCII whitespace (or empty).
+/// True if `bytes` is only a BOM and ASCII whitespace, in UTF-8 or UTF-16
+/// (or empty). A trailing odd byte of UTF-16 is ignored, as a cap may split a
+/// unit.
 pub(crate) fn is_blank(bytes: &[u8]) -> bool {
-    skip_bom_and_ws(bytes).is_empty()
+    match utf16_bom(bytes) {
+        Some((big_endian, body)) => {
+            let mut units = crate::xml::utf16_units(body, big_endian).peekable();
+            units.next_if_eq(&0xFEFF);
+            units.all(|u| u8::try_from(u).is_ok_and(|b| b.is_ascii_whitespace()))
+        }
+        None => skip_bom_and_ws(bytes).is_empty(),
+    }
 }
 
-/// Parse `bytes` as a binary (`bplist00`) or XML property list.
+/// Parse `bytes` as a binary (`bplist00`) or UTF-8 XML property list.
 ///
 /// Returns `None` for anything that isn't a plist this reader recognizes, or
 /// that it can't walk within its bounds — truncated, malformed, cyclic, an
@@ -116,7 +127,59 @@ pub fn parse(bytes: &[u8]) -> Option<PlistValue> {
     if bytes.starts_with(b"bplist00") {
         return binary::parse(bytes);
     }
+    if utf16_bom(bytes).is_some() {
+        return None;
+    }
     xml_reader::parse(skip_bom_and_ws(bytes))
+}
+
+/// [`parse`], plus XML in BOM-prefixed UTF-16, which launchd loads (§5.2,
+/// #111). Only the launchd rule uses it: other plist consumers weren't measured.
+pub fn parse_launchd(bytes: &[u8]) -> Option<PlistValue> {
+    match utf16_bom(bytes) {
+        Some((big_endian, body)) if could_be_plist(bytes) => {
+            let text = utf16_to_string(body, big_endian)?;
+            xml_reader::parse_str(skip_bom_and_ws_str(&text))
+        }
+        _ => parse(bytes),
+    }
+}
+
+/// `(big_endian, rest)` if `bytes` starts with a UTF-16 BOM. A BOM decides
+/// UTF-16 and the declared encoding is ignored, as measured for launchd (§5.2).
+fn utf16_bom(bytes: &[u8]) -> Option<(bool, &[u8])> {
+    match bytes {
+        [0xFF, 0xFE, rest @ ..] => Some((false, rest)),
+        [0xFE, 0xFF, rest @ ..] => Some((true, rest)),
+        _ => None,
+    }
+}
+
+/// True if the UTF-16 `body` is an optional U+FEFF, ASCII whitespace, then `<`
+/// (the same prefix [`skip_bom_and_ws`] allows in UTF-8).
+fn utf16_starts_xml(body: &[u8], big_endian: bool) -> bool {
+    let mut units = crate::xml::utf16_units(body, big_endian).peekable();
+    units.next_if_eq(&0xFEFF);
+    let mut rest = units.skip_while(|&u| u8::try_from(u).is_ok_and(|b| b.is_ascii_whitespace()));
+    rest.next() == Some(u16::from(b'<'))
+}
+
+/// Strict UTF-16 decode: `None` on an odd byte count or an unpaired surrogate,
+/// both measured as refused by launchd.
+fn utf16_to_string(body: &[u8], big_endian: bool) -> Option<String> {
+    if body.len() % 2 != 0 {
+        return None;
+    }
+    char::decode_utf16(crate::xml::utf16_units(body, big_endian))
+        .collect::<Result<String, _>>()
+        .ok()
+}
+
+/// [`skip_bom_and_ws`] for text already decoded.
+fn skip_bom_and_ws_str(text: &str) -> &str {
+    text.strip_prefix('\u{FEFF}')
+        .unwrap_or(text)
+        .trim_start_matches(|c: char| c.is_ascii_whitespace())
 }
 
 /// Skip a UTF-8 BOM and leading ASCII whitespace, returning the remaining slice.
@@ -415,7 +478,10 @@ mod xml_reader {
     use crate::xml;
 
     pub(super) fn parse(bytes: &[u8]) -> Option<PlistValue> {
-        let text = std::str::from_utf8(bytes).ok()?;
+        parse_str(std::str::from_utf8(bytes).ok()?)
+    }
+
+    pub(super) fn parse_str(text: &str) -> Option<PlistValue> {
         let mut p = Parser {
             b: text.as_bytes(),
             pos: 0,
@@ -590,6 +656,7 @@ mod xml_reader {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::utf16;
 
     /// Build a `bplist00` blob from top-level dict entries (string/bool/int/
     /// string-array values) — enough for the tests without `plutil`.
@@ -784,6 +851,46 @@ mod tests {
         assert!(!could_be_plist(b""));
         assert!(!could_be_plist(b"#!/bin/sh\necho hi\n"));
         assert!(!could_be_plist(b"\x7fELF\x02\x01\x01\x00"));
+        for be in [false, true] {
+            assert!(could_be_plist(&utf16(" \n<plist>", be, true)));
+            assert!(could_be_plist(&utf16("\u{FEFF}<plist>", be, true)));
+            assert!(!could_be_plist(&utf16("{ a = b; }", be, true)));
+            assert!(!could_be_plist(&utf16("\"k\" = \"v\";", be, true)));
+            assert!(!could_be_plist(&utf16("", be, true)));
+        }
+        assert!(!could_be_plist(b"\xFF\xFE\0\0<\0\0\0")); // UTF-32LE
+    }
+
+    #[test]
+    fn utf16_xml_with_a_bom_parses_whatever_it_declares() {
+        let xml = std::str::from_utf8(INFO_PLIST_XML).unwrap();
+        let declared_16 = xml.replace("UTF-8", "UTF-16");
+        let doubled_bom = format!("\u{FEFF}{xml}");
+        let leading_ws = format!("\n  {xml}");
+        for text in [xml, &declared_16, &doubled_bom, &leading_ws] {
+            for be in [false, true] {
+                let v = parse_launchd(&utf16(text, be, true)).expect("parses");
+                assert_eq!(
+                    v.get("CFBundleExecutable").and_then(|x| x.as_str()),
+                    Some("realmain")
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn utf16_without_a_bom_or_with_bad_units_does_not_parse() {
+        let xml = std::str::from_utf8(INFO_PLIST_XML).unwrap();
+        assert!(parse_launchd(&utf16(xml, false, false)).is_none());
+        assert!(parse_launchd(&utf16(xml, true, false)).is_none());
+        assert!(parse(&utf16(xml, false, true)).is_none());
+        let mut odd = utf16(xml, false, true);
+        odd.push(b'\n');
+        assert!(parse_launchd(&odd).is_none());
+        let mut lone_surrogate = utf16("<plist><string>", false, true);
+        lone_surrogate.extend([0x00, 0xD8]);
+        lone_surrogate.extend(utf16("</string></plist>", false, false));
+        assert!(parse_launchd(&lone_surrogate).is_none());
     }
 
     #[test]

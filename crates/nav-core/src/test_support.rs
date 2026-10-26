@@ -1,5 +1,5 @@
-//! Shared temp-file helpers for tests that need bytes on a real file, not
-//! just in-memory content — a range past `context::MAX_CONTENT_BYTES` only
+//! Shared test helpers: a UTF-16 encoder, and temp files for tests that need
+//! bytes on a real file, not just in-memory content — a range past `context::MAX_CONTENT_BYTES` only
 //! reaches a rule through `ScanContext`'s file handle. Mirrors the
 //! `macho::tests_support` pattern for non-Mach-O fixtures.
 
@@ -57,4 +57,24 @@ pub(crate) fn xorshift_bytes(len: usize) -> Vec<u8> {
             (state & 0xff) as u8
         })
         .collect()
+}
+
+/// `s` encoded as UTF-16 in the given byte order, with a BOM if `bom`.
+pub(crate) fn utf16(s: &str, big_endian: bool, bom: bool) -> Vec<u8> {
+    let mut out = Vec::new();
+    if bom {
+        out.extend(if big_endian {
+            [0xFE, 0xFF]
+        } else {
+            [0xFF, 0xFE]
+        });
+    }
+    for u in s.encode_utf16() {
+        out.extend(if big_endian {
+            u.to_be_bytes()
+        } else {
+            u.to_le_bytes()
+        });
+    }
+    out
 }
