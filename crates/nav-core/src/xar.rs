@@ -433,7 +433,14 @@ impl ReadBudget {
     /// counts it and every entry still to come. Call once before each entry,
     /// cheapest ([`entry_cost`]) first, so unused allowance carries to later ones.
     pub fn start_entry(&mut self, entries_left: usize) {
-        self.entry_remaining = self.remaining / entries_left.max(1);
+        self.start_share(entries_left);
+    }
+
+    /// Gives the next entry one of `parts` equal shares of what remains;
+    /// `parts` may exceed the entries to come to leave room for entries not
+    /// yet known.
+    pub fn start_share(&mut self, parts: usize) {
+        self.entry_remaining = self.remaining / parts.max(1);
     }
 
     /// Charges `n` bytes against the archive total and the current entry's
