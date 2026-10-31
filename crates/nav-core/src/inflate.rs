@@ -93,20 +93,11 @@ pub fn zlib_decompress_partial(data: &[u8], budget: usize) -> (Vec<u8>, Result<(
 
 /// Decode a zlib stream into `out`. On error `out` holds whatever was written.
 fn zlib_into(data: &[u8], budget: usize, out: &mut Vec<u8>) -> Result<(), InflateError> {
-    let cmf = *data.first().ok_or(InflateError::Truncated)?;
-    let flg = *data.get(1).ok_or(InflateError::Truncated)?;
-
-    // CM must be 8 (deflate); CINFO above 7 means a window larger than the
-    // 32 KiB the format allows.
-    if cmf & 0x0f != 8 || (cmf >> 4) > 7 {
-        return Err(InflateError::BadHeader);
+    if data.len() < 2 {
+        return Err(InflateError::Truncated);
     }
-    // The two header bytes, read big-endian, are a multiple of 31.
-    if ((cmf as u16) * 256 + flg as u16) % 31 != 0 {
+    if !has_zlib_header(data) {
         return Err(InflateError::BadHeader);
-    }
-    if (flg >> 5) & 1 == 1 {
-        return Err(InflateError::BadHeader); // FDICT: preset dictionary
     }
 
     let body = data.get(2..).ok_or(InflateError::Truncated)?;
@@ -122,6 +113,18 @@ fn zlib_into(data: &[u8], budget: usize, out: &mut Vec<u8>) -> Result<(), Inflat
         return Err(InflateError::ChecksumMismatch);
     }
     Ok(())
+}
+
+/// A valid two-byte zlib header: CM 8 (deflate), a window of at most 32 KiB,
+/// a correct check value, and no preset dictionary.
+pub(crate) fn has_zlib_header(data: &[u8]) -> bool {
+    let (Some(&cmf), Some(&flg)) = (data.first(), data.get(1)) else {
+        return false;
+    };
+    cmf & 0x0f == 8
+        && (cmf >> 4) <= 7
+        && (u16::from(cmf) * 256 + u16::from(flg)) % 31 == 0
+        && (flg >> 5) & 1 == 0
 }
 
 /// The gzip magic `1f 8b`: a gzip stream header.
