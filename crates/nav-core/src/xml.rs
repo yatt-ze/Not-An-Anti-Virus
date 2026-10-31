@@ -347,7 +347,17 @@ impl<'a> Scanner<'a> {
                     None => return Next::Bad,
                 }
             }
-            if rest.starts_with(b"<?") || rest.starts_with(b"<!") {
+            if rest.starts_with(b"<?") {
+                // A processing instruction ends at `?>`, not the first `>`.
+                match rest.get(2..).and_then(|r| find(r, b"?>")) {
+                    Some(i) => {
+                        self.pos = self.pos.saturating_add(i + 4);
+                        continue;
+                    }
+                    None => return Next::Bad,
+                }
+            }
+            if rest.starts_with(b"<!") {
                 match find(rest, b">") {
                     Some(i) => {
                         self.pos = self.pos.saturating_add(i + 1);
@@ -675,5 +685,21 @@ mod tests {
         // Malformed (unquoted) value ends iteration.
         assert_eq!(attrs(b" a=1 b=\"2\"").count(), 0);
         assert_eq!(attrs(b"").count(), 0);
+    }
+
+    #[test]
+    fn a_processing_instruction_ends_at_question_gt() {
+        let mut sc = Scanner::new(b"<?pi a>b?><r/><?x?>");
+        assert_eq!(
+            sc.next_event(),
+            Next::Event(Event::Open {
+                name: "r",
+                attrs: b"",
+                self_closing: true
+            })
+        );
+        assert_eq!(sc.next_event(), Next::End);
+        assert_eq!(Scanner::new(b"<?pi >").next_event(), Next::Bad);
+        assert_eq!(Scanner::new(b"<?>").next_event(), Next::Bad);
     }
 }

