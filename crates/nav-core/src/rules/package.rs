@@ -299,8 +299,8 @@ fn scan_scripts_entry(
         .map_err(|_| RuleOutcome::NotApplicable)?;
 
     let label = format!("{}!{}", ctx.path.display(), entry.path);
-    // Input a nested gzip never reached (stored-block text past a limit,
-    // plaintext behind a broken header) is scanned raw.
+    // A nested gzip's input past where it stopped (stored-block text past a
+    // limit) is scanned raw.
     if !read.unread.is_empty() {
         findings.scan(label.clone(), read.unread, "install scripts (unparsed)");
     }

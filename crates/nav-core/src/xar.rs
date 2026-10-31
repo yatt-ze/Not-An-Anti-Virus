@@ -424,7 +424,8 @@ pub type NestedRead<'d> = (Vec<u8>, Option<XarEntryError>, &'d [u8]);
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NestedEntry {
     /// The decoded entry, or the first member of a gzip inside it as far as it
-    /// decoded; if none of that member decoded, the gzip bytes undecoded.
+    /// decoded; if none of that member decoded, the gzip's bytes from where its
+    /// decoder stopped (all of them after a header failure).
     pub bytes: Vec<u8>,
     /// The nested gzip's input past where it failed, when some of it decoded.
     pub unread: Vec<u8>,
