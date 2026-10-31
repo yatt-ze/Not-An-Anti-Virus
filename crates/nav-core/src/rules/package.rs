@@ -3627,6 +3627,16 @@ mod tests {
     }
 
     #[test]
+    fn a_processing_instruction_cannot_hide_a_line() {
+        let names = ["a.pkg", "b.pkg"];
+        let outline = r#"<?pi > </choices-outline><choices-outline><z a='?><line choice="ca"/>'/>"#;
+        let rest = r##"<choice id="ca"><pkg-ref id="a"/></choice>
+            <pkg-ref id="a">#a.pkg</pkg-ref><pkg-ref id="b">#b.pkg</pkg-ref>"##;
+        let doc = wired(Some(outline), rest);
+        assert_eq!(refs_of(&doc, &names).expect("trusted"), ["a.pkg"]);
+    }
+
+    #[test]
     fn unreachable_padding_components_cannot_starve_a_reachable_one() {
         let limits = padding_limits();
         let mut heap = Heap::default();
