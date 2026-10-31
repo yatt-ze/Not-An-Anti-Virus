@@ -3083,7 +3083,8 @@ mod tests {
         let k = 3;
         let limits = xar::XarLimits {
             max_entry_bytes: 1 << 20,
-            max_read_back_bytes: k * per_entry,
+            // Slack past `k` reads, so the next is a real cut read.
+            max_read_back_bytes: k * per_entry + blob.len(),
             ..xar::XarLimits::default()
         };
         let mut bytes = xar::toc_xar_bytes(&scripts_toc(blob.len(), 2 * k));
@@ -3103,6 +3104,7 @@ mod tests {
         }
         // `k` full reads, then only cut ones from what is left.
         assert_eq!(charged[..k], vec![per_entry; k]);
+        assert!(charged[k] > 0, "{charged:?}");
         assert!(charged[k..].iter().all(|c| *c < per_entry), "{charged:?}");
         assert_eq!(
             charged.iter().sum::<usize>(),

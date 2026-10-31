@@ -1703,12 +1703,20 @@ mod tests {
         let gz = gzip_of_empty_dynamic_blocks(64);
         let inner_work = 64 * inflate::DYNAMIC_BLOCK_WORK;
         let blob = stored_zlib(&gz);
-        // Alone, with room, the entry decodes in full.
+        // Alone, the entry decodes in full with exactly its input, its outer
+        // output and the inner work, and not with a byte less.
+        let exact = blob.len() + gz.len() + inner_work;
         let one = single_entry(&blob);
-        let a = parse(&one, &XarLimits::default()).expect("xar");
-        let mut budget = ReadBudget::new(&XarLimits::default());
-        let read = budget.read_entry_nested(&one, &a, &a.files[0]);
-        assert_eq!(read.map(|e| (e.bytes, e.gap)), Ok((Vec::new(), None)));
+        for (allowance, gap) in [(exact, None), (exact - 1, Some(BUDGET_ERR))] {
+            let limits = XarLimits {
+                max_read_back_bytes: allowance,
+                ..XarLimits::default()
+            };
+            let a = parse(&one, &limits).expect("xar");
+            let mut budget = ReadBudget::new(&limits);
+            let read = budget.read_entry_nested(&one, &a, &a.files[0]);
+            assert_eq!(read.map(|e| e.gap), Ok(gap), "{allowance}");
+        }
 
         let n = 200;
         let spans: Vec<(usize, usize)> = (0..n).map(|i| (0, blob.len() + i)).collect();
