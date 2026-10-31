@@ -847,8 +847,14 @@ mod tests {
         ]
     }
 
-    fn zlib_cases() -> [(&'static str, &'static [u8], &'static [u8]); 2] {
-        raw_vectors!["zlib_hello", "zlib_toc"]
+    fn zlib_cases() -> [(&'static str, &'static [u8], &'static [u8]); 3] {
+        raw_vectors!["zlib_hello", "zlib_toc", "zlib_scripts_gzip_stored"]
+    }
+
+    #[test]
+    fn gzip_over_gzip_vector_decodes_to_the_inner_gzip() {
+        let [(_, input, expected)] = raw_vectors!["gzip_scripts_gzip_stored"];
+        assert_eq!(gzip_decompress(input, 1 << 20).as_deref(), Ok(expected));
     }
 
     const BOMB: &[u8] = include_bytes!("../testdata/inflate/bomb.in");
