@@ -58,6 +58,13 @@ impl Work {
         }
     }
 
+    fn metered(budget: usize, max_paid: usize) -> Self {
+        Work {
+            paid_cap: Some(max_paid),
+            ..Work::of_budget(budget)
+        }
+    }
+
     /// Output written plus the per-block charges: the work past input read.
     fn paid(&self, out: &[u8]) -> usize {
         out.len().saturating_add(self.blocks)
@@ -123,7 +130,7 @@ pub type InflateError = DecodeError;
 /// Decode a raw DEFLATE stream, producing at most `budget` bytes.
 pub fn inflate(data: &[u8], budget: usize) -> Result<Vec<u8>, InflateError> {
     let mut out = Vec::new();
-    inflate_into(data, budget, &mut out)?;
+    inflate_into(data, budget, &mut Work::of_budget(budget), &mut out)?;
     Ok(out)
 }
 
@@ -139,12 +146,31 @@ pub fn zlib_decompress(data: &[u8], budget: usize) -> Result<Vec<u8>, InflateErr
 /// failure, including `BadHeader`, yields an empty `Vec`.
 pub fn zlib_decompress_partial(data: &[u8], budget: usize) -> (Vec<u8>, Result<(), InflateError>) {
     let mut out = Vec::new();
-    let result = zlib_into(data, budget, &mut out);
+    let result = zlib_into(data, budget, &mut Work::of_budget(budget), &mut out);
     (out, result)
 }
 
+/// Like [`zlib_decompress_partial`], metered as [`gzip_decompress_metered`]:
+/// also returns the work past input read, which never exceeds `max_paid`.
+pub(crate) fn zlib_decompress_metered(
+    data: &[u8],
+    budget: usize,
+    max_paid: usize,
+) -> (Vec<u8>, usize, Result<(), InflateError>) {
+    let mut out = Vec::new();
+    let mut work = Work::metered(budget, max_paid);
+    let result = zlib_into(data, budget, &mut work, &mut out);
+    let paid = work.paid(&out);
+    (out, paid, result)
+}
+
 /// Decode a zlib stream into `out`. On error `out` holds whatever was written.
-fn zlib_into(data: &[u8], budget: usize, out: &mut Vec<u8>) -> Result<(), InflateError> {
+fn zlib_into(
+    data: &[u8],
+    budget: usize,
+    work: &mut Work,
+    out: &mut Vec<u8>,
+) -> Result<(), InflateError> {
     if data.len() < 2 {
         return Err(InflateError::Truncated);
     }
@@ -153,7 +179,7 @@ fn zlib_into(data: &[u8], budget: usize, out: &mut Vec<u8>) -> Result<(), Inflat
     }
 
     let body = data.get(2..).ok_or(InflateError::Truncated)?;
-    let used = inflate_into(body, budget, out)?;
+    let used = inflate_into(body, budget, work, out)?;
 
     let end = used.checked_add(4).ok_or(InflateError::Malformed)?;
     let trailer: [u8; 4] = body
@@ -235,10 +261,7 @@ pub(crate) fn gzip_decompress_metered(
 ) -> (Vec<u8>, usize, usize, Result<(), InflateError>) {
     let mut out = Vec::new();
     let mut used = 0;
-    let mut work = Work {
-        paid_cap: Some(max_paid),
-        ..Work::of_budget(budget)
-    };
+    let mut work = Work::metered(budget, max_paid);
     let result = gzip_into(data, budget, &mut work, &mut out, &mut used);
     let paid = work.paid(&out);
     (out, used, paid, result)
@@ -346,9 +369,14 @@ fn gzip_into(
 
 /// Decode a DEFLATE stream into `out` (empty on entry), returning how many
 /// bytes of `data` were consumed. On error `out` holds whatever was written.
-fn inflate_into(data: &[u8], budget: usize, out: &mut Vec<u8>) -> Result<usize, InflateError> {
+fn inflate_into(
+    data: &[u8],
+    budget: usize,
+    work: &mut Work,
+    out: &mut Vec<u8>,
+) -> Result<usize, InflateError> {
     let mut r = BitReader::new(data);
-    inflate_blocks(&mut r, budget, &mut Work::of_budget(budget), out)?;
+    inflate_blocks(&mut r, budget, work, out)?;
     Ok(r.bytes_consumed())
 }
 
