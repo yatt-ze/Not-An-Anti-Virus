@@ -792,7 +792,9 @@ fn pkg_ref_paths(text: &[u8], query: &RefQuery) -> Option<Vec<usize>> {
                 },
                 None,
             ) => {
-                scanner.raw_until_close("script")?;
+                // libxml2 parses a script body as markup; NAV does not.
+                let body = scanner.raw_until_close("script")?;
+                wiring.unclear |= has_wiring_tag(body);
             }
             // Metadata children (`<bundle-version>`) are fine; a script or
             // anything the wiring reads is not.
@@ -802,12 +804,7 @@ fn pkg_ref_paths(text: &[u8], query: &RefQuery) -> Option<Vec<usize>> {
                 },
                 Some(_),
             ) => {
-                let local = name.rsplit(':').next().unwrap_or(name);
-                if Wiring::NAMES
-                    .iter()
-                    .chain(&["script"])
-                    .any(|n| n.eq_ignore_ascii_case(local))
-                {
+                if Wiring::is_wiring(name) || local_name(name).eq_ignore_ascii_case("script") {
                     return None;
                 }
                 child = true;
@@ -851,6 +848,13 @@ fn pkg_ref_paths(text: &[u8], query: &RefQuery) -> Option<Vec<usize>> {
         }
     }
     wiring.unclear |= has_declaration(text);
+    // Installer resolves an id to one path; which one, for a repeat, is unmeasured.
+    let mut path_of: HashMap<&str, usize> = HashMap::new();
+    for (id, j) in &named {
+        if let Some(id) = id {
+            wiring.unclear |= *path_of.entry(id.as_str()).or_insert(*j) != *j;
+        }
+    }
     let runs = wiring.runnable();
     let mut seen = HashSet::new();
     let found = named
@@ -889,12 +893,14 @@ struct Wiring<'a> {
 impl<'a> Wiring<'a> {
     const NAMES: [&'static str; 4] = ["choices-outline", "line", "choice", "pkg-ref"];
 
+    /// Whether `name`, in any case or with a prefix, is one the wiring reads.
+    fn is_wiring(name: &str) -> bool {
+        let local = local_name(name);
+        Self::NAMES.iter().any(|n| n.eq_ignore_ascii_case(local))
+    }
+
     fn open(&mut self, name: &'a str, attrs: &[u8], self_closing: bool) {
-        let local = name.rsplit(':').next().unwrap_or(name);
-        if Self::NAMES
-            .iter()
-            .any(|n| n.eq_ignore_ascii_case(local) && *n != name)
-        {
+        if Self::is_wiring(name) && !Self::NAMES.contains(&name) {
             self.unclear = true;
         }
         let mut choice = None;
@@ -956,12 +962,13 @@ impl<'a> Wiring<'a> {
     fn id(&mut self, attrs: &[u8], want: &str) -> Option<String> {
         let mut out = None;
         for (name, value) in xml::attrs(attrs) {
-            if !name.eq_ignore_ascii_case(want.as_bytes()) {
+            let name = String::from_utf8_lossy(name);
+            if !local_name(&name).eq_ignore_ascii_case(want) {
                 continue;
             }
             let plain =
                 !value.is_empty() && value.iter().all(|b| b.is_ascii_graphic() && *b != b'&');
-            if name != want.as_bytes() || out.is_some() || !plain {
+            if name != want || out.is_some() || !plain {
                 self.unclear = true;
                 return None;
             }
@@ -985,16 +992,39 @@ impl<'a> Wiring<'a> {
     }
 }
 
-/// Whether `text` has a `<!` declaration other than a comment or CDATA (a
+/// Whether `raw` holds something shaped like a tag the wiring reads.
+fn has_wiring_tag(raw: &[u8]) -> bool {
+    raw.split(|b| *b == b'<').skip(1).any(|tail| {
+        let end = tail
+            .iter()
+            .position(|b| !(b.is_ascii_alphanumeric() || matches!(b, b':' | b'-' | b'_' | b'.')))
+            .unwrap_or(tail.len());
+        std::str::from_utf8(tail.get(..end).unwrap_or(&[])).is_ok_and(Wiring::is_wiring)
+    })
+}
+
+/// `name` without a namespace prefix.
+fn local_name(name: &str) -> &str {
+    name.rsplit(':').next().unwrap_or(name)
+}
+
+/// Whether `text` has a `<!` declaration outside comments and CDATA (a
 /// DOCTYPE's attribute defaults could add an id or choice NAV never sees).
 fn has_declaration(text: &[u8]) -> bool {
     let mut rest = text;
     while let Some(i) = xml::find(rest, b"<!") {
         let here = rest.get(i..).unwrap_or(&[]);
-        if !here.starts_with(b"<!--") && !here.starts_with(b"<![CDATA[") {
+        let closer: &[u8] = if here.starts_with(b"<!--") {
+            b"-->"
+        } else if here.starts_with(b"<![CDATA[") {
+            b"]]>"
+        } else {
             return true;
+        };
+        match xml::find(here.get(4..).unwrap_or(&[]), closer) {
+            Some(end) => rest = here.get(4 + end + closer.len()..).unwrap_or(&[]),
+            None => return false,
         }
-        rest = here.get(2..).unwrap_or(&[]);
     }
     false
 }
@@ -3575,6 +3605,14 @@ mod tests {
         // An outline that reaches nothing keeps nothing.
         let none = wired(Some(r#"<line choice="nope"/>"#), rest);
         assert_eq!(refs_of(&none, &names), Some(vec![]));
+        // `<!` in a comment or CDATA is not a declaration.
+        let quoted = [
+            b"<!-- <!DOCTYPE x> -->".as_slice(),
+            &none,
+            b"<![CDATA[ a<!b ]]>",
+        ]
+        .concat();
+        assert_eq!(refs_of(&quoted, &names), Some(vec![]));
         // Ids compare case-folded.
         let folded = wired(
             Some(r#"<line choice="CA"/>"#),
@@ -3641,6 +3679,17 @@ mod tests {
                 ),
             ),
             wired(Some(line), &format!("<x>{choice}</y>{refs}")),
+            // A prefixed attribute, a wiring tag in a script body.
+            wired(Some(r#"<line x:choice="cb"/>"#), &format!("{choice}{refs}")),
+            wired(
+                Some(line),
+                &format!(r#"{choice}<script>var s = '<choice id="cb">';</script>{refs}"#),
+            ),
+            // One id naming two paths.
+            wired(
+                Some(line),
+                &format!(r##"{choice}{refs}<pkg-ref id="a">#b.pkg</pkg-ref>"##),
+            ),
             // An outline with no line, a prefixed name, a DOCTYPE.
             wired(Some(""), &format!("{choice}{refs}")),
             wired(Some(r#"<x:line choice="cb"/>"#), &format!("{choice}{refs}")),
@@ -3694,7 +3743,8 @@ mod tests {
         let pkg =
             include_bytes!("../../fixtures/suspicious/installer_choices_unreachable_component.pkg");
         let start = xml::find(pkg, b"<?xml").expect("Distribution");
-        let len = xml::find(&pkg[start..], b"</installer-gui-script>").expect("end") + 23;
+        let close = b"</installer-gui-script>";
+        let len = xml::find(&pkg[start..], close).expect("end") + close.len();
         let names = ["updater.pkg", "extras.pkg"];
         assert_eq!(
             refs_of(&pkg[start..start + len], &names).expect("trusted"),
