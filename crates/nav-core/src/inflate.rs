@@ -25,7 +25,7 @@ const MAX_BITS: usize = 15;
 const INITIAL_OUTPUT_CAPACITY: usize = 64 * 1024;
 
 /// Work charged per stored or fixed block, in output-byte terms.
-const BLOCK_WORK: usize = 64;
+pub(crate) const BLOCK_WORK: usize = 64;
 
 /// Work charged per dynamic block: roughly one table build.
 pub(crate) const DYNAMIC_BLOCK_WORK: usize = 1024;
@@ -40,10 +40,12 @@ pub(crate) fn work_cap(budget: usize) -> usize {
         .saturating_add(WORK_SLACK)
 }
 
-/// One stream's decode-work ceiling and its block charges so far.
+/// One stream's decode-work ceilings and its block charges so far.
 struct Work {
     /// [`work_cap`] of the output budget, on input read plus [`Work::paid`].
     cap: usize,
+    /// A ceiling on [`Work::paid`] alone; output stops where it would cross it.
+    paid_cap: Option<usize>,
     blocks: usize,
 }
 
@@ -51,6 +53,7 @@ impl Work {
     fn of_budget(budget: usize) -> Self {
         Work {
             cap: work_cap(budget),
+            paid_cap: None,
             blocks: 0,
         }
     }
@@ -61,10 +64,11 @@ impl Work {
     }
 
     fn over(&self, r: &BitReader, out: &[u8]) -> bool {
-        r.byte_pos().saturating_add(self.paid(out)) > self.cap
+        let paid = self.paid(out);
+        r.byte_pos().saturating_add(paid) > self.cap || self.paid_cap.is_some_and(|c| paid > c)
     }
 
-    /// Adds a block's charge, unless that takes the work over its ceiling.
+    /// Adds a block's charge, unless that takes the work over a ceiling.
     fn charge_block(
         &mut self,
         r: &BitReader,
@@ -77,6 +81,14 @@ impl Work {
             return Err(InflateError::BudgetExceeded);
         }
         Ok(())
+    }
+
+    /// The output cap for the next block.
+    fn output_limit(&self, budget: usize) -> usize {
+        match self.paid_cap {
+            Some(c) => budget.min(c.saturating_sub(self.blocks)),
+            None => budget,
+        }
     }
 }
 
@@ -212,6 +224,26 @@ pub fn gzip_decompress_consumed(
     (out, used, result)
 }
 
+/// Like [`gzip_decompress_consumed`], also capping the work past input read
+/// (output written plus the per-block charges) at `max_paid`, for a caller
+/// that has already paid for the input. Also returns that work, which never
+/// exceeds `max_paid`.
+pub(crate) fn gzip_decompress_metered(
+    data: &[u8],
+    budget: usize,
+    max_paid: usize,
+) -> (Vec<u8>, usize, usize, Result<(), InflateError>) {
+    let mut out = Vec::new();
+    let mut used = 0;
+    let mut work = Work {
+        paid_cap: Some(max_paid),
+        ..Work::of_budget(budget)
+    };
+    let result = gzip_into(data, budget, &mut work, &mut out, &mut used);
+    let paid = work.paid(&out);
+    (out, used, paid, result)
+}
+
 /// Length of the RFC 1952 header that opens `data`. `BadHeader` if it is not
 /// one [`gzip_decompress`] accepts, `Truncated` if `data` ends inside it.
 fn gzip_header_len(data: &[u8]) -> Result<usize, InflateError> {
@@ -340,15 +372,16 @@ fn inflate_blocks(
             BLOCK_WORK
         };
         work.charge_block(r, out, charge)?;
+        let limit = work.output_limit(budget);
         match btype {
-            0 => stored_block(r, out, budget)?,
+            0 => stored_block(r, out, limit)?,
             1 => {
                 let (lit, dist) = fixed_tables()?;
-                compressed_block(r, out, budget, lit, dist)?;
+                compressed_block(r, out, limit, lit, dist)?;
             }
             2 => {
                 let (lit, dist) = dynamic_tables(r)?;
-                compressed_block(r, out, budget, &lit, &dist)?;
+                compressed_block(r, out, limit, &lit, &dist)?;
             }
             // BTYPE=11 is reserved.
             _ => return Err(InflateError::Malformed),
@@ -1838,5 +1871,26 @@ mod tests {
         }
         let expected = vec![b'a'; blocks * 517];
         assert_eq!(inflate(&w.finish(), expected.len()), Ok(expected));
+    }
+
+    /// Metered work is output plus block charges, and never passes its cap:
+    /// output is clamped at what the cap leaves after the block charge.
+    #[test]
+    fn metered_work_stops_at_its_cap() {
+        let body = [b'a'; 100];
+        let mut trailer = crc32(&body).to_le_bytes().to_vec();
+        trailer.extend_from_slice(&(body.len() as u32).to_le_bytes());
+        let gz = gzip_stored_one(&body, &trailer);
+        let full = BLOCK_WORK + body.len();
+        assert_eq!(
+            gzip_decompress_metered(&gz, BIG, full),
+            (body.to_vec(), gz.len() - 8, full, Ok(()))
+        );
+        for cap in [0, BLOCK_WORK - 1, BLOCK_WORK, full - 1] {
+            let (out, _, paid, result) = gzip_decompress_metered(&gz, BIG, cap);
+            assert_eq!(result, Err(InflateError::BudgetExceeded), "{cap}");
+            assert_eq!(out.len(), cap.saturating_sub(BLOCK_WORK), "{cap}");
+            assert!(paid <= cap, "{cap}: {paid}");
+        }
     }
 }

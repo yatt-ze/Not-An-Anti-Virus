@@ -2855,7 +2855,8 @@ mod tests {
         let blob = zlib_stored(gz);
         let limits = xar::XarLimits {
             max_entry_bytes: 1 << 20,
-            max_read_back_bytes: 3000,
+            // The inner third also pays the dynamic block's 1 KiB charge.
+            max_read_back_bytes: 4500,
             ..xar::XarLimits::default()
         };
         assert!(
@@ -3068,19 +3069,21 @@ mod tests {
     }
 
     /// A `Scripts` read is charged its outer input and output and the inner
-    /// gzip's output; the inner input is the outer output, not charged again.
-    /// A budget with room for exactly `k` such reads makes `k` in full.
+    /// gzip's output and block work; the inner input is the outer output, not
+    /// charged again. A budget with room for exactly `k` such reads makes `k`
+    /// in full.
     #[test]
     fn a_scripts_entrys_inner_gzip_input_is_charged_once() {
         let gz = empty_gzip(600);
         let blob = zlib_stored(&gz);
-        // Outer input and output; the inner gzip reads the output and writes nothing.
-        let per_entry = blob.len() + gz.len();
-        // Room for `k` entries at a third of the allowance for input each.
+        // Outer input and output; the inner gzip reads the output and writes
+        // nothing, at a block charge for each of its 601 blocks.
+        let per_entry = blob.len() + gz.len() + 601 * crate::inflate::BLOCK_WORK;
+        assert!(per_entry >= 3 * blob.len(), "input fits in a third");
         let k = 3;
         let limits = xar::XarLimits {
             max_entry_bytes: 1 << 20,
-            max_read_back_bytes: (k - 1) * per_entry + 3 * blob.len(),
+            max_read_back_bytes: k * per_entry,
             ..xar::XarLimits::default()
         };
         let mut bytes = xar::toc_xar_bytes(&scripts_toc(blob.len(), 2 * k));
