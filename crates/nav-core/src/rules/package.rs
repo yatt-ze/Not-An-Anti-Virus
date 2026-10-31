@@ -337,10 +337,26 @@ fn scan_scripts_entry(
     // Members that did parse, plus one cut off mid-body, are scanned even
     // when the archive is incomplete.
     let complete = members.is_complete() && gap.is_none();
+    scan_cpio_members(ctx, entry, &members, "", findings);
+    if complete {
+        Ok(())
+    } else {
+        Err(RuleOutcome::NotApplicable)
+    }
+}
 
+/// Scans each non-empty regular member of `members`, including one cut off
+/// mid-body, labelled `install script {name}{note}`.
+fn scan_cpio_members(
+    ctx: &ScanContext,
+    entry: &xar::XarFile,
+    members: &cpio::CpioArchive,
+    note: &str,
+    findings: &mut ScriptFindings,
+) {
     let parsed = members.entries.iter().map(|m| (m, ""));
     let cut = members.cut_short.iter().map(|m| (m, " (cut short)"));
-    for (member, note) in parsed.chain(cut) {
+    for (member, cut_note) in parsed.chain(cut) {
         if !member.is_regular_file() || member.data.is_empty() {
             continue;
         }
@@ -348,13 +364,8 @@ fn scan_scripts_entry(
         findings.scan(
             label,
             member.data.to_vec(),
-            &format!("install script {}{note}", member.name),
+            &format!("install script {}{note}{cut_note}", member.name),
         );
-    }
-    if complete {
-        Ok(())
-    } else {
-        Err(RuleOutcome::NotApplicable)
     }
 }
 
