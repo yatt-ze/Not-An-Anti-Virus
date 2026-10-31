@@ -610,7 +610,7 @@ impl ReadBudget {
     /// fails (keeping what it decoded), or when the allowance is spent.
     fn decode_later_members(&mut self, mut rest: &[u8]) -> Vec<u8> {
         let mut out = Vec::new();
-        while inflate::has_gzip_magic(rest) && self.entry_cap() > 0 {
+        while inflate::has_gzip_magic(rest) {
             let (bytes, used, result) = self.decode_gzip(rest);
             out.extend_from_slice(&bytes);
             if result.is_err() {
