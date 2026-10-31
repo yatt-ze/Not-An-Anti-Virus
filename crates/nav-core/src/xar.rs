@@ -410,15 +410,42 @@ fn decode_entry(
     raw: &[u8],
     limits: &XarLimits,
 ) -> Result<(Vec<u8>, Option<XarEntryError>), XarEntryError> {
+    decode_entry_to(raw, limits).0
+}
+
+/// Bytes read and the gap, if any, as [`read_entry_partial`] returns them.
+type PartialRead = (Vec<u8>, Option<XarEntryError>);
+
+/// A [`ReadBudget::read_entry_partial_nested`] result: a [`PartialRead`] plus
+/// the input past a gzip entry's first member.
+pub type NestedRead<'d> = (Vec<u8>, Option<XarEntryError>, &'d [u8]);
+
+/// [`decode_entry`], also returning where decoding ended: just past the first
+/// member of a gzip entry that decoded in full, else `raw.len()`.
+fn decode_entry_to(raw: &[u8], limits: &XarLimits) -> (Result<PartialRead, XarEntryError>, usize) {
+    if inflate::has_gzip_magic(raw) {
+        let (bytes, used, result) = inflate::gzip_decompress_consumed(raw, limits.max_entry_bytes);
+        // The 8-byte trailer follows the consumed input.
+        let end = match result {
+            Ok(()) => used.saturating_add(8).min(raw.len()),
+            Err(_) => raw.len(),
+        };
+        return (partial_read(bytes, result), end);
+    }
+    (decode_entry_other(raw, limits), raw.len())
+}
+
+/// [`decode_entry`] for everything but gzip.
+fn decode_entry_other(
+    raw: &[u8],
+    limits: &XarLimits,
+) -> Result<(Vec<u8>, Option<XarEntryError>), XarEntryError> {
     // Dispatch on the bytes, not the `encoding` attribute (see module docs).
     // Formats we have no decoder for (xz) must not come back as "stored" text.
     if is_xz(raw) {
         Err(XarEntryError::UnknownEncoding)
     } else if crate::bzip2::has_bzip2_magic(raw) {
         let (bytes, result) = crate::bzip2::bzip2_decompress_partial(raw, limits.max_entry_bytes);
-        partial_read(bytes, result)
-    } else if inflate::has_gzip_magic(raw) {
-        let (bytes, result) = inflate::gzip_decompress_partial(raw, limits.max_entry_bytes);
         partial_read(bytes, result)
     } else if raw.first().is_some_and(|b| b & 0x0f == 8) {
         // Plausible zlib CMF; if the header checks fail, treat it as stored.
@@ -499,6 +526,7 @@ impl ReadBudget {
         file: &XarFile,
     ) -> Result<(Vec<u8>, Option<XarEntryError>), XarEntryError> {
         self.read_with_split(data, archive, file, false)
+            .map(|(bytes, gap, _)| (bytes, gap))
     }
 
     /// Like [`ReadBudget::read_entry_partial`], for an entry whose output may
@@ -506,24 +534,26 @@ impl ReadBudget {
     /// a third of the allowance for input and half of the rest for output, so
     /// the nested layer always has room; other entries are read as by
     /// `read_entry_partial`. Decode the nested layer
-    /// under [`ReadBudget::entry_cap`] and charge only its output.
-    pub fn read_entry_partial_nested(
+    /// under [`ReadBudget::entry_cap`] and charge only its output. Also returns
+    /// the input read past a gzip entry's first member (empty if none, or if
+    /// that member did not decode in full), already charged as input.
+    pub fn read_entry_partial_nested<'d>(
         &mut self,
-        data: &[u8],
+        data: &'d [u8],
         archive: &XarArchive,
         file: &XarFile,
-    ) -> Result<(Vec<u8>, Option<XarEntryError>), XarEntryError> {
+    ) -> Result<NestedRead<'d>, XarEntryError> {
         self.read_with_split(data, archive, file, true)
     }
 
     /// The reads above; `nested` selects the split for [`may_nest`] entries.
-    fn read_with_split(
+    fn read_with_split<'d>(
         &mut self,
-        data: &[u8],
+        data: &'d [u8],
         archive: &XarArchive,
         file: &XarFile,
         nested: bool,
-    ) -> Result<(Vec<u8>, Option<XarEntryError>), XarEntryError> {
+    ) -> Result<NestedRead<'d>, XarEntryError> {
         let over = XarEntryError::BUDGET_EXCEEDED;
         let raw = entry_bytes(data, archive, file)?;
         if is_xz(raw) {
@@ -558,14 +588,15 @@ impl ReadBudget {
             max_entry_bytes: out_cap,
             ..self.limits
         };
-        let result = decode_entry(input, &capped);
+        let (result, end) = decode_entry_to(input, &capped);
+        let rest = input.get(end..).unwrap_or_default();
         if let Ok((bytes, _)) = &result {
             self.charge(bytes.len());
         }
         match (cut, result) {
-            (true, Ok((bytes, _))) if !bytes.is_empty() => Ok((bytes, Some(over))),
+            (true, Ok((bytes, _))) if !bytes.is_empty() => Ok((bytes, Some(over), rest)),
             (true, Ok(_) | Err(XarEntryError::Undecodable(_))) => Err(over),
-            (_, result) => result,
+            (_, result) => result.map(|(bytes, gap)| (bytes, gap, rest)),
         }
     }
 }
@@ -1538,9 +1569,10 @@ mod tests {
         assert_eq!(entry_allowance(&bytes, &a, f, true), Ok(3 * zlib.len()));
         assert_eq!(entry_allowance(&bytes, &a, f, false), Ok(2 * zlib.len()));
         let mut budget = ReadBudget::new(&limits);
-        let (out, gap) = budget
+        let (out, gap, rest) = budget
             .read_entry_partial_nested(&bytes, &a, f)
             .expect("reads");
+        assert!(rest.is_empty());
         // All the input, then half of what is left for output.
         assert_eq!(out.len(), (3000 - zlib.len()) / 2);
         assert_eq!(gap, Some(BUDGET_ERR));
@@ -1560,7 +1592,7 @@ mod tests {
         let mut budget = ReadBudget::new(&limits);
         assert_eq!(
             budget.read_entry_partial_nested(&bytes, &a, f),
-            Ok((blob[..500].to_vec(), Some(BUDGET_ERR)))
+            Ok((blob[..500].to_vec(), Some(BUDGET_ERR), &[][..]))
         );
         assert_eq!(budget.remaining(), 0);
     }

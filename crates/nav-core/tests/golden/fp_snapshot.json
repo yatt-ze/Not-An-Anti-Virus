@@ -514,6 +514,15 @@
     ],
     "completeness": "partial"
   },
+  "suspicious/installer_scripts_later_gzip_member.pkg": {
+    "score": 23,
+    "recommendation": "notify",
+    "rule_ids": [
+      "installer-script-suspicious",
+      "unsigned-installer-package"
+    ],
+    "completeness": "complete"
+  },
   "suspicious/installer_scripts_repeated_range.pkg": {
     "score": 25,
     "recommendation": "notify",

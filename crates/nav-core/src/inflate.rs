@@ -710,7 +710,7 @@ impl<'a> BitReader<'a> {
 
 /// CRC-32 (reflected IEEE polynomial, RFC 1952 §8), computed bitwise —
 /// inputs are kilobytes.
-fn crc32(data: &[u8]) -> u32 {
+pub(crate) fn crc32(data: &[u8]) -> u32 {
     let mut crc: u32 = 0xFFFF_FFFF;
     for &byte in data {
         crc ^= byte as u32;

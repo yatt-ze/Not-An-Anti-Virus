@@ -63,7 +63,9 @@ fuzz_target!(|data: &[u8]| {
         let result = if i % 2 == 0 {
             budget.read_entry_partial(data, &archive, f)
         } else {
-            budget.read_entry_partial_nested(data, &archive, f)
+            budget
+                .read_entry_partial_nested(data, &archive, f)
+                .map(|(bytes, gap, _)| (bytes, gap))
         };
         assert!(budget.remaining() <= before, "the budget grew");
         assert!(
