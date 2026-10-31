@@ -750,7 +750,8 @@ fn scan_distribution_entry(
 /// [`Wiring`]); otherwise all are.
 ///
 /// `None` (trust no reference) if any reference could resolve differently in
-/// Installer: CDATA or child elements inside it, non-ASCII or control
+/// Installer: CDATA inside it, child elements beside non-blank text (or a
+/// `script` or [`Wiring`] element), non-ASCII or control
 /// characters, a non-plain path (empty, `.` or `..` segment), or a `%` escape
 /// for a byte of 0x80 or above, `/` or NUL.
 fn pkg_ref_paths(text: &[u8], query: &RefQuery) -> Option<Vec<usize>> {
@@ -759,6 +760,9 @@ fn pkg_ref_paths(text: &[u8], query: &RefQuery) -> Option<Vec<usize>> {
     let mut scanner = xml::Scanner::new(text);
     let mut open: Option<(&[u8], Option<String>)> = None;
     let mut content = Vec::new();
+    // Elements open inside the current `pkg-ref`, and whether it had any.
+    let mut inner: Vec<&str> = Vec::new();
+    let mut child = false;
     loop {
         let event = match scanner.next_event() {
             xml::Next::Event(event) => event,
@@ -777,6 +781,7 @@ fn pkg_ref_paths(text: &[u8], query: &RefQuery) -> Option<Vec<usize>> {
                 let id = wiring.pkg_ref(attrs);
                 open = Some((scanner.rest(), id));
                 content.clear();
+                child = false;
             }
             // Skipped as `distribution_pieces` skips it: raw text, not markup.
             (
@@ -789,7 +794,27 @@ fn pkg_ref_paths(text: &[u8], query: &RefQuery) -> Option<Vec<usize>> {
             ) => {
                 scanner.raw_until_close("script")?;
             }
-            (xml::Event::Open { .. }, Some(_)) => return None,
+            // Metadata children (`<bundle-version>`) are fine; a script or
+            // anything the wiring reads is not.
+            (
+                xml::Event::Open {
+                    name, self_closing, ..
+                },
+                Some(_),
+            ) => {
+                let local = name.rsplit(':').next().unwrap_or(name);
+                if Wiring::NAMES
+                    .iter()
+                    .chain(&["script"])
+                    .any(|n| n.eq_ignore_ascii_case(local))
+                {
+                    return None;
+                }
+                child = true;
+                if !self_closing {
+                    inner.push(name);
+                }
+            }
             (
                 xml::Event::Open {
                     name,
@@ -799,7 +824,16 @@ fn pkg_ref_paths(text: &[u8], query: &RefQuery) -> Option<Vec<usize>> {
                 None,
             ) => wiring.open(name, attrs, self_closing),
             (xml::Event::Text(t), Some(_)) => content.extend_from_slice(t),
+            (xml::Event::Close { name }, Some(_)) if !inner.is_empty() => {
+                if inner.pop() != Some(name) {
+                    return None;
+                }
+            }
             (xml::Event::Close { name: "pkg-ref" }, Some((start, _))) => {
+                // A path split by markup could read differently in Installer.
+                if child && !content.iter().all(u8::is_ascii_whitespace) {
+                    return None;
+                }
                 let span = start.get(..start.len().checked_sub(scanner.rest().len())?)?;
                 if xml::find(span, b"<![CDATA[").is_some() {
                     return None;
@@ -3624,6 +3658,48 @@ mod tests {
                 "{shown}"
             );
         }
+    }
+
+    #[test]
+    fn metadata_children_do_not_void_the_reference_set() {
+        let names = ["a.pkg", "b.pkg"];
+        // productbuild's shape: one pkg-ref with the path, one with metadata.
+        let doc = br##"<g><pkg-ref id="a">#a.pkg</pkg-ref>
+            <pkg-ref id="a"><bundle-version><bundle id="x" path="A.app"/></bundle-version></pkg-ref>
+            <pkg-ref id="b">
+                <bundle-version/>
+            </pkg-ref></g>"##;
+        assert_eq!(refs_of(doc, &names).expect("trusted"), ["a.pkg"]);
+        let bad: [&[u8]; 6] = [
+            b"<g><pkg-ref>#a.pkg<bundle-version/></pkg-ref></g>",
+            b"<g><pkg-ref><x>#a.pkg</x></pkg-ref></g>",
+            b"<g><pkg-ref><x><y></x></y></pkg-ref></g>",
+            b"<g><pkg-ref><x:Pkg-Ref/></pkg-ref></g>",
+            b"<g><pkg-ref><line choice='c'/></pkg-ref></g>",
+            b"<g><pkg-ref><script>x</script></pkg-ref></g>",
+        ];
+        for doc in bad {
+            assert_eq!(
+                refs_of(doc, &names),
+                None,
+                "{}",
+                String::from_utf8_lossy(doc)
+            );
+        }
+    }
+
+    /// The fixture's `Distribution` (stored uncompressed) wires only `updater.pkg`.
+    #[test]
+    fn the_unreachable_component_fixture_keeps_one_reference() {
+        let pkg =
+            include_bytes!("../../fixtures/suspicious/installer_choices_unreachable_component.pkg");
+        let start = xml::find(pkg, b"<?xml").expect("Distribution");
+        let len = xml::find(&pkg[start..], b"</installer-gui-script>").expect("end") + 23;
+        let names = ["updater.pkg", "extras.pkg"];
+        assert_eq!(
+            refs_of(&pkg[start..start + len], &names).expect("trusted"),
+            ["updater.pkg"]
+        );
     }
 
     #[test]
