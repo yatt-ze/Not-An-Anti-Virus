@@ -4,9 +4,11 @@
 //! heap entries).
 //!
 //! Beyond no-panic/no-OOB/terminates, asserts: the §6.2 ceilings hold on what
-//! comes back (entry count, depth); `ReadBudget::read_entry_partial` respects
-//! its entry cap, never charges more than the entry's allowance (or grows the
-//! archive budget), and charges at least the bytes it returns; the
+//! comes back (entry count, depth); `ReadBudget::read_entry_partial` and
+//! `read_entry_nested` respect the entry cap, never charge more than the
+//! entry's allowance (outer and nested layers together) or grow the archive
+//! budget, and charge at least the bytes they return; a nested zlib read
+//! leaves the nested layer at least a third of the allowance; the
 //! un-budgeted `read_entry_partial` respects `max_entry_bytes` and a gap
 //! carries bytes; a complete archive is not also halted.
 //!
@@ -60,12 +62,34 @@ fuzz_target!(|data: &[u8]| {
         budget.start_entry(archive.files.len() - i);
         let cap = budget.entry_cap();
         let before = budget.remaining();
+        // (bytes, gap, other bytes returned)
         let result = if i % 2 == 0 {
-            budget.read_entry_partial(data, &archive, f)
-        } else {
             budget
-                .read_entry_partial_nested(data, &archive, f)
-                .map(|(bytes, gap, _)| (bytes, gap))
+                .read_entry_partial(data, &archive, f)
+                .map(|(bytes, gap)| (bytes, gap, 0))
+        } else {
+            // A zlib entry is the one a nested read splits in three.
+            let zlib = matches!(
+                (
+                    xar::entry_allowance(data, &archive, f, true),
+                    xar::entry_allowance(data, &archive, f, false),
+                ),
+                (Ok(three), Ok(two)) if three > two
+            );
+            let mut outer = budget.clone();
+            let _ = outer.read_entry_partial_nested(data, &archive, f);
+            if zlib {
+                assert!(
+                    outer.entry_cap() >= (allowance / 3).min(limits.max_entry_bytes),
+                    "entry {:?}: the outer read left the nested layer {} of a {}-byte allowance",
+                    f.path,
+                    outer.entry_cap(),
+                    allowance
+                );
+            }
+            budget
+                .read_entry_nested(data, &archive, f)
+                .map(|e| (e.bytes, e.gap, e.unread.len() + e.later.len()))
         };
         assert!(budget.remaining() <= before, "the budget grew");
         assert!(
@@ -74,9 +98,9 @@ fuzz_target!(|data: &[u8]| {
             f.path,
             allowance
         );
-        if let Ok((bytes, gap)) = result {
+        if let Ok((bytes, gap, other)) = result {
             assert!(
-                before - budget.remaining() >= bytes.len(),
+                before - budget.remaining() >= bytes.len() + other,
                 "entry {:?}: returned bytes were not charged",
                 f.path
             );
@@ -87,8 +111,9 @@ fuzz_target!(|data: &[u8]| {
                 bytes.len(),
                 cap
             );
+            // A nested gzip can fail having consumed all its input.
             assert!(
-                gap.is_none() || !bytes.is_empty(),
+                gap.is_none() || !bytes.is_empty() || i % 2 == 1,
                 "entry {:?}: a partial read must carry bytes",
                 f.path
             );
