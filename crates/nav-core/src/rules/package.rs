@@ -84,7 +84,8 @@ impl InstallerScriptRule {
             .metadata_entries()
             .filter(|e| matches!(e.name.as_str(), "Scripts" | "Distribution"));
         for (toc_index, entry) in wanted.enumerate() {
-            let cost = xar::entry_cost(content, &archive, entry).ok();
+            let nested = entry.name == "Scripts";
+            let cost = xar::entry_allowance(content, &archive, entry, nested).ok();
             unreadable |= cost.is_none();
             entries.push(Wanted {
                 toc_index,
@@ -238,7 +239,8 @@ impl InstallerScriptRule {
     }
 }
 
-/// A `Scripts` or `Distribution` TOC entry; `cost` is `None` if unreadable.
+/// A `Scripts` or `Distribution` TOC entry; `cost` is the allowance needed to
+/// read its input in full (`xar::entry_allowance`), `None` if unreadable.
 struct Wanted<'a> {
     toc_index: usize,
     entry: &'a xar::XarFile,
@@ -290,7 +292,7 @@ fn scan_scripts_entry(
     // unreadable, not absent. A partial read is scanned, then reported
     // unreadable below.
     let (mut raw, mut gap) = budget
-        .read_entry_partial(content, archive, entry)
+        .read_entry_partial_nested(content, archive, entry)
         .map_err(|_| RuleOutcome::NotApplicable)?;
 
     let label = format!("{}!{}", ctx.path.display(), entry.path);
@@ -301,8 +303,7 @@ fn scan_scripts_entry(
     let archive_bytes = if !crate::inflate::has_gzip_magic(&raw) {
         raw
     } else {
-        // The inner layer reads all of `raw` as input, then writes its output.
-        budget.charge(raw.len());
+        // `raw` was charged as the outer read's output; only the inner output is new.
         let cap = budget.entry_cap();
         let (v, used, result) = if cap == 0 {
             (Vec::new(), 0, Err(DecodeError::BudgetExceeded))
@@ -2228,10 +2229,10 @@ mod tests {
         assert!(r.expect("evaluates").is_some());
     }
 
-    /// The inner gzip is decoded under what the outer read left: none, or a
-    /// few bytes. Either way the entry is incomplete, never clean.
+    /// A tight allowance cuts the outer read and leaves the inner gzip little:
+    /// incomplete, never clean.
     #[test]
-    fn a_scripts_entry_whose_inner_gzip_has_no_budget_left_is_incomplete() {
+    fn a_tight_allowance_leaves_a_zlib_scripts_incomplete() {
         let full = include_bytes!("../../testdata/gzip/scripts_dropper.in");
         let bytes = pkg_with_scripts(&zlib_stored(full));
         for spare in [0, 5] {
@@ -2390,10 +2391,9 @@ mod tests {
         ] {
             let mut cpio = odc_member("preinstall", body);
             cpio.extend(odc_member("TRAILER!!!", b""));
-            let blob = zlib_stored(&cpio);
-            let bytes = pkg_with_scripts(&blob);
-            // Input is at most half the allowance, and output needs the rest.
-            let cost = (2 * blob.len()).max(blob.len() + cpio.len());
+            // Stored cpio cannot nest: half the allowance is input, half its copy.
+            let bytes = pkg_with_scripts(&cpio);
+            let cost = 2 * cpio.len();
             let exact = xar::XarLimits {
                 max_entry_bytes: 1 << 20,
                 max_read_back_bytes: cost,
@@ -2462,32 +2462,90 @@ mod tests {
         }
     }
 
-    /// The outer read lands exactly on the allowance, so the inner gzip cannot
-    /// be decoded: incomplete, never clean.
+    /// A gzip-in-gzip `Scripts` (not split for nesting) whose outer read uses
+    /// the whole allowance leaves the inner gzip none: the inner bytes are
+    /// scanned raw, and the entry is incomplete, never clean.
     #[test]
     fn a_gzip_scripts_entry_the_budget_cannot_decode_is_incomplete() {
-        let gz = gzip_stored(&scoring_cpio());
-        let blob = zlib_stored(&gz);
-        let bytes = pkg_with_scripts(&blob);
+        let blob = include_bytes!("../../testdata/inflate/gzip_scripts_gzip_stored.in");
+        let bytes = pkg_with_scripts(blob);
+        // The input fits in half; its output then takes the rest.
         let limits = xar::XarLimits {
             max_entry_bytes: 1 << 20,
-            max_read_back_bytes: blob.len() + gz.len(),
+            max_read_back_bytes: 2 * blob.len() + 300,
             ..xar::XarLimits::default()
         };
         let (r, c) = evaluate_small(&bytes, &limits);
-        match r {
-            Err(RuleOutcome::NotApplicable) => {}
-            Ok(Some(_)) => assert!(c.marked_incomplete("installer-script-suspicious")),
-            other => panic!("{other:?}"),
-        }
+        let found = r
+            .expect("evaluates")
+            .expect("the raw text scores")
+            .description;
+        assert!(found.contains("install scripts (unparsed)"), "{found}");
+        assert!(c.marked_incomplete("installer-script-suspicious"));
 
-        // With room for the inner layer the decoded script scores.
+        // With room for the inner layer the cpio member is scanned.
         let roomy = xar::XarLimits {
             max_read_back_bytes: 1 << 20,
             ..limits
         };
         let (r, _) = evaluate_small(&bytes, &roomy);
-        assert!(r.expect("evaluates").is_some());
+        let found = r.expect("evaluates").expect("scores").description;
+        assert!(found.contains("install script preinstall"), "{found}");
+        assert!(!found.contains("unparsed"), "{found}");
+    }
+
+    /// A zlib `Scripts` cut on input still leaves room to decode part of the
+    /// inner gzip, so its cut-short member is scanned (#110).
+    #[test]
+    fn a_cut_outer_read_still_decodes_the_inner_gzip() {
+        let gz = include_bytes!("../../testdata/gzip/scripts_dropper_long.in");
+        let blob = zlib_stored(gz);
+        let limits = xar::XarLimits {
+            max_entry_bytes: 1 << 20,
+            max_read_back_bytes: 3000,
+            ..xar::XarLimits::default()
+        };
+        assert!(
+            blob.len() > limits.max_read_back_bytes / 3,
+            "outer read is cut"
+        );
+        let (r, c) = evaluate_small(&pkg_with_scripts(&blob), &limits);
+        let signal = r.expect("evaluates").expect("the decoded prefix scores");
+        assert!(
+            signal.description.contains("(cut short)"),
+            "{}",
+            signal.description
+        );
+        assert!(
+            !signal.description.contains("unparsed"),
+            "{}",
+            signal.description
+        );
+        assert!(c.marked_incomplete("installer-script-suspicious"));
+    }
+
+    /// A zlib `Scripts` whose output compresses well is cut on output, not
+    /// input, and still leaves the inner gzip room for its first member (#110).
+    #[test]
+    fn a_compressible_outer_read_leaves_the_inner_gzip_room() {
+        let blob = include_bytes!("../../testdata/inflate/zlib_scripts_gzip_stored.in");
+        let limits = xar::XarLimits {
+            max_entry_bytes: 1 << 20,
+            max_read_back_bytes: 3000,
+            ..xar::XarLimits::default()
+        };
+        assert!(3 * blob.len() <= limits.max_read_back_bytes, "input fits");
+        let (r, c) = evaluate_small(&pkg_with_scripts(blob), &limits);
+        let found = r
+            .expect("evaluates")
+            .expect("the member scores")
+            .description;
+        assert!(
+            found.contains("install script preinstall (cut short)"),
+            "{found}"
+        );
+        assert!(!found.contains("unparsed"), "{found}");
+        assert!(c.marked_incomplete("installer-script-suspicious"));
     }
 
     /// Evaluates `Scripts` = zlib(`gz`) under `limits`; returns the signal
@@ -2656,17 +2714,20 @@ mod tests {
         gz
     }
 
-    /// The inner gzip's input is charged as well as the outer read's input
-    /// and output: a budget of exactly `k` such entries reads `k` and no more.
+    /// A `Scripts` read is charged its outer input and output and the inner
+    /// gzip's output; the inner input is the outer output, not charged again.
+    /// A budget with room for exactly `k` such reads makes `k` in full.
     #[test]
-    fn a_scripts_entrys_inner_gzip_input_is_charged() {
+    fn a_scripts_entrys_inner_gzip_input_is_charged_once() {
         let gz = empty_gzip(600);
         let blob = zlib_stored(&gz);
-        let per_entry = blob.len() + 2 * gz.len();
+        // Outer input and output; the inner gzip reads the output and writes nothing.
+        let per_entry = blob.len() + gz.len();
+        // Room for `k` entries at a third of the allowance for input each.
         let k = 3;
         let limits = xar::XarLimits {
             max_entry_bytes: 1 << 20,
-            max_read_back_bytes: k * per_entry,
+            max_read_back_bytes: (k - 1) * per_entry + 3 * blob.len(),
             ..xar::XarLimits::default()
         };
         let mut bytes = xar::toc_xar_bytes(&scripts_toc(blob.len(), 2 * k));
@@ -2684,7 +2745,13 @@ mod tests {
             let _ = scan_scripts_entry(&c, &bytes, &archive, entry, &mut budget, &mut found);
             charged.push(before - budget.remaining());
         }
-        assert_eq!(charged, [per_entry, per_entry, per_entry, 0, 0, 0]);
+        // `k` full reads, then only cut ones from what is left.
+        assert_eq!(charged[..k], vec![per_entry; k]);
+        assert!(charged[k..].iter().all(|c| *c < per_entry), "{charged:?}");
+        assert_eq!(
+            charged.iter().sum::<usize>(),
+            limits.max_read_back_bytes - budget.remaining()
+        );
 
         // Through the rule, the same archive is never reported clean.
         let (r, _) = evaluate_small(&bytes, &limits);
@@ -2779,14 +2846,14 @@ mod tests {
     fn padding_limits() -> xar::XarLimits {
         xar::XarLimits {
             max_entry_bytes: 4096,
-            max_read_back_bytes: 64 * 1024,
+            max_read_back_bytes: 16 * 1024,
             ..xar::XarLimits::default()
         }
     }
 
     /// Enough padding that an equal share of the budget is below one `Scripts`.
     fn starving_padding(limits: &xar::XarLimits) -> usize {
-        let n = 2 * limits.max_read_back_bytes / scripts_blob("preinstall").len();
+        let n = 6 * limits.max_read_back_bytes / scripts_blob("preinstall").len();
         assert!(n < limits.max_entries);
         n
     }

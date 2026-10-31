@@ -365,7 +365,11 @@ pub fn entry_cost(
     archive: &XarArchive,
     file: &XarFile,
 ) -> Result<usize, XarEntryError> {
-    let raw = entry_bytes(data, archive, file)?;
+    raw_cost(entry_bytes(data, archive, file)?)
+}
+
+/// [`entry_cost`] of an entry's raw heap bytes.
+fn raw_cost(raw: &[u8]) -> Result<usize, XarEntryError> {
     if is_xz(raw) {
         return Err(XarEntryError::UnknownEncoding);
     }
@@ -373,6 +377,32 @@ pub fn entry_cost(
         Some(block) => raw.len().max(block),
         None => raw.len(),
     })
+}
+
+/// Whether [`decode_entry`] reads `raw` as zlib, the one encoding split for a
+/// nested layer. Stored bytes cannot be gzip (stored gzip is decoded as gzip);
+/// gzip-in-gzip is out of scope; bzip2's input charge is a block of decode
+/// work, so a third for it would only leave entries unread.
+fn may_nest(raw: &[u8]) -> bool {
+    !is_xz(raw)
+        && !crate::bzip2::has_bzip2_magic(raw)
+        && !inflate::has_gzip_magic(raw)
+        && inflate::has_zlib_header(raw)
+}
+
+/// The allowance a read of `file` needs to take all its input: [`entry_cost`]
+/// times 3 for a [`ReadBudget::read_entry_partial_nested`] read of a zlib
+/// entry (`nested`), else times 2. Errors as `entry_cost`.
+pub fn entry_allowance(
+    data: &[u8],
+    archive: &XarArchive,
+    file: &XarFile,
+    nested: bool,
+) -> Result<usize, XarEntryError> {
+    let raw = entry_bytes(data, archive, file)?;
+    let cost = raw_cost(raw)?;
+    let parts = if nested && may_nest(raw) { 3 } else { 2 };
+    Ok(cost.saturating_mul(parts))
 }
 
 /// Decodes one entry's raw heap bytes under `limits`; results as [`read_entry_partial`].
@@ -431,7 +461,7 @@ impl ReadBudget {
 
     /// Gives the next entry an equal share of what remains. `entries_left`
     /// counts it and every entry still to come. Call once before each entry,
-    /// cheapest ([`entry_cost`]) first, so unused allowance carries to later ones.
+    /// cheapest ([`entry_allowance`]) first, so unused allowance carries to later ones.
     pub fn start_entry(&mut self, entries_left: usize) {
         self.start_share(entries_left);
     }
@@ -468,32 +498,64 @@ impl ReadBudget {
         archive: &XarArchive,
         file: &XarFile,
     ) -> Result<(Vec<u8>, Option<XarEntryError>), XarEntryError> {
+        self.read_with_split(data, archive, file, false)
+    }
+
+    /// Like [`ReadBudget::read_entry_partial`], for an entry whose output may
+    /// hold a nested layer (a gzip inside `Scripts`). A zlib entry gets at most
+    /// a third of the allowance for input and half of the rest for output, so
+    /// the nested layer always has room; other entries are read as by
+    /// `read_entry_partial`. Decode the nested layer
+    /// under [`ReadBudget::entry_cap`] and charge only its output.
+    pub fn read_entry_partial_nested(
+        &mut self,
+        data: &[u8],
+        archive: &XarArchive,
+        file: &XarFile,
+    ) -> Result<(Vec<u8>, Option<XarEntryError>), XarEntryError> {
+        self.read_with_split(data, archive, file, true)
+    }
+
+    /// The reads above; `nested` selects the split for [`may_nest`] entries.
+    fn read_with_split(
+        &mut self,
+        data: &[u8],
+        archive: &XarArchive,
+        file: &XarFile,
+        nested: bool,
+    ) -> Result<(Vec<u8>, Option<XarEntryError>), XarEntryError> {
         let over = XarEntryError::BUDGET_EXCEEDED;
         let raw = entry_bytes(data, archive, file)?;
         if is_xz(raw) {
             return Err(XarEntryError::UnknownEncoding);
         }
-        let half = self.entry_remaining / 2;
-        if half == 0 || self.limits.max_entry_bytes == 0 {
+        let nests = nested && may_nest(raw);
+        let share = self.entry_remaining / if nests { 3 } else { 2 };
+        if share == 0 || self.limits.max_entry_bytes == 0 {
             return Err(over);
         }
         let (input, cost, cut) = match crate::bzip2::block_size(raw) {
             // A block is decoded before its first output byte is checked.
             Some(block) => {
                 let cost = raw.len().max(block);
-                if cost > half {
+                if cost > share {
                     return Err(over);
                 }
                 (raw, cost, false)
             }
             None => {
-                let input = raw.get(..half).unwrap_or(raw);
-                (input, input.len(), raw.len() > half)
+                let input = raw.get(..share).unwrap_or(raw);
+                (input, input.len(), raw.len() > share)
             }
         };
         self.charge(cost);
+        let out_cap = if nests {
+            self.entry_cap().min(self.entry_remaining / 2)
+        } else {
+            self.entry_cap()
+        };
         let capped = XarLimits {
-            max_entry_bytes: self.entry_cap(),
+            max_entry_bytes: out_cap,
             ..self.limits
         };
         let result = decode_entry(input, &capped);
@@ -1457,6 +1519,47 @@ mod tests {
         // At most half the allowance pays for input; the same half is output.
         assert_eq!(
             budget.read_entry_partial(&bytes, &a, f),
+            Ok((blob[..500].to_vec(), Some(BUDGET_ERR)))
+        );
+        assert_eq!(budget.remaining(), 0);
+    }
+
+    #[test]
+    fn a_nested_read_splits_zlib_in_three_and_stored_in_two() {
+        let zlib = include_bytes!("../testdata/inflate/zlib_scripts_gzip_stored.in");
+        let limits = XarLimits {
+            max_entry_bytes: 1 << 20,
+            max_read_back_bytes: 3000,
+            ..XarLimits::default()
+        };
+        let bytes = single_entry(zlib);
+        let a = parse(&bytes, &limits).expect("xar");
+        let f = a.files.first().expect("entry");
+        assert_eq!(entry_allowance(&bytes, &a, f, true), Ok(3 * zlib.len()));
+        assert_eq!(entry_allowance(&bytes, &a, f, false), Ok(2 * zlib.len()));
+        let mut budget = ReadBudget::new(&limits);
+        let (out, gap) = budget
+            .read_entry_partial_nested(&bytes, &a, f)
+            .expect("reads");
+        // All the input, then half of what is left for output.
+        assert_eq!(out.len(), (3000 - zlib.len()) / 2);
+        assert_eq!(gap, Some(BUDGET_ERR));
+        assert_eq!(budget.entry_cap(), 3000 - zlib.len() - out.len());
+
+        // Stored bytes cannot nest: half the allowance for input, as unnested.
+        let limits = XarLimits {
+            max_entry_bytes: 1000,
+            max_read_back_bytes: 1000,
+            ..XarLimits::default()
+        };
+        let blob = vec![b'a'; 800];
+        let bytes = single_entry(&blob);
+        let a = parse(&bytes, &limits).expect("xar");
+        let f = a.files.first().expect("entry");
+        assert_eq!(entry_allowance(&bytes, &a, f, true), Ok(1600));
+        let mut budget = ReadBudget::new(&limits);
+        assert_eq!(
+            budget.read_entry_partial_nested(&bytes, &a, f),
             Ok((blob[..500].to_vec(), Some(BUDGET_ERR)))
         );
         assert_eq!(budget.remaining(), 0);

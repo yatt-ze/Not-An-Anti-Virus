@@ -53,14 +53,18 @@ fuzz_target!(|data: &[u8]| {
             limits.max_depth
         );
 
-        // read_entry_partial is where a hostile container turns a few TOC
+        // read_entry_partial(_nested) is where a hostile container turns a few TOC
         // bytes into an allocation. Output must fit the entry cap and the
         // total work the archive budget; failing is fine.
         let allowance = budget.remaining() / (archive.files.len() - i);
         budget.start_entry(archive.files.len() - i);
         let cap = budget.entry_cap();
         let before = budget.remaining();
-        let result = budget.read_entry_partial(data, &archive, f);
+        let result = if i % 2 == 0 {
+            budget.read_entry_partial(data, &archive, f)
+        } else {
+            budget.read_entry_partial_nested(data, &archive, f)
+        };
         assert!(budget.remaining() <= before, "the budget grew");
         assert!(
             before - budget.remaining() <= allowance,
