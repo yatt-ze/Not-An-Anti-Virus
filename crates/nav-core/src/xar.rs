@@ -391,8 +391,8 @@ fn may_nest(raw: &[u8]) -> bool {
 }
 
 /// The allowance a read of `file` needs to take all its input: [`entry_cost`]
-/// times 3 for a [`ReadBudget::read_entry_partial_nested`] read of a zlib
-/// entry (`nested`), else times 2. Errors as `entry_cost`.
+/// times 3 for a [`ReadBudget::read_entry_nested`] read of a zlib entry
+/// (`nested`), else times 2. Errors as `entry_cost`.
 pub fn entry_allowance(
     data: &[u8],
     archive: &XarArchive,
@@ -419,6 +419,21 @@ type PartialRead = (Vec<u8>, Option<XarEntryError>);
 /// A [`ReadBudget::read_entry_partial_nested`] result: a [`PartialRead`] plus
 /// the input past a gzip entry's first member.
 pub type NestedRead<'d> = (Vec<u8>, Option<XarEntryError>, &'d [u8]);
+
+/// A [`ReadBudget::read_entry_nested`] result.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NestedEntry {
+    /// The decoded entry, or the first member of a gzip inside it as far as it
+    /// decoded; if none of that member decoded, the gzip bytes undecoded.
+    pub bytes: Vec<u8>,
+    /// The nested gzip's input past where it failed, when some of it decoded.
+    pub unread: Vec<u8>,
+    /// Why `bytes` is not the whole entry or first member, if it is not.
+    pub gap: Option<XarEntryError>,
+    /// The gzip members after the first, decoded and joined: the nested
+    /// gzip's, then the entry's own. Never part of `gap`.
+    pub later: Vec<u8>,
+}
 
 /// [`decode_entry`], also returning where decoding ended: just past the first
 /// member of a gzip entry that decoded in full, else `raw.len()`.
@@ -529,14 +544,86 @@ impl ReadBudget {
             .map(|(bytes, gap, _)| (bytes, gap))
     }
 
-    /// Like [`ReadBudget::read_entry_partial`], for an entry whose output may
-    /// hold a nested layer (a gzip inside `Scripts`). A zlib entry gets at most
-    /// a third of the allowance for input and half of the rest for output, so
-    /// the nested layer always has room; other entries are read as by
-    /// `read_entry_partial`. Decode the nested layer
-    /// under [`ReadBudget::entry_cap`] and charge only its output. Also returns
-    /// the input read past a gzip entry's first member (empty if none, or if
-    /// that member did not decode in full), already charged as input.
+    /// Reads an entry whose output may hold a nested gzip (`Scripts`): the
+    /// outer read as [`ReadBudget::read_entry_partial_nested`], then, if the
+    /// output is gzip, its first member, then every later gzip member, all
+    /// under the entry's allowance. `Err` as `read_entry_partial`. Sort such
+    /// entries by [`entry_allowance`] with `nested` set.
+    pub fn read_entry_nested(
+        &mut self,
+        data: &[u8],
+        archive: &XarArchive,
+        file: &XarFile,
+    ) -> Result<NestedEntry, XarEntryError> {
+        let (raw, gap, heap_rest) = self.read_entry_partial_nested(data, archive, file)?;
+        let mut entry = NestedEntry {
+            bytes: raw,
+            unread: Vec::new(),
+            gap,
+            later: Vec::new(),
+        };
+        if inflate::has_gzip_magic(&entry.bytes) {
+            let mut raw = std::mem::take(&mut entry.bytes);
+            let (bytes, used, result) = self.decode_gzip(&raw);
+            match result {
+                Ok(()) => {
+                    // The trailer (CRC-32, ISIZE) follows the consumed input.
+                    let rest = raw.get(used.saturating_add(8)..).unwrap_or_default();
+                    entry.later = self.decode_later_members(rest);
+                    entry.bytes = bytes;
+                }
+                Err(e) => {
+                    entry.gap.get_or_insert(XarEntryError::Undecodable(e));
+                    raw.drain(..used.min(raw.len()));
+                    if bytes.is_empty() {
+                        entry.bytes = raw;
+                    } else {
+                        entry.bytes = bytes;
+                        entry.unread = raw;
+                    }
+                }
+            }
+        }
+        let own_later = self.decode_later_members(heap_rest);
+        entry.later.extend(own_later);
+        Ok(entry)
+    }
+
+    /// One gzip member of already-charged bytes, under [`ReadBudget::entry_cap`];
+    /// charges its output. Results as [`inflate::gzip_decompress_consumed`].
+    fn decode_gzip(&mut self, data: &[u8]) -> (Vec<u8>, usize, Result<(), DecodeError>) {
+        let cap = self.entry_cap();
+        let (bytes, used, result) = if cap == 0 {
+            (Vec::new(), 0, Err(DecodeError::BudgetExceeded))
+        } else {
+            inflate::gzip_decompress_consumed(data, cap)
+        };
+        self.charge(bytes.len());
+        (bytes, used, result)
+    }
+
+    /// Decodes the gzip members that open `rest`, joined as `gunzip` joins
+    /// them. Stops at bytes that do not start a member, at a member that
+    /// fails (keeping what it decoded), or when the allowance is spent.
+    fn decode_later_members(&mut self, mut rest: &[u8]) -> Vec<u8> {
+        let mut out = Vec::new();
+        while inflate::has_gzip_magic(rest) && self.entry_cap() > 0 {
+            let (bytes, used, result) = self.decode_gzip(rest);
+            out.extend_from_slice(&bytes);
+            if result.is_err() {
+                break;
+            }
+            rest = rest.get(used.saturating_add(8)..).unwrap_or_default();
+        }
+        out
+    }
+
+    /// The outer read of [`ReadBudget::read_entry_nested`]. A zlib entry gets
+    /// at most a third of the allowance for input and half of the rest for
+    /// output, so the nested layer always has room; other entries are read as
+    /// by [`ReadBudget::read_entry_partial`]. Also returns the input read past
+    /// a gzip entry's first member (empty if none, or if that member did not
+    /// decode in full), already charged as input.
     pub fn read_entry_partial_nested<'d>(
         &mut self,
         data: &'d [u8],

@@ -14,7 +14,6 @@
 
 use super::{embedded_content_ruleset, Rule, RuleOutcome};
 use crate::context::ScanContext;
-use crate::decode::DecodeError;
 use crate::macho::ByteSource;
 use crate::model::{MatchedSignal, SignalCategory};
 use crate::scan::scan_embedded_bytes;
@@ -84,12 +83,14 @@ impl InstallerScriptRule {
             .metadata_entries()
             .filter(|e| matches!(e.name.as_str(), "Scripts" | "Distribution"));
         for (toc_index, entry) in wanted.enumerate() {
+            // `Scripts` holds a nested gzip: sorted and read as one.
             let nested = entry.name == "Scripts";
             let cost = xar::entry_allowance(content, &archive, entry, nested).ok();
             unreadable |= cost.is_none();
             entries.push(Wanted {
                 toc_index,
                 entry,
+                nested,
                 cost,
             });
         }
@@ -183,7 +184,7 @@ impl InstallerScriptRule {
             for (rank, i) in work.into_iter().enumerate() {
                 budget.start_entry(total - rank);
                 let mut found = ScriptFindings::default();
-                let result = if entries[i].entry.name == "Scripts" {
+                let result = if entries[i].nested {
                     scan_scripts_entry(
                         ctx,
                         content,
@@ -239,11 +240,13 @@ impl InstallerScriptRule {
     }
 }
 
-/// A `Scripts` or `Distribution` TOC entry; `cost` is the allowance needed to
-/// read its input in full (`xar::entry_allowance`), `None` if unreadable.
+/// A `Scripts` or `Distribution` TOC entry; `nested` if it is read with
+/// `read_entry_nested`, and `cost` is the allowance needed to read its input
+/// in full (`xar::entry_allowance`), `None` if unreadable.
 struct Wanted<'a> {
     toc_index: usize,
     entry: &'a xar::XarFile,
+    nested: bool,
     cost: Option<usize>,
 }
 
@@ -291,56 +294,23 @@ fn scan_scripts_entry(
     // An entry we can't reach (bounded read stopped short) is
     // unreadable, not absent. A partial read is scanned, then reported
     // unreadable below.
-    let (mut raw, mut gap, heap_rest) = budget
-        .read_entry_partial_nested(content, archive, entry)
+    let read = budget
+        .read_entry_nested(content, archive, entry)
         .map_err(|_| RuleOutcome::NotApplicable)?;
 
     let label = format!("{}!{}", ctx.path.display(), entry.path);
-    // Scripts is normally gzip-wrapped cpio; if not gzip, the heap read
-    // already undid the entry's encoding. A gzip stream that stops early is
-    // scanned as far as it decoded, plus, raw, the input it never reached
-    // (stored-block text past a limit, plaintext behind a broken header).
-    let mut later = Vec::new();
-    let archive_bytes = if !crate::inflate::has_gzip_magic(&raw) {
-        raw
-    } else {
-        // `raw` was charged as the outer read's output; only the inner output is new.
-        let cap = budget.entry_cap();
-        let (v, used, result) = if cap == 0 {
-            (Vec::new(), 0, Err(DecodeError::BudgetExceeded))
-        } else {
-            crate::inflate::gzip_decompress_consumed(&raw, cap)
-        };
-        budget.charge(v.len());
-        match result {
-            Ok(()) => {
-                // The trailer (CRC-32, ISIZE) follows the consumed input.
-                let rest = raw.get(used.saturating_add(8)..).unwrap_or_default();
-                later = decode_later_members(rest, budget);
-                v
-            }
-            Err(e) => {
-                gap.get_or_insert(xar::XarEntryError::Undecodable(e));
-                raw.drain(..used.min(raw.len()));
-                let unread = raw;
-                if v.is_empty() {
-                    unread // not cpio: scanned raw below
-                } else {
-                    if !unread.is_empty() {
-                        findings.scan(label.clone(), unread, "install scripts (unparsed)");
-                    }
-                    v
-                }
-            }
-        }
-    };
+    // Input a nested gzip never reached (stored-block text past a limit,
+    // plaintext behind a broken header) is scanned raw.
+    if !read.unread.is_empty() {
+        findings.scan(label.clone(), read.unread, "install scripts (unparsed)");
+    }
 
-    let result = match cpio::parse(&archive_bytes, &cpio::CpioLimits::default()) {
+    let result = match cpio::parse(&read.bytes, &cpio::CpioLimits::default()) {
         // Members that did parse, plus one cut off mid-body, are scanned even
         // when the archive is incomplete.
         Some(members) => {
             scan_cpio_members(ctx, entry, &members, "", findings);
-            if members.is_complete() && gap.is_none() {
+            if members.is_complete() && read.gap.is_none() {
                 Ok(())
             } else {
                 Err(RuleOutcome::NotApplicable)
@@ -348,34 +318,15 @@ fn scan_scripts_entry(
         }
         None => {
             // Something is in there, but not in a shape we can read: scan it raw.
-            findings.scan(label.clone(), archive_bytes, "install scripts (unparsed)");
+            findings.scan(label.clone(), read.bytes, "install scripts (unparsed)");
             Err(RuleOutcome::NotApplicable)
         }
     };
-    // A gzip entry's own later members, after those of a gzip inside it.
-    later.extend(decode_later_members(heap_rest, budget));
-    scan_later_members(ctx, entry, label, later, findings);
+    scan_later_members(ctx, entry, label, read.later, findings);
     result
 }
 
-/// Decodes the gzip members after the first, joined as `gunzip` joins them,
-/// under the current entry's allowance. Stops at bytes that do not start a
-/// member, or at a member that fails, keeping what that member decoded.
-fn decode_later_members(mut rest: &[u8], budget: &mut xar::ReadBudget) -> Vec<u8> {
-    let mut out = Vec::new();
-    while crate::inflate::has_gzip_magic(rest) && budget.entry_cap() > 0 {
-        let (v, used, result) = crate::inflate::gzip_decompress_consumed(rest, budget.entry_cap());
-        budget.charge(v.len());
-        out.extend_from_slice(&v);
-        if result.is_err() {
-            break;
-        }
-        rest = rest.get(used.saturating_add(8)..).unwrap_or_default();
-    }
-    out
-}
-
-/// Scans what [`decode_later_members`] returned: as cpio members if it parses,
+/// Scans a [`xar::NestedEntry`]'s later gzip members: as cpio members if it parses,
 /// raw otherwise. Installer never runs these (#109), so nothing here makes the
 /// entry unreadable; a script from the first member can still extract them.
 fn scan_later_members(
@@ -1217,6 +1168,7 @@ impl Rule for UnsignedPackageRule {
 mod tests {
     use super::*;
     use crate::context::{ContentSource, ScanContext};
+    use crate::decode::DecodeError;
     use crate::test_support::utf16;
     use std::path::PathBuf;
 
