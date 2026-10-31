@@ -40,6 +40,46 @@ pub(crate) fn work_cap(budget: usize) -> usize {
         .saturating_add(WORK_SLACK)
 }
 
+/// One stream's decode-work ceiling and its block charges so far.
+struct Work {
+    /// [`work_cap`] of the output budget, on input read plus [`Work::paid`].
+    cap: usize,
+    blocks: usize,
+}
+
+impl Work {
+    fn of_budget(budget: usize) -> Self {
+        Work {
+            cap: work_cap(budget),
+            blocks: 0,
+        }
+    }
+
+    /// Output written plus the per-block charges: the work past input read.
+    fn paid(&self, out: &[u8]) -> usize {
+        out.len().saturating_add(self.blocks)
+    }
+
+    fn over(&self, r: &BitReader, out: &[u8]) -> bool {
+        r.byte_pos().saturating_add(self.paid(out)) > self.cap
+    }
+
+    /// Adds a block's charge, unless that takes the work over its ceiling.
+    fn charge_block(
+        &mut self,
+        r: &BitReader,
+        out: &[u8],
+        charge: usize,
+    ) -> Result<(), InflateError> {
+        self.blocks = self.blocks.saturating_add(charge);
+        if self.over(r, out) {
+            self.blocks -= charge;
+            return Err(InflateError::BudgetExceeded);
+        }
+        Ok(())
+    }
+}
+
 /// Base lengths for length symbols 257..=285 (RFC 1951 §3.2.5).
 const LENGTH_BASE: [u16; 29] = [
     3, 4, 5, 6, 7, 8, 9, 10, 11, 13, 15, 17, 19, 23, 27, 31, 35, 43, 51, 59, 67, 83, 99, 115, 131,
@@ -162,7 +202,13 @@ pub fn gzip_decompress_consumed(
 ) -> (Vec<u8>, usize, Result<(), InflateError>) {
     let mut out = Vec::new();
     let mut used = 0;
-    let result = gzip_into(data, budget, &mut out, &mut used);
+    let result = gzip_into(
+        data,
+        budget,
+        &mut Work::of_budget(budget),
+        &mut out,
+        &mut used,
+    );
     (out, used, result)
 }
 
@@ -229,6 +275,7 @@ fn gzip_header_len(data: &[u8]) -> Result<usize, InflateError> {
 fn gzip_into(
     data: &[u8],
     budget: usize,
+    work: &mut Work,
     out: &mut Vec<u8>,
     consumed: &mut usize,
 ) -> Result<(), InflateError> {
@@ -236,7 +283,7 @@ fn gzip_into(
     // gzip_header_len guarantees `off <= data.len()`.
     let body = data.get(off..).unwrap_or_default();
     let mut r = BitReader::new(body);
-    let result = inflate_blocks(&mut r, budget, out);
+    let result = inflate_blocks(&mut r, budget, work, out);
     let used = r.bytes_consumed();
     *consumed = off.saturating_add(used);
     result?;
@@ -269,24 +316,20 @@ fn gzip_into(
 /// bytes of `data` were consumed. On error `out` holds whatever was written.
 fn inflate_into(data: &[u8], budget: usize, out: &mut Vec<u8>) -> Result<usize, InflateError> {
     let mut r = BitReader::new(data);
-    inflate_blocks(&mut r, budget, out)?;
+    inflate_blocks(&mut r, budget, &mut Work::of_budget(budget), out)?;
     Ok(r.bytes_consumed())
 }
 
-/// The DEFLATE block loop over `r`; see [`inflate_into`].
-fn inflate_blocks(r: &mut BitReader, budget: usize, out: &mut Vec<u8>) -> Result<(), InflateError> {
+/// The DEFLATE block loop over `r` under `work`; see [`inflate_into`].
+fn inflate_blocks(
+    r: &mut BitReader,
+    budget: usize,
+    work: &mut Work,
+    out: &mut Vec<u8>,
+) -> Result<(), InflateError> {
     out.reserve(budget.min(INITIAL_OUTPUT_CAPACITY));
-    let work_cap = work_cap(budget);
-    let mut block_work = 0usize;
-    // Input read + output written + the per-block charges.
-    let work = |r: &BitReader, out: &[u8], block_work: usize| {
-        r.byte_pos()
-            .saturating_add(out.len())
-            .saturating_add(block_work)
-    };
-
     loop {
-        if work(r, out, block_work) > work_cap {
+        if work.over(r, out) {
             return Err(InflateError::BudgetExceeded);
         }
         let final_block = r.bits(1)? == 1;
@@ -296,10 +339,7 @@ fn inflate_blocks(r: &mut BitReader, budget: usize, out: &mut Vec<u8>) -> Result
         } else {
             BLOCK_WORK
         };
-        block_work = block_work.saturating_add(charge);
-        if work(r, out, block_work) > work_cap {
-            return Err(InflateError::BudgetExceeded);
-        }
+        work.charge_block(r, out, charge)?;
         match btype {
             0 => stored_block(r, out, budget)?,
             1 => {
