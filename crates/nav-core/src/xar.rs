@@ -622,8 +622,8 @@ impl ReadBudget {
 
     /// The outer read of [`ReadBudget::read_entry_nested`]. A zlib entry gets
     /// at most a third of the allowance for input and half of the rest for
-    /// output, so the nested layer always has room; other entries are read as
-    /// by [`ReadBudget::read_entry_partial`]. Also returns the input read past
+    /// output, so the nested layer keeps at least a third of the allowance;
+    /// other entries are read as by [`ReadBudget::read_entry_partial`]. Also returns the input read past
     /// a gzip entry's first member (empty if none, or if that member did not
     /// decode in full), already charged as input.
     pub fn read_entry_partial_nested<'d>(
