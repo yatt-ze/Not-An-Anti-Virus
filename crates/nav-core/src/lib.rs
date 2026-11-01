@@ -29,6 +29,7 @@ pub(crate) mod test_support;
 pub(crate) mod textclass;
 pub mod xar;
 pub mod xml;
+pub mod zip;
 
 pub use bundle::BundleLayout;
 pub use context::{ContentSource, ScanContext};

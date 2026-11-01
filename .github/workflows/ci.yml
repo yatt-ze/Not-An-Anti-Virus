@@ -99,7 +99,7 @@ jobs:
     name: bounded fuzz run (nightly)
     # Off the PR path by design (NAV-014) — scheduled, or manually via
     # workflow_dispatch. Priority order per the issue: xml/plist, xar, cpio,
-    # inflate, bzip2, then macho.
+    # inflate, bzip2, then macho; zip was added after.
     if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     steps:
@@ -143,6 +143,7 @@ jobs:
           seed inflate testdata/inflate/*.in testdata/gzip/*.in
           seed parse_cpio testdata/cpio/*.cpio
           seed parse_xar testdata/xar/*.xar testdata/xar/*.pkg fixtures/*/*.pkg
+          seed parse_zip testdata/zip/*.zip fixtures/*/*.zip
           plists=()
           while IFS= read -r -d '' f; do plists+=("$f"); done \
             < <(find fixtures -name '*.plist' -print0)
@@ -161,7 +162,7 @@ jobs:
         working-directory: crates/nav-core
         run: |
           set -euo pipefail
-          for target in parse_plist parse_xar parse_cpio inflate bzip2 parse_macho; do
+          for target in parse_plist parse_xar parse_cpio inflate bzip2 parse_macho parse_zip; do
             echo "::group::fuzz ${target} (60s)"
             cargo fuzz run --target x86_64-unknown-linux-gnu "${target}" -- -max_total_time=60
             echo "::endgroup::"

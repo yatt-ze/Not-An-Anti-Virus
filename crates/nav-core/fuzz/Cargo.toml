@@ -59,6 +59,13 @@ test = false
 doc = false
 bench = false
 
+[[bin]]
+name = "parse_zip"
+path = "fuzz_targets/parse_zip.rs"
+test = false
+doc = false
+bench = false
+
 # Empty table: makes this package its own workspace root so the parent
 # workspace (crates listed explicitly in ../../../Cargo.toml) never tries to
 # build it. See the comment above.
