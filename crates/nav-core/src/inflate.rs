@@ -150,6 +150,20 @@ pub fn zlib_decompress_partial(data: &[u8], budget: usize) -> (Vec<u8>, Result<(
     (out, result)
 }
 
+/// Like [`zlib_decompress_partial`], metered as [`gzip_decompress_metered`]:
+/// also returns the work past input read, which never exceeds `max_paid`.
+pub(crate) fn zlib_decompress_metered(
+    data: &[u8],
+    budget: usize,
+    max_paid: usize,
+) -> (Vec<u8>, usize, Result<(), InflateError>) {
+    let mut out = Vec::new();
+    let mut work = Work::metered(budget, max_paid);
+    let result = zlib_into(data, budget, &mut work, &mut out);
+    let paid = work.paid(&out);
+    (out, paid, result)
+}
+
 /// Decode a zlib stream into `out`. On error `out` holds whatever was written.
 fn zlib_into(
     data: &[u8],

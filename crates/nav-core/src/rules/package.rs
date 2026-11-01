@@ -2550,7 +2550,11 @@ mod tests {
 
     #[test]
     fn a_small_dropper_is_read_despite_nested_padding() {
-        let limits = small_limits();
+        // A share covers the dropper's dynamic block, not a padding read.
+        let limits = xar::XarLimits {
+            max_read_back_bytes: 96 * 1024,
+            ..small_limits()
+        };
         let (r, c) = evaluate_small(&distinct_padding_archive(50, 1, Some(0), true), &limits);
         let signal = r.expect("evaluates").expect("the dropper scores");
         assert!(
@@ -2684,7 +2688,8 @@ mod tests {
     fn a_dropper_is_found_among_many_padding_entries() {
         let limits = xar::XarLimits {
             max_entry_bytes: 4096,
-            max_read_back_bytes: 64 * 1024,
+            // A share covers the dropper's dynamic block, not a padding read.
+            max_read_back_bytes: 360 * 1024,
             ..xar::XarLimits::default()
         };
         let (r, c) = evaluate_small(&distinct_padding_archive(200, 0, Some(0), true), &limits);
@@ -2822,10 +2827,10 @@ mod tests {
     fn a_gzip_scripts_entry_the_budget_cannot_decode_is_incomplete() {
         let blob = include_bytes!("../../testdata/inflate/gzip_scripts_gzip_stored.in");
         let bytes = pkg_with_scripts(blob);
-        // The input fits in half; its output then takes the rest.
+        // The input fits in half; its block and output then take the rest.
         let limits = xar::XarLimits {
             max_entry_bytes: 1 << 20,
-            max_read_back_bytes: 2 * blob.len() + 300,
+            max_read_back_bytes: 2 * blob.len() + 300 + crate::inflate::DYNAMIC_BLOCK_WORK,
             ..xar::XarLimits::default()
         };
         let (r, c) = evaluate_small(&bytes, &limits);
@@ -3076,9 +3081,9 @@ mod tests {
     fn a_scripts_entrys_inner_gzip_input_is_charged_once() {
         let gz = empty_gzip(600);
         let blob = zlib_stored(&gz);
-        // Outer input and output; the inner gzip reads the output and writes
-        // nothing, at a block charge for each of its 601 blocks.
-        let per_entry = blob.len() + gz.len() + 601 * crate::inflate::BLOCK_WORK;
+        // Outer input, output and stored block; the inner gzip reads the
+        // output and writes nothing, at a block charge for each of its 601 blocks.
+        let per_entry = blob.len() + gz.len() + 602 * crate::inflate::BLOCK_WORK;
         assert!(per_entry >= 3 * blob.len(), "input fits in a third");
         let k = 3;
         let limits = xar::XarLimits {
