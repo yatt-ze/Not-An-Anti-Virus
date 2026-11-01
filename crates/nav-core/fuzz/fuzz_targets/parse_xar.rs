@@ -70,15 +70,14 @@ fuzz_target!(|data: &[u8]| {
                 .read_entry_partial(data, &archive, f)
                 .map(|(bytes, gap)| (bytes, gap, 0, false))
         } else {
-            // The outer read alone, on a copy: held to the plain read's checks,
-            // and a zlib entry's must leave the nested layer a third.
-            let mut outer = budget.clone();
-            let outer_read = outer.read_entry_partial_nested(data, &archive, f);
-            assert_charge(&f.path, before, outer.remaining(), allowance);
+            // The outer step alone: held to the plain read's checks, and a
+            // zlib entry's must leave the nested layer a third.
+            let outer_read = budget.read_entry_partial_nested(data, &archive, f);
+            assert_charge(&f.path, before, budget.remaining(), allowance);
             let mut nested = false;
             if let Ok((bytes, gap, _)) = &outer_read {
                 nested = bytes.starts_with(&[0x1f, 0x8b]);
-                let charged = before - outer.remaining();
+                let charged = before - budget.remaining();
                 assert_read(&f.path, charged, bytes, gap.is_some(), cap, false);
             }
             // A zlib entry is the one a nested read splits in three.
@@ -91,15 +90,15 @@ fuzz_target!(|data: &[u8]| {
             );
             if zlib {
                 assert!(
-                    outer.entry_cap() >= (allowance / 3).min(limits.max_entry_bytes),
+                    budget.entry_cap() >= (allowance / 3).min(limits.max_entry_bytes),
                     "entry {:?}: the outer read left the nested layer {} of a {}-byte allowance",
                     f.path,
-                    outer.entry_cap(),
+                    budget.entry_cap(),
                     allowance
                 );
             }
-            budget
-                .read_entry_nested(data, &archive, f)
+            outer_read
+                .map(|read| budget.decode_nested(read))
                 .map(|e| (e.bytes, e.gap, e.unread.len() + e.later.len(), nested))
         };
         assert_charge(&f.path, before, budget.remaining(), allowance);
