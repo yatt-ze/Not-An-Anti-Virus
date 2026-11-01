@@ -200,8 +200,8 @@ pub fn zlib_decompress_to(data: &[u8], budget: usize, sink: &mut Sink) -> Result
     zlib_stream(data, budget, Work::of_budget(budget), sink).1
 }
 
-/// Like [`zlib_decompress_partial`], metered as [`gzip_decompress_metered`]:
-/// also returns the work past input read, which never exceeds `max_paid`.
+/// [`zlib_decompress_metered_to`] into a `Vec`.
+#[cfg(test)]
 pub(crate) fn zlib_decompress_metered(
     data: &[u8],
     budget: usize,
@@ -212,7 +212,7 @@ pub(crate) fn zlib_decompress_metered(
     (out, paid, result)
 }
 
-/// [`zlib_decompress_metered`], streaming its output to `sink`.
+/// [`zlib_decompress_to`], metered as [`gzip_decompress_metered_to`].
 pub(crate) fn zlib_decompress_metered_to(
     data: &[u8],
     budget: usize,
@@ -324,10 +324,8 @@ pub fn gzip_decompress_to(
     (used, result)
 }
 
-/// Like [`gzip_decompress_consumed`], also capping the work past input read
-/// (output written plus the per-block charges) at `max_paid`, for a caller
-/// that has already paid for the input. Also returns that work, which never
-/// exceeds `max_paid`, as a [`Paid`].
+/// [`gzip_decompress_metered_to`] into a `Vec`.
+#[cfg(test)]
 pub(crate) fn gzip_decompress_metered(
     data: &[u8],
     budget: usize,
@@ -338,7 +336,10 @@ pub(crate) fn gzip_decompress_metered(
     (out, used, paid, result)
 }
 
-/// [`gzip_decompress_metered`], streaming its output to `sink`.
+/// Like [`gzip_decompress_to`], also capping the work past input read
+/// (output written plus the per-block charges) at `max_paid`, for a caller
+/// that has already paid for the input. Also returns that work, which never
+/// exceeds `max_paid`, as a [`Paid`].
 pub(crate) fn gzip_decompress_metered_to(
     data: &[u8],
     budget: usize,

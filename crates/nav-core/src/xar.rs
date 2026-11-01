@@ -410,35 +410,78 @@ fn decode_entry(
     raw: &[u8],
     limits: &XarLimits,
 ) -> Result<(Vec<u8>, Option<XarEntryError>), XarEntryError> {
-    decode_entry_to(raw, limits, usize::MAX).result
+    let mut bytes = Vec::new();
+    let caps = Caps::all(limits.max_entry_bytes, usize::MAX);
+    let decoded = decode_entry_to(raw, caps, &mut |b| bytes.extend_from_slice(b));
+    decoded.result.map(|gap| (bytes, gap))
 }
 
-/// Bytes read and the gap, if any, as [`read_entry_partial`] returns them.
-type PartialRead = (Vec<u8>, Option<XarEntryError>);
+/// Where [`ReadBudget::read_entry_nested`] sends what it decodes.
+pub trait NestedSink {
+    /// The decoded entry, or the first member of a gzip inside it, in order;
+    /// if none of that member decoded, the gzip's bytes from where its decoder
+    /// stopped (all of them after a header failure).
+    fn first(&mut self, bytes: &[u8]);
+    /// The gzip members after the first, decoded and joined: the nested
+    /// gzip's, then the entry's own. Never part of a gap.
+    fn later(&mut self, bytes: &[u8]);
+}
 
-/// A [`ReadBudget::read_entry_partial_nested`] result: a [`PartialRead`] plus
-/// the input past a gzip entry's first member.
-pub type NestedRead<'d> = (Vec<u8>, Option<XarEntryError>, &'d [u8]);
+/// A [`ReadBudget::read_entry_partial_nested`] result.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NestedRead<'d> {
+    /// Why the outer output is not the whole entry or first member, if it is not.
+    pub gap: Option<XarEntryError>,
+    /// The outer output when it is a gzip, held for [`ReadBudget::decode_nested`];
+    /// otherwise `None`, and the output went to [`NestedSink::first`].
+    pub held: Option<Vec<u8>>,
+    /// Bytes the outer read decoded, held or sent.
+    pub written: usize,
+    /// The input past a gzip entry's first member (empty if none, or if that
+    /// member did not decode in full), already charged as input.
+    pub rest: &'d [u8],
+}
 
-/// A [`ReadBudget::read_entry_nested`] result.
+/// A [`ReadBudget::read_entry_nested`] result; the bytes went to the sink.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NestedEntry {
-    /// The decoded entry, or the first member of a gzip inside it as far as it
-    /// decoded; if none of that member decoded, the gzip's bytes from where its
-    /// decoder stopped (all of them after a header failure).
-    pub bytes: Vec<u8>,
     /// The nested gzip's input past where it failed, when some of it decoded.
     pub unread: Vec<u8>,
-    /// Why `bytes` is not the whole entry or first member, if it is not.
+    /// Why [`NestedSink::first`] did not get the whole entry or first member.
     pub gap: Option<XarEntryError>,
-    /// The gzip members after the first, decoded and joined: the nested
-    /// gzip's, then the entry's own. Never part of `gap`.
-    pub later: Vec<u8>,
+}
+
+/// Output ceilings for [`decode_entry_to`], by encoding.
+#[derive(Debug, Clone, Copy)]
+struct Caps {
+    /// A gzip or zlib stream's output.
+    stream: usize,
+    /// A gzip or zlib stream's output plus block work (input not counted).
+    max_paid: usize,
+    bzip2: usize,
+    stored: usize,
+}
+
+impl Caps {
+    /// Every encoding's output capped at `cap`.
+    fn all(cap: usize, max_paid: usize) -> Self {
+        Caps {
+            stream: cap,
+            max_paid,
+            bzip2: cap,
+            stored: cap,
+        }
+    }
 }
 
 /// A [`decode_entry_to`] result.
 struct Decoded {
-    result: Result<PartialRead, XarEntryError>,
+    /// The gap, or `Err` when the decode failed having written nothing.
+    result: Result<Option<XarEntryError>, XarEntryError>,
+    /// Bytes written to the sink.
+    written: usize,
+    /// The output cap that applied to this entry's encoding.
+    cap: usize,
     /// Just past the first member of a gzip entry that decoded in full, else
     /// the input's length.
     end: usize,
@@ -454,62 +497,71 @@ impl Decoded {
     /// The decode error the result stopped on, if any.
     fn stop_error(&self) -> Option<DecodeError> {
         match self.result {
-            Ok((_, Some(XarEntryError::Undecodable(e)))) | Err(XarEntryError::Undecodable(e)) => {
-                Some(e)
-            }
+            Ok(Some(XarEntryError::Undecodable(e))) | Err(XarEntryError::Undecodable(e)) => Some(e),
             _ => None,
         }
     }
 }
 
-/// [`decode_entry`] with a gzip or zlib entry's output plus block work capped
-/// at `max_paid` (input not counted).
-fn decode_entry_to(raw: &[u8], limits: &XarLimits, max_paid: usize) -> Decoded {
-    let cap = limits.max_entry_bytes;
-    let plain = |result| Decoded {
-        result,
+/// Decodes one entry's raw heap bytes under `caps`, sending the output to
+/// `out`. On failure `out` has had everything written before it.
+fn decode_entry_to(raw: &[u8], caps: Caps, out: &mut inflate::Sink) -> Decoded {
+    let plain = |result: Result<Option<XarEntryError>, XarEntryError>, written, cap| Decoded {
+        // Decoded bytes are kept as evidence for every error kind (§5.2).
+        result: match result {
+            Ok(Some(e)) if written == 0 => Err(e),
+            result => result,
+        },
+        written,
+        cap,
         end: raw.len(),
         blocks: 0,
         capped: false,
         stream: false,
     };
+    let gap = |result: Result<(), DecodeError>| Ok(result.err().map(XarEntryError::Undecodable));
+    let stream = |result, paid: inflate::Paid, end| Decoded {
+        end,
+        blocks: paid.work - paid.output,
+        capped: paid.capped,
+        stream: true,
+        ..plain(gap(result), paid.output, caps.stream)
+    };
     if inflate::has_gzip_magic(raw) {
-        let (bytes, used, paid, result) = inflate::gzip_decompress_metered(raw, cap, max_paid);
+        let (used, paid, result) =
+            inflate::gzip_decompress_metered_to(raw, caps.stream, caps.max_paid, out);
         // The 8-byte trailer follows the consumed input.
         let end = match result {
             Ok(()) => used.saturating_add(8).min(raw.len()),
             Err(_) => raw.len(),
         };
-        return Decoded {
-            blocks: paid.work - paid.output,
-            result: partial_read(bytes, result),
-            end,
-            capped: paid.capped,
-            stream: true,
-        };
+        return stream(result, paid, end);
     }
     // Dispatch on the bytes, not the `encoding` attribute (see module docs).
     // Formats we have no decoder for (xz) must not come back as "stored" text.
     if is_xz(raw) {
-        plain(Err(XarEntryError::UnknownEncoding))
+        plain(Err(XarEntryError::UnknownEncoding), 0, 0)
     } else if crate::bzip2::has_bzip2_magic(raw) {
-        let (bytes, result) = crate::bzip2::bzip2_decompress_partial(raw, cap);
-        plain(partial_read(bytes, result))
+        let (bytes, result) = crate::bzip2::bzip2_decompress_partial(raw, caps.bzip2);
+        if !bytes.is_empty() {
+            out(&bytes);
+        }
+        plain(gap(result), bytes.len(), caps.bzip2)
     } else if raw.first().is_some_and(|b| b & 0x0f == 8) {
         // Plausible zlib CMF; if the header checks fail, treat it as stored.
-        let (bytes, paid, result) = inflate::zlib_decompress_metered(raw, cap, max_paid);
+        let (paid, result) =
+            inflate::zlib_decompress_metered_to(raw, caps.stream, caps.max_paid, out);
         match result {
-            Err(DecodeError::BadHeader) => plain(stored(raw, limits)),
-            result => Decoded {
-                blocks: paid.work - paid.output,
-                result: partial_read(bytes, result),
-                end: raw.len(),
-                capped: paid.capped,
-                stream: true,
-            },
+            // A header failure writes nothing.
+            Err(DecodeError::BadHeader) => {
+                let (result, written) = stored(raw, caps.stored, out);
+                plain(result, written, caps.stored)
+            }
+            result => stream(result, paid, raw.len()),
         }
     } else {
-        plain(stored(raw, limits))
+        let (result, written) = stored(raw, caps.stored, out);
+        plain(result, written, caps.stored)
     }
 }
 
@@ -518,6 +570,50 @@ fn decode_entry_to(raw: &[u8], limits: &XarLimits, max_paid: usize) -> Decoded {
 /// inflate's paid cap alone (`capped`).
 fn stopped_by_share(err: Option<DecodeError>, below_max: bool, capped: bool) -> bool {
     err == Some(DecodeError::BudgetExceeded) && (below_max || capped)
+}
+
+/// Routes a nested read's outer output: held when it opens with gzip magic
+/// (a layer for [`ReadBudget::decode_nested`]), else passed to [`NestedSink::first`].
+enum Route {
+    /// Fewer than two bytes seen.
+    Undecided(Vec<u8>),
+    Held(Vec<u8>),
+    Passing,
+}
+
+impl Route {
+    fn push(&mut self, bytes: &[u8], sink: &mut dyn NestedSink) {
+        match self {
+            Route::Undecided(head) => {
+                head.extend_from_slice(bytes);
+                if head.len() >= 2 {
+                    let head = std::mem::take(head);
+                    if inflate::has_gzip_magic(&head) {
+                        *self = Route::Held(head);
+                    } else {
+                        sink.first(&head);
+                        *self = Route::Passing;
+                    }
+                }
+            }
+            Route::Held(held) => held.extend_from_slice(bytes),
+            Route::Passing => sink.first(bytes),
+        }
+    }
+
+    /// The held gzip, if any, after passing on an undecided byte.
+    fn finish(self, sink: &mut dyn NestedSink) -> Option<Vec<u8>> {
+        match self {
+            Route::Undecided(head) => {
+                if !head.is_empty() {
+                    sink.first(&head);
+                }
+                None
+            }
+            Route::Held(held) => Some(held),
+            Route::Passing => None,
+        }
+    }
 }
 
 /// Work spent reading entries back from one archive's heap (§6.2): compressed
@@ -598,129 +694,144 @@ impl ReadBudget {
         archive: &XarArchive,
         file: &XarFile,
     ) -> Result<(Vec<u8>, Option<XarEntryError>), XarEntryError> {
-        self.read_with_split(data, archive, file, false)
-            .map(|(bytes, gap, _)| (bytes, gap))
+        let mut bytes = Vec::new();
+        self.read_into(data, archive, file, false, &mut |b| {
+            bytes.extend_from_slice(b)
+        })
+        .map(|(gap, _, _)| (bytes, gap))
     }
 
-    /// Reads an entry whose output may hold a nested gzip (`Scripts`): the
-    /// outer read as [`ReadBudget::read_entry_partial_nested`], then, if the
-    /// output is gzip, its first member, then every later gzip member, all
-    /// under the entry's allowance, which their decode work is charged to.
-    /// `Err` as `read_entry_partial`. Sort such entries by [`entry_allowance`]
-    /// with `nested` set.
+    /// Reads an entry whose output may hold a nested gzip (`Scripts`), sending
+    /// what it decodes to `sink`: the outer read as
+    /// [`ReadBudget::read_entry_partial_nested`], then, if its output is gzip,
+    /// that gzip's first member, then every later gzip member, all under the
+    /// entry's allowance, which their decode work is charged to. `Err` as
+    /// `read_entry_partial`, with nothing sent. Sort such entries by
+    /// [`entry_allowance`] with `nested` set.
     pub fn read_entry_nested(
         &mut self,
         data: &[u8],
         archive: &XarArchive,
         file: &XarFile,
+        sink: &mut dyn NestedSink,
     ) -> Result<NestedEntry, XarEntryError> {
-        let read = self.read_entry_partial_nested(data, archive, file)?;
-        Ok(self.decode_nested(read))
+        let read = self.read_entry_partial_nested(data, archive, file, sink)?;
+        Ok(self.decode_nested(read, sink))
     }
 
     /// The rest of [`ReadBudget::read_entry_nested`] after its outer step:
-    /// decodes a nested gzip in `read` and any later members. Call only with
+    /// decodes a held gzip and any later members into `sink`. Call only with
     /// the result of the [`ReadBudget::read_entry_partial_nested`] just made
     /// on this budget.
-    pub fn decode_nested(&mut self, read: NestedRead<'_>) -> NestedEntry {
-        let (raw, gap, heap_rest) = read;
+    pub fn decode_nested(
+        &mut self,
+        read: NestedRead<'_>,
+        sink: &mut dyn NestedSink,
+    ) -> NestedEntry {
         let mut entry = NestedEntry {
-            bytes: raw,
             unread: Vec::new(),
-            gap,
-            later: Vec::new(),
+            gap: read.gap,
         };
-        if inflate::has_gzip_magic(&entry.bytes) {
-            let mut raw = std::mem::take(&mut entry.bytes);
-            let (bytes, used, result, by_share) = self.decode_gzip(&raw);
+        if let Some(raw) = read.held {
+            let (written, used, result, by_share) = self.decode_gzip(&raw, &mut |b| sink.first(b));
             self.cut_by_share |= by_share;
             match result {
                 Ok(()) => {
                     // The trailer (CRC-32, ISIZE) follows the consumed input.
                     let rest = raw.get(used.saturating_add(8)..).unwrap_or_default();
-                    entry.later = self.decode_later_members(rest);
-                    entry.bytes = bytes;
+                    self.decode_later_members(rest, sink);
                 }
                 Err(e) => {
                     entry.gap.get_or_insert(XarEntryError::Undecodable(e));
-                    raw.drain(..used.min(raw.len()));
-                    if bytes.is_empty() {
-                        entry.bytes = raw;
+                    let left = raw.get(used..).unwrap_or_default();
+                    if written == 0 {
+                        sink.first(left);
                     } else {
-                        entry.bytes = bytes;
-                        entry.unread = raw;
+                        entry.unread = left.to_vec();
                     }
                 }
             }
         }
-        let own_later = self.decode_later_members(heap_rest);
-        entry.later.extend(own_later);
+        self.decode_later_members(read.rest, sink);
         entry
     }
 
-    /// One gzip member of already-charged bytes, under [`ReadBudget::entry_cap`];
-    /// charges its decode work (output plus per-block charges), which stops at
-    /// the entry's allowance. Results as [`inflate::gzip_decompress_consumed`],
-    /// plus whether the allowance, not `max_entry_bytes`, stopped it.
-    fn decode_gzip(&mut self, data: &[u8]) -> (Vec<u8>, usize, Result<(), DecodeError>, bool) {
+    /// One gzip member of already-charged bytes into `out`, under
+    /// [`ReadBudget::entry_cap`]; charges its decode work (output plus
+    /// per-block charges), which stops at the entry's allowance. Returns the
+    /// bytes written, the input consumed, the result, and whether the
+    /// allowance, not `max_entry_bytes`, stopped it.
+    fn decode_gzip(
+        &mut self,
+        data: &[u8],
+        out: &mut inflate::Sink,
+    ) -> (usize, usize, Result<(), DecodeError>, bool) {
         let cap = self.entry_cap();
         let below_max = cap < self.limits.max_entry_bytes;
         if cap == 0 {
             let err = DecodeError::BudgetExceeded;
             return (
-                Vec::new(),
+                0,
                 0,
                 Err(err),
                 stopped_by_share(Some(err), below_max, false),
             );
         }
-        let (bytes, used, spent, result) =
-            inflate::gzip_decompress_metered(data, cap, self.entry_remaining);
+        let (used, spent, result) =
+            inflate::gzip_decompress_metered_to(data, cap, self.entry_remaining, out);
         self.charge(spent.work);
         let by_share = stopped_by_share(result.err(), below_max, spent.capped);
-        (bytes, used, result, by_share)
+        (spent.output, used, result, by_share)
     }
 
-    /// Decodes the gzip members that open `rest`, joined as `gunzip` joins
-    /// them. Stops at bytes that do not start a member, at a member that
-    /// fails (keeping what it decoded), or when the allowance is spent.
-    fn decode_later_members(&mut self, mut rest: &[u8]) -> Vec<u8> {
-        let mut out = Vec::new();
+    /// Decodes the gzip members that open `rest` into [`NestedSink::later`],
+    /// joined as `gunzip` joins them. Stops at bytes that do not start a
+    /// member, at a member that fails (after what it decoded), or when the
+    /// allowance is spent.
+    fn decode_later_members(&mut self, mut rest: &[u8], sink: &mut dyn NestedSink) {
         while inflate::has_gzip_magic(rest) {
-            let (bytes, used, result, _) = self.decode_gzip(rest);
-            out.extend_from_slice(&bytes);
+            let (_, used, result, _) = self.decode_gzip(rest, &mut |b| sink.later(b));
             if result.is_err() {
                 break;
             }
             rest = rest.get(used.saturating_add(8)..).unwrap_or_default();
         }
-        out
     }
 
     /// The outer read of [`ReadBudget::read_entry_nested`]. A zlib entry gets
     /// at most a third of the allowance for input and half of the rest for
     /// output and block work, so the nested layer keeps at least a third of
     /// the allowance; other entries are read as by
-    /// [`ReadBudget::read_entry_partial`]. Also returns the input read past a
-    /// gzip entry's first member (empty if none, or if that member did not
-    /// decode in full), already charged as input.
+    /// [`ReadBudget::read_entry_partial`]. Output that opens with gzip magic
+    /// is held in the result; other output goes to [`NestedSink::first`].
     pub fn read_entry_partial_nested<'d>(
         &mut self,
         data: &'d [u8],
         archive: &XarArchive,
         file: &XarFile,
+        sink: &mut dyn NestedSink,
     ) -> Result<NestedRead<'d>, XarEntryError> {
-        self.read_with_split(data, archive, file, true)
+        let mut route = Route::Undecided(Vec::new());
+        let read = self.read_into(data, archive, file, true, &mut |b| route.push(b, sink));
+        read.map(|(gap, rest, written)| NestedRead {
+            gap,
+            held: route.finish(sink),
+            written,
+            rest,
+        })
     }
 
-    /// The reads above; `nested` selects the split for [`may_nest`] entries.
-    fn read_with_split<'d>(
+    /// The reads above, sending output to `out`; `nested` selects the split
+    /// for [`may_nest`] entries. Returns the gap, the input past a gzip
+    /// entry's first member, and the bytes sent.
+    fn read_into<'d>(
         &mut self,
         data: &'d [u8],
         archive: &XarArchive,
         file: &XarFile,
         nested: bool,
-    ) -> Result<NestedRead<'d>, XarEntryError> {
+        out: &mut inflate::Sink,
+    ) -> Result<(Option<XarEntryError>, &'d [u8], usize), XarEntryError> {
         self.cut_by_share = false;
         let over = XarEntryError::BUDGET_EXCEEDED;
         let raw = entry_bytes(data, archive, file)?;
@@ -758,14 +869,12 @@ impl ReadBudget {
         } else {
             self.entry_remaining
         };
-        let capped = XarLimits {
-            max_entry_bytes: self.entry_cap().min(max_paid),
-            ..self.limits
-        };
-        let decoded = decode_entry_to(input, &capped, max_paid);
-        // Below `max_entry_bytes` any budget stop is the allowance's: it is then
-        // `max_paid`, which bounds the input too, so inflate's work cap cannot trip.
-        let below_max = capped.max_entry_bytes < self.limits.max_entry_bytes;
+        let caps = Caps::all(self.entry_cap().min(max_paid), max_paid);
+        let decoded = decode_entry_to(input, caps, out);
+        // Below `max_entry_bytes` any budget stop is the allowance's: the cap is
+        // then `max_paid`, which bounds the input too, so inflate's work cap
+        // cannot trip.
+        let below_max = decoded.cap < self.limits.max_entry_bytes;
         let err = decoded.stop_error();
         // A cut input stops a stored read, or a stream only if it ran out mid-stream.
         let cut_short = cut
@@ -774,55 +883,41 @@ impl ReadBudget {
                 Some(e) => e == DecodeError::Truncated,
             };
         self.cut_by_share = cut_short || stopped_by_share(err, below_max, decoded.capped);
-        let Decoded {
-            result,
-            end,
-            blocks,
-            ..
-        } = decoded;
-        let rest = input.get(end..).unwrap_or_default();
-        if let Ok((bytes, _)) = &result {
-            self.charge(bytes.len());
-        }
-        self.charge(blocks);
-        match (cut, result) {
-            (true, Ok((bytes, _))) if !bytes.is_empty() => Ok((bytes, Some(over), rest)),
+        let rest = input.get(decoded.end..).unwrap_or_default();
+        self.charge(decoded.written);
+        self.charge(decoded.blocks);
+        match (cut, decoded.result) {
+            (true, Ok(_)) if decoded.written > 0 => Ok((Some(over), rest, decoded.written)),
             (true, Ok(_) | Err(XarEntryError::Undecodable(_))) => Err(over),
-            (_, result) => result.map(|(bytes, gap)| (bytes, gap, rest)),
+            (_, result) => result.map(|gap| (gap, rest, decoded.written)),
         }
     }
 }
 
-/// A decoder's result as a partial read: a failure with output is
-/// `Ok((bytes, Some(err)))`, a failure with none is `Err`.
-fn partial_read(
-    bytes: Vec<u8>,
-    result: Result<(), DecodeError>,
-) -> Result<(Vec<u8>, Option<XarEntryError>), XarEntryError> {
-    match result {
-        Ok(()) => Ok((bytes, None)),
-        // Decoded bytes are kept as evidence for every error kind (§5.2).
-        Err(e) if !bytes.is_empty() => Ok((bytes, Some(XarEntryError::Undecodable(e)))),
-        Err(e) => Err(XarEntryError::Undecodable(e)),
-    }
-}
-
-/// An entry stored without compression. Over `max_entry_bytes` it yields the
-/// first `max_entry_bytes` bytes with `BudgetExceeded`, or `Err` if that is none.
+/// An entry stored without compression, sent to `out`, and the bytes sent.
+/// Over `cap` it sends the first `cap` bytes with `BudgetExceeded`, or
+/// nothing and `Err` if that is none.
 fn stored(
     raw: &[u8],
-    limits: &XarLimits,
-) -> Result<(Vec<u8>, Option<XarEntryError>), XarEntryError> {
+    cap: usize,
+    out: &mut inflate::Sink,
+) -> (Result<Option<XarEntryError>, XarEntryError>, usize) {
     let over = XarEntryError::BUDGET_EXCEEDED;
-    match raw.get(..limits.max_entry_bytes) {
+    match raw.get(..cap) {
         Some(prefix) if prefix.len() < raw.len() => {
             if prefix.is_empty() {
-                Err(over)
+                (Err(over), 0)
             } else {
-                Ok((prefix.to_vec(), Some(over)))
+                out(prefix);
+                (Ok(Some(over)), prefix.len())
             }
         }
-        _ => Ok((raw.to_vec(), None)),
+        _ => {
+            if !raw.is_empty() {
+                out(raw);
+            }
+            (Ok(None), raw.len())
+        }
     }
 }
 
@@ -1764,15 +1859,19 @@ mod tests {
         assert_eq!(entry_allowance(&bytes, &a, f, true), Ok(3 * zlib.len()));
         assert_eq!(entry_allowance(&bytes, &a, f, false), Ok(2 * zlib.len()));
         let mut budget = ReadBudget::new(&limits);
-        let (out, gap, rest) = budget
-            .read_entry_partial_nested(&bytes, &a, f)
+        let mut sink = Collect::default();
+        let read = budget
+            .read_entry_partial_nested(&bytes, &a, f, &mut sink)
             .expect("reads");
-        assert!(rest.is_empty());
+        assert!(read.rest.is_empty());
         // All the input, then half of what is left for output and the one
-        // dynamic block's work.
+        // dynamic block's work. The output is a gzip: held, not sent.
         let block = inflate::DYNAMIC_BLOCK_WORK;
+        let out = read.held.expect("gzip held");
+        assert!(sink.first.is_empty());
         assert_eq!(out.len(), (3000 - zlib.len()) / 2 - block);
-        assert_eq!(gap, Some(BUDGET_ERR));
+        assert_eq!(read.written, out.len());
+        assert_eq!(read.gap, Some(BUDGET_ERR));
         assert_eq!(budget.entry_cap(), 3000 - zlib.len() - out.len() - block);
 
         // Stored bytes cannot nest: half the allowance for input, as unnested.
@@ -1787,11 +1886,35 @@ mod tests {
         let f = a.files.first().expect("entry");
         assert_eq!(entry_allowance(&bytes, &a, f, true), Ok(1600));
         let mut budget = ReadBudget::new(&limits);
+        let mut sink = Collect::default();
         assert_eq!(
-            budget.read_entry_partial_nested(&bytes, &a, f),
-            Ok((blob[..500].to_vec(), Some(BUDGET_ERR), &[][..]))
+            budget.read_entry_partial_nested(&bytes, &a, f, &mut sink),
+            Ok(NestedRead {
+                gap: Some(BUDGET_ERR),
+                held: None,
+                written: 500,
+                rest: &[][..]
+            })
         );
+        assert_eq!(sink.first, &blob[..500]);
         assert_eq!(budget.remaining(), 0);
+    }
+
+    /// Collects what a nested read sends.
+    #[derive(Default)]
+    struct Collect {
+        first: Vec<u8>,
+        later: Vec<u8>,
+    }
+
+    impl NestedSink for Collect {
+        fn first(&mut self, bytes: &[u8]) {
+            self.first.extend_from_slice(bytes);
+        }
+
+        fn later(&mut self, bytes: &[u8]) {
+            self.later.extend_from_slice(bytes);
+        }
     }
 
     /// A gzip of `n` empty dynamic blocks: no output, `n` KiB of block work.
@@ -1821,7 +1944,7 @@ mod tests {
             };
             let a = parse(&one, &limits).expect("xar");
             let mut budget = ReadBudget::new(&limits);
-            let read = budget.read_entry_nested(&one, &a, &a.files[0]);
+            let read = budget.read_entry_nested(&one, &a, &a.files[0], &mut Collect::default());
             assert_eq!(read.map(|e| e.gap), Ok(gap), "{allowance}");
         }
 
@@ -1842,7 +1965,7 @@ mod tests {
         let mut full = 0;
         for (i, f) in a.files.iter().enumerate() {
             budget.start_entry(n - i);
-            match budget.read_entry_nested(&bytes, &a, f) {
+            match budget.read_entry_nested(&bytes, &a, f, &mut Collect::default()) {
                 Ok(e) if e.gap.is_none() => full += 1,
                 Ok(e) => assert_eq!(e.gap, Some(BUDGET_ERR)),
                 Err(e) => assert_eq!(e, BUDGET_ERR),
@@ -1921,7 +2044,7 @@ mod tests {
         let a = parse(&bytes, &limits).expect("xar");
         let mut budget = ReadBudget::new(&limits);
         let gap = if nested {
-            match budget.read_entry_nested(&bytes, &a, &a.files[0]) {
+            match budget.read_entry_nested(&bytes, &a, &a.files[0], &mut Collect::default()) {
                 Ok(e) => e.gap,
                 Err(e) => Some(e),
             }

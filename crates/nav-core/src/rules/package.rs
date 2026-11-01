@@ -317,8 +317,9 @@ fn scan_scripts_entry(
     // An entry we can't reach (bounded read stopped short) is
     // unreadable, not absent. A partial read is scanned, then reported
     // unreadable below.
+    let mut bytes = CollectedScripts::default();
     let read = budget
-        .read_entry_nested(content, archive, entry)
+        .read_entry_nested(content, archive, entry, &mut bytes)
         .map_err(|_| RuleOutcome::NotApplicable)?;
 
     let label = format!("{}!{}", ctx.path.display(), entry.path);
@@ -328,7 +329,7 @@ fn scan_scripts_entry(
         findings.scan(label.clone(), read.unread, "install scripts (unparsed)");
     }
 
-    let result = match cpio::parse(&read.bytes, &cpio::CpioLimits::default()) {
+    let result = match cpio::parse(&bytes.first, &cpio::CpioLimits::default()) {
         // Members that did parse, plus one cut off mid-body, are scanned even
         // when the archive is incomplete.
         Some(members) => {
@@ -341,12 +342,30 @@ fn scan_scripts_entry(
         }
         None => {
             // Something is in there, but not in a shape we can read: scan it raw.
-            findings.scan(label.clone(), read.bytes, "install scripts (unparsed)");
+            findings.scan(label.clone(), bytes.first, "install scripts (unparsed)");
             Err(RuleOutcome::NotApplicable)
         }
     };
-    scan_later_members(ctx, entry, label, read.later, findings);
+    scan_later_members(ctx, entry, label, bytes.later, findings);
     result
+}
+
+/// A `Scripts` entry's decoded bytes, as [`xar::ReadBudget::read_entry_nested`]
+/// sends them.
+#[derive(Default)]
+struct CollectedScripts {
+    first: Vec<u8>,
+    later: Vec<u8>,
+}
+
+impl xar::NestedSink for CollectedScripts {
+    fn first(&mut self, bytes: &[u8]) {
+        self.first.extend_from_slice(bytes);
+    }
+
+    fn later(&mut self, bytes: &[u8]) {
+        self.later.extend_from_slice(bytes);
+    }
 }
 
 /// Scans a [`xar::NestedEntry`]'s later gzip members: as cpio members if it parses,
@@ -3920,11 +3939,12 @@ mod tests {
             .collect();
         assert_eq!(scripts.len(), 2048);
         for entry in [scripts[0], scripts[2047]] {
+            let mut bytes = CollectedScripts::default();
             let read = xar::ReadBudget::new(&limits)
-                .read_entry_nested(pkg, &archive, entry)
+                .read_entry_nested(pkg, &archive, entry, &mut bytes)
                 .expect("reads");
             assert_eq!(read.gap, None);
-            let members = cpio::parse(&read.bytes, &cpio::CpioLimits::default()).expect("cpio");
+            let members = cpio::parse(&bytes.first, &cpio::CpioLimits::default()).expect("cpio");
             assert!(members.is_complete());
             assert!(members.entries.iter().any(|m| m.name == "preinstall"));
         }
