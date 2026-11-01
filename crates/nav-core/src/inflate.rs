@@ -42,19 +42,33 @@ pub(crate) fn work_cap(budget: usize) -> usize {
 
 /// One stream's decode-work ceilings and its block charges so far.
 struct Work {
+    /// The output budget.
+    budget: usize,
     /// [`work_cap`] of the output budget, on input read plus [`Work::paid`].
     cap: usize,
     /// A ceiling on [`Work::paid`] alone; output stops where it would cross it.
     paid_cap: Option<usize>,
     blocks: usize,
+    /// The stream stopped where [`Work::paid_cap`] alone was the binding limit.
+    paid_stop: bool,
+}
+
+/// A metered decode's work past input read, and whether its `max_paid` ceiling
+/// alone stopped it (the output budget and work cap would have let it go on).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Paid {
+    pub(crate) work: usize,
+    pub(crate) capped: bool,
 }
 
 impl Work {
     fn of_budget(budget: usize) -> Self {
         Work {
+            budget,
             cap: work_cap(budget),
             paid_cap: None,
             blocks: 0,
+            paid_stop: false,
         }
     }
 
@@ -70,9 +84,23 @@ impl Work {
         out.len().saturating_add(self.blocks)
     }
 
-    fn over(&self, r: &BitReader, out: &[u8]) -> bool {
+    /// `BudgetExceeded` if the work is past a ceiling, noting whether
+    /// [`Work::paid_cap`] was the only one (output still below the budget).
+    fn check(&mut self, r: &BitReader, out: &[u8]) -> Result<(), InflateError> {
         let paid = self.paid(out);
-        r.byte_pos().saturating_add(paid) > self.cap || self.paid_cap.is_some_and(|c| paid > c)
+        let over_cap = r.byte_pos().saturating_add(paid) > self.cap;
+        if over_cap || self.paid_cap.is_some_and(|c| paid > c) {
+            self.paid_stop = !over_cap && out.len() < self.budget;
+            return Err(InflateError::BudgetExceeded);
+        }
+        Ok(())
+    }
+
+    fn paid_report(&self, out: &[u8]) -> Paid {
+        Paid {
+            work: self.paid(out),
+            capped: self.paid_stop,
+        }
     }
 
     /// Adds a block's charge, unless that takes the work over a ceiling.
@@ -83,11 +111,11 @@ impl Work {
         charge: usize,
     ) -> Result<(), InflateError> {
         self.blocks = self.blocks.saturating_add(charge);
-        if self.over(r, out) {
+        let result = self.check(r, out);
+        if result.is_err() {
             self.blocks -= charge;
-            return Err(InflateError::BudgetExceeded);
         }
-        Ok(())
+        result
     }
 
     /// The output cap for the next block.
@@ -156,11 +184,11 @@ pub(crate) fn zlib_decompress_metered(
     data: &[u8],
     budget: usize,
     max_paid: usize,
-) -> (Vec<u8>, usize, Result<(), InflateError>) {
+) -> (Vec<u8>, Paid, Result<(), InflateError>) {
     let mut out = Vec::new();
     let mut work = Work::metered(budget, max_paid);
     let result = zlib_into(data, budget, &mut work, &mut out);
-    let paid = work.paid(&out);
+    let paid = work.paid_report(&out);
     (out, paid, result)
 }
 
@@ -253,17 +281,17 @@ pub fn gzip_decompress_consumed(
 /// Like [`gzip_decompress_consumed`], also capping the work past input read
 /// (output written plus the per-block charges) at `max_paid`, for a caller
 /// that has already paid for the input. Also returns that work, which never
-/// exceeds `max_paid`.
+/// exceeds `max_paid`, as a [`Paid`].
 pub(crate) fn gzip_decompress_metered(
     data: &[u8],
     budget: usize,
     max_paid: usize,
-) -> (Vec<u8>, usize, usize, Result<(), InflateError>) {
+) -> (Vec<u8>, usize, Paid, Result<(), InflateError>) {
     let mut out = Vec::new();
     let mut used = 0;
     let mut work = Work::metered(budget, max_paid);
     let result = gzip_into(data, budget, &mut work, &mut out, &mut used);
-    let paid = work.paid(&out);
+    let paid = work.paid_report(&out);
     (out, used, paid, result)
 }
 
@@ -389,9 +417,7 @@ fn inflate_blocks(
 ) -> Result<(), InflateError> {
     out.reserve(budget.min(INITIAL_OUTPUT_CAPACITY));
     loop {
-        if work.over(r, out) {
-            return Err(InflateError::BudgetExceeded);
-        }
+        work.check(r, out)?;
         let final_block = r.bits(1)? == 1;
         let btype = r.bits(2)?;
         let charge = if btype == 2 {
@@ -401,25 +427,40 @@ fn inflate_blocks(
         };
         work.charge_block(r, out, charge)?;
         let limit = work.output_limit(budget);
-        match btype {
-            0 => stored_block(r, out, limit)?,
-            1 => {
-                let (lit, dist) = fixed_tables()?;
-                compressed_block(r, out, limit, lit, dist)?;
-            }
-            2 => {
-                let (lit, dist) = dynamic_tables(r)?;
-                compressed_block(r, out, limit, &lit, &dist)?;
-            }
-            // BTYPE=11 is reserved.
-            _ => return Err(InflateError::Malformed),
+        let result = block(r, out, limit, btype);
+        // A block stops at `limit` with `BudgetExceeded`; below `budget` it is the paid cap.
+        if result == Err(InflateError::BudgetExceeded) && limit < budget {
+            work.paid_stop = true;
         }
+        result?;
         if final_block {
             break;
         }
     }
 
     Ok(())
+}
+
+/// One block of type `btype`, its output capped at `limit`.
+fn block(
+    r: &mut BitReader,
+    out: &mut Vec<u8>,
+    limit: usize,
+    btype: u32,
+) -> Result<(), InflateError> {
+    match btype {
+        0 => stored_block(r, out, limit),
+        1 => {
+            let (lit, dist) = fixed_tables()?;
+            compressed_block(r, out, limit, lit, dist)
+        }
+        2 => {
+            let (lit, dist) = dynamic_tables(r)?;
+            compressed_block(r, out, limit, &lit, &dist)
+        }
+        // BTYPE=11 is reserved.
+        _ => Err(InflateError::Malformed),
+    }
 }
 
 /// An uncompressed block: byte-aligned, with a length and its ones-complement.
@@ -1910,15 +1951,69 @@ mod tests {
         trailer.extend_from_slice(&(body.len() as u32).to_le_bytes());
         let gz = gzip_stored_one(&body, &trailer);
         let full = BLOCK_WORK + body.len();
+        let paid = Paid {
+            work: full,
+            capped: false,
+        };
         assert_eq!(
             gzip_decompress_metered(&gz, BIG, full),
-            (body.to_vec(), gz.len() - 8, full, Ok(()))
+            (body.to_vec(), gz.len() - 8, paid, Ok(()))
         );
         for cap in [0, BLOCK_WORK - 1, BLOCK_WORK, full - 1] {
             let (out, _, paid, result) = gzip_decompress_metered(&gz, BIG, cap);
             assert_eq!(result, Err(InflateError::BudgetExceeded), "{cap}");
             assert_eq!(out.len(), cap.saturating_sub(BLOCK_WORK), "{cap}");
-            assert!(paid <= cap, "{cap}: {paid}");
+            assert!(paid.work <= cap, "{cap}: {paid:?}");
+            assert!(paid.capped, "{cap}");
         }
+    }
+
+    /// `capped` is set only when `max_paid` was the binding limit: a stop at
+    /// the output budget or on a cut-short stream leaves it clear.
+    #[test]
+    fn metered_work_reports_only_a_paid_cap_stop() {
+        let body = [b'a'; 100];
+        let mut trailer = crc32(&body).to_le_bytes().to_vec();
+        trailer.extend_from_slice(&(body.len() as u32).to_le_bytes());
+        let gz = gzip_stored_one(&body, &trailer);
+        let full = BLOCK_WORK + body.len();
+        // The output budget binds: the same as with no paid cap.
+        let (_, _, paid, result) = gzip_decompress_metered(&gz, 50, full);
+        assert_eq!(result, Err(InflateError::BudgetExceeded));
+        assert!(!paid.capped);
+        // Output budget and paid cap tie: the budget alone would stop it.
+        let (_, _, paid, _) = gzip_decompress_metered(&gz, 50, BLOCK_WORK + 50);
+        assert!(!paid.capped);
+        // One byte under the tie: the paid cap binds.
+        let (_, _, paid, _) = gzip_decompress_metered(&gz, 50, BLOCK_WORK + 49);
+        assert!(paid.capped);
+        // A block charge over the paid cap once output has reached the budget:
+        // the budget alone stops the next block.
+        let two = [
+            &gz[..10],
+            &[0, 50, 0, !50, 0xff],
+            &body[..50],
+            &[1, 50, 0, !50, 0xff],
+            &body[50..],
+            &trailer,
+        ]
+        .concat();
+        let (out, _, paid, result) = gzip_decompress_metered(&two, 50, 2 * BLOCK_WORK + 49);
+        assert_eq!((out.len(), result), (50, Err(InflateError::BudgetExceeded)));
+        assert!(!paid.capped);
+        let (out, _, paid, _) = gzip_decompress_metered(&two, 51, 2 * BLOCK_WORK + 50);
+        assert_eq!(out.len(), 50);
+        assert!(paid.capped);
+        // A cut-short stream is not a budget stop.
+        let (_, _, paid, result) = gzip_decompress_metered(&gz[..gz.len() - 20], BIG, full);
+        assert_eq!(result, Err(InflateError::Truncated));
+        assert!(!paid.capped);
+        let mut raw = vec![1, 100, 0, !100, 0xff];
+        raw.extend_from_slice(&body);
+        let zlib = zlib_wrap(&raw, &body);
+        let (_, paid, _) = zlib_decompress_metered(&zlib, 50, full - 1);
+        assert!(!paid.capped);
+        let (_, paid, _) = zlib_decompress_metered(&zlib, BIG, full - 1);
+        assert!(paid.capped);
     }
 }
