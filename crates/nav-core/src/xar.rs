@@ -481,7 +481,7 @@ fn decode_entry_to(raw: &[u8], limits: &XarLimits, max_paid: usize) -> Decoded {
             Err(_) => raw.len(),
         };
         return Decoded {
-            blocks: paid.work - bytes.len(),
+            blocks: paid.work - paid.output,
             result: partial_read(bytes, result),
             end,
             capped: paid.capped,
@@ -501,7 +501,7 @@ fn decode_entry_to(raw: &[u8], limits: &XarLimits, max_paid: usize) -> Decoded {
         match result {
             Err(DecodeError::BadHeader) => plain(stored(raw, limits)),
             result => Decoded {
-                blocks: paid.work - bytes.len(),
+                blocks: paid.work - paid.output,
                 result: partial_read(bytes, result),
                 end: raw.len(),
                 capped: paid.capped,

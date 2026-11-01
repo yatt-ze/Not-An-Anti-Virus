@@ -75,6 +75,14 @@ def build():
     # The same gzip, gzip-compressed again: decoded on the heap, then nested.
     co = zlib.compressobj(9, zlib.DEFLATED, 31)
     c["gzip_scripts_gzip_stored"] = (gz, co.compress(gz) + co.flush())
+    # Output several times inflate's flush size, with back-references across
+    # each flush, in all three wrappers (own RNG: earlier vectors unchanged).
+    rng = random.Random(20261101)
+    long_text = (" ".join(rng.choice(words) + str(rng.randrange(1000)) for _ in range(20000))).encode()
+    c["window_long"] = (long_text, raw(long_text, 9))
+    c["zlib_window_long"] = (long_text, zlib.compress(long_text, 9))
+    co = zlib.compressobj(9, zlib.DEFLATED, 31)
+    c["gzip_window_long"] = (long_text, co.compress(long_text) + co.flush())
     return c
 
 def odc(name, data=b""):
