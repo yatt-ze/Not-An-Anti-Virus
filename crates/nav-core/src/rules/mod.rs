@@ -14,6 +14,7 @@ mod package;
 mod persistence;
 mod quarantine_xattr;
 mod strings;
+mod zip_member;
 
 pub use codesign::{
     AdHocSignedRule, InvalidSignatureRule, NotarizedRule, RevokedSignatureRule,
@@ -26,6 +27,8 @@ pub use package::{InstallerScriptRule, UnsignedPackageRule};
 pub use persistence::LaunchdPersistenceRule;
 pub use quarantine_xattr::QuarantineXattrRule;
 pub use strings::SuspiciousStringsRule;
+pub(crate) use zip_member::ZipInspection;
+pub use zip_member::{ZipMemberRule, ZipMemberUnsignedRule};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RuleOutcome {
@@ -98,6 +101,8 @@ pub fn default_ruleset() -> Vec<Box<dyn Rule>> {
         Box::new(UnsignedPackageRule),
         Box::new(MachOStructureRule),
         Box::new(UninspectedContainerRule),
+        Box::new(ZipMemberRule),
+        Box::new(ZipMemberUnsignedRule),
     ]
 }
 
