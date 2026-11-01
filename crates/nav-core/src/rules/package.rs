@@ -14,7 +14,6 @@
 
 use super::{embedded_content_ruleset, Rule, RuleOutcome};
 use crate::context::ScanContext;
-use crate::decode::DecodeError;
 use crate::macho::ByteSource;
 use crate::model::{MatchedSignal, SignalCategory};
 use crate::scan::scan_embedded_bytes;
@@ -84,12 +83,14 @@ impl InstallerScriptRule {
             .metadata_entries()
             .filter(|e| matches!(e.name.as_str(), "Scripts" | "Distribution"));
         for (toc_index, entry) in wanted.enumerate() {
+            // `Scripts` holds a nested gzip: sorted and read as one.
             let nested = entry.name == "Scripts";
             let cost = xar::entry_allowance(content, &archive, entry, nested).ok();
             unreadable |= cost.is_none();
             entries.push(Wanted {
                 toc_index,
                 entry,
+                nested,
                 cost,
             });
         }
@@ -183,7 +184,7 @@ impl InstallerScriptRule {
             for (rank, i) in work.into_iter().enumerate() {
                 budget.start_entry(total - rank);
                 let mut found = ScriptFindings::default();
-                let result = if entries[i].entry.name == "Scripts" {
+                let result = if entries[i].nested {
                     scan_scripts_entry(
                         ctx,
                         content,
@@ -239,11 +240,13 @@ impl InstallerScriptRule {
     }
 }
 
-/// A `Scripts` or `Distribution` TOC entry; `cost` is the allowance needed to
-/// read its input in full (`xar::entry_allowance`), `None` if unreadable.
+/// A `Scripts` or `Distribution` TOC entry; `nested` if it is read with
+/// `read_entry_nested`, and `cost` is the allowance needed to read its input
+/// in full (`xar::entry_allowance`), `None` if unreadable.
 struct Wanted<'a> {
     toc_index: usize,
     entry: &'a xar::XarFile,
+    nested: bool,
     cost: Option<usize>,
 }
 
@@ -291,56 +294,23 @@ fn scan_scripts_entry(
     // An entry we can't reach (bounded read stopped short) is
     // unreadable, not absent. A partial read is scanned, then reported
     // unreadable below.
-    let (mut raw, mut gap, heap_rest) = budget
-        .read_entry_partial_nested(content, archive, entry)
+    let read = budget
+        .read_entry_nested(content, archive, entry)
         .map_err(|_| RuleOutcome::NotApplicable)?;
 
     let label = format!("{}!{}", ctx.path.display(), entry.path);
-    // Scripts is normally gzip-wrapped cpio; if not gzip, the heap read
-    // already undid the entry's encoding. A gzip stream that stops early is
-    // scanned as far as it decoded, plus, raw, the input it never reached
-    // (stored-block text past a limit, plaintext behind a broken header).
-    let mut later = Vec::new();
-    let archive_bytes = if !crate::inflate::has_gzip_magic(&raw) {
-        raw
-    } else {
-        // `raw` was charged as the outer read's output; only the inner output is new.
-        let cap = budget.entry_cap();
-        let (v, used, result) = if cap == 0 {
-            (Vec::new(), 0, Err(DecodeError::BudgetExceeded))
-        } else {
-            crate::inflate::gzip_decompress_consumed(&raw, cap)
-        };
-        budget.charge(v.len());
-        match result {
-            Ok(()) => {
-                // The trailer (CRC-32, ISIZE) follows the consumed input.
-                let rest = raw.get(used.saturating_add(8)..).unwrap_or_default();
-                later = decode_later_members(rest, budget);
-                v
-            }
-            Err(e) => {
-                gap.get_or_insert(xar::XarEntryError::Undecodable(e));
-                raw.drain(..used.min(raw.len()));
-                let unread = raw;
-                if v.is_empty() {
-                    unread // not cpio: scanned raw below
-                } else {
-                    if !unread.is_empty() {
-                        findings.scan(label.clone(), unread, "install scripts (unparsed)");
-                    }
-                    v
-                }
-            }
-        }
-    };
+    // A nested gzip's input past where it stopped (stored-block text past a
+    // limit) is scanned raw.
+    if !read.unread.is_empty() {
+        findings.scan(label.clone(), read.unread, "install scripts (unparsed)");
+    }
 
-    let result = match cpio::parse(&archive_bytes, &cpio::CpioLimits::default()) {
+    let result = match cpio::parse(&read.bytes, &cpio::CpioLimits::default()) {
         // Members that did parse, plus one cut off mid-body, are scanned even
         // when the archive is incomplete.
         Some(members) => {
             scan_cpio_members(ctx, entry, &members, "", findings);
-            if members.is_complete() && gap.is_none() {
+            if members.is_complete() && read.gap.is_none() {
                 Ok(())
             } else {
                 Err(RuleOutcome::NotApplicable)
@@ -348,34 +318,15 @@ fn scan_scripts_entry(
         }
         None => {
             // Something is in there, but not in a shape we can read: scan it raw.
-            findings.scan(label.clone(), archive_bytes, "install scripts (unparsed)");
+            findings.scan(label.clone(), read.bytes, "install scripts (unparsed)");
             Err(RuleOutcome::NotApplicable)
         }
     };
-    // A gzip entry's own later members, after those of a gzip inside it.
-    later.extend(decode_later_members(heap_rest, budget));
-    scan_later_members(ctx, entry, label, later, findings);
+    scan_later_members(ctx, entry, label, read.later, findings);
     result
 }
 
-/// Decodes the gzip members after the first, joined as `gunzip` joins them,
-/// under the current entry's allowance. Stops at bytes that do not start a
-/// member, or at a member that fails, keeping what that member decoded.
-fn decode_later_members(mut rest: &[u8], budget: &mut xar::ReadBudget) -> Vec<u8> {
-    let mut out = Vec::new();
-    while crate::inflate::has_gzip_magic(rest) && budget.entry_cap() > 0 {
-        let (v, used, result) = crate::inflate::gzip_decompress_consumed(rest, budget.entry_cap());
-        budget.charge(v.len());
-        out.extend_from_slice(&v);
-        if result.is_err() {
-            break;
-        }
-        rest = rest.get(used.saturating_add(8)..).unwrap_or_default();
-    }
-    out
-}
-
-/// Scans what [`decode_later_members`] returned: as cpio members if it parses,
+/// Scans a [`xar::NestedEntry`]'s later gzip members: as cpio members if it parses,
 /// raw otherwise. Installer never runs these (#109), so nothing here makes the
 /// entry unreadable; a script from the first member can still extract them.
 fn scan_later_members(
@@ -1217,6 +1168,7 @@ impl Rule for UnsignedPackageRule {
 mod tests {
     use super::*;
     use crate::context::{ContentSource, ScanContext};
+    use crate::decode::DecodeError;
     use crate::test_support::utf16;
     use std::path::PathBuf;
 
@@ -2598,7 +2550,11 @@ mod tests {
 
     #[test]
     fn a_small_dropper_is_read_despite_nested_padding() {
-        let limits = small_limits();
+        // A share covers the dropper's dynamic block, not a padding read.
+        let limits = xar::XarLimits {
+            max_read_back_bytes: 96 * 1024,
+            ..small_limits()
+        };
         let (r, c) = evaluate_small(&distinct_padding_archive(50, 1, Some(0), true), &limits);
         let signal = r.expect("evaluates").expect("the dropper scores");
         assert!(
@@ -2732,7 +2688,8 @@ mod tests {
     fn a_dropper_is_found_among_many_padding_entries() {
         let limits = xar::XarLimits {
             max_entry_bytes: 4096,
-            max_read_back_bytes: 64 * 1024,
+            // A share covers the dropper's dynamic block, not a padding read.
+            max_read_back_bytes: 360 * 1024,
             ..xar::XarLimits::default()
         };
         let (r, c) = evaluate_small(&distinct_padding_archive(200, 0, Some(0), true), &limits);
@@ -2870,10 +2827,10 @@ mod tests {
     fn a_gzip_scripts_entry_the_budget_cannot_decode_is_incomplete() {
         let blob = include_bytes!("../../testdata/inflate/gzip_scripts_gzip_stored.in");
         let bytes = pkg_with_scripts(blob);
-        // The input fits in half; its output then takes the rest.
+        // The input fits in half; its block and output then take the rest.
         let limits = xar::XarLimits {
             max_entry_bytes: 1 << 20,
-            max_read_back_bytes: 2 * blob.len() + 300,
+            max_read_back_bytes: 2 * blob.len() + 300 + crate::inflate::DYNAMIC_BLOCK_WORK,
             ..xar::XarLimits::default()
         };
         let (r, c) = evaluate_small(&bytes, &limits);
@@ -2903,7 +2860,8 @@ mod tests {
         let blob = zlib_stored(gz);
         let limits = xar::XarLimits {
             max_entry_bytes: 1 << 20,
-            max_read_back_bytes: 3000,
+            // The inner third also pays the dynamic block's 1 KiB charge.
+            max_read_back_bytes: 4500,
             ..xar::XarLimits::default()
         };
         assert!(
@@ -3116,19 +3074,22 @@ mod tests {
     }
 
     /// A `Scripts` read is charged its outer input and output and the inner
-    /// gzip's output; the inner input is the outer output, not charged again.
-    /// A budget with room for exactly `k` such reads makes `k` in full.
+    /// gzip's output and block work; the inner input is the outer output, not
+    /// charged again. A budget with room for exactly `k` such reads makes `k`
+    /// in full.
     #[test]
     fn a_scripts_entrys_inner_gzip_input_is_charged_once() {
         let gz = empty_gzip(600);
         let blob = zlib_stored(&gz);
-        // Outer input and output; the inner gzip reads the output and writes nothing.
-        let per_entry = blob.len() + gz.len();
-        // Room for `k` entries at a third of the allowance for input each.
+        // Outer input, output and stored block; the inner gzip reads the
+        // output and writes nothing, at a block charge for each of its 601 blocks.
+        let per_entry = blob.len() + gz.len() + 602 * crate::inflate::BLOCK_WORK;
+        assert!(per_entry >= 3 * blob.len(), "input fits in a third");
         let k = 3;
         let limits = xar::XarLimits {
             max_entry_bytes: 1 << 20,
-            max_read_back_bytes: (k - 1) * per_entry + 3 * blob.len(),
+            // Slack past `k` reads, so the next is a real cut read.
+            max_read_back_bytes: k * per_entry + blob.len(),
             ..xar::XarLimits::default()
         };
         let mut bytes = xar::toc_xar_bytes(&scripts_toc(blob.len(), 2 * k));
@@ -3148,6 +3109,7 @@ mod tests {
         }
         // `k` full reads, then only cut ones from what is left.
         assert_eq!(charged[..k], vec![per_entry; k]);
+        assert!(charged[k] > 0, "{charged:?}");
         assert!(charged[k..].iter().all(|c| *c < per_entry), "{charged:?}");
         assert_eq!(
             charged.iter().sum::<usize>(),
