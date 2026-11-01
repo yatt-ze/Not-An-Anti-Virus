@@ -614,7 +614,16 @@ impl ReadBudget {
         archive: &XarArchive,
         file: &XarFile,
     ) -> Result<NestedEntry, XarEntryError> {
-        let (raw, gap, heap_rest) = self.read_entry_partial_nested(data, archive, file)?;
+        let read = self.read_entry_partial_nested(data, archive, file)?;
+        Ok(self.decode_nested(read))
+    }
+
+    /// The rest of [`ReadBudget::read_entry_nested`] after its outer step:
+    /// decodes a nested gzip in `read` and any later members. Call only with
+    /// the result of the [`ReadBudget::read_entry_partial_nested`] just made
+    /// on this budget.
+    pub fn decode_nested(&mut self, read: NestedRead<'_>) -> NestedEntry {
+        let (raw, gap, heap_rest) = read;
         let mut entry = NestedEntry {
             bytes: raw,
             unread: Vec::new(),
@@ -646,7 +655,7 @@ impl ReadBudget {
         }
         let own_later = self.decode_later_members(heap_rest);
         entry.later.extend(own_later);
-        Ok(entry)
+        entry
     }
 
     /// One gzip member of already-charged bytes, under [`ReadBudget::entry_cap`];
