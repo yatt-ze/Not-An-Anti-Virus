@@ -28,6 +28,12 @@ const MAX_SCRIPT_WEIGHT: i32 = 20;
 /// Corroboration only: below Notify on its own (§5.1).
 const DISTRIBUTION_INTERPRETER_WEIGHT: i32 = 8;
 
+/// Weight for a package listing so many components Installer runs that their
+/// `Scripts` cannot all be read under the read-back budget (§5.2, §6.2).
+/// Corroboration only: below Notify alone; with `unsigned-installer-package`
+/// it reaches Notify across two categories (§5.1).
+const INSTALLER_SCRIPTS_STARVED_WEIGHT: i32 = 10;
+
 /// Weight for a package with no signature. Well below the notify threshold:
 /// plenty of legitimate packages are unsigned (all default `pkgbuild` output).
 /// Earns its place by corroborating (§5.1, §5.4).
@@ -115,6 +121,7 @@ impl InstallerScriptRule {
         // The entries Installer runs go first, so padding elsewhere cannot
         // shrink their allowance (§5.2).
         let mut installer_scripts = Vec::new();
+        let mut refs_trusted = false;
         let first_dist = entries
             .iter()
             .position(|w| w.entry.name == "Distribution" && w.entry.depth == 0 && is_file(w));
@@ -146,6 +153,7 @@ impl InstallerScriptRule {
                     Some(&query),
                 ) {
                     Ok(Some(refs)) => {
+                        refs_trusted = true;
                         for j in refs {
                             if !taken[j] {
                                 taken[j] = true;
@@ -167,7 +175,10 @@ impl InstallerScriptRule {
         }
 
         let rest: Vec<usize> = (0..entries.len()).filter(|i| !taken[*i]).collect();
-        for group in [installer_scripts, rest] {
+        let mut starved = false;
+        // Without a trusted reference set, Installer may run any `Scripts`.
+        let rest_runs = first_dist.is_some() && !refs_trusted;
+        for (runs, group) in [(true, installer_scripts), (rest_runs, rest)] {
             // Cheapest to read first: small real entries are read in full
             // before large or padded ones, and their unused allowance carries
             // forward. Ties go to the shallower, then the earlier TOC entry. An
@@ -181,18 +192,30 @@ impl InstallerScriptRule {
             work.retain(|i| seen.insert(range_key(entries[*i].entry)));
 
             let total = work.len();
+            let scripts = work.iter().filter(|i| entries[**i].nested).count();
             for (rank, i) in work.into_iter().enumerate() {
                 budget.start_entry(total - rank);
                 let mut found = ScriptFindings::default();
                 let result = if entries[i].nested {
-                    scan_scripts_entry(
+                    let result = scan_scripts_entry(
                         ctx,
                         content,
                         &archive,
                         entries[i].entry,
                         &mut budget,
                         &mut found,
-                    )
+                    );
+                    // Reported once per package (§5.2, #112).
+                    if runs && total > 1 && !starved && budget.last_cut_by_share() {
+                        starved = true;
+                        found.add(
+                            INSTALLER_SCRIPTS_STARVED_WEIGHT,
+                            format!(
+                                "scripts Installer runs exceed the read budget ({scripts} components)"
+                            ),
+                        );
+                    }
+                    result
                 } else {
                     scan_distribution_entry(
                         ctx,
@@ -3303,8 +3326,9 @@ mod tests {
             let dists = [dist];
             let (d, incomplete) = found(&product_with(&dists, &comps, 0), &limits);
             assert!(d.is_some() && incomplete);
+            // Unread, but any Scripts may run: its starving is reported.
             let (d, _) = found(&product_with(&dists, &comps, pads), &limits);
-            assert_eq!(d, None);
+            assert!(d.expect("starved").starts_with(STARVED));
         }
 
         // Out of the heap: no cost, no read.
@@ -3317,7 +3341,7 @@ mod tests {
             padding(&mut heap, pads)
         );
         let (d, _) = found(&archive(&toc, &heap), &limits);
-        assert_eq!(d, None);
+        assert!(d.expect("starved").starts_with(STARVED));
     }
 
     #[test]
@@ -3444,7 +3468,7 @@ mod tests {
         let (d, _) = found(&product(&["#a.pkg"], &comps, pads), &limits);
         assert!(d.is_some());
         let (d, _) = found(&product(&["#a.pkg", "#x/../y"], &comps, pads), &limits);
-        assert_eq!(d, None);
+        assert!(d.expect("starved").starts_with(STARVED));
     }
 
     #[test]
@@ -3762,12 +3786,147 @@ mod tests {
         assert!(d.expect("scores").contains("install script preinstall"));
         assert!(incomplete);
 
-        // Reachable padding still starves it (the rest of #112).
+        // Reachable padding still starves it, which is itself reported (#112).
         let all: String = std::iter::once("cr".to_string())
             .chain((0..pads).map(|i| format!("c{i}")))
             .map(|c| format!(r#"<line choice="{c}"/>"#))
             .collect();
-        let (d, _) = found(&build(doc(&all)), &limits);
+        let (d, incomplete) = found(&build(doc(&all)), &limits);
+        let d = d.expect("starved");
+        assert_eq!(
+            d,
+            "scripts Installer runs exceed the read budget (13 components)"
+        );
+        assert!(incomplete);
+    }
+
+    /// A zlib-over-gzip `Scripts` whose one member is `body_len` bytes of a
+    /// benign script.
+    fn benign_scripts(body_len: usize) -> Vec<u8> {
+        let mut body = b"#!/bin/sh\n".to_vec();
+        body.resize(body_len, b'\n');
+        let mut cpio = odc_member("preinstall", &body);
+        cpio.extend(odc_member("TRAILER!!!", b""));
+        zlib_stored(&gzip_member(&cpio))
+    }
+
+    /// A product archive whose components hold `blobs` as their `Scripts`, all
+    /// named by its `Distribution` if `reachable`, else none.
+    fn components_archive(blobs: &[Vec<u8>], reachable: bool) -> Vec<u8> {
+        let names: Vec<String> = (0..blobs.len()).map(|i| format!("#c{i}.pkg")).collect();
+        let refs: Vec<&str> = if reachable {
+            names.iter().map(String::as_str).collect()
+        } else {
+            Vec::new()
+        };
+        let mut heap = Heap::default();
+        let mut toc = file("Distribution", heap.add(&distribution_xml(&refs)));
+        for (i, blob) in blobs.iter().enumerate() {
+            toc += &nested(&format!("c{i}.pkg"), file("Scripts", heap.add(blob)));
+        }
+        archive(&toc, &heap)
+    }
+
+    const STARVED: &str = "scripts Installer runs exceed the read budget";
+
+    #[test]
+    fn reachable_components_over_the_budget_are_reported_once() {
+        let limits = padding_limits();
+        let blobs = vec![benign_scripts(1000); 12];
+        // An equal share of what the Distribution leaves cannot read one.
+        let share = limits.max_read_back_bytes / 12;
+        assert!(3 * blobs[0].len() > share);
+        let (r, c) = evaluate_small(&components_archive(&blobs, true), &limits);
+        let signal = r.expect("rule runs").expect("finding");
+        assert_eq!(signal.weight, INSTALLER_SCRIPTS_STARVED_WEIGHT);
+        assert_eq!(signal.description, format!("{STARVED} (12 components)"));
+        assert!(c.marked_incomplete("installer-script-suspicious"));
+    }
+
+    #[test]
+    fn unreachable_components_over_the_budget_are_not_reported() {
+        let blobs = vec![benign_scripts(1000); 12];
+        let (r, _) = evaluate_small(&components_archive(&blobs, false), &padding_limits());
+        assert!(matches!(r, Err(RuleOutcome::NotApplicable)), "{r:?}");
+    }
+
+    #[test]
+    fn untrusted_references_report_a_starved_scripts_in_any_group() {
+        let limits = padding_limits();
+        let pads = starving_padding(&limits);
+        let comps = [("comp.pkg", "preinstall")];
+        // An escaped '/' voids the whole reference set.
+        let (d, incomplete) = found(
+            &product(&["#comp.pkg", "#a%2Fb.pkg"], &comps, pads),
+            &limits,
+        );
+        assert!(d.expect("starved").starts_with(STARVED));
+        assert!(incomplete);
+        // Trusted but unreferenced: Installer does not run it.
+        let (d, _) = found(&product(&[], &comps, pads), &limits);
         assert_eq!(d, None);
+    }
+
+    #[test]
+    fn reachable_components_that_fit_are_not_reported() {
+        let limits = padding_limits();
+        let blobs = vec![benign_scripts(1000); 2];
+        let (r, _) = evaluate_small(&components_archive(&blobs, true), &limits);
+        assert!(matches!(r, Ok(None)), "{r:?}");
+    }
+
+    #[test]
+    fn a_scripts_cut_by_the_entry_cap_or_corruption_is_not_reported() {
+        let limits = xar::XarLimits {
+            max_entry_bytes: 4096,
+            max_read_back_bytes: 1 << 20,
+            ..xar::XarLimits::default()
+        };
+        let mut truncated = benign_scripts(1000);
+        truncated.truncate(truncated.len() - 100);
+        for odd in [benign_scripts(8000), truncated] {
+            let blobs = [benign_scripts(1000), odd];
+            let (r, _) = evaluate_small(&components_archive(&blobs, true), &limits);
+            assert!(matches!(r, Err(RuleOutcome::NotApplicable)), "{r:?}");
+        }
+        // A flat package's one Scripts over the whole budget is not starved by peers.
+        let tight = xar::XarLimits {
+            max_read_back_bytes: 2048,
+            ..limits
+        };
+        let mut heap = Heap::default();
+        let toc = file("Scripts", heap.add(&benign_scripts(1000)));
+        let (r, _) = evaluate_small(&archive(&toc, &heap), &tight);
+        assert!(matches!(r, Err(RuleOutcome::NotApplicable)), "{r:?}");
+    }
+
+    /// Each of the fixture's `Scripts` reads clean on its own budget, through
+    /// to its `preinstall`; under one shared budget a share runs out first.
+    #[test]
+    fn the_starved_components_fixture_is_cut_only_by_sharing() {
+        let pkg = include_bytes!(
+            "../../fixtures/suspicious/installer_reachable_components_exceed_budget.pkg"
+        );
+        let limits = xar::XarLimits::default();
+        let (r, c) = evaluate_small(pkg, &limits);
+        let signal = r.expect("rule runs").expect("finding");
+        assert_eq!(signal.description, format!("{STARVED} (2048 components)"));
+        assert!(c.marked_incomplete("installer-script-suspicious"));
+
+        let archive = xar::parse(pkg, &limits).expect("xar");
+        let scripts: Vec<_> = archive
+            .metadata_entries()
+            .filter(|e| e.name == "Scripts")
+            .collect();
+        assert_eq!(scripts.len(), 2048);
+        for entry in [scripts[0], scripts[2047]] {
+            let read = xar::ReadBudget::new(&limits)
+                .read_entry_nested(pkg, &archive, entry)
+                .expect("reads");
+            assert_eq!(read.gap, None);
+            let members = cpio::parse(&read.bytes, &cpio::CpioLimits::default()).expect("cpio");
+            assert!(members.is_complete());
+            assert!(members.entries.iter().any(|m| m.name == "preinstall"));
+        }
     }
 }
