@@ -16,6 +16,7 @@
 //! Hand-written per §3. XML goes through [`crate::xml`], shared with the plist
 //! reader so there is only one XML implementation to fuzz.
 
+use crate::budget::ShareBudget;
 use crate::decode::DecodeError;
 use crate::inflate;
 use crate::xml::{self, Event, Next, Scanner};
@@ -645,8 +646,7 @@ impl Route {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReadBudget {
     limits: XarLimits,
-    remaining: usize,
-    entry_remaining: usize,
+    shares: ShareBudget,
     cut_by_share: bool,
     cut_at_limit: bool,
     input_over_share: bool,
@@ -659,8 +659,7 @@ impl ReadBudget {
     pub fn new(limits: &XarLimits) -> Self {
         ReadBudget {
             limits: *limits,
-            remaining: limits.max_read_back_bytes,
-            entry_remaining: limits.max_read_back_bytes,
+            shares: ShareBudget::new(limits.max_read_back_bytes),
             cut_by_share: false,
             cut_at_limit: false,
             input_over_share: false,
@@ -693,7 +692,7 @@ impl ReadBudget {
 
     /// Bytes still available across the archive.
     pub fn remaining(&self) -> usize {
-        self.remaining
+        self.shares.remaining()
     }
 
     /// Gives the next entry an equal share of what remains. `entries_left`
@@ -707,20 +706,21 @@ impl ReadBudget {
     /// `parts` may exceed the entries to come to leave room for entries not
     /// yet known.
     pub fn start_share(&mut self, parts: usize) {
-        self.entry_remaining = self.remaining / parts.max(1);
+        self.shares.start_share(parts);
     }
 
     /// Charges `n` bytes against the archive total and the current entry's
     /// allowance (a nested layer, or an entry read). Saturates at zero.
     pub fn charge(&mut self, n: usize) {
-        self.remaining = self.remaining.saturating_sub(n);
-        self.entry_remaining = self.entry_remaining.saturating_sub(n);
+        self.shares.charge(n);
     }
 
     /// The decoded-size cap for the current entry: the smaller of
     /// `limits.max_entry_bytes` and its allowance.
     pub fn entry_cap(&self) -> usize {
-        self.limits.max_entry_bytes.min(self.entry_remaining)
+        self.limits
+            .max_entry_bytes
+            .min(self.shares.entry_remaining())
     }
 
     /// [`read_entry_partial`] under the current entry's allowance: at most half
@@ -815,7 +815,7 @@ impl ReadBudget {
         data: &[u8],
         out: &mut inflate::Sink,
     ) -> (usize, usize, Result<(), DecodeError>, bool) {
-        let cap = self.entry_remaining;
+        let cap = self.shares.entry_remaining();
         let over = Err(DecodeError::BudgetExceeded);
         if cap == 0 {
             return (0, 0, over, true);
@@ -898,7 +898,7 @@ impl ReadBudget {
         }
         let nests = nested && may_nest(raw);
         let divisor = if nests { 3 } else { 2 };
-        let share = self.entry_remaining / divisor;
+        let share = self.shares.entry_remaining() / divisor;
         if self.limits.max_entry_bytes == 0 {
             return Err(over);
         }
@@ -924,9 +924,9 @@ impl ReadBudget {
         self.charge(cost);
         // Output and block work; a nested entry leaves half for its inner layer.
         let max_paid = if nests {
-            self.entry_remaining / 2
+            self.shares.entry_remaining() / 2
         } else {
-            self.entry_remaining
+            self.shares.entry_remaining()
         };
         let cap = self.entry_cap().min(max_paid);
         let caps = if nested {
