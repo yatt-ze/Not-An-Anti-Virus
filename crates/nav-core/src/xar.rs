@@ -439,7 +439,7 @@ pub struct NestedEntry {
 /// [`decode_entry`] with a gzip or zlib entry's output plus block work capped
 /// at `max_paid` (input not counted). Also returns where decoding ended (just
 /// past the first member of a gzip entry that decoded in full, else
-/// `raw.len()`) and that work: the output bytes for other encodings.
+/// `raw.len()`) and the block work, 0 for other encodings.
 fn decode_entry_to(
     raw: &[u8],
     limits: &XarLimits,
@@ -448,39 +448,33 @@ fn decode_entry_to(
     let cap = limits.max_entry_bytes;
     if inflate::has_gzip_magic(raw) {
         let (bytes, used, paid, result) = inflate::gzip_decompress_metered(raw, cap, max_paid);
+        let blocks = paid - bytes.len();
         // The 8-byte trailer follows the consumed input.
         let end = match result {
             Ok(()) => used.saturating_add(8).min(raw.len()),
             Err(_) => raw.len(),
         };
-        return (partial_read(bytes, result), end, paid);
+        return (partial_read(bytes, result), end, blocks);
     }
     // Dispatch on the bytes, not the `encoding` attribute (see module docs).
     // Formats we have no decoder for (xz) must not come back as "stored" text.
-    let (result, paid) = if is_xz(raw) {
+    let (result, blocks) = if is_xz(raw) {
         (Err(XarEntryError::UnknownEncoding), 0)
     } else if crate::bzip2::has_bzip2_magic(raw) {
         let (bytes, result) = crate::bzip2::bzip2_decompress_partial(raw, cap);
-        let paid = bytes.len();
-        (partial_read(bytes, result), paid)
+        (partial_read(bytes, result), 0)
     } else if raw.first().is_some_and(|b| b & 0x0f == 8) {
         // Plausible zlib CMF; if the header checks fail, treat it as stored.
         let (bytes, paid, result) = inflate::zlib_decompress_metered(raw, cap, max_paid);
+        let blocks = paid - bytes.len();
         match result {
-            Err(DecodeError::BadHeader) => stored_paid(raw, limits),
-            result => (partial_read(bytes, result), paid),
+            Err(DecodeError::BadHeader) => (stored(raw, limits), 0),
+            result => (partial_read(bytes, result), blocks),
         }
     } else {
-        stored_paid(raw, limits)
+        (stored(raw, limits), 0)
     };
-    (result, raw.len(), paid)
-}
-
-/// [`stored`], with its output as the work.
-fn stored_paid(raw: &[u8], limits: &XarLimits) -> (Result<PartialRead, XarEntryError>, usize) {
-    let result = stored(raw, limits);
-    let paid = result.as_ref().map_or(0, |(bytes, _)| bytes.len());
-    (result, paid)
+    (result, raw.len(), blocks)
 }
 
 /// Work spent reading entries back from one archive's heap (§6.2): compressed
@@ -689,9 +683,12 @@ impl ReadBudget {
             max_entry_bytes: self.entry_cap().min(max_paid),
             ..self.limits
         };
-        let (result, end, paid) = decode_entry_to(input, &capped, max_paid);
+        let (result, end, blocks) = decode_entry_to(input, &capped, max_paid);
         let rest = input.get(end..).unwrap_or_default();
-        self.charge(paid);
+        if let Ok((bytes, _)) = &result {
+            self.charge(bytes.len());
+        }
+        self.charge(blocks);
         match (cut, result) {
             (true, Ok((bytes, _))) if !bytes.is_empty() => Ok((bytes, Some(over), rest)),
             (true, Ok(_) | Err(XarEntryError::Undecodable(_))) => Err(over),
