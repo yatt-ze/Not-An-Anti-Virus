@@ -1031,8 +1031,7 @@ impl<'a> BitReader<'a> {
     }
 }
 
-/// CRC-32 (reflected IEEE polynomial, RFC 1952 §8), computed bitwise —
-/// output is checked as it streams.
+/// CRC-32 (reflected IEEE polynomial, RFC 1952 §8).
 #[cfg(test)]
 pub(crate) fn crc32(data: &[u8]) -> u32 {
     !crc32_update(CRC32_INIT, data)
@@ -1041,14 +1040,31 @@ pub(crate) fn crc32(data: &[u8]) -> u32 {
 /// The CRC-32 register before any input.
 const CRC32_INIT: u32 = 0xFFFF_FFFF;
 
+/// The register after shifting each byte value through it bit by bit.
+const CRC32_TABLE: [u32; 256] = crc32_table();
+
+const fn crc32_table() -> [u32; 256] {
+    let mut table = [0u32; 256];
+    let mut i = 0;
+    while i < 256 {
+        let mut crc = i as u32;
+        let mut bit = 0;
+        while bit < 8 {
+            let mask = (crc & 1).wrapping_neg();
+            crc = (crc >> 1) ^ (0xEDB8_8320 & mask);
+            bit += 1;
+        }
+        table[i] = crc;
+        i += 1;
+    }
+    table
+}
+
 /// Feeds `data` through a running CRC-32 register (not yet inverted).
 fn crc32_update(mut crc: u32, data: &[u8]) -> u32 {
     for &byte in data {
-        crc ^= byte as u32;
-        for _ in 0..8 {
-            let mask = (crc & 1).wrapping_neg();
-            crc = (crc >> 1) ^ (0xEDB8_8320 & mask);
-        }
+        let index = ((crc ^ u32::from(byte)) & 0xFF) as usize;
+        crc = (crc >> 8) ^ CRC32_TABLE[index];
     }
     crc
 }
@@ -1663,6 +1679,17 @@ mod tests {
         assert!(inflate(gz, BIG).is_err());
         let (_, zl, _) = zlib_cases()[0];
         assert_eq!(gzip_decompress(zl, BIG), Err(InflateError::BadHeader));
+    }
+
+    #[test]
+    fn crc32_table_matches_the_bitwise_register() {
+        for (i, &entry) in CRC32_TABLE.iter().enumerate() {
+            let mut crc = i as u32;
+            for _ in 0..8 {
+                crc = (crc >> 1) ^ (0xEDB8_8320 & (crc & 1).wrapping_neg());
+            }
+            assert_eq!(entry, crc, "{i}");
+        }
     }
 
     #[test]
