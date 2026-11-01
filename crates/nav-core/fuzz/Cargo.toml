@@ -13,6 +13,8 @@ cargo-fuzz = true
 
 [dependencies]
 libfuzzer-sys = "0.4"
+# Independent DEFLATE reference for the inflate target (miniz_oxide backend).
+flate2 = "1"
 nav-core = { path = ".." }
 
 [[bin]]

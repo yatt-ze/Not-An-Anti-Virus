@@ -9,7 +9,8 @@
 //! output written, plus a fixed charge per block) is likewise capped
 //! at a multiple of `budget`; exceeding it is also `BudgetExceeded`. The
 //! strict entry points return no bytes on error; the `_partial` ones return
-//! the clamped output.
+//! the clamped output; the `_to` ones stream the same output to a sink,
+//! holding only a 32 KiB back-reference window.
 //! `BudgetExceeded` is a §6.2 policy stop, not evidence of malice — callers
 //! must keep it distinct from `Malformed`.
 
@@ -19,10 +20,6 @@ use crate::decode::DecodeError;
 
 /// Longest Huffman code permitted by RFC 1951 §3.2.7.
 const MAX_BITS: usize = 15;
-
-/// Starting capacity. The buffer grows toward `budget` as bytes are produced,
-/// so a large budget is not allocated up front.
-const INITIAL_OUTPUT_CAPACITY: usize = 64 * 1024;
 
 /// Work charged per stored or fixed block, in output-byte terms.
 pub(crate) const BLOCK_WORK: usize = 64;
@@ -53,11 +50,13 @@ struct Work {
     paid_stop: bool,
 }
 
-/// A metered decode's work past input read, and whether its `max_paid` ceiling
-/// alone stopped it (the output budget and work cap would have let it go on).
+/// A metered decode's work past input read (`output` plus block charges), the
+/// bytes it wrote, and whether its `max_paid` ceiling alone stopped it (the
+/// output budget and work cap would have let it go on).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Paid {
     pub(crate) work: usize,
+    pub(crate) output: usize,
     pub(crate) capped: bool,
 }
 
@@ -80,13 +79,13 @@ impl Work {
     }
 
     /// Output written plus the per-block charges: the work past input read.
-    fn paid(&self, out: &[u8]) -> usize {
+    fn paid(&self, out: &Output) -> usize {
         out.len().saturating_add(self.blocks)
     }
 
     /// `BudgetExceeded` if the work is past a ceiling, noting whether
     /// [`Work::paid_cap`] was the only one (output still below the budget).
-    fn check(&mut self, r: &BitReader, out: &[u8]) -> Result<(), InflateError> {
+    fn check(&mut self, r: &BitReader, out: &Output) -> Result<(), InflateError> {
         let paid = self.paid(out);
         let over_cap = r.byte_pos().saturating_add(paid) > self.cap;
         if over_cap || self.paid_cap.is_some_and(|c| paid > c) {
@@ -96,9 +95,10 @@ impl Work {
         Ok(())
     }
 
-    fn paid_report(&self, out: &[u8]) -> Paid {
+    fn paid_report(&self, out: &Output) -> Paid {
         Paid {
             work: self.paid(out),
+            output: out.len(),
             capped: self.paid_stop,
         }
     }
@@ -107,7 +107,7 @@ impl Work {
     fn charge_block(
         &mut self,
         r: &BitReader,
-        out: &[u8],
+        out: &Output,
         charge: usize,
     ) -> Result<(), InflateError> {
         self.blocks = self.blocks.saturating_add(charge);
@@ -155,11 +155,30 @@ const CLEN_ORDER: [usize; 19] = [
 /// Inflate's name for the shared decode error.
 pub type InflateError = DecodeError;
 
+/// Where streamed output goes: called with each run of decoded bytes, in order.
+pub type Sink<'s> = dyn FnMut(&[u8]) + 's;
+
 /// Decode a raw DEFLATE stream, producing at most `budget` bytes.
 pub fn inflate(data: &[u8], budget: usize) -> Result<Vec<u8>, InflateError> {
+    let (out, result) = collect(|sink| inflate_to(data, budget, sink));
+    result.map(|()| out)
+}
+
+/// [`inflate`], streaming: hands the output to `sink` as it is produced
+/// instead of returning it. The same bytes and result; on error `sink` has
+/// had everything written before the failure.
+pub fn inflate_to(data: &[u8], budget: usize, sink: &mut Sink) -> Result<(), InflateError> {
+    let mut out = Output::new(sink, Check::None);
+    let result = inflate_into(data, budget, &mut Work::of_budget(budget), &mut out).map(|_| ());
+    out.flush_all();
+    result
+}
+
+/// Runs a streaming decode into a `Vec`.
+fn collect<T>(decode: impl FnOnce(&mut Sink) -> T) -> (Vec<u8>, T) {
     let mut out = Vec::new();
-    inflate_into(data, budget, &mut Work::of_budget(budget), &mut out)?;
-    Ok(out)
+    let result = decode(&mut |b: &[u8]| out.extend_from_slice(b));
+    (out, result)
 }
 
 /// Decode an RFC 1950 zlib stream (2-byte header, DEFLATE body, 4-byte BE
@@ -173,31 +192,60 @@ pub fn zlib_decompress(data: &[u8], budget: usize) -> Result<Vec<u8>, InflateErr
 /// before the failure (at most `budget`), unverified by the trailer. A header
 /// failure, including `BadHeader`, yields an empty `Vec`.
 pub fn zlib_decompress_partial(data: &[u8], budget: usize) -> (Vec<u8>, Result<(), InflateError>) {
-    let mut out = Vec::new();
-    let result = zlib_into(data, budget, &mut Work::of_budget(budget), &mut out);
-    (out, result)
+    collect(|sink| zlib_decompress_to(data, budget, sink))
 }
 
-/// Like [`zlib_decompress_partial`], metered as [`gzip_decompress_metered`]:
-/// also returns the work past input read, which never exceeds `max_paid`.
+/// [`zlib_decompress_partial`], streaming its output to `sink` (see [`inflate_to`]).
+pub fn zlib_decompress_to(data: &[u8], budget: usize, sink: &mut Sink) -> Result<(), InflateError> {
+    zlib_stream(data, budget, Work::of_budget(budget), sink).2
+}
+
+/// [`zlib_decompress_metered_to`] into a `Vec`.
+#[cfg(test)]
 pub(crate) fn zlib_decompress_metered(
     data: &[u8],
     budget: usize,
     max_paid: usize,
 ) -> (Vec<u8>, Paid, Result<(), InflateError>) {
-    let mut out = Vec::new();
-    let mut work = Work::metered(budget, max_paid);
-    let result = zlib_into(data, budget, &mut work, &mut out);
-    let paid = work.paid_report(&out);
+    let (out, (_, paid, result)) =
+        collect(|sink| zlib_decompress_metered_to(data, budget, max_paid, sink));
     (out, paid, result)
 }
 
-/// Decode a zlib stream into `out`. On error `out` holds whatever was written.
+/// [`zlib_decompress_to`], metered as [`gzip_decompress_metered_to`]; also
+/// returns the input consumed, as it does.
+pub(crate) fn zlib_decompress_metered_to(
+    data: &[u8],
+    budget: usize,
+    max_paid: usize,
+    sink: &mut Sink,
+) -> (usize, Paid, Result<(), InflateError>) {
+    zlib_stream(data, budget, Work::metered(budget, max_paid), sink)
+}
+
+/// A zlib decode under `work` into `sink`: input consumed, work charged, result.
+fn zlib_stream(
+    data: &[u8],
+    budget: usize,
+    mut work: Work,
+    sink: &mut Sink,
+) -> (usize, Paid, Result<(), InflateError>) {
+    let mut out = Output::new(sink, Check::adler32());
+    let mut used = 0;
+    let result = zlib_into(data, budget, &mut work, &mut out, &mut used);
+    out.flush_all();
+    (used, work.paid_report(&out), result)
+}
+
+/// Decode a zlib stream into `out`, setting `consumed` to the input read up
+/// to the end of the DEFLATE data or where it stopped. On error `out` holds
+/// whatever was written.
 fn zlib_into(
     data: &[u8],
     budget: usize,
     work: &mut Work,
-    out: &mut Vec<u8>,
+    out: &mut Output,
+    consumed: &mut usize,
 ) -> Result<(), InflateError> {
     if data.len() < 2 {
         return Err(InflateError::Truncated);
@@ -207,7 +255,11 @@ fn zlib_into(
     }
 
     let body = data.get(2..).ok_or(InflateError::Truncated)?;
-    let used = inflate_into(body, budget, work, out)?;
+    let mut r = BitReader::new(body);
+    let result = inflate_blocks(&mut r, budget, work, out);
+    let used = r.bytes_consumed();
+    *consumed = used.saturating_add(2);
+    result?;
 
     let end = used.checked_add(4).ok_or(InflateError::Malformed)?;
     let trailer: [u8; 4] = body
@@ -215,7 +267,7 @@ fn zlib_into(
         .ok_or(InflateError::Truncated)?
         .try_into()
         .map_err(|_| InflateError::Truncated)?;
-    if adler32(out) != u32::from_be_bytes(trailer) {
+    if out.checksum() != u32::from_be_bytes(trailer) {
         return Err(InflateError::ChecksumMismatch);
     }
     Ok(())
@@ -266,33 +318,58 @@ pub fn gzip_decompress_consumed(
     data: &[u8],
     budget: usize,
 ) -> (Vec<u8>, usize, Result<(), InflateError>) {
-    let mut out = Vec::new();
-    let mut used = 0;
-    let result = gzip_into(
-        data,
-        budget,
-        &mut Work::of_budget(budget),
-        &mut out,
-        &mut used,
-    );
+    let (out, (used, result)) = collect(|sink| gzip_decompress_to(data, budget, sink));
     (out, used, result)
 }
 
-/// Like [`gzip_decompress_consumed`], also capping the work past input read
-/// (output written plus the per-block charges) at `max_paid`, for a caller
-/// that has already paid for the input. Also returns that work, which never
-/// exceeds `max_paid`, as a [`Paid`].
+/// [`gzip_decompress_consumed`], streaming its output to `sink` (see
+/// [`inflate_to`]); returns the input consumed and the result.
+pub fn gzip_decompress_to(
+    data: &[u8],
+    budget: usize,
+    sink: &mut Sink,
+) -> (usize, Result<(), InflateError>) {
+    let (used, _, result) = gzip_stream(data, budget, Work::of_budget(budget), sink);
+    (used, result)
+}
+
+/// [`gzip_decompress_metered_to`] into a `Vec`.
+#[cfg(test)]
 pub(crate) fn gzip_decompress_metered(
     data: &[u8],
     budget: usize,
     max_paid: usize,
 ) -> (Vec<u8>, usize, Paid, Result<(), InflateError>) {
-    let mut out = Vec::new();
-    let mut used = 0;
-    let mut work = Work::metered(budget, max_paid);
-    let result = gzip_into(data, budget, &mut work, &mut out, &mut used);
-    let paid = work.paid_report(&out);
+    let (out, (used, paid, result)) =
+        collect(|sink| gzip_decompress_metered_to(data, budget, max_paid, sink));
     (out, used, paid, result)
+}
+
+/// Like [`gzip_decompress_to`], also capping the work past input read
+/// (output written plus the per-block charges) at `max_paid`, for a caller
+/// that has already paid for the input. Also returns that work, which never
+/// exceeds `max_paid`, as a [`Paid`].
+pub(crate) fn gzip_decompress_metered_to(
+    data: &[u8],
+    budget: usize,
+    max_paid: usize,
+    sink: &mut Sink,
+) -> (usize, Paid, Result<(), InflateError>) {
+    gzip_stream(data, budget, Work::metered(budget, max_paid), sink)
+}
+
+/// A gzip decode under `work` into `sink`: input consumed, work charged, result.
+fn gzip_stream(
+    data: &[u8],
+    budget: usize,
+    mut work: Work,
+    sink: &mut Sink,
+) -> (usize, Paid, Result<(), InflateError>) {
+    let mut out = Output::new(sink, Check::crc32());
+    let mut used = 0;
+    let result = gzip_into(data, budget, &mut work, &mut out, &mut used);
+    out.flush_all();
+    (used, work.paid_report(&out), result)
 }
 
 /// Length of the RFC 1952 header that opens `data`. `BadHeader` if it is not
@@ -359,7 +436,7 @@ fn gzip_into(
     data: &[u8],
     budget: usize,
     work: &mut Work,
-    out: &mut Vec<u8>,
+    out: &mut Output,
     consumed: &mut usize,
 ) -> Result<(), InflateError> {
     let off = gzip_header_len(data)?;
@@ -384,7 +461,7 @@ fn gzip_into(
         .try_into()
         .map_err(|_| InflateError::Truncated)?;
 
-    if crc32(out) != u32::from_le_bytes(crc) {
+    if out.checksum() != u32::from_le_bytes(crc) {
         return Err(InflateError::ChecksumMismatch);
     }
     // ISIZE is the output length mod 2^32; a mismatch means the stream and
@@ -401,7 +478,7 @@ fn inflate_into(
     data: &[u8],
     budget: usize,
     work: &mut Work,
-    out: &mut Vec<u8>,
+    out: &mut Output,
 ) -> Result<usize, InflateError> {
     let mut r = BitReader::new(data);
     inflate_blocks(&mut r, budget, work, out)?;
@@ -413,9 +490,8 @@ fn inflate_blocks(
     r: &mut BitReader,
     budget: usize,
     work: &mut Work,
-    out: &mut Vec<u8>,
+    out: &mut Output,
 ) -> Result<(), InflateError> {
-    out.reserve(budget.min(INITIAL_OUTPUT_CAPACITY));
     loop {
         work.check(r, out)?;
         let final_block = r.bits(1)? == 1;
@@ -444,7 +520,7 @@ fn inflate_blocks(
 /// One block of type `btype`, its output capped at `limit`.
 fn block(
     r: &mut BitReader,
-    out: &mut Vec<u8>,
+    out: &mut Output,
     limit: usize,
     btype: u32,
 ) -> Result<(), InflateError> {
@@ -464,7 +540,7 @@ fn block(
 }
 
 /// An uncompressed block: byte-aligned, with a length and its ones-complement.
-fn stored_block(r: &mut BitReader, out: &mut Vec<u8>, budget: usize) -> Result<(), InflateError> {
+fn stored_block(r: &mut BitReader, out: &mut Output, budget: usize) -> Result<(), InflateError> {
     let len = r.take_u16_le()?;
     let nlen = r.take_u16_le()?;
     if len != !nlen {
@@ -475,7 +551,7 @@ fn stored_block(r: &mut BitReader, out: &mut Vec<u8>, budget: usize) -> Result<(
     let room = budget.saturating_sub(out.len());
     let want = len.min(room);
     let bytes = r.take_up_to(want);
-    out.extend_from_slice(bytes);
+    out.extend(bytes);
     if len > room {
         return Err(InflateError::BudgetExceeded);
     }
@@ -490,7 +566,7 @@ fn stored_block(r: &mut BitReader, out: &mut Vec<u8>, budget: usize) -> Result<(
 /// never reaches 256 returns `Truncated` rather than looping.
 fn compressed_block(
     r: &mut BitReader,
-    out: &mut Vec<u8>,
+    out: &mut Output,
     budget: usize,
     lit: &Huffman,
     dist: &Huffman,
@@ -526,13 +602,7 @@ fn compressed_block(
                 let room = budget.saturating_sub(out.len());
                 let n = len.min(room);
 
-                // Byte-at-a-time: `len` may exceed `distance`, so the copy can
-                // legitimately read bytes it just wrote.
-                let start = out.len() - distance;
-                for i in 0..n {
-                    let b = *out.get(start + i).ok_or(InflateError::Malformed)?;
-                    out.push(b);
-                }
+                out.copy_back(distance, n)?;
                 if len > room {
                     return Err(InflateError::BudgetExceeded);
                 }
@@ -757,6 +827,127 @@ impl Huffman {
     }
 }
 
+/// Bytes kept for back-references: DEFLATE's largest distance (RFC 1951 §3.2.5).
+const WINDOW: usize = 32 * 1024;
+
+/// Bytes held past [`WINDOW`] before they are handed to the sink.
+const FLUSH_CHUNK: usize = 64 * 1024;
+
+/// The trailer checksum a stream's output is checked against.
+enum Check {
+    None,
+    Crc32(u32),
+    /// Adler-32's two running sums.
+    Adler32(u32, u32),
+}
+
+impl Check {
+    fn crc32() -> Self {
+        Check::Crc32(CRC32_INIT)
+    }
+
+    fn adler32() -> Self {
+        Check::Adler32(1, 0)
+    }
+
+    fn update(&mut self, data: &[u8]) {
+        match self {
+            Check::None => {}
+            Check::Crc32(crc) => *crc = crc32_update(*crc, data),
+            Check::Adler32(a, b) => (*a, *b) = adler32_update((*a, *b), data),
+        }
+    }
+
+    fn value(&self) -> u32 {
+        match *self {
+            Check::None => 0,
+            Check::Crc32(crc) => !crc,
+            Check::Adler32(a, b) => (b << 16) | a,
+        }
+    }
+}
+
+/// A stream's output: the last [`WINDOW`] bytes or more for back-references,
+/// with older bytes checksummed and handed to the sink. Callers must call
+/// [`Output::flush_all`] when the decode ends, on error too.
+struct Output<'s, 'k> {
+    window: Vec<u8>,
+    /// Bytes already handed to `sink`.
+    flushed: usize,
+    sink: &'s mut Sink<'k>,
+    check: Check,
+}
+
+impl<'s, 'k> Output<'s, 'k> {
+    fn new(sink: &'s mut Sink<'k>, check: Check) -> Self {
+        Output {
+            window: Vec::new(),
+            flushed: 0,
+            sink,
+            check,
+        }
+    }
+
+    /// Bytes written so far.
+    fn len(&self) -> usize {
+        self.flushed.saturating_add(self.window.len())
+    }
+
+    fn push(&mut self, b: u8) {
+        self.window.push(b);
+        self.flush_old();
+    }
+
+    fn extend(&mut self, bytes: &[u8]) {
+        self.window.extend_from_slice(bytes);
+        self.flush_old();
+    }
+
+    /// Appends `n` bytes copied from `distance` back, one at a time, since the
+    /// copy may read bytes it just wrote. `distance` must be in `1..=len()`.
+    fn copy_back(&mut self, distance: usize, n: usize) -> Result<(), InflateError> {
+        for _ in 0..n {
+            let at = self
+                .window
+                .len()
+                .checked_sub(distance)
+                .ok_or(InflateError::Malformed)?;
+            let b = *self.window.get(at).ok_or(InflateError::Malformed)?;
+            self.push(b);
+        }
+        Ok(())
+    }
+
+    /// Hands all but the last [`WINDOW`] bytes to the sink once enough build up.
+    fn flush_old(&mut self) {
+        if self.window.len() >= WINDOW + FLUSH_CHUNK {
+            self.flush_to(self.window.len() - WINDOW);
+        }
+    }
+
+    fn flush_to(&mut self, n: usize) {
+        let n = n.min(self.window.len());
+        if n == 0 {
+            return;
+        }
+        let (old, _) = self.window.split_at(n);
+        self.check.update(old);
+        (self.sink)(old);
+        self.flushed = self.flushed.saturating_add(n);
+        self.window.drain(..n);
+    }
+
+    fn flush_all(&mut self) {
+        self.flush_to(self.window.len());
+    }
+
+    /// The checksum of everything written; flushes it all first.
+    fn checksum(&mut self) -> u32 {
+        self.flush_all();
+        self.check.value()
+    }
+}
+
 /// LSB-first bit reader. Running out of input is `Truncated` — never a panic,
 /// never a silent zero-fill.
 struct BitReader<'a> {
@@ -850,27 +1041,56 @@ impl<'a> BitReader<'a> {
     }
 }
 
-/// CRC-32 (reflected IEEE polynomial, RFC 1952 §8), computed bitwise —
-/// inputs are kilobytes.
+/// CRC-32 (reflected IEEE polynomial, RFC 1952 §8).
+#[cfg(test)]
 pub(crate) fn crc32(data: &[u8]) -> u32 {
-    let mut crc: u32 = 0xFFFF_FFFF;
-    for &byte in data {
-        crc ^= byte as u32;
-        for _ in 0..8 {
-            let mask = (crc & 1).wrapping_neg();
-            crc = (crc >> 1) ^ (0xEDB8_8320 & mask);
-        }
-    }
-    !crc
+    !crc32_update(CRC32_INIT, data)
 }
 
-/// Adler-32 (RFC 1950 §9). Chunked at 5552 bytes — the longest run before the
-/// accumulators can overflow 32 bits.
+/// The CRC-32 register before any input.
+const CRC32_INIT: u32 = 0xFFFF_FFFF;
+
+/// The register after shifting each byte value through it bit by bit.
+const CRC32_TABLE: [u32; 256] = crc32_table();
+
+const fn crc32_table() -> [u32; 256] {
+    let mut table = [0u32; 256];
+    let mut i = 0;
+    while i < 256 {
+        let mut crc = i as u32;
+        let mut bit = 0;
+        while bit < 8 {
+            let mask = (crc & 1).wrapping_neg();
+            crc = (crc >> 1) ^ (0xEDB8_8320 & mask);
+            bit += 1;
+        }
+        table[i] = crc;
+        i += 1;
+    }
+    table
+}
+
+/// Feeds `data` through a running CRC-32 register (not yet inverted).
+fn crc32_update(mut crc: u32, data: &[u8]) -> u32 {
+    for &byte in data {
+        let index = ((crc ^ u32::from(byte)) & 0xFF) as usize;
+        crc = (crc >> 8) ^ CRC32_TABLE[index];
+    }
+    crc
+}
+
+/// Adler-32 (RFC 1950 §9).
+#[cfg(test)]
 pub(crate) fn adler32(data: &[u8]) -> u32 {
+    let (a, b) = adler32_update((1, 0), data);
+    (b << 16) | a
+}
+
+/// Feeds `data` into Adler-32's running sums `(a, b)`, each kept below the
+/// modulus. Chunked at 5552 bytes, the longest run before they can overflow.
+fn adler32_update((mut a, mut b): (u32, u32), data: &[u8]) -> (u32, u32) {
     const MOD: u32 = 65521;
     const NMAX: usize = 5552;
-    let mut a: u32 = 1;
-    let mut b: u32 = 0;
     for chunk in data.chunks(NMAX) {
         for &byte in chunk {
             a += byte as u32;
@@ -879,7 +1099,7 @@ pub(crate) fn adler32(data: &[u8]) -> u32 {
         a %= MOD;
         b %= MOD;
     }
-    (b << 16) | a
+    (a, b)
 }
 
 /// Bits in one empty dynamic block built by [`empty_dynamic_blocks`].
@@ -1472,6 +1692,17 @@ mod tests {
     }
 
     #[test]
+    fn crc32_table_matches_the_bitwise_register() {
+        for (i, &entry) in CRC32_TABLE.iter().enumerate() {
+            let mut crc = i as u32;
+            for _ in 0..8 {
+                crc = (crc >> 1) ^ (0xEDB8_8320 & (crc & 1).wrapping_neg());
+            }
+            assert_eq!(entry, crc, "{i}");
+        }
+    }
+
+    #[test]
     fn crc32_matches_known_values() {
         assert_eq!(crc32(b""), 0);
         assert_eq!(crc32(b"a"), 0xE8B7_BE43);
@@ -1953,6 +2184,7 @@ mod tests {
         let full = BLOCK_WORK + body.len();
         let paid = Paid {
             work: full,
+            output: body.len(),
             capped: false,
         };
         assert_eq!(
@@ -1964,6 +2196,7 @@ mod tests {
             assert_eq!(result, Err(InflateError::BudgetExceeded), "{cap}");
             assert_eq!(out.len(), cap.saturating_sub(BLOCK_WORK), "{cap}");
             assert!(paid.work <= cap, "{cap}: {paid:?}");
+            assert_eq!(paid.output, out.len(), "{cap}");
             assert!(paid.capped, "{cap}");
         }
     }
@@ -2015,5 +2248,41 @@ mod tests {
         assert!(!paid.capped);
         let (_, paid, _) = zlib_decompress_metered(&zlib, BIG, full - 1);
         assert!(paid.capped);
+    }
+
+    /// Output several flushes long, with back-references across each flush,
+    /// decodes to zlib's output in every wrapper and streams in bounded runs.
+    #[test]
+    fn long_output_streams_through_the_window() {
+        let plain = include_bytes!("../testdata/inflate/window_long.out");
+        assert!(plain.len() > 2 * (WINDOW + FLUSH_CHUNK));
+        let raw = include_bytes!("../testdata/inflate/window_long.in");
+        let zlib = include_bytes!("../testdata/inflate/zlib_window_long.in");
+        let gzip = include_bytes!("../testdata/inflate/gzip_window_long.in");
+        type Decode<'a> = Box<dyn Fn(&mut Sink) -> Result<(), InflateError> + 'a>;
+        let cases: [(&str, Decode); 3] = [
+            ("raw", Box::new(|s: &mut Sink| inflate_to(raw, BIG, s))),
+            (
+                "zlib",
+                Box::new(|s: &mut Sink| zlib_decompress_to(zlib, BIG, s)),
+            ),
+            (
+                "gzip",
+                Box::new(|s: &mut Sink| gzip_decompress_to(gzip, BIG, s).1),
+            ),
+        ];
+        for (name, decode) in cases {
+            let mut runs: Vec<Vec<u8>> = Vec::new();
+            let result = decode(&mut |b: &[u8]| runs.push(b.to_vec()));
+            assert_eq!(result, Ok(()), "{name}");
+            assert!(runs.iter().all(|r| !r.is_empty()), "{name}: an empty run");
+            assert!(runs.len() > 2, "{name}");
+            let longest = WINDOW + FLUSH_CHUNK + u16::MAX as usize;
+            assert!(runs.iter().all(|r| r.len() <= longest), "{name}");
+            assert_eq!(runs.concat(), plain, "{name}");
+        }
+        assert_eq!(inflate(raw, BIG).as_deref(), Ok(&plain[..]));
+        assert_eq!(zlib_decompress(zlib, BIG).as_deref(), Ok(&plain[..]));
+        assert_eq!(gzip_decompress(gzip, BIG).as_deref(), Ok(&plain[..]));
     }
 }

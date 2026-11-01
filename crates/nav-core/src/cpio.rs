@@ -8,7 +8,8 @@
 //! rule to weigh, not a path this code opens — callers must keep it that way.
 //!
 //! Hand-written per §3: no panics, every field bounds-checked, explicit
-//! ceilings on entry count and total bytes.
+//! ceilings on entry count and total bytes. [`CpioStream`] walks the same
+//! format as it arrives, holding at most one member's body (up to a cap).
 
 /// Header sizes and magics for the two families this reader accepts.
 const ODC_MAGIC: &[u8] = b"070707";
@@ -70,7 +71,8 @@ pub enum CpioHalt {
     Malformed,
     /// Hit [`CpioLimits::max_entries`].
     EntryLimit,
-    /// Hit [`CpioLimits::max_total_bytes`].
+    /// Hit [`CpioLimits::max_total_bytes`], or in a [`CpioStream`] a name
+    /// longer than [`StreamLimits::max_member_bytes`].
     ByteLimit,
 }
 
@@ -311,6 +313,406 @@ fn parse_radix(field: &[u8], radix: u32) -> Option<u64> {
         v = v.checked_mul(u64::from(radix))?.checked_add(u64::from(d))?;
     }
     Some(v)
+}
+
+// --- Streaming walk ------------------------------------------------------
+
+/// Ceilings on a [`CpioStream`]. Memory is bounded by `max_member_bytes`, not
+/// by the archive's size.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StreamLimits {
+    /// Members walked before the walk halts with [`CpioHalt::EntryLimit`].
+    pub max_entries: usize,
+    /// Bytes kept of one member's body, the longest name read (longer halts
+    /// with [`CpioHalt::ByteLimit`]), and bytes kept of non-cpio input.
+    pub max_member_bytes: usize,
+}
+
+/// How a [`StreamedMember`]'s body ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MemberEnd {
+    /// `data` is the whole body.
+    Whole,
+    /// The body was longer than [`StreamLimits::max_member_bytes`]: `data` is
+    /// its first part, and the rest was read past and dropped.
+    OverCap,
+    /// The input ended inside the body: `data` is what arrived (at most the cap).
+    CutShort,
+}
+
+/// One archive member as [`CpioStream`] hands it over.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StreamedMember {
+    /// As [`CpioEntry::name`].
+    pub name: String,
+    pub name_lossy: bool,
+    pub mode: u32,
+    pub data: Vec<u8>,
+    pub end: MemberEnd,
+}
+
+impl StreamedMember {
+    /// As [`CpioEntry::is_regular_file`].
+    pub fn is_regular_file(&self) -> bool {
+        self.mode & 0o170000 == 0o100000
+    }
+}
+
+/// How a [`CpioStream`] ended.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StreamEnd {
+    /// The input is not cpio ([`parse`] would return `None`): its first
+    /// `max_member_bytes` bytes, and whether there was more.
+    NotCpio { raw: Vec<u8>, more: bool },
+    /// As [`CpioArchive::halted`] and [`CpioArchive::cut_short`]; a cut-short
+    /// member comes only with `Truncated`, with [`MemberEnd::CutShort`].
+    Archive {
+        halted: Option<CpioHalt>,
+        cut_short: Option<StreamedMember>,
+    },
+}
+
+/// Where a [`CpioStream`] is in the archive.
+#[derive(Debug)]
+enum Walk {
+    /// Fewer than six bytes seen.
+    Start,
+    NotCpio,
+    Header,
+    Body {
+        member: StreamedMember,
+        /// newc name padding still to skip before the body.
+        skip: usize,
+        left: usize,
+        /// Padding after the body, before the next header.
+        pad: usize,
+    },
+    Pad(usize),
+    Done(Option<CpioHalt>),
+}
+
+/// A cpio walk over input that arrives in pieces. Yields the members, halt
+/// and cut-short member [`parse`] would on the joined input, except that no
+/// total-size ceiling applies and only [`StreamLimits`] bound it: a body is
+/// kept up to `max_member_bytes` ([`MemberEnd::OverCap`] past that). Feed it
+/// with [`CpioStream::push`], then call [`CpioStream::finish`].
+#[derive(Debug)]
+pub struct CpioStream {
+    limits: StreamLimits,
+    walk: Walk,
+    /// Header and name bytes waiting for the rest, or the non-cpio bytes kept.
+    buf: Vec<u8>,
+    /// Members started so far.
+    entries: usize,
+    /// Input consumed before `buf`: newc aligns to offsets in the whole archive.
+    consumed: usize,
+    /// Non-cpio input went past what `buf` keeps.
+    not_cpio_cut: bool,
+}
+
+impl CpioStream {
+    pub fn new(limits: StreamLimits) -> Self {
+        CpioStream {
+            limits,
+            walk: Walk::Start,
+            buf: Vec::new(),
+            entries: 0,
+            consumed: 0,
+            not_cpio_cut: false,
+        }
+    }
+
+    /// Feeds the next input bytes; returns the members they completed, in order.
+    pub fn push(&mut self, bytes: &[u8]) -> Vec<StreamedMember> {
+        let mut done = Vec::new();
+        self.feed(bytes, &mut done);
+        done
+    }
+
+    /// Ends the input: the members that completes, and how the walk ended.
+    pub fn finish(mut self) -> (Vec<StreamedMember>, StreamEnd) {
+        let mut done = Vec::new();
+        loop {
+            match &self.walk {
+                Walk::Start | Walk::NotCpio => {
+                    let raw = std::mem::take(&mut self.buf);
+                    let more = self.not_cpio_cut;
+                    return (done, StreamEnd::NotCpio { raw, more });
+                }
+                Walk::Header => {
+                    let pending = std::mem::take(&mut self.buf);
+                    let base = self.consumed;
+                    let step = header(
+                        &mut self.walk,
+                        &mut self.entries,
+                        &self.limits,
+                        (base, &pending),
+                        true,
+                    );
+                    match step {
+                        Some(Ok(used)) => {
+                            self.consumed = base.saturating_add(used);
+                            self.settle(&mut done);
+                            self.feed(pending.get(used..).unwrap_or_default(), &mut done);
+                        }
+                        Some(Err(halt)) => self.walk = Walk::Done(halt),
+                        // `header` always decides at the end.
+                        None => self.walk = Walk::Done(Some(CpioHalt::Truncated)),
+                    }
+                }
+                Walk::Body { .. } => {
+                    let Walk::Body { mut member, .. } =
+                        std::mem::replace(&mut self.walk, Walk::Done(None))
+                    else {
+                        unreachable!("matched Body above")
+                    };
+                    member.end = MemberEnd::CutShort;
+                    let end = StreamEnd::Archive {
+                        halted: Some(CpioHalt::Truncated),
+                        cut_short: Some(member),
+                    };
+                    return (done, end);
+                }
+                // `settle` leaves no empty padding behind.
+                Walk::Pad(_) => self.walk = Walk::Done(Some(CpioHalt::Truncated)),
+                Walk::Done(halted) => {
+                    let end = StreamEnd::Archive {
+                        halted: *halted,
+                        cut_short: None,
+                    };
+                    return (done, end);
+                }
+            }
+        }
+    }
+
+    /// Walks `input`, borrowing it: only header and name bytes that have not
+    /// all arrived, and non-cpio bytes kept, are copied into `buf`.
+    fn feed(&mut self, mut input: &[u8], done: &mut Vec<StreamedMember>) {
+        while !input.is_empty() {
+            match &mut self.walk {
+                Walk::Start => {
+                    let take = input.len().min(6 - self.buf.len());
+                    let (head, rest) = input.split_at(take);
+                    self.buf.extend_from_slice(head);
+                    input = rest;
+                    if self.buf.len() == 6 {
+                        let magic = self.buf.as_slice();
+                        self.walk =
+                            if magic == ODC_MAGIC || magic == NEWC_MAGIC || magic == NEWC_CRC_MAGIC
+                            {
+                                Walk::Header
+                            } else {
+                                Walk::NotCpio
+                            };
+                    }
+                }
+                Walk::NotCpio => {
+                    let room = self.limits.max_member_bytes.saturating_sub(self.buf.len());
+                    let keep = input.get(..room).unwrap_or(input);
+                    self.not_cpio_cut |= keep.len() < input.len();
+                    self.buf.extend_from_slice(keep);
+                    return;
+                }
+                Walk::Done(_) => return,
+                Walk::Header if self.buf.is_empty() => {
+                    let base = self.consumed;
+                    match header(
+                        &mut self.walk,
+                        &mut self.entries,
+                        &self.limits,
+                        (base, input),
+                        false,
+                    ) {
+                        Some(Ok(used)) => {
+                            self.consumed = base.saturating_add(used);
+                            input = input.get(used..).unwrap_or_default();
+                            self.settle(done);
+                        }
+                        Some(Err(halt)) => {
+                            self.walk = Walk::Done(halt);
+                            return;
+                        }
+                        None => {
+                            // Bounded: `header` waits only for lookahead or a
+                            // name within the cap.
+                            self.buf.extend_from_slice(input);
+                            return;
+                        }
+                    }
+                }
+                Walk::Header => {
+                    // Top up the pending header just far enough to decide it.
+                    let want = header_want(&self.buf).saturating_sub(self.buf.len());
+                    let (more, rest) = input.split_at(want.min(input.len()));
+                    self.buf.extend_from_slice(more);
+                    input = rest;
+                    let pending = std::mem::take(&mut self.buf);
+                    let base = self.consumed;
+                    match header(
+                        &mut self.walk,
+                        &mut self.entries,
+                        &self.limits,
+                        (base, &pending),
+                        false,
+                    ) {
+                        Some(Ok(used)) => {
+                            self.consumed = base.saturating_add(used);
+                            self.settle(done);
+                            // At most a header's lookahead past the name.
+                            self.feed(pending.get(used..).unwrap_or_default(), done);
+                        }
+                        Some(Err(halt)) => {
+                            self.walk = Walk::Done(halt);
+                            return;
+                        }
+                        None => self.buf = pending,
+                    }
+                }
+                Walk::Body {
+                    member, skip, left, ..
+                } => {
+                    let n = (*skip).min(input.len());
+                    *skip -= n;
+                    let body_from = n;
+                    let n = if *skip == 0 {
+                        (*left).min(input.len() - body_from)
+                    } else {
+                        0
+                    };
+                    let body = input.get(body_from..body_from + n).unwrap_or_default();
+                    let room = self
+                        .limits
+                        .max_member_bytes
+                        .saturating_sub(member.data.len());
+                    if body.len() > room {
+                        member.end = MemberEnd::OverCap;
+                    }
+                    member
+                        .data
+                        .extend_from_slice(body.get(..room).unwrap_or(body));
+                    *left -= n;
+                    let used = body_from + n;
+                    self.consumed = self.consumed.saturating_add(used);
+                    input = input.get(used..).unwrap_or_default();
+                    self.settle(done);
+                }
+                Walk::Pad(left) => {
+                    let n = (*left).min(input.len());
+                    *left -= n;
+                    self.consumed = self.consumed.saturating_add(n);
+                    input = input.get(n..).unwrap_or_default();
+                    self.settle(done);
+                }
+            }
+        }
+    }
+
+    /// Moves past states that need no more input: a finished body (handing
+    /// over its member) and spent padding.
+    fn settle(&mut self, done: &mut Vec<StreamedMember>) {
+        loop {
+            match &self.walk {
+                Walk::Body {
+                    skip: 0,
+                    left: 0,
+                    pad,
+                    ..
+                } => {
+                    let pad = *pad;
+                    if let Walk::Body { member, .. } =
+                        std::mem::replace(&mut self.walk, Walk::Pad(pad))
+                    {
+                        done.push(member);
+                    }
+                }
+                Walk::Pad(0) => self.walk = Walk::Header,
+                _ => return,
+            }
+        }
+    }
+}
+
+/// How many bytes of a pending header `header` needs to decide it: its
+/// lookahead, then through the end of the name once the header parses.
+fn header_want(pending: &[u8]) -> usize {
+    if pending.len() < NEWC_HEADER {
+        return NEWC_HEADER;
+    }
+    let parsed = match pending.get(..6) {
+        Some(m) if m == ODC_MAGIC => read_odc(pending, 0),
+        Some(m) if m == NEWC_MAGIC || m == NEWC_CRC_MAGIC => read_newc(pending, 0),
+        _ => None,
+    };
+    parsed.map_or(NEWC_HEADER, |hdr| hdr.name_end.max(NEWC_HEADER))
+}
+
+/// Reads the [`CpioStream`] header that opens `avail`, at archive offset
+/// `base`, as [`parse`] would, once enough of it is there or `at_end`. `None`
+/// to wait for more input; `Ok(n)` when it moved `walk` to the member's body
+/// after `n` header and name bytes; `Err` with the walk's end (`None` at the
+/// trailer).
+fn header(
+    walk: &mut Walk,
+    entries: &mut usize,
+    limits: &StreamLimits,
+    (base, avail): (usize, &[u8]),
+    at_end: bool,
+) -> Option<Result<usize, Option<CpioHalt>>> {
+    // `parse` decides truncated versus malformed on this much lookahead.
+    if avail.len() < NEWC_HEADER && !at_end {
+        return None;
+    }
+    let parsed = match avail.get(..6) {
+        None => return Some(Err(Some(CpioHalt::Truncated))),
+        Some(m) if m == ODC_MAGIC => read_odc(avail, 0),
+        Some(m) if m == NEWC_MAGIC || m == NEWC_CRC_MAGIC => read_newc(avail, 0),
+        Some(_) => return Some(Err(Some(CpioHalt::Malformed))),
+    };
+    let Some(hdr) = parsed else {
+        return Some(Err(Some(if avail.len() < NEWC_HEADER {
+            CpioHalt::Truncated
+        } else {
+            CpioHalt::Malformed
+        })));
+    };
+    if hdr.name_end - hdr.name_start > limits.max_member_bytes {
+        return Some(Err(Some(CpioHalt::ByteLimit)));
+    }
+    let Some(name_bytes) = avail.get(hdr.name_start..hdr.name_end) else {
+        return at_end.then_some(Err(Some(CpioHalt::Truncated)));
+    };
+    // The recorded namesize includes a trailing NUL.
+    let name_bytes = name_bytes.strip_suffix(b"\0").unwrap_or(name_bytes);
+    if name_bytes == TRAILER {
+        return Some(Err(None));
+    }
+    if *entries >= limits.max_entries {
+        return Some(Err(Some(CpioHalt::EntryLimit)));
+    }
+    // Padding is to offsets in the whole archive, which `avail` starts `base` into.
+    let layout = base.checked_add(hdr.name_end).and_then(|name_end| {
+        let data_start = align_up(name_end, hdr.align)?;
+        let data_end = data_start.checked_add(hdr.filesize)?;
+        Some((data_start - name_end, data_end, hdr.next_offset(data_end)?))
+    });
+    let Some((skip, data_end, next)) = layout else {
+        return Some(Err(Some(CpioHalt::Malformed)));
+    };
+    *entries += 1;
+    *walk = Walk::Body {
+        member: StreamedMember {
+            name: String::from_utf8_lossy(name_bytes).into_owned(),
+            name_lossy: std::str::from_utf8(name_bytes).is_err(),
+            mode: hdr.mode,
+            data: Vec::new(),
+            end: MemberEnd::Whole,
+        },
+        skip,
+        left: hdr.filesize,
+        pad: next - data_end,
+    };
+    Some(Ok(hdr.name_end))
 }
 
 #[cfg(test)]
@@ -623,6 +1025,197 @@ mod tests {
                 }
             }
         }
+    }
+
+    // --- Streaming walk ---------------------------------------------------
+
+    /// Streams `data` in `chunk`-byte pieces.
+    fn stream(data: &[u8], chunk: usize, limits: StreamLimits) -> (Vec<StreamedMember>, StreamEnd) {
+        let mut walk = CpioStream::new(limits);
+        let mut members = Vec::new();
+        for piece in data.chunks(chunk.max(1)) {
+            members.extend(walk.push(piece));
+        }
+        let (last, end) = walk.finish();
+        members.extend(last);
+        (members, end)
+    }
+
+    /// [`parse`]'s view of `data` in [`stream`]'s terms, with no byte ceiling.
+    fn parsed_as_stream(data: &[u8], max_entries: usize) -> (Vec<StreamedMember>, StreamEnd) {
+        let limits = CpioLimits {
+            max_entries,
+            max_total_bytes: usize::MAX,
+        };
+        let member = |e: &CpioEntry, end| StreamedMember {
+            name: e.name.clone(),
+            name_lossy: e.name_lossy,
+            mode: e.mode,
+            data: e.data.to_vec(),
+            end,
+        };
+        match parse(data, &limits) {
+            None => (
+                Vec::new(),
+                StreamEnd::NotCpio {
+                    raw: data.to_vec(),
+                    more: false,
+                },
+            ),
+            Some(a) => (
+                a.entries
+                    .iter()
+                    .map(|e| member(e, MemberEnd::Whole))
+                    .collect(),
+                StreamEnd::Archive {
+                    halted: a.halted,
+                    cut_short: a.cut_short.as_ref().map(|e| member(e, MemberEnd::CutShort)),
+                },
+            ),
+        }
+    }
+
+    const UNCAPPED: StreamLimits = StreamLimits {
+        max_entries: 16,
+        max_member_bytes: usize::MAX,
+    };
+
+    /// Without a cap in play, the stream sees what `parse` sees, however the
+    /// input is split: every vector, its prefixes, and some bit flips.
+    #[test]
+    fn a_stream_walks_as_parse_does_however_it_is_split() {
+        for (name, bytes) in all_vectors() {
+            let mut inputs: Vec<Vec<u8>> = (0..bytes.len().min(300))
+                .map(|n| bytes[..n].to_vec())
+                .collect();
+            inputs.push(bytes.to_vec());
+            // A newc member after an odc one, at an offset newc never aligns to.
+            inputs.push([odc("a", b""), bytes.to_vec()].concat());
+            for i in (0..bytes.len().min(200)).step_by(7) {
+                let mut v = bytes.to_vec();
+                v[i] ^= 0x10;
+                inputs.push(v);
+            }
+            for input in &inputs {
+                let want = parsed_as_stream(input, UNCAPPED.max_entries);
+                for chunk in [1, 5, 76, 110, 111, 4096] {
+                    assert_eq!(
+                        stream(input, chunk, UNCAPPED),
+                        want,
+                        "{name}: {} bytes in {chunk}-byte pieces",
+                        input.len()
+                    );
+                }
+            }
+        }
+    }
+
+    fn odc(name: &str, body: &[u8]) -> Vec<u8> {
+        let mut v = format!(
+            "070707000000000000100644000000000000000001000000{:011o}{:06o}{:011o}",
+            0,
+            name.len() + 1,
+            body.len()
+        )
+        .into_bytes();
+        v.extend_from_slice(name.as_bytes());
+        v.push(0);
+        v.extend_from_slice(body);
+        v
+    }
+
+    /// A body over the cap is kept up to it and read past; the walk goes on.
+    #[test]
+    fn a_member_over_the_cap_is_kept_up_to_it_and_read_past() {
+        let limits = StreamLimits {
+            max_entries: 16,
+            max_member_bytes: 100,
+        };
+        let big = vec![b'x'; 250];
+        let archive = [
+            odc("pad", &big),
+            odc("preinstall", b"echo hi\n"),
+            odc("TRAILER!!!", b""),
+        ]
+        .concat();
+        for chunk in [1, 7, 100, 4096] {
+            let (members, end) = stream(&archive, chunk, limits);
+            assert_eq!(members.len(), 2, "{chunk}");
+            assert_eq!(members[0].end, MemberEnd::OverCap);
+            assert_eq!(members[0].data, &big[..100]);
+            assert_eq!(members[1].end, MemberEnd::Whole);
+            assert_eq!(members[1].data, b"echo hi\n");
+            assert_eq!(
+                end,
+                StreamEnd::Archive {
+                    halted: None,
+                    cut_short: None
+                }
+            );
+        }
+        // Exactly the cap is whole; cut inside an over-cap body is cut short.
+        let (members, _) = stream(&odc("f", &big[..100]), 9, limits);
+        assert_eq!(members[0].end, MemberEnd::Whole);
+        let (members, end) = stream(&odc("f", &big)[..200], 9, limits);
+        assert!(members.is_empty());
+        let StreamEnd::Archive {
+            halted: Some(CpioHalt::Truncated),
+            cut_short: Some(cut),
+        } = end
+        else {
+            panic!("{end:?}");
+        };
+        assert_eq!((cut.end, cut.data.len()), (MemberEnd::CutShort, 100));
+    }
+
+    /// Bodies are walked in place: only an unfinished header is copied.
+    #[test]
+    fn a_stream_copies_only_unfinished_headers() {
+        let limits = StreamLimits {
+            max_entries: 16,
+            max_member_bytes: 100,
+        };
+        let archive = [odc("big", &[b'x'; 5000]), odc("next", b"")].concat();
+        let mut walk = CpioStream::new(limits);
+        // Through the first body and into the second header.
+        let members = walk.push(&archive[..archive.len() - 40]);
+        assert_eq!(members.len(), 1);
+        assert!(walk.buf.len() <= NEWC_HEADER, "{}", walk.buf.len());
+        // The last header is short of the lookahead until the end.
+        assert!(walk.push(&archive[archive.len() - 40..]).is_empty());
+        let (members, _) = walk.finish();
+        assert_eq!(members.len(), 1);
+    }
+
+    /// The other ceilings: names, member count, and non-cpio bytes kept.
+    #[test]
+    fn stream_limits_halt_or_bound_the_walk() {
+        let limits = StreamLimits {
+            max_entries: 2,
+            max_member_bytes: 8,
+        };
+        let halted = |data: &[u8]| match stream(data, 3, limits).1 {
+            StreamEnd::Archive { halted, .. } => halted,
+            StreamEnd::NotCpio { .. } => panic!("cpio"),
+        };
+        assert_eq!(halted(&odc("a-long-name", b"")), Some(CpioHalt::ByteLimit));
+        let three = [odc("a", b""), odc("b", b""), odc("c", b"")].concat();
+        assert_eq!(halted(&three), Some(CpioHalt::EntryLimit));
+        assert_eq!(stream(&three, 3, limits).0.len(), 2);
+        assert_eq!(
+            stream(b"#!/bin/sh\necho hi\n", 3, limits).1,
+            StreamEnd::NotCpio {
+                raw: b"#!/bin/s".to_vec(),
+                more: true
+            }
+        );
+        assert_eq!(
+            stream(b"0707", 3, limits).1,
+            StreamEnd::NotCpio {
+                raw: b"0707".to_vec(),
+                more: false
+            }
+        );
     }
 
     #[test]

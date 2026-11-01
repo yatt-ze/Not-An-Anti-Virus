@@ -4,12 +4,13 @@
 //! heap entries).
 //!
 //! Beyond no-panic/no-OOB/terminates, asserts: the §6.2 ceilings hold on what
-//! comes back (entry count, depth); `ReadBudget::read_entry_partial` and
-//! `read_entry_nested` respect the entry cap, never charge more than the
-//! entry's allowance (outer and nested layers together) or grow the archive
-//! budget, and charge at least the bytes they return; so does a nested
-//! read's outer step, which for a zlib entry leaves the nested layer at least
-//! a third of the allowance; the
+//! comes back (entry count, depth); `ReadBudget::read_entry_partial`
+//! respects the entry cap and a nested read's outer step its allowance; both
+//! and `read_entry_nested` never charge more than
+//! the entry's allowance (outer and nested layers together) or grow the
+//! archive budget, and charge at least the bytes they return or send to the
+//! sink; a zlib entry's outer step leaves the nested layer at least a third
+//! of the allowance; the
 //! un-budgeted `read_entry_partial` respects `max_entry_bytes` and a gap
 //! carries bytes; a complete archive is not also halted.
 //!
@@ -21,7 +22,24 @@
 //! deep nesting, a tiny heap entry declaring megabytes.
 
 use libfuzzer_sys::fuzz_target;
-use nav_core::xar::{self, XarLimits};
+use nav_core::xar::{self, NestedSink, XarLimits};
+
+/// Counts what a nested read sends.
+#[derive(Default)]
+struct Count {
+    first: usize,
+    later: usize,
+}
+
+impl NestedSink for Count {
+    fn first(&mut self, bytes: &[u8]) {
+        self.first += bytes.len();
+    }
+
+    fn later(&mut self, bytes: &[u8]) {
+        self.later += bytes.len();
+    }
+}
 
 fuzz_target!(|data: &[u8]| {
     // Tight ceilings: unambiguous violations, no budget wasted on big trees.
@@ -57,61 +75,109 @@ fuzz_target!(|data: &[u8]| {
         );
 
         // read_entry_partial(_nested) is where a hostile container turns a few TOC
-        // bytes into an allocation. Output must fit the entry cap and the
+        // bytes into an allocation. Output must fit its cap and the
         // total work the archive budget; failing is fine.
         let allowance = budget.remaining() / (archive.files.len() - i);
         budget.start_entry(archive.files.len() - i);
         let cap = budget.entry_cap();
         assert!(cap <= limits.max_entry_bytes);
         let before = budget.remaining();
-        // (bytes, gap, other bytes returned, whether a nested gzip was decoded)
-        let result = if i % 2 == 0 {
-            budget
-                .read_entry_partial(data, &archive, f)
-                .map(|(bytes, gap)| (bytes, gap, 0, false))
-        } else {
-            // The outer step alone: held to the plain read's checks, and a
-            // zlib entry's must leave the nested layer a third.
-            let outer_read = budget.read_entry_partial_nested(data, &archive, f);
+        if i % 2 == 0 {
+            let result = budget.read_entry_partial(data, &archive, f);
             assert_charge(&f.path, before, budget.remaining(), allowance);
-            let mut nested = false;
-            if let Ok((bytes, gap, _)) = &outer_read {
-                nested = bytes.starts_with(&[0x1f, 0x8b]);
+            if let Ok((bytes, gap)) = result {
                 let charged = before - budget.remaining();
-                assert_read(&f.path, charged, bytes, gap.is_some(), cap, false);
+                assert_read(&f.path, charged, bytes.len(), gap.is_some(), cap, false);
             }
-            // A zlib entry is the one a nested read splits in three.
-            let zlib = matches!(
-                (
-                    xar::entry_allowance(data, &archive, f, true),
-                    xar::entry_allowance(data, &archive, f, false),
-                ),
-                (Ok(three), Ok(two)) if three > two
-            );
-            if zlib {
-                assert!(
-                    budget.entry_cap() >= (allowance / 3).min(limits.max_entry_bytes),
-                    "entry {:?}: the outer read left the nested layer {} of a {}-byte allowance",
-                    f.path,
-                    budget.entry_cap(),
-                    allowance
-                );
-            }
-            outer_read
-                .map(|read| budget.decode_nested(read))
-                .map(|e| (e.bytes, e.gap, e.unread.len() + e.later.len(), nested))
-        };
+            continue;
+        }
+        // The outer step alone: held to the plain read's checks with the
+        // allowance as its cap (a held gzip at four entry caps), and a zlib
+        // entry's must leave the nested layer a third.
+        let mut sink = Count::default();
+        let outer_read = budget.read_entry_partial_nested(data, &archive, f, &mut sink);
         assert_charge(&f.path, before, budget.remaining(), allowance);
-        if let Ok((bytes, gap, other, nested)) = result {
-            let charged = before - budget.remaining();
+        let mut nested = false;
+        if let Ok(read) = &outer_read {
+            nested = read.held.is_some();
+            let held = read.held.as_ref().map_or(0, Vec::len);
             assert!(
-                charged >= bytes.len() + other,
-                "entry {:?}: returned bytes were not charged",
+                held <= 4 * limits.max_entry_bytes,
+                "entry {:?}: held {held} bytes of a nested gzip",
                 f.path
             );
-            // A nested gzip can fail having consumed all its input.
-            assert_read(&f.path, charged, &bytes, gap.is_some(), cap, nested);
+            // Bytes past the held cap are dropped, and the read has a gap.
+            assert!(
+                read.written >= held + sink.first
+                    && (read.written == held + sink.first || read.gap.is_some()),
+                "entry {:?}: outer bytes lost",
+                f.path
+            );
+            assert_eq!(
+                sink.later, 0,
+                "entry {:?}: later bytes before the nested step",
+                f.path
+            );
+            let charged = before - budget.remaining();
+            assert_read(
+                &f.path,
+                charged,
+                read.written,
+                read.gap.is_some(),
+                allowance,
+                false,
+            );
         }
+        // A zlib entry is the one a nested read splits in three.
+        let zlib = matches!(
+            (
+                xar::entry_allowance(data, &archive, f, true),
+                xar::entry_allowance(data, &archive, f, false),
+            ),
+            (Ok(three), Ok(two)) if three > two
+        );
+        if zlib {
+            assert!(
+                budget.entry_cap() >= (allowance / 3).min(limits.max_entry_bytes),
+                "entry {:?}: the outer read left the nested layer {} of a {}-byte allowance",
+                f.path,
+                budget.entry_cap(),
+                allowance
+            );
+        }
+        let Ok(read) = outer_read else {
+            assert_eq!(
+                (sink.first, sink.later),
+                (0, 0),
+                "entry {:?}: a failed read sent bytes",
+                f.path
+            );
+            continue;
+        };
+        let held = read.held.as_ref().map_or(0, Vec::len);
+        let passed = sink.first;
+        let entry = budget.decode_nested(read, &mut sink);
+        assert_charge(&f.path, before, budget.remaining(), allowance);
+        let charged = before - budget.remaining();
+        // Bytes from a held gzip (decoded, or left raw) and later members are
+        // each charged once: as outer output, or as the decode's own.
+        let sent = sink.first - passed + entry.unread.len() + sink.later;
+        assert!(
+            charged >= passed + sent,
+            "entry {:?}: sent bytes were not charged",
+            f.path
+        );
+        assert!(
+            entry.unread.len() <= held.min(limits.max_entry_bytes),
+            "entry {:?}: unread input is not the held gzip's, capped",
+            f.path
+        );
+        // A nested gzip can fail having consumed all its input.
+        assert!(
+            entry.gap.is_none() || sink.first > 0 || nested,
+            "entry {:?}: a partial read must carry bytes",
+            f.path
+        );
     }
 
     for f in archive.files.iter().take(4) {
@@ -145,27 +211,26 @@ fn assert_charge(path: &str, before: usize, after: usize, allowance: usize) {
     );
 }
 
-/// A successful read's bytes were charged and fit the cap, and a partial one
-/// carries bytes unless `empty_gap_ok`.
+/// A successful read's `bytes` were charged and fit the cap, and a partial
+/// one carries bytes unless `empty_gap_ok`.
 fn assert_read(
     path: &str,
     charged: usize,
-    bytes: &[u8],
+    bytes: usize,
     gap: bool,
     cap: usize,
     empty_gap_ok: bool,
 ) {
     assert!(
-        charged >= bytes.len(),
+        charged >= bytes,
         "entry {path:?}: returned bytes were not charged"
     );
     assert!(
-        bytes.len() <= cap,
-        "entry {path:?} produced {} bytes against a {cap}-byte cap",
-        bytes.len()
+        bytes <= cap,
+        "entry {path:?} produced {bytes} bytes against a {cap}-byte cap"
     );
     assert!(
-        !gap || !bytes.is_empty() || empty_gap_ok,
+        !gap || bytes > 0 || empty_gap_ok,
         "entry {path:?}: a partial read must carry bytes"
     );
 }
