@@ -4,9 +4,9 @@
 //! heap entries).
 //!
 //! Beyond no-panic/no-OOB/terminates, asserts: the §6.2 ceilings hold on what
-//! comes back (entry count, depth); `ReadBudget::read_entry_partial` and a
-//! nested read's outer step respect the entry cap; both and
-//! `read_entry_nested` never charge more than
+//! comes back (entry count, depth); `ReadBudget::read_entry_partial`
+//! respects the entry cap and a nested read's outer step its allowance; both
+//! and `read_entry_nested` never charge more than
 //! the entry's allowance (outer and nested layers together) or grow the
 //! archive budget, and charge at least the bytes they return or send to the
 //! sink; a zlib entry's outer step leaves the nested layer at least a third
@@ -91,7 +91,8 @@ fuzz_target!(|data: &[u8]| {
             }
             continue;
         }
-        // The outer step alone: held to the plain read's checks, and a zlib
+        // The outer step alone: held to the plain read's checks with the
+        // allowance as its cap (a held gzip at four entry caps), and a zlib
         // entry's must leave the nested layer a third.
         let mut sink = Count::default();
         let outer_read = budget.read_entry_partial_nested(data, &archive, f, &mut sink);
@@ -100,9 +101,15 @@ fuzz_target!(|data: &[u8]| {
         if let Ok(read) = &outer_read {
             nested = read.held.is_some();
             let held = read.held.as_ref().map_or(0, Vec::len);
-            assert_eq!(
-                read.written,
-                held + sink.first,
+            assert!(
+                held <= 4 * limits.max_entry_bytes,
+                "entry {:?}: held {held} bytes of a nested gzip",
+                f.path
+            );
+            // Bytes past the held cap are dropped, and the read has a gap.
+            assert!(
+                read.written >= held + sink.first
+                    && (read.written == held + sink.first || read.gap.is_some()),
                 "entry {:?}: outer bytes lost",
                 f.path
             );
@@ -117,7 +124,7 @@ fuzz_target!(|data: &[u8]| {
                 charged,
                 read.written,
                 read.gap.is_some(),
-                cap,
+                allowance,
                 false,
             );
         }
@@ -161,8 +168,8 @@ fuzz_target!(|data: &[u8]| {
             f.path
         );
         assert!(
-            entry.unread.len() <= held,
-            "entry {:?}: unread input is not the held gzip's",
+            entry.unread.len() <= held.min(limits.max_entry_bytes),
+            "entry {:?}: unread input is not the held gzip's, capped",
             f.path
         );
         // A nested gzip can fail having consumed all its input.

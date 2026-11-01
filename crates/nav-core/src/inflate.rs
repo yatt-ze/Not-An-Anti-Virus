@@ -197,7 +197,7 @@ pub fn zlib_decompress_partial(data: &[u8], budget: usize) -> (Vec<u8>, Result<(
 
 /// [`zlib_decompress_partial`], streaming its output to `sink` (see [`inflate_to`]).
 pub fn zlib_decompress_to(data: &[u8], budget: usize, sink: &mut Sink) -> Result<(), InflateError> {
-    zlib_stream(data, budget, Work::of_budget(budget), sink).1
+    zlib_stream(data, budget, Work::of_budget(budget), sink).2
 }
 
 /// [`zlib_decompress_metered_to`] into a `Vec`.
@@ -207,40 +207,45 @@ pub(crate) fn zlib_decompress_metered(
     budget: usize,
     max_paid: usize,
 ) -> (Vec<u8>, Paid, Result<(), InflateError>) {
-    let (out, (paid, result)) =
+    let (out, (_, paid, result)) =
         collect(|sink| zlib_decompress_metered_to(data, budget, max_paid, sink));
     (out, paid, result)
 }
 
-/// [`zlib_decompress_to`], metered as [`gzip_decompress_metered_to`].
+/// [`zlib_decompress_to`], metered as [`gzip_decompress_metered_to`]; also
+/// returns the input consumed, as it does.
 pub(crate) fn zlib_decompress_metered_to(
     data: &[u8],
     budget: usize,
     max_paid: usize,
     sink: &mut Sink,
-) -> (Paid, Result<(), InflateError>) {
+) -> (usize, Paid, Result<(), InflateError>) {
     zlib_stream(data, budget, Work::metered(budget, max_paid), sink)
 }
 
-/// A zlib decode under `work` into `sink`, with the work it was charged.
+/// A zlib decode under `work` into `sink`: input consumed, work charged, result.
 fn zlib_stream(
     data: &[u8],
     budget: usize,
     mut work: Work,
     sink: &mut Sink,
-) -> (Paid, Result<(), InflateError>) {
+) -> (usize, Paid, Result<(), InflateError>) {
     let mut out = Output::new(sink, Check::adler32());
-    let result = zlib_into(data, budget, &mut work, &mut out);
+    let mut used = 0;
+    let result = zlib_into(data, budget, &mut work, &mut out, &mut used);
     out.flush_all();
-    (work.paid_report(&out), result)
+    (used, work.paid_report(&out), result)
 }
 
-/// Decode a zlib stream into `out`. On error `out` holds whatever was written.
+/// Decode a zlib stream into `out`, setting `consumed` to the input read up
+/// to the end of the DEFLATE data or where it stopped. On error `out` holds
+/// whatever was written.
 fn zlib_into(
     data: &[u8],
     budget: usize,
     work: &mut Work,
     out: &mut Output,
+    consumed: &mut usize,
 ) -> Result<(), InflateError> {
     if data.len() < 2 {
         return Err(InflateError::Truncated);
@@ -250,7 +255,11 @@ fn zlib_into(
     }
 
     let body = data.get(2..).ok_or(InflateError::Truncated)?;
-    let used = inflate_into(body, budget, work, out)?;
+    let mut r = BitReader::new(body);
+    let result = inflate_blocks(&mut r, budget, work, out);
+    let used = r.bytes_consumed();
+    *consumed = used.saturating_add(2);
+    result?;
 
     let end = used.checked_add(4).ok_or(InflateError::Malformed)?;
     let trailer: [u8; 4] = body

