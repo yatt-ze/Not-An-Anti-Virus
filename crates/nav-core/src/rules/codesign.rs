@@ -110,6 +110,10 @@ fn classify_dv(success: bool, stderr: &str) -> Result<DvStatus, RuleOutcome> {
     }
 }
 
+/// Weight for a binary with no code signature: small and generic (§5.1).
+const UNSIGNED_WEIGHT: i32 = 4;
+const UNSIGNED_DESCRIPTION: &str = "binary is not code-signed";
+
 pub struct UnsignedBinaryRule;
 
 impl Default for UnsignedBinaryRule {
@@ -148,8 +152,8 @@ impl Rule for UnsignedBinaryRule {
         if run_codesign_dv(ctx)? == DvStatus::Unsigned {
             Ok(Some(MatchedSignal {
                 id: "unsigned-binary".to_string(),
-                weight: 4,
-                description: "binary is not code-signed".to_string(),
+                weight: UNSIGNED_WEIGHT,
+                description: UNSIGNED_DESCRIPTION.to_string(),
                 category: SignalCategory::ProvenanceConcern,
             }))
         } else {
@@ -248,6 +252,8 @@ fn unanchored_fires(ctx: &ScanContext, native: DvStatus) -> Result<bool, RuleOut
 /// Weight for a binary carrying a hand-applied ad-hoc signature — no real
 /// identity, but not as bare as `unsigned-binary`'s "no signature at all".
 const ADHOC_MANUAL_WEIGHT: i32 = 3;
+const ADHOC_MANUAL_DESCRIPTION: &str =
+    "binary carries a hand-applied ad-hoc signature (no identity)";
 
 /// Notes a binary signed ad-hoc *by hand* (`codesign -s -`), as distinct
 /// from the linker-applied ad-hoc signature every Apple Silicon binary
@@ -295,7 +301,7 @@ impl Rule for AdHocSignedRule {
         Ok(Some(MatchedSignal {
             id: "adhoc-signed-binary".to_string(),
             weight: ADHOC_MANUAL_WEIGHT,
-            description: "binary carries a hand-applied ad-hoc signature (no identity)".to_string(),
+            description: ADHOC_MANUAL_DESCRIPTION.to_string(),
             category: SignalCategory::ProvenanceConcern,
         }))
     }
