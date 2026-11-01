@@ -128,6 +128,10 @@ const SUB_THRESHOLD_ALLOWLIST: &[(&str, &str)] = &[
         "disk image contents not inspected until #86 part 2; must scan Partial, never clean",
     ),
     (
+        "suspicious/dropper_in_zip.zip",
+        "ZIP contents not inspected until #86 part 2; must scan Partial, never clean",
+    ),
+    (
         "suspicious/macho_self_signed_identity",
         "an unanchored signing identity is corroboration-only by design (§5.1, #89); needs a second signal",
     ),

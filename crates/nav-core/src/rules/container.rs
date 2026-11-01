@@ -1,7 +1,7 @@
 //! Containers the engine cannot look inside (§10, §11.8).
 
 use super::{Rule, RuleOutcome};
-use crate::context::ScanContext;
+use crate::context::{ContentSource, ScanContext};
 use crate::macho::ByteSource;
 use crate::model::{MatchedSignal, SignalCategory};
 
@@ -57,6 +57,60 @@ fn disk_image_format(ctx: &ScanContext) -> Option<Option<&'static str>> {
     Some(None)
 }
 
+/// Size of an end-of-central-directory record with an empty comment.
+const ZIP_EOCD_LEN: u64 = 22;
+
+/// True when `ctx` is ZIP-format: a local file header at 0, or an empty-comment
+/// end record with at least one entry in the last 22 bytes. Known gap: a
+/// prefixed zip with an archive comment is not found. `None` if an in-range
+/// probe could not be read.
+fn is_zip(ctx: &ScanContext) -> Option<bool> {
+    let len = ctx.file_len?;
+    if len >= 4 && ctx.read_at(0, 4)? == b"PK\x03\x04" {
+        return Some(true);
+    }
+    if len >= ZIP_EOCD_LEN {
+        let eocd = ctx.read_at(len - ZIP_EOCD_LEN, ZIP_EOCD_LEN as usize)?;
+        let has_entries = eocd[10..12] != [0, 0];
+        return Some(&eocd[..4] == b"PK\x05\x06" && eocd[20..] == [0, 0] && has_entries);
+    }
+    Some(false)
+}
+
+/// True for a real file at `<...>/X.app/Contents/...` (§6.2): apps ship ZIP
+/// resources, so those are not flagged. Embedded content is never exempt.
+fn inside_app_bundle(ctx: &ScanContext) -> bool {
+    if ctx.source != ContentSource::File {
+        return false;
+    }
+    // Judge where the file really is, not how its path is spelled (`..`,
+    // symlinks, relative paths).
+    let Ok(real) = std::fs::canonicalize(&ctx.path) else {
+        return false;
+    };
+    let mut parts = real.components().map(|c| c.as_os_str()).peekable();
+    while let Some(name) = parts.next() {
+        let b = name.as_encoded_bytes();
+        let is_app = b.len() > 4 && b[b.len() - 4..].eq_ignore_ascii_case(b".app");
+        if is_app && parts.peek().is_some_and(|n| *n == "Contents") {
+            return true;
+        }
+    }
+    false
+}
+
+impl UninspectedContainerRule {
+    fn signal(&self, ctx: &ScanContext, description: String) -> MatchedSignal {
+        ctx.mark_incomplete(self.id());
+        MatchedSignal {
+            id: self.id().to_string(),
+            weight: 0,
+            description,
+            category: self.category(),
+        }
+    }
+}
+
 impl Rule for UninspectedContainerRule {
     fn id(&self) -> &'static str {
         UNINSPECTED_CONTAINER_ID
@@ -76,18 +130,22 @@ impl Rule for UninspectedContainerRule {
         }
         match disk_image_format(ctx) {
             None => Err(RuleOutcome::NotApplicable),
-            Some(None) => Ok(None),
-            Some(Some(format)) => {
-                ctx.mark_incomplete(self.id());
-                Ok(Some(MatchedSignal {
-                    id: self.id().to_string(),
-                    weight: 0,
-                    description: format!(
-                        "disk image ({format}) not inspected — mount it read-only and scan the volume"
-                    ),
-                    category: self.category(),
-                }))
-            }
+            Some(Some(format)) => Ok(Some(self.signal(
+                ctx,
+                format!(
+                    "disk image ({format}) not inspected — mount it read-only and scan the volume"
+                ),
+            ))),
+            Some(None) => match is_zip(ctx) {
+                None => Err(RuleOutcome::NotApplicable),
+                Some(false) => Ok(None),
+                Some(true) if inside_app_bundle(ctx) => Ok(None),
+                Some(true) => Ok(Some(self.signal(
+                    ctx,
+                    "ZIP-format file (archive or document) not inspected — extract it and scan the files"
+                        .to_string(),
+                ))),
+            },
         }
     }
 
@@ -222,6 +280,115 @@ mod tests {
         let result = scan_context(&ctx, &rules);
         let _ = std::fs::remove_file(&path);
         assert_eq!(result.signals.len(), 1);
+        assert_eq!(result.completeness, ScanCompleteness::Partial);
+    }
+
+    fn eocd(comment_len: u16, prefix: usize) -> Vec<u8> {
+        let mut buf = vec![0u8; prefix];
+        buf.extend_from_slice(b"PK\x05\x06");
+        // One entry in total (offset 10), so it is not an empty archive.
+        buf.extend_from_slice(&[0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+        buf.extend_from_slice(&comment_len.to_le_bytes());
+        buf
+    }
+
+    #[test]
+    fn zip_local_header_fires() {
+        let ctx = embedded(b"PK\x03\x04rest".to_vec());
+        assert!(fires(&ctx));
+        assert!(ctx.marked_incomplete("uninspected-container"));
+        let sig = UninspectedContainerRule.evaluate(&ctx).unwrap().unwrap();
+        assert!(sig.description.starts_with("ZIP-format file"));
+    }
+
+    #[test]
+    fn zip_end_record_with_empty_comment_fires() {
+        assert!(fires(&embedded(eocd(0, 0))));
+        assert!(fires(&embedded(eocd(0, 100))));
+    }
+
+    #[test]
+    fn zip_end_record_with_a_comment_or_elsewhere_does_not_fire() {
+        assert!(!fires(&embedded(eocd(5, 100))));
+        let mut late = eocd(0, 100);
+        late.push(0);
+        assert!(!fires(&embedded(late)));
+    }
+
+    #[test]
+    fn short_and_random_inputs_are_not_zip() {
+        for buf in [
+            Vec::new(),
+            b"PK\x03".to_vec(),
+            b"PK\x05\x06".to_vec(),
+            crate::test_support::xorshift_bytes(4096),
+        ] {
+            assert!(!fires(&embedded(buf)));
+        }
+    }
+
+    /// A fresh, empty temp directory, removed on drop.
+    struct TempDir(std::path::PathBuf);
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn temp_dir(tag: &str) -> TempDir {
+        let p = crate::test_support::write_temp_file(tag, b"");
+        std::fs::remove_file(&p).unwrap();
+        std::fs::create_dir_all(&p).unwrap();
+        TempDir(p)
+    }
+
+    fn file_in(dir: &std::path::Path, rel: &str, body: &[u8]) -> ScanContext {
+        let path = dir.join(rel);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, body).unwrap();
+        ScanContext::load(&path)
+    }
+
+    #[test]
+    fn zip_inside_app_bundle_is_exempt_only_for_real_files() {
+        let tmp = temp_dir("zip-app");
+        let dir = &tmp.0;
+        let zip = b"PK\x03\x04rest";
+        assert!(!fires(&file_in(dir, "X.app/Contents/Resources/r.zip", zip)));
+        assert!(!fires(&file_in(dir, "y.APP/Contents/r.zip", zip)));
+        assert!(fires(&file_in(dir, "r.zip", zip)));
+        assert!(fires(&file_in(dir, "X.app/Other/r.zip", zip)));
+        assert!(fires(&file_in(dir, "X.app/r.zip", zip)));
+        let label = ScanContext::from_embedded_bytes("X.app/Contents/r.zip", zip.to_vec(), false);
+        assert!(fires(&label));
+        let mut dmg = vec![0u8; 1024];
+        dmg[512..516].copy_from_slice(b"koly");
+        assert!(fires(&file_in(dir, "X.app/Contents/Resources/i.dmg", &dmg)));
+        // The spelling of the path must not create an exemption.
+        let dotdot = dir.join("X.app/Contents/../../r.zip");
+        assert!(fires(&ScanContext::load(&dotdot)));
+        let link = dir.join("X.app/Contents/Resources/link.zip");
+        std::os::unix::fs::symlink(dir.join("r.zip"), &link).unwrap();
+        assert!(fires(&ScanContext::load(&link)));
+    }
+
+    #[test]
+    fn empty_zip_is_not_flagged() {
+        assert!(!fires(&embedded(
+            b"PK\x05\x06".iter().copied().chain([0; 18]).collect()
+        )));
+    }
+
+    #[test]
+    fn fixture_zip_scans_partial() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("fixtures/suspicious/dropper_in_zip.zip");
+        let result = crate::scan::scan_file(&path);
+        assert!(result
+            .signals
+            .iter()
+            .any(|s| s.id == "uninspected-container"));
         assert_eq!(result.completeness, ScanCompleteness::Partial);
     }
 
