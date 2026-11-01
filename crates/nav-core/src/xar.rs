@@ -410,7 +410,7 @@ fn decode_entry(
     raw: &[u8],
     limits: &XarLimits,
 ) -> Result<(Vec<u8>, Option<XarEntryError>), XarEntryError> {
-    decode_entry_to(raw, limits, usize::MAX).0
+    decode_entry_to(raw, limits, usize::MAX).result
 }
 
 /// Bytes read and the gap, if any, as [`read_entry_partial`] returns them.
@@ -436,45 +436,88 @@ pub struct NestedEntry {
     pub later: Vec<u8>,
 }
 
+/// A [`decode_entry_to`] result.
+struct Decoded {
+    result: Result<PartialRead, XarEntryError>,
+    /// Just past the first member of a gzip entry that decoded in full, else
+    /// the input's length.
+    end: usize,
+    /// Inflate's block work; 0 for other encodings.
+    blocks: usize,
+    /// `max_paid` alone stopped the decode ([`inflate::Paid::capped`]).
+    capped: bool,
+    /// Read as a gzip or zlib stream (not stored bytes or bzip2).
+    stream: bool,
+}
+
+impl Decoded {
+    /// The decode error the result stopped on, if any.
+    fn stop_error(&self) -> Option<DecodeError> {
+        match self.result {
+            Ok((_, Some(XarEntryError::Undecodable(e)))) | Err(XarEntryError::Undecodable(e)) => {
+                Some(e)
+            }
+            _ => None,
+        }
+    }
+}
+
 /// [`decode_entry`] with a gzip or zlib entry's output plus block work capped
-/// at `max_paid` (input not counted). Also returns where decoding ended (just
-/// past the first member of a gzip entry that decoded in full, else
-/// `raw.len()`) and the block work, 0 for other encodings.
-fn decode_entry_to(
-    raw: &[u8],
-    limits: &XarLimits,
-    max_paid: usize,
-) -> (Result<PartialRead, XarEntryError>, usize, usize) {
+/// at `max_paid` (input not counted).
+fn decode_entry_to(raw: &[u8], limits: &XarLimits, max_paid: usize) -> Decoded {
     let cap = limits.max_entry_bytes;
+    let plain = |result| Decoded {
+        result,
+        end: raw.len(),
+        blocks: 0,
+        capped: false,
+        stream: false,
+    };
     if inflate::has_gzip_magic(raw) {
         let (bytes, used, paid, result) = inflate::gzip_decompress_metered(raw, cap, max_paid);
-        let blocks = paid - bytes.len();
         // The 8-byte trailer follows the consumed input.
         let end = match result {
             Ok(()) => used.saturating_add(8).min(raw.len()),
             Err(_) => raw.len(),
         };
-        return (partial_read(bytes, result), end, blocks);
+        return Decoded {
+            blocks: paid.work - bytes.len(),
+            result: partial_read(bytes, result),
+            end,
+            capped: paid.capped,
+            stream: true,
+        };
     }
     // Dispatch on the bytes, not the `encoding` attribute (see module docs).
     // Formats we have no decoder for (xz) must not come back as "stored" text.
-    let (result, blocks) = if is_xz(raw) {
-        (Err(XarEntryError::UnknownEncoding), 0)
+    if is_xz(raw) {
+        plain(Err(XarEntryError::UnknownEncoding))
     } else if crate::bzip2::has_bzip2_magic(raw) {
         let (bytes, result) = crate::bzip2::bzip2_decompress_partial(raw, cap);
-        (partial_read(bytes, result), 0)
+        plain(partial_read(bytes, result))
     } else if raw.first().is_some_and(|b| b & 0x0f == 8) {
         // Plausible zlib CMF; if the header checks fail, treat it as stored.
         let (bytes, paid, result) = inflate::zlib_decompress_metered(raw, cap, max_paid);
-        let blocks = paid - bytes.len();
         match result {
-            Err(DecodeError::BadHeader) => (stored(raw, limits), 0),
-            result => (partial_read(bytes, result), blocks),
+            Err(DecodeError::BadHeader) => plain(stored(raw, limits)),
+            result => Decoded {
+                blocks: paid.work - bytes.len(),
+                result: partial_read(bytes, result),
+                end: raw.len(),
+                capped: paid.capped,
+                stream: true,
+            },
         }
     } else {
-        (stored(raw, limits), 0)
-    };
-    (result, raw.len(), blocks)
+        plain(stored(raw, limits))
+    }
+}
+
+/// Whether a decode that stopped on `err` was stopped by the entry's allowance:
+/// a budget stop under a cap below `max_entry_bytes` (`below_max`), or at
+/// inflate's paid cap alone (`capped`).
+fn stopped_by_share(err: Option<DecodeError>, below_max: bool, capped: bool) -> bool {
+    err == Some(DecodeError::BudgetExceeded) && (below_max || capped)
 }
 
 /// Work spent reading entries back from one archive's heap (§6.2): compressed
@@ -485,6 +528,7 @@ pub struct ReadBudget {
     limits: XarLimits,
     remaining: usize,
     entry_remaining: usize,
+    cut_by_share: bool,
 }
 
 impl ReadBudget {
@@ -496,7 +540,17 @@ impl ReadBudget {
             limits: *limits,
             remaining: limits.max_read_back_bytes,
             entry_remaining: limits.max_read_back_bytes,
+            cut_by_share: false,
         }
+    }
+
+    /// Whether the last entry read stopped at its allowance before reaching
+    /// `max_entry_bytes` or the end of what Installer reads (a stored entry's
+    /// input, a stream's first member). Not set by corruption, by a stop at
+    /// `max_entry_bytes`, by input cut past a complete stream, or by later
+    /// gzip members. Reset by every read method, including on `Err`.
+    pub fn last_cut_by_share(&self) -> bool {
+        self.cut_by_share
     }
 
     /// Bytes still available across the archive.
@@ -569,7 +623,8 @@ impl ReadBudget {
         };
         if inflate::has_gzip_magic(&entry.bytes) {
             let mut raw = std::mem::take(&mut entry.bytes);
-            let (bytes, used, result) = self.decode_gzip(&raw);
+            let (bytes, used, result, by_share) = self.decode_gzip(&raw);
+            self.cut_by_share |= by_share;
             match result {
                 Ok(()) => {
                     // The trailer (CRC-32, ISIZE) follows the consumed input.
@@ -596,16 +651,25 @@ impl ReadBudget {
 
     /// One gzip member of already-charged bytes, under [`ReadBudget::entry_cap`];
     /// charges its decode work (output plus per-block charges), which stops at
-    /// the entry's allowance. Results as [`inflate::gzip_decompress_consumed`].
-    fn decode_gzip(&mut self, data: &[u8]) -> (Vec<u8>, usize, Result<(), DecodeError>) {
+    /// the entry's allowance. Results as [`inflate::gzip_decompress_consumed`],
+    /// plus whether the allowance, not `max_entry_bytes`, stopped it.
+    fn decode_gzip(&mut self, data: &[u8]) -> (Vec<u8>, usize, Result<(), DecodeError>, bool) {
         let cap = self.entry_cap();
+        let below_max = cap < self.limits.max_entry_bytes;
         if cap == 0 {
-            return (Vec::new(), 0, Err(DecodeError::BudgetExceeded));
+            let err = DecodeError::BudgetExceeded;
+            return (
+                Vec::new(),
+                0,
+                Err(err),
+                stopped_by_share(Some(err), below_max, false),
+            );
         }
         let (bytes, used, spent, result) =
             inflate::gzip_decompress_metered(data, cap, self.entry_remaining);
-        self.charge(spent);
-        (bytes, used, result)
+        self.charge(spent.work);
+        let by_share = stopped_by_share(result.err(), below_max, spent.capped);
+        (bytes, used, result, by_share)
     }
 
     /// Decodes the gzip members that open `rest`, joined as `gunzip` joins
@@ -614,7 +678,7 @@ impl ReadBudget {
     fn decode_later_members(&mut self, mut rest: &[u8]) -> Vec<u8> {
         let mut out = Vec::new();
         while inflate::has_gzip_magic(rest) {
-            let (bytes, used, result) = self.decode_gzip(rest);
+            let (bytes, used, result, _) = self.decode_gzip(rest);
             out.extend_from_slice(&bytes);
             if result.is_err() {
                 break;
@@ -648,6 +712,7 @@ impl ReadBudget {
         file: &XarFile,
         nested: bool,
     ) -> Result<NestedRead<'d>, XarEntryError> {
+        self.cut_by_share = false;
         let over = XarEntryError::BUDGET_EXCEEDED;
         let raw = entry_bytes(data, archive, file)?;
         if is_xz(raw) {
@@ -655,7 +720,11 @@ impl ReadBudget {
         }
         let nests = nested && may_nest(raw);
         let share = self.entry_remaining / if nests { 3 } else { 2 };
-        if share == 0 || self.limits.max_entry_bytes == 0 {
+        if self.limits.max_entry_bytes == 0 {
+            return Err(over);
+        }
+        if share == 0 {
+            self.cut_by_share = true;
             return Err(over);
         }
         let (input, cost, cut) = match crate::bzip2::block_size(raw) {
@@ -663,6 +732,7 @@ impl ReadBudget {
             Some(block) => {
                 let cost = raw.len().max(block);
                 if cost > share {
+                    self.cut_by_share = true;
                     return Err(over);
                 }
                 (raw, cost, false)
@@ -683,7 +753,24 @@ impl ReadBudget {
             max_entry_bytes: self.entry_cap().min(max_paid),
             ..self.limits
         };
-        let (result, end, blocks) = decode_entry_to(input, &capped, max_paid);
+        let decoded = decode_entry_to(input, &capped, max_paid);
+        // Below `max_entry_bytes` any budget stop is the allowance's: it is then
+        // `max_paid`, which bounds the input too, so inflate's work cap cannot trip.
+        let below_max = capped.max_entry_bytes < self.limits.max_entry_bytes;
+        let err = decoded.stop_error();
+        // A cut input stops a stored read, or a stream only if it ran out mid-stream.
+        let cut_short = cut
+            && match err {
+                None => !decoded.stream,
+                Some(e) => e == DecodeError::Truncated,
+            };
+        self.cut_by_share = cut_short || stopped_by_share(err, below_max, decoded.capped);
+        let Decoded {
+            result,
+            end,
+            blocks,
+            ..
+        } = decoded;
         let rest = input.get(end..).unwrap_or_default();
         if let Ok((bytes, _)) = &result {
             self.charge(bytes.len());
@@ -1806,6 +1893,102 @@ mod tests {
             }
         }
         assert!(full * work <= limits.max_read_back_bytes, "{full}");
+    }
+
+    /// One entry over `blob`, read nested or not under `max_entry_bytes` and
+    /// an allowance of `allowance`: its gap and [`ReadBudget::last_cut_by_share`].
+    fn cut_by_share(
+        blob: &[u8],
+        max_entry_bytes: usize,
+        allowance: usize,
+        nested: bool,
+    ) -> (Option<XarEntryError>, bool) {
+        let limits = XarLimits {
+            max_entry_bytes,
+            max_read_back_bytes: allowance,
+            ..XarLimits::default()
+        };
+        let bytes = single_entry(blob);
+        let a = parse(&bytes, &limits).expect("xar");
+        let mut budget = ReadBudget::new(&limits);
+        let gap = if nested {
+            match budget.read_entry_nested(&bytes, &a, &a.files[0]) {
+                Ok(e) => e.gap,
+                Err(e) => Some(e),
+            }
+        } else {
+            match budget.read_entry_partial(&bytes, &a, &a.files[0]) {
+                Ok((_, gap)) => gap,
+                Err(e) => Some(e),
+            }
+        };
+        (gap, budget.last_cut_by_share())
+    }
+
+    #[test]
+    fn a_read_reports_whether_its_allowance_stopped_it() {
+        let over = Some(BUDGET_ERR);
+        let big = 1 << 20;
+        // Stored: input cut by the allowance, versus output cut at the cap.
+        let blob = vec![b'a'; 800];
+        assert_eq!(cut_by_share(&blob, big, 1000, false), (over, true));
+        assert_eq!(cut_by_share(&blob, 500, big, false), (over, false));
+        assert_eq!(cut_by_share(&blob, big, 1600, false), (None, false));
+
+        // zlib output: the allowance, the cap, a tie (the cap alone binds), a fit.
+        let enough = ORDINARY_COST;
+        assert_eq!(cut_by_share(ORDINARY, big, enough - 1, false), (over, true));
+        assert_eq!(cut_by_share(ORDINARY, 100, big, false), (over, false));
+        let tie = ORDINARY_OUT - 1;
+        assert_eq!(
+            cut_by_share(ORDINARY, tie, enough - 1, false),
+            (over, false)
+        );
+        assert_eq!(cut_by_share(ORDINARY, big, enough, false), (None, false));
+        // A cut-short stream is corrupt, not over its allowance.
+        let short = &ORDINARY[..ORDINARY.len() - 10];
+        assert!(!cut_by_share(short, big, big, false).1);
+        // Its outer output nested: half the allowance after input (1/3).
+        assert_eq!(
+            cut_by_share(ORDINARY, big, 3 * ORDINARY_IN, true),
+            (over, true)
+        );
+
+        // The nested gzip's block work, at its exact boundary.
+        let gz = gzip_of_empty_dynamic_blocks(64);
+        let inner = stored_zlib(&gz);
+        let exact = inner.len() + gz.len() + inflate::BLOCK_WORK + 64 * inflate::DYNAMIC_BLOCK_WORK;
+        assert_eq!(cut_by_share(&inner, big, exact, true), (None, false));
+        assert_eq!(cut_by_share(&inner, big, exact - 1, true), (over, true));
+        // Cut at `max_entry_bytes` instead: the outer output (the gzip) is over it.
+        assert_eq!(cut_by_share(&inner, gz.len() - 1, big, true), (over, false));
+
+        // A later gzip member the allowance stops never makes the entry unreadable.
+        let mut joined = gzip_of_empty_dynamic_blocks(1);
+        joined.extend_from_slice(&gz);
+        let blob = stored_zlib(&joined);
+        let allowance = 3 * (blob.len() + inflate::BLOCK_WORK);
+        let left = allowance - blob.len() - joined.len() - inflate::BLOCK_WORK;
+        assert!((inflate::DYNAMIC_BLOCK_WORK..64 * inflate::DYNAMIC_BLOCK_WORK).contains(&left));
+        assert_eq!(cut_by_share(&blob, big, allowance, true), (None, false));
+
+        // Input cut only past a complete gzip member or zlib stream: what
+        // Installer reads was read, so the allowance did not stop it.
+        let mut gz = gzip_of_empty_dynamic_blocks(1);
+        let gz_len = gz.len();
+        gz.resize(gz_len + 2000, 0);
+        let allowance = 2 * (gz_len + inflate::DYNAMIC_BLOCK_WORK);
+        assert_eq!(cut_by_share(&gz, big, allowance, false), (over, false));
+        let zlib = [ORDINARY, &[0; 2000]].concat();
+        assert_eq!(cut_by_share(&zlib, big, 2 * 1900, false), (over, false));
+
+        // A stream the cut leaves mid-way: a long gzip FNAME header.
+        let mut named = vec![0x1f, 0x8b, 0x08, 0x08, 0, 0, 0, 0, 0, 3];
+        named.resize(1010, b'n');
+        named.push(0);
+        named.extend_from_slice(&gzip_of_empty_dynamic_blocks(1)[10..]);
+        assert_eq!(cut_by_share(&named, big, 1000, false), (over, true));
+        assert_eq!(cut_by_share(&named, big, big, false), (None, false));
     }
 
     #[test]
