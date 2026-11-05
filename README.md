@@ -1,70 +1,104 @@
 # NAV — Not an Anti-Virus
 
-NAV is a heuristic, alert-only behavioral monitor for macOS. It is
-deliberately *not* signature-based antivirus: it decides what looks
-suspicious from static file analysis and behavioral signals, not from a
-downloaded virus-definition feed. And it never silently blocks, deletes, or
-quarantines anything — it inspects, scores, explains what it found, and
-leaves the decision to you.
+[![CI](https://github.com/yatt-ze/Not-An-Anti-Virus/actions/workflows/ci.yml/badge.svg)](https://github.com/yatt-ze/Not-An-Anti-Virus/actions/workflows/ci.yml) ![Status: early development](https://img.shields.io/badge/status-early%20development-orange) ![Platform: macOS](https://img.shields.io/badge/platform-macOS-lightgrey) [![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue)](LICENSE)
 
-It is a command-line tool. There is no app to open and no menu-bar icon.
+**A heuristic static scanner for macOS that tells you *why* a file looks suspicious**
+
+NAV inspects Mach-O binaries, `.app` bundles, scripts, installer packages,
+launchd property lists, etc. It scores them on how they are built and what they do,
+not on virus signatures, and prints every signal that went into the score.
+It never blocks, deletes or quarantines anything.
+
+
+```console
+$ navctl rules test crates/nav-core/fixtures/suspicious/packed_payload.sh
+Threat score:        34
+Evidence confidence: Medium
+Scan completeness:   Partial
+
+Signals matched:
+  [ +15] high-entropy-content         binary data embedded in a script/text file (entropy: 7.9 bits/byte over 4369 bytes)
+  [ +19] suspicious-strings           matched 3 indicator(s): decoded payload piped to a shell; references osascript (AppleScript/JXA interpreter); curl/download-pipe-to-shell pattern
+
+Recommendation: notify
+```
+
+Every result has three separate parts:
+
+- **Threat score**: how suspicious the file looks.
+- **Evidence confidence**: how much evidence that score rests on.
+- **Scan completeness**: whether every check could run. A file NAV couldn't
+  fully check is never reported as clean.
+
+## Philosophy
+
+NAV treats you like an adult. It doesn't assume that unfamiliar, unsigned or
+unusual software is malicious, and it doesn't make a decision for you.
+
+NAV is a second set of eyes for technical users: it explains what triggered concern
+and leaves the decision with the you.
+
+- **It doesn't act on scan results.** NAV reports what it finds; it doesn't
+  block, delete or quarantine the file being inspected.
+- **It shows its working.** There are no black-box verdicts. Every score comes
+  with the signals behind it, so you can judge the evidence for yourself.
+- **It doesn't run the software it inspects.** NAV may invoke macOS
+  verification utilities to assess signing and notarization.
+- **It's upfront about its limits.** When NAV couldn't check something, it
+  says so instead of calling the file clean.
+
+**NAV is not protection.** It won't stop anything from running. It gives you
+more information about a file before you decide what to do with it. Keep
+macOS's built-in defences turned on.
 
 ## Status
 
-Early development
+NAV is in **early development** (v0.2.0).
 
-`navctl scan` and `navctl rules test` work today: point them at a file, a
-folder, or a `.app` bundle and they produce a verdict with a full breakdown
-of which signals fired. This runs entirely as your own user — no background
-service, no root, no special macOS permissions.
+- [x] `navctl scan`: a verdict for a file, a folder or a `.app` bundle
+- [x] `navctl rules test`: the full signal-by-signal breakdown, as text or JSON
+- [x] `navctl rules list`: the active ruleset
 
-Everything else is not built yet: automatic scanning of newly-downloaded
-files, network monitoring, persistence-watching, Notification Center
-alerts, quarantine. Those need a privileged background service (`navd`)
-that doesn't exist yet. `navctl` lists those subcommands, but they tell you
-plainly that they're unavailable rather than pretending to work.
+Scanning runs entirely as your own user: no background service, no root, no
+special macOS permissions.
 
-## What the scanner looks for
+In progress: `navd`, a privileged background service. `navctl service
+install | uninstall | status` can install it as a LaunchDaemon, but today it
+only stays alive so its install and permission behaviour can be tested. It does not scan or monitor anything yet.
 
-- **Code signing & notarization** — unsigned, ad-hoc signed, or
-  signed-but-not-notarized code, weighed in context rather than as an
-  automatic pass or fail.
-- **Mach-O structure** — dylib/rpath load paths into writable or transient
-  locations (`/tmp`, a hidden directory, under `/Users/`), suspicious
-  entitlements (e.g. disabled library validation) weighted higher on an
-  unsigned binary, and packed or obfuscated code sections.
-- **Obfuscation** — high-entropy regions where readable code or script text
-  is expected (packed sections, base64 blobs), judged by *where* they
-  appear rather than as one whole-file number.
-- **Scripts** — shell / AppleScript / `.command` files with `curl | sh`
-  patterns, base64 piped into an interpreter, and similar loader shapes.
-- **Persistence** — LaunchAgent / LaunchDaemon property lists in staging
-  locations, anomalous run-at-load + keep-alive + short-interval
-  combinations, or an inline downloader as the program to run.
-- **Installer packages** (`.pkg`) — the container structure, signature, and
-  the contents of the install scripts, all read without executing the
-  package.
+Planned, not built yet:
 
-High-severity verdicts needs corroborating
-signals from different categories, or one narrow known-bad pattern. Keeping
-false positives low is the priority over raw detection rate.
+- [ ] Automatic scanning of newly downloaded files
+- [ ] Persistence watching (new LaunchAgents / LaunchDaemons)
+- [ ] Network monitoring
+- [ ] Notification Center alerts
+- [ ] Opt-in quarantine
 
-## Build
+`navctl` already lists the subcommands for these, but they tell you plainly
+that they're unavailable rather than pretending to work.
 
-Requires a recent stable Rust toolchain.
+## Install
+
+Requires Rust 1.75 or newer. macOS is the target platform. NAV also builds
+and runs on Linux, but the macOS-only checks (code signing, notarization, the
+quarantine attribute) are skipped there, so results are marked `Partial`.
 
 ```sh
-cargo build --workspace
-cargo test --workspace
+git clone https://github.com/yatt-ze/Not-An-Anti-Virus.git
+cd Not-An-Anti-Virus
+cargo install --locked --path crates/navctl
 ```
 
-The binary is then `target/debug/navctl` (or `target/release/navctl` with
-`--release`).
+This puts `navctl` in `~/.cargo/bin`. Homebrew and signed release binaries
+are planned.
 
 ## Usage
 
+Use `navctl scan` for a quick verdict. Use `navctl rules test` when you want
+the signal-by-signal evidence behind that verdict.
+
 ```sh
-# Scan a file and print a verdict
+# Quick verdict for a file
 navctl scan ./some-binary
 
 # Scan a folder
@@ -73,76 +107,138 @@ navctl scan ./some-dir --recursive
 # Scan a .app: one verdict line for the whole bundle (--verbose lists every file)
 navctl scan ./Some.app
 
-# Full signal-by-signal breakdown for a file, folder, or .app bundle.
-# A .app is scanned as one unit: its real executable is located, compiled
-# resources (nibs, asset catalogs) are skipped, and the bundle's verdict is
-# that of the single worst file inside it.
+# Full breakdown of which signals fired, and why
 navctl rules test ./suspicious.app
 
-# The same breakdown as JSON — identical structure to the text output,
-# plus a top-level "schema_version" field (currently 1) marking it as a
-# versioned contract: scripts should check it before parsing further
+# The same breakdown as versioned JSON, for scripts
 navctl rules test ./suspicious.app --json
 
 # Show the active ruleset
 navctl rules list
 ```
 
-**Exit codes** report scan completeness as well as verdict, so a script can
-tell "checked, clean" apart from "couldn't finish". A finding outranks an
-incomplete scan: a flagged file returns `1`/`2` even if part of the scan
-came up short (check each file's `completeness` in `--json`, and stderr for skipped coverage):
+A `.app` bundle is scanned as one unit. NAV finds its main executable, skips
+compiled resources (nibs, asset catalogs), and gives the bundle the verdict of
+the worst file inside it.
+
+### Recommendations
+
+| Recommendation | When |
+| --- | --- |
+| `no action` | Score below 15 |
+| `notify` | Score 15 or more |
+| `notify + suggest quarantine` | Score 45 or more, with signals from at least two different categories |
+
+These labels describe the response NAV recommends; they are not actions NAV
+performs. In the current CLI, `notify` does not send a notification.
+Notification Center delivery is planned, not implemented. Likewise,
+"suggest quarantine" is a recommendation only: NAV does not quarantine the
+file.
+
+### Exit codes
+
+Exit codes report whether the scan finished, as well as what it found, so a
+script can tell "checked, clean" apart from "couldn't check":
 
 | Code | Meaning |
-|---|---|
-| `0` | Clean, scan complete |
-| `1` | Suspicious |
-| `2` | High risk |
-| `3` | Nothing flagged, but the scan was incomplete (e.g. the file couldn't be fully read) |
+| --- | --- |
+| `0` | Nothing flagged, scan complete |
+| `1` | Suspicious (`notify`) |
+| `2` | High risk (`notify + suggest quarantine`) |
+| `3` | Nothing flagged, but the scan was incomplete (e.g. a check couldn't run or the file couldn't be fully read) |
 | `4` | Operational error |
 
-## Repository layout
+A finding outranks an incomplete scan: a flagged file returns `1` or `2` even
+if part of the scan came up short. Check each file's `completeness` in
+`--json` output, and stderr for skipped coverage.
+
+### JSON output
+
+`--json` output has the same structure as the text breakdown, plus a
+top-level `"schema_version"` (currently `1`). Check the version before
+parsing further. Rule IDs such as `suspicious-strings` and
+`macho-loader-anomaly` identify the signals in a result; consumers should
+tolerate IDs they don't recognise as the ruleset evolves.
+
+## What NAV looks for
+
+| Category | Signals |
+| --- | --- |
+| **Code signing** | Unsigned, ad-hoc signed, invalid, revoked, or signed-but-not-notarized code, weighed in context rather than as an automatic pass or fail |
+| **Mach-O structure** | Dylib/rpath load paths into writable or transient locations (`/tmp`, hidden directories, under `/Users/`); risky entitlements such as disabled library validation, weighted higher on unsigned binaries |
+| **Obfuscation** | High-entropy regions where readable code or text is expected (packed sections, base64 blobs), judged by *where* they appear rather than by one whole-file number |
+| **Scripts** | Shell, AppleScript, JavaScript and `.command` files with `curl \| sh`, base64 piped into an interpreter, and similar loader patterns |
+| **Persistence** | LaunchAgent/LaunchDaemon plists in staging locations, unusual run-at-load + keep-alive + short-interval combinations, or an inline downloader as the program to run |
+| **Installer packages** | `.pkg` structure, signature, Distribution scripts and install-script contents, inspected without executing installer scripts or payloads |
+
+Run `navctl rules list` for the full set of rule IDs.
+
+**Conservative scoring is deliberate.** A high-risk verdict needs signals
+from at least two different categories; no single generic signal can trigger
+it alone. In the 500+ sample corpus used during development, NAV has so far
+recorded zero false positives. That is a result on the corpus tested, not a
+guarantee about every file or environment. NAV would rather leave a borderline
+case for you to assess than present a weak signal as certainty.
+
+## Reporting false positives and misses
+
+Detection quality depends on real samples. If NAV flags something legitimate,
+or misses something it should have caught, please
+[open an issue](https://github.com/yatt-ze/Not-An-Anti-Virus/issues/new) with:
+
+- the output of `navctl rules test <file> --json`
+- where the file came from (a download link for legitimate software is ideal)
+- **never attach live malware**: share its SHA-256 hash instead
+
+## Contributing
+
+Contributions are welcome.
+
+### Repository layout
 
 A Cargo workspace:
 
 | Crate | What it is |
-|---|---|
-| `crates/nav-core` | The scoring engine. A plain library — no privilege, no I/O beyond reading the file it's handed. Every parser and heuristic lives here. |
+| --- | --- |
+| `crates/nav-core` | The scoring engine. A plain library: no privilege, no I/O beyond reading the file it's handed. Every parser and heuristic lives here. |
 | `crates/navctl` | The command-line tool. `scan` and `rules test` run in-process against `nav-core`. |
-| `crates/navd` | The privileged background service. Not implemented yet. |
-| `crates/navnotify` | The per-user notifier — background-only, no window. Not implemented yet. |
+| `crates/navd` | The privileged background service. |
+| `crates/nav-service` | Install layout for `navd` (LaunchDaemon plist, file manifest), shared by `navctl service` and `xtask`. |
+| `crates/navnotify` | The per-user notifier. Not implemented yet. |
+| `crates/xtask` | Dev tooling: the real-machine corpus comparison and install/uninstall checks. |
 
-The parsers in `nav-core` (Mach-O, xar / `.pkg`, property lists, DEFLATE) have
-libFuzzer targets under `crates/nav-core/fuzz/`, which is a separate
-workspace — it needs a nightly toolchain and `cargo install cargo-fuzz`:
+### Checks
+
+These must all pass before a commit, and CI runs the same ones on Linux and
+macOS:
 
 ```sh
-cd crates/nav-core
-cargo +nightly fuzz run parse_macho
+cargo fmt --all
+cargo clippy --workspace --all-targets -- -D warnings
+cargo test --workspace
 ```
 
-`crates/nav-core/tests/fp_harness.rs` runs every fixture under
-`crates/nav-core/fixtures/` (known-benign and synthetic-suspicious) on each
-test run, and fails if a rule change pushes a benign sample over the alert
-threshold or makes scoring nondeterministic. Add coverage by dropping files
-— or `.app` directories — into `fixtures/benign/` or `fixtures/suspicious/`;
-no code changes needed.
-
-## Contributing
-
-`cargo fmt`, `cargo clippy --workspace --all-targets -- -D warnings`, and
-`cargo test --workspace` must all pass before a commit. To run them
-automatically on every commit:
+To run them automatically on every commit:
 
 ```sh
 git config core.hooksPath .githooks
 ```
 
-Before merging a change that can move scores, check it against real
+### Test samples
+
+`crates/nav-core/tests/fp_harness.rs` scans every fixture under
+`crates/nav-core/fixtures/` on each test run. It fails if a change pushes a
+benign sample over the alert threshold or makes scoring nondeterministic. To
+add coverage, drop a file (or a `.app` directory) into `fixtures/benign/` or
+`fixtures/suspicious/`; no code changes needed.
+
+### Checking against real software
+
+Before merging a change that can move scores, compare it against real
 software on your machine. This builds `origin/main` and your working tree,
-scans `/usr/bin`, `/Applications`, Homebrew's Cellar, `~/.cargo/bin` and
-Steam with both, and exits 2 if any file's verdict or coverage got worse, or
-a file went missing:
+scans `/usr/bin`, `/Applications`, Homebrew's Cellar, `~/.cargo/bin` and Steam
+with both, and exits 2 if any file's verdict or coverage got worse, or a file
+went missing:
 
 ```sh
 cargo xtask corpus compare            # or pass your own roots
@@ -151,7 +247,24 @@ cargo xtask corpus compare            # or pass your own roots
 `cargo xtask corpus scan` and `cargo xtask corpus diff` run the two halves
 separately.
 
-The design rationale and longer-term roadmap live in
-[`docs/design.md`](docs/design.md) — worth reading before proposing
-anything architectural, though you don't need it to build or use what's
-here.
+### Fuzzing
+
+The parsers in `nav-core` (Mach-O, xar / `.pkg`, cpio, property lists,
+DEFLATE, bzip2) have libFuzzer targets under `crates/nav-core/fuzz/`. That is
+a separate workspace and needs a nightly toolchain plus
+`cargo install cargo-fuzz`:
+
+```sh
+cd crates/nav-core
+cargo +nightly fuzz run parse_macho
+```
+
+### Design
+
+Design rationale and the longer-term roadmap are in
+[`docs/design.md`](docs/design.md). Read it for the reasoning behind the
+architecture and the trade-offs NAV is making.
+
+## License
+
+Licensed under the [Apache License, Version 2.0](LICENSE).
