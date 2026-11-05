@@ -45,6 +45,30 @@ Now targeted for Phase 0a, not Phase 1 (see §12). Start small (e.g., ~20 known-
 
 **Quantitative acceptance gate (NAV-015).** "Low false-positive rate is the primary success metric" (§1, §12 go/no-go) is enforced as a measured, asserted number, not left as a stated priority: the harness computes and reports the corpus's benign false-positive rate, suspicious signal coverage, verdict mix (high-risk/notify counts), partial/indeterminate count, and per-fixture runtime p50/p95, and asserts two corpus-size-independent criteria — benign false-positive rate is exactly 0%, and suspicious signal coverage is 100% (no deliberately-suspicious fixture scored silently clean). Runtime percentiles are reported but not asserted (environment-dependent, would flake CI). Peak memory stays deliberately untracked: cargo runs every test as a thread in one shared process with one allocator, so a per-fixture number would misattribute concurrent allocation — an honestly-absent metric beats a wrong one, and an honest external benchmark is the right home for it later.
 
+### 11.1a Real-World Malware Benchmark
+
+The fixtures in §11.1 are small and synthetic, built to exercise one rule each. This benchmark measures how the engine does on real macOS malware. It is optional and run by maintainers only: contributing never needs it, and `cargo test` must never depend on its sample store.
+
+**Gate: regressions only.** Each sample records an `expected` result: its recommendation and completeness from the last accepted baseline. A run compares the branch with `origin/main` and fails (exit 2, as `cargo xtask corpus compare` does) when any sample's recommendation or completeness gets worse, or a sample is missing or fails its hash check. Exit 1 means the tool itself failed. Improvements are reported, and `expected` is raised on purpose in the PR that earns it. There is no absolute recall target. Chasing one would push towards family-specific rules, and NAV's detection is heuristic, not a signature feed (§5.6).
+
+**Source and manifest.** Samples come from the Objective-See macOS Malware Collection (`github.com/objective-see/Malware`, GPL-3.0), pinned to one commit. Samples are never committed. The committed manifest, `crates/nav-core/fixtures/real-world/manifest.toml`, lists for each sample:
+- `id` and `family`;
+- `category`: `stealer`, `adware`, `trojanized`, `other` or `format-gap`;
+- `scope`: `in`, or `out` for nation-state (APT) samples;
+- the family `archive` and its `archive_sha256`;
+- the `member` path inside the archive;
+- the member's `sha256`, or for an `.app` or other bundle a `tree_sha256`: the SHA-256 of its sorted `relative-path<TAB>sha256` lines;
+- `bytes`, the sample's size;
+- `expected`.
+
+The local store under that directory is git-ignored.
+
+**Composition.** 100 samples: 33 stealers, 22 adware or scareware, 15 trojanized installers, and 10 others (miners, ransomware, commercial spyware). There are also 14 APT samples as out-of-scope controls: they are measured and reported separately, never counted as misses (§1: APT-grade threats are not the focus). Six `format-gap` samples are in formats NAV cannot read yet (Java archives, Python, Ruby, AppleScript, tar). They are expected to come out not inspected, and track progress as readers are added. Most families give one sample each, so the set favours breadth over depth.
+
+**Isolation.** Samples are fetched and scanned only inside a throwaway macOS VM, never on the host. A golden Tart image (Virtualization.framework) holds the toolchain and a cache of the family archives the manifest needs, at `~/nav-bench-cache/<commit>/`. The archives are cached as published: still encrypted with the collection's password and never extracted in the golden image. So the only sample bytes on the host sit encrypted inside the VM's disk file. Each run clones the golden image and checks out the branch. It then takes each archive from the cache, verifies it against `archive_sha256` (re-downloading it if it is missing or does not match), and extracts and verifies the members. Finally it runs the comparison, copies the report out and deletes the clone. The cache only saves the download, about 830 MB for the 92 archives. The tool works without it, and a new pinned commit needs a cache refresh. The golden image is never pushed to a registry, since that would distribute malware. Nothing is ever executed: the scan is static.
+
+**Known gaps.** The collection has no Adload, the most common macOS adware family. Only 22 of its ~380 Mach-O files are arm64-only, so the benchmark leans heavily on x86_64 and universal code. Some member names contain CR or newline characters, so tooling must treat paths as opaque bytes.
+
 ### 11.2 Ruleset Rollback
 
 `navctl rules rollback`, since there's no cloud-based auto-tuning safety net; a bad rule update needs a fast, user-triggerable reversion path.
