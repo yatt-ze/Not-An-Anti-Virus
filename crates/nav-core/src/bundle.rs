@@ -39,7 +39,7 @@ impl BundleLayout {
             return None;
         }
         let contents = path.join("Contents");
-        if !contents.is_dir() {
+        if !is_real_dir(&contents) {
             return None;
         }
 
@@ -59,6 +59,9 @@ impl BundleLayout {
 /// `../../elsewhere` can't escape `Contents/MacOS/`.
 fn executable_from_info_plist(contents: &Path) -> Option<PathBuf> {
     let info = contents.join("Info.plist");
+    if !is_real_file(&info) {
+        return None;
+    }
     let mut buf = Vec::new();
     std::fs::File::open(&info)
         .ok()?
@@ -72,7 +75,7 @@ fn executable_from_info_plist(contents: &Path) -> Option<PathBuf> {
         .to_string();
     let leaf = Path::new(&name).file_name()?;
     let candidate = contents.join("MacOS").join(leaf);
-    candidate.is_file().then_some(candidate)
+    is_real_file(&candidate).then_some(candidate)
 }
 
 /// `Contents/MacOS/<stem>` if it exists as a file; otherwise, if
@@ -80,9 +83,12 @@ fn executable_from_info_plist(contents: &Path) -> Option<PathBuf> {
 /// `None`.
 fn resolve_main_executable(contents: &Path, stem: &str) -> Option<PathBuf> {
     let macos = contents.join("MacOS");
+    if !is_real_dir(&macos) {
+        return None;
+    }
 
     let by_name = macos.join(stem);
-    if by_name.is_file() {
+    if is_real_file(&by_name) {
         return Some(by_name);
     }
 
@@ -97,6 +103,17 @@ fn resolve_main_executable(contents: &Path, stem: &str) -> Option<PathBuf> {
         }
     }
     only_file
+}
+
+/// A directory that is not a symlink. Bundle members are never followed out
+/// of the bundle, matching the walk in `target.rs`.
+fn is_real_dir(path: &Path) -> bool {
+    std::fs::symlink_metadata(path).is_ok_and(|m| m.is_dir())
+}
+
+/// A regular file that is not a symlink (so never a FIFO or device to block on).
+fn is_real_file(path: &Path) -> bool {
+    std::fs::symlink_metadata(path).is_ok_and(|m| m.is_file())
 }
 
 /// Bundle members that are compiled UI/localization resources or the code
@@ -231,6 +248,63 @@ mod tests {
         let appish = tmp.0.join("weird.app");
         fs::create_dir_all(&appish).unwrap(); // no Contents/
         assert!(BundleLayout::detect(&appish).is_none());
+    }
+
+    #[test]
+    fn symlinked_members_are_not_followed() {
+        use std::os::unix::fs::symlink;
+        let tmp = TempDir::new();
+        let outside = make_bundle(&tmp.0, "Outside.app", Some("Outside"));
+
+        let linked_contents = tmp.0.join("A.app");
+        fs::create_dir_all(&linked_contents).unwrap();
+        symlink(outside.join("Contents"), linked_contents.join("Contents")).unwrap();
+        assert!(BundleLayout::detect(&linked_contents).is_none());
+
+        let linked_exec = make_bundle(&tmp.0, "B.app", None);
+        symlink(
+            outside.join("Contents/MacOS/Outside"),
+            linked_exec.join("Contents/MacOS/B"),
+        )
+        .unwrap();
+        assert_eq!(
+            BundleLayout::detect(&linked_exec).unwrap().main_executable,
+            None
+        );
+
+        let linked_macos = make_bundle(&tmp.0, "C.app", None);
+        fs::remove_dir(linked_macos.join("Contents/MacOS")).unwrap();
+        symlink(
+            outside.join("Contents/MacOS"),
+            linked_macos.join("Contents/MacOS"),
+        )
+        .unwrap();
+        assert_eq!(
+            BundleLayout::detect(&linked_macos).unwrap().main_executable,
+            None
+        );
+    }
+
+    #[test]
+    fn symlinked_info_plist_is_not_read() {
+        let tmp = TempDir::new();
+        let root = make_bundle(&tmp.0, "Foo.app", Some("Foo"));
+        let decoy = tmp.0.join("decoy.plist");
+        fs::write(
+            &decoy,
+            br#"<plist><dict><key>CFBundleExecutable</key><string>other</string></dict></plist>"#,
+        )
+        .unwrap();
+        fs::write(root.join("Contents/MacOS/other"), b"#!/bin/sh\n").unwrap();
+        fs::remove_file(root.join("Contents/Info.plist")).unwrap();
+        std::os::unix::fs::symlink(&decoy, root.join("Contents/Info.plist")).unwrap();
+
+        // The plist is ignored, so the naming convention picks `Foo`.
+        let layout = BundleLayout::detect(&root).unwrap();
+        assert_eq!(
+            layout.main_executable,
+            Some(root.join("Contents/MacOS/Foo"))
+        );
     }
 
     #[test]
