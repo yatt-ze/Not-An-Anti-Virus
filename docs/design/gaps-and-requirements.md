@@ -51,21 +51,23 @@ The fixtures in §11.1 are small and synthetic, built to exercise one rule each.
 
 **Gate: regressions only.** Each sample records an `expected` result: its recommendation and completeness from the last accepted baseline. A run compares the branch with `origin/main` and fails (exit 2, as `cargo xtask corpus compare` does) when any sample's recommendation or completeness gets worse, or a sample is missing or fails its hash check. Exit 1 means the tool itself failed. Improvements are reported, and `expected` is raised on purpose in the PR that earns it. There is no absolute recall target. Chasing one would push towards family-specific rules, and NAV's detection is heuristic, not a signature feed (§5.6).
 
-**Source and manifest.** Samples come from the Objective-See macOS Malware Collection (`github.com/objective-see/Malware`, GPL-3.0), pinned to one commit. Samples are never committed. The committed manifest, `crates/nav-core/fixtures/real-world/manifest.toml`, lists for each sample:
+**Source and manifest.** Samples come from the Objective-See macOS Malware Collection (`github.com/objective-see/Malware`, GPL-3.0), pinned to one commit. Samples are never committed. The committed manifest, `crates/nav-core/fixtures/real-world/manifest.toml`, opens with a `[source]` table (the collection's `repo`, the pinned `commit`, and the archives' published `password`), then lists for each sample:
 - `id` and `family`;
 - `category`: `stealer`, `adware`, `trojanized`, `other` or `format-gap`;
 - `scope`: `in`, or `out` for nation-state (APT) samples;
 - the family `archive` and its `archive_sha256`;
-- the `member` path inside the archive;
+- the `member` path inside the archive, and its `kind` (`macho`, `app`, `dmg`, `pkg`, `script`, ...);
 - the member's `sha256`, or for an `.app` or other bundle a `tree_sha256`: the SHA-256 of its sorted `relative-path<TAB>sha256` lines;
 - `bytes`, the sample's size;
 - `expected`.
 
-The local store under that directory is git-ignored.
+The local store under that directory, `store/<id>/<member's file name>`, is git-ignored.
 
 **Composition.** 100 samples: 33 stealers, 22 adware or scareware, 15 trojanized installers, and 10 others (miners, ransomware, commercial spyware). There are also 14 APT samples as out-of-scope controls: they are measured and reported separately, never counted as misses (§1: APT-grade threats are not the focus). Six `format-gap` samples are in formats NAV cannot read yet (Java archives, Python, Ruby, AppleScript, tar). They are expected to come out not inspected, and track progress as readers are added. Most families give one sample each, so the set favours breadth over depth.
 
 **Isolation.** Samples are fetched and scanned only inside a throwaway macOS VM, never on the host. A golden Tart image (Virtualization.framework) holds the toolchain and a cache of the family archives the manifest needs, at `~/nav-bench-cache/<commit>/`. The archives are cached as published: still encrypted with the collection's password and never extracted in the golden image. So the only sample bytes on the host sit encrypted inside the VM's disk file. Each run clones the golden image and checks out the branch. It then takes each archive from the cache, verifies it against `archive_sha256` (re-downloading it if it is missing or does not match), and extracts and verifies the members. Finally it runs the comparison, copies the report out and deletes the clone. The cache only saves the download, about 830 MB for the 92 archives. The tool works without it, and a new pinned commit needs a cache refresh. The golden image is never pushed to a registry, since that would distribute malware. Nothing is ever executed: the scan is static.
+
+**Tooling.** `cargo xtask malware fetch` takes each archive from the cache, or downloads it from the pinned commit, checks `archive_sha256`, extracts it with `unzip`, and places each member in the store once its hash and `bytes` match. It refuses to run unless macOS reports a hypervisor (`kern.hv_vmm_present`), with no override, so the host can never be used by mistake. `cargo xtask malware verify` re-hashes the store without network access. Both exit 0 when every sample checks out, 2 when one is missing or does not match, and 1 when the tool itself fails. Their tests use a small harmless archive built at test time, never a sample.
 
 **Known gaps.** The collection has no Adload, the most common macOS adware family. Only 22 of its ~380 Mach-O files are arm64-only, so the benchmark leans heavily on x86_64 and universal code. Some member names contain CR or newline characters, so tooling must treat paths as opaque bytes.
 
