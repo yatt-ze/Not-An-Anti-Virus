@@ -19,3 +19,6 @@
 
 # agent worktrees (Claude Code)
 .claude/worktrees/
+
+# real-world malware benchmark sample store (§11.1a) - never commit samples
+/crates/nav-core/fixtures/real-world/store/

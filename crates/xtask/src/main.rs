@@ -5,6 +5,7 @@
 //! `corpus` scans real files with two navctl builds and diffs the verdicts.
 
 mod corpus;
+mod malware;
 
 use std::process::ExitCode;
 
@@ -39,6 +40,9 @@ enum Command {
     /// Real-machine false-positive check: scan a corpus, diff two builds.
     #[command(subcommand)]
     Corpus(corpus::CorpusCommand),
+    /// Real-world malware benchmark: fetch and verify the sample store (§11.1a).
+    #[command(subcommand)]
+    Malware(malware::MalwareCommand),
 }
 
 fn main() -> Result<ExitCode> {
@@ -53,6 +57,7 @@ fn main() -> Result<ExitCode> {
             Ok(ExitCode::SUCCESS)
         }
         Command::Corpus(cmd) => corpus::run(cmd),
+        Command::Malware(cmd) => malware::run(cmd),
     }
 }
 

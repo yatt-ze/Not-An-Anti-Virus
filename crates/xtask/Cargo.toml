@@ -1,6 +1,6 @@
 [package]
 name = "xtask"
-description = "Dev runner: nav-service install/uninstall/residue in --fake (CI) or --real (sudo) mode (§11.10), and the real-machine corpus scan/diff/compare false-positive check."
+description = "Dev runner: nav-service install/uninstall/residue in --fake (CI) or --real (sudo) mode (§11.10), the real-machine corpus scan/diff/compare false-positive check, and the real-world malware benchmark fetch/verify (§11.1a)."
 publish = false
 version.workspace = true
 edition.workspace = true
@@ -18,3 +18,6 @@ serde_json = { workspace = true }
 anyhow = { workspace = true }
 clap = { workspace = true }
 libc = { workspace = true }
+serde = { workspace = true }
+toml = { workspace = true }
+sha2 = { workspace = true }
