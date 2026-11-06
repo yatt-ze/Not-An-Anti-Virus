@@ -53,11 +53,11 @@ The fixtures in §11.1 are small and synthetic, built to exercise one rule each.
 
 **Source and manifest.** Samples come from the Objective-See macOS Malware Collection (`github.com/objective-see/Malware`, GPL-3.0), pinned to one commit. Samples are never committed. The committed manifest, `crates/nav-core/fixtures/real-world/manifest.toml`, opens with a `[source]` table (the collection's `repo`, the pinned `commit`, and the archives' published `password`), then lists for each sample:
 - `id` and `family`;
-- `category`: `stealer`, `adware`, `trojanized`, `other` or `format-gap`;
-- `scope`: `in`, or `out` for nation-state (APT) samples;
+- `category`: `stealer`, `adware`, `trojanized`, `other`, `format-gap` or `apt`;
+- `scope`: `in`, or `out` for nation-state (APT) samples (`apt` is always `out`, every other category `in`);
 - the family `archive` and its `archive_sha256`;
 - the `member` path inside the archive, and its `kind` (`macho`, `app`, `dmg`, `pkg`, `script`, ...);
-- the member's `sha256`, or for an `.app` or other bundle a `tree_sha256`: the SHA-256 of its sorted `relative-path<TAB>sha256` lines;
+- the member's `sha256`, or for an `.app` or other bundle a `tree_sha256`: the SHA-256 of one `/<relative path><TAB><sha256 hex><LF>` line per regular file in it (symlinks skipped), sorted by bytes and joined;
 - `bytes`, the sample's size;
 - `expected`.
 
@@ -67,7 +67,7 @@ The local store under that directory, `store/<id>/<member's file name>`, is git-
 
 **Isolation.** Samples are fetched and scanned only inside a throwaway macOS VM, never on the host. A golden Tart image (Virtualization.framework) holds the toolchain and a cache of the family archives the manifest needs, at `~/nav-bench-cache/<commit>/`. The archives are cached as published: still encrypted with the collection's password and never extracted in the golden image. So the only sample bytes on the host sit encrypted inside the VM's disk file. Each run clones the golden image and checks out the branch. It then takes each archive from the cache, verifies it against `archive_sha256` (re-downloading it if it is missing or does not match), and extracts and verifies the members. Finally it runs the comparison, copies the report out and deletes the clone. The cache only saves the download, about 830 MB for the 92 archives. The tool works without it, and a new pinned commit needs a cache refresh. The golden image is never pushed to a registry, since that would distribute malware. Nothing is ever executed: the scan is static.
 
-**Tooling.** `cargo xtask malware fetch` takes each archive from the cache, or downloads it from the pinned commit, checks `archive_sha256`, extracts it with `unzip`, and places each member in the store once its hash and `bytes` match. It refuses to run unless macOS reports a hypervisor (`kern.hv_vmm_present`), with no override, so the host can never be used by mistake. `cargo xtask malware verify` re-hashes the store without network access. Both exit 0 when every sample checks out, 2 when one is missing or does not match, and 1 when the tool itself fails. Their tests use a small harmless archive built at test time, never a sample.
+**Tooling.** `cargo xtask malware fetch` takes each archive from the cache, or downloads it from the pinned commit, checks `archive_sha256`, extracts it with `unzip`, and places each member in the store once its hash and `bytes` match. It refuses to run unless macOS reports a hypervisor (`kern.hv_vmm_present`), with no override, so the host can never be used by mistake. `cargo xtask malware verify` re-hashes the store without network access. Both exit 0 when every sample checks out, 2 when one is missing or does not match, and 1 when the tool itself fails. Their tests use a small harmless archive built at test time, never a sample. The store lives in the VM's own clone of the repository; a working tree shared in from the host would put samples on the host disk.
 
 **Known gaps.** The collection has no Adload, the most common macOS adware family. Only 22 of its ~380 Mach-O files are arm64-only, so the benchmark leans heavily on x86_64 and universal code. Some member names contain CR or newline characters, so tooling must treat paths as opaque bytes.
 
