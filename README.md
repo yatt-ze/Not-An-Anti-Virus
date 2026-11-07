@@ -170,13 +170,14 @@ tolerate IDs they don't recognise as the ruleset evolves.
 | **Scripts** | Shell, AppleScript, JavaScript and `.command` files with `curl \| sh`, base64 piped into an interpreter, and similar loader patterns |
 | **Persistence** | LaunchAgent/LaunchDaemon plists in staging locations, unusual run-at-load + keep-alive + short-interval combinations, or an inline downloader as the program to run |
 | **Installer packages** | `.pkg` structure, signature, Distribution scripts and install-script contents, inspected without executing installer scripts or payloads |
+| **Archives** | ZIP files (documents such as `.docx` included) are read in memory and their contents scanned; a disk image, or anything NAV could not read, is reported as not fully checked rather than clean |
 
 Run `navctl rules list` for the full set of rule IDs.
 
 **Conservative scoring is deliberate.** A high-risk verdict needs signals
 from at least two different categories; no single generic signal can trigger
-it alone. In the 500+ sample corpus used during development, NAV has so far
-recorded zero false positives. That is a result on the corpus tested, not a
+it alone. Across the several hundred thousand files of ordinary software
+scanned during development, NAV has so far recorded zero false positives. That is a result on the corpus tested, not a
 guarantee about every file or environment. NAV would rather leave a borderline
 case for you to assess than present a weak signal as certainty.
 
@@ -205,7 +206,7 @@ A Cargo workspace:
 | `crates/navd` | The privileged background service. |
 | `crates/nav-service` | Install layout for `navd` (LaunchDaemon plist, file manifest), shared by `navctl service` and `xtask`. |
 | `crates/navnotify` | The per-user notifier. Not implemented yet. |
-| `crates/xtask` | Dev tooling: the real-machine corpus comparison and install/uninstall checks. |
+| `crates/xtask` | Dev tooling: the real-machine corpus comparison, the real-world malware benchmark and install/uninstall checks. |
 
 ### Checks
 
@@ -247,9 +248,14 @@ cargo xtask corpus compare            # or pass your own roots
 `cargo xtask corpus scan` and `cargo xtask corpus diff` run the two halves
 separately.
 
+Maintainers can also run a benchmark against 100 real macOS malware samples
+(`cargo xtask malware vm`). Samples are only ever fetched and scanned inside a
+throwaway macOS VM; contributing never needs it. See §11.1a in
+[`docs/design/gaps-and-requirements.md`](docs/design/gaps-and-requirements.md).
+
 ### Fuzzing
 
-The parsers in `nav-core` (Mach-O, xar / `.pkg`, cpio, property lists,
+The parsers in `nav-core` (Mach-O, xar / `.pkg`, cpio, ZIP, property lists,
 DEFLATE, bzip2) have libFuzzer targets under `crates/nav-core/fuzz/`. That is
 a separate workspace and needs a nightly toolchain plus
 `cargo install cargo-fuzz`:
