@@ -589,7 +589,8 @@ impl Reader<'_> {
                 }
             }
         }
-        spans.sort_unstable();
+        // The longest reading of each header is the one that can overrun the next.
+        spans.sort_unstable_by_key(|&(header, end)| (header, std::cmp::Reverse(end)));
         spans.dedup_by_key(|s| s.0);
         if spans.windows(2).any(|w| w[1].0 < w[0].1) {
             self.gap(archive, GapKind::Disagree(Disagreement::Overlap));
@@ -1692,6 +1693,16 @@ mod tests {
         assert_eq!(&zip[second..second + 4], CENTRAL_SIG);
         zip[second + 42..second + 46].copy_from_slice(&(a_local as u32).to_le_bytes());
         let (_, r) = read_all(&zip);
+        assert!(kinds(&r).contains(&GapKind::Disagree(Disagreement::Overlap)));
+    }
+
+    #[test]
+    fn a_longer_reading_of_one_header_that_overlaps_is_partial() {
+        // The directory sizes `a` to its data; its local header runs into b's.
+        let mut a = Spec::stored("a", b"alpha");
+        a.local_csize = 15;
+        a.local_usize = 15;
+        let (_, r) = read_all(&plain(&[a, Spec::stored("b", b"bravo")]));
         assert!(kinds(&r).contains(&GapKind::Disagree(Disagreement::Overlap)));
     }
 
