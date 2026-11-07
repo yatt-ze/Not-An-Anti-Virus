@@ -953,7 +953,8 @@ impl Reader<'_> {
     }
 
     /// Visits a decoded member under `label` and each alias, or reads it as a
-    /// nested zip once, under `label`. Each alias visit is charged its bytes.
+    /// nested zip once, under `label`. Each alias visit is charged
+    /// [`ENTRY_COST`] plus its bytes against the entry's share.
     fn deliver(
         &mut self,
         label: &str,
@@ -985,11 +986,12 @@ impl Reader<'_> {
                 cut,
             });
             for alias in aliases {
-                if shares.remaining() < bytes.len() {
+                let cost = ENTRY_COST.saturating_add(bytes.len());
+                if shares.entry_remaining() < cost {
                     self.gap(alias, GapKind::Limit(Limit::Budget));
                     continue;
                 }
-                shares.charge(bytes.len());
+                shares.charge(cost);
                 self.members += 1;
                 (self.visit)(Member {
                     path: alias,
@@ -1978,6 +1980,58 @@ mod tests {
         let (seen, r) = read_with(&many, &limits);
         assert!(kinds(&r).contains(&GapKind::Limit(Limit::Budget)), "{r:?}");
         assert!(seen.len() < 50, "{}", seen.len());
+    }
+
+    /// `zip` (whose first member has a one-byte name) with that member's
+    /// directory entry repeated under `n` names, `A` onwards.
+    fn with_aliases(zip: &[u8], n: u8) -> Vec<u8> {
+        let cd = zip.windows(4).position(|w| w == CENTRAL_SIG).unwrap();
+        let end = zip.len() - END_LEN;
+        let len = CENTRAL_LEN + 1;
+        let mut out = zip[..cd].to_vec();
+        for i in 0..n {
+            let mut e = zip[cd..cd + len].to_vec();
+            e[CENTRAL_LEN] = b'A' + i;
+            out.extend(e);
+        }
+        out.extend(&zip[cd + len..end]);
+        let mut eocd = zip[end..].to_vec();
+        let extra = u16::from(n) - 1;
+        for at in [8, 10] {
+            let count = u16::from_le_bytes([eocd[at], eocd[at + 1]]) + extra;
+            eocd[at..at + 2].copy_from_slice(&count.to_le_bytes());
+        }
+        let size = u32::from_le_bytes(eocd[12..16].try_into().unwrap());
+        let size = size + u32::from(extra) * len as u32;
+        eocd[12..16].copy_from_slice(&size.to_le_bytes());
+        out.extend(eocd);
+        out
+    }
+
+    #[test]
+    fn each_name_is_charged_the_fixed_member_cost() {
+        let many = with_aliases(&plain(&[Spec::stored("a", b"q")]), 50);
+        let limits = ZipLimits {
+            max_read_back_bytes: 20_000,
+            ..ZipLimits::default()
+        };
+        let (seen, r) = read_with(&many, &limits);
+        assert!(kinds(&r).contains(&GapKind::Limit(Limit::Budget)), "{r:?}");
+        assert!(seen.len() <= 20_000 / ENTRY_COST, "{}", seen.len());
+    }
+
+    #[test]
+    fn a_members_names_cannot_spend_a_later_members_share() {
+        let decoy = Spec::stored("a", &[b'q'; 1000]);
+        let later = Spec::stored("z", &[b'z'; 3000]);
+        let many = with_aliases(&plain(&[decoy, later]), 50);
+        let limits = ZipLimits {
+            max_read_back_bytes: 30_000,
+            ..ZipLimits::default()
+        };
+        let (seen, r) = read_with(&many, &limits);
+        assert!(seen.contains(&("z".to_string(), vec![b'z'; 3000], false)));
+        assert!(!r.gaps.iter().any(|g| g.member == "z"), "{r:?}");
     }
 
     /// Crafted zips where views or readers may disagree, by name.
