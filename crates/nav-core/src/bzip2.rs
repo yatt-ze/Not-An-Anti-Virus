@@ -95,9 +95,25 @@ pub fn bzip2_decompress_partial(data: &[u8], budget: usize) -> (Vec<u8>, Result<
     (out, result)
 }
 
+/// [`bzip2_decompress_partial`], also returning the input read: through the
+/// end-of-stream trailer, or to where it stopped.
+pub(crate) fn bzip2_decompress_consumed(
+    data: &[u8],
+    budget: usize,
+) -> (Vec<u8>, usize, Result<(), DecodeError>) {
+    let mut out = Vec::with_capacity(budget.min(INITIAL_OUTPUT_CAPACITY));
+    let mut r = BitReader::new(data);
+    let result = decode_from(&mut r, budget, &mut out);
+    (out, r.bytes_consumed(), result)
+}
+
 /// Decode the stream into `out`. On error `out` holds whatever was written.
 fn decode_stream(data: &[u8], budget: usize, out: &mut Vec<u8>) -> Result<(), DecodeError> {
-    let mut r = BitReader::new(data);
+    decode_from(&mut BitReader::new(data), budget, out)
+}
+
+/// [`decode_stream`] over `r`, which is left where the decode stopped.
+fn decode_from(r: &mut BitReader, budget: usize, out: &mut Vec<u8>) -> Result<(), DecodeError> {
     for expected in *b"BZh" {
         if r.bits(8)? != u32::from(expected) {
             return Err(DecodeError::BadHeader);
@@ -116,7 +132,7 @@ fn decode_stream(data: &[u8], budget: usize, out: &mut Vec<u8>) -> Result<(), De
         let magic = (u64::from(r.bits(24)?) << 24) | u64::from(r.bits(24)?);
         match magic {
             BLOCK_MAGIC => {
-                let crc = decode_block(&mut r, max_block, &mut tt, out, budget)?;
+                let crc = decode_block(r, max_block, &mut tt, out, budget)?;
                 combined = combined.rotate_left(1) ^ crc;
             }
             END_MAGIC => {
@@ -496,6 +512,11 @@ impl<'a> BitReader<'a> {
             buf: 0,
             cnt: 0,
         }
+    }
+
+    /// Whole bytes read; the last one may be partly unread.
+    fn bytes_consumed(&self) -> usize {
+        self.pos - (self.cnt / 8) as usize
     }
 
     /// Read `n` bits (`n <= 32`) as an unsigned value.

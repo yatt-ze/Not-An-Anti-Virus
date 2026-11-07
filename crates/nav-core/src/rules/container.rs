@@ -1,9 +1,11 @@
-//! Containers the engine cannot look inside (§10, §11.8).
+//! Containers the engine cannot look inside, or could not read in full
+//! (§6.2, §10, §11.8).
 
-use super::{Rule, RuleOutcome};
+use super::{zip_member, Rule, RuleOutcome};
 use crate::context::{ContentSource, ScanContext};
 use crate::macho::ByteSource;
 use crate::model::{MatchedSignal, SignalCategory};
+use crate::zip;
 
 /// Id of the signal [`UninspectedContainerRule`] emits.
 pub const UNINSPECTED_CONTAINER_ID: &str = "uninspected-container";
@@ -29,15 +31,16 @@ const IMAGE_FORMATS: &[(&str, Anchor, &[u8])] = &[
     ("ISO 9660", Anchor::Start(0x8001), b"CD001"),
 ];
 
-/// Flags a mountable disk image as not inspected. Weight 0: it only marks
-/// the scan incomplete so the file never reads as clean (§10, §11.8).
+/// Flags a mountable disk image, or a zip not read in full, as not
+/// inspected. Weight 0: it only marks the scan incomplete so the file never
+/// reads as clean (§10, §11.8).
 #[derive(Debug, Default, Clone, Copy)]
 pub struct UninspectedContainerRule;
 
 /// The disk-image format of `ctx`. Outer `None`: length unknown or an
 /// in-range probe could not be read. Inner `None`: not a disk image. A probe
 /// that falls outside the file is "not this format", not a read failure.
-fn disk_image_format(ctx: &ScanContext) -> Option<Option<&'static str>> {
+pub(super) fn disk_image_format(ctx: &ScanContext) -> Option<Option<&'static str>> {
     let len = ctx.file_len?;
     for &(name, anchor, magic) in IMAGE_FORMATS {
         let offset = match anchor {
@@ -57,29 +60,34 @@ fn disk_image_format(ctx: &ScanContext) -> Option<Option<&'static str>> {
     Some(None)
 }
 
-/// Size of an end-of-central-directory record with an empty comment.
-const ZIP_EOCD_LEN: u64 = 22;
-
-/// True when `ctx` is ZIP-format: a local file header at 0, or an empty-comment
-/// end record with at least one entry in the last 22 bytes. Known gap: a
-/// prefixed zip with an archive comment is not found. `None` if an in-range
+/// True when `ctx` is ZIP-format ([`zip::is_zip_format`]): a local file
+/// header at 0, or an end record with entries whose comment reaches the end
+/// of the file (prefixed, self-extracting and commented zips). Reads up to
+/// the last 64 KiB from the file; memoized per scan. `None` if an in-range
 /// probe could not be read.
-fn is_zip(ctx: &ScanContext) -> Option<bool> {
+pub(super) fn is_zip(ctx: &ScanContext) -> Option<bool> {
+    *ctx.zip_format_cache.get_or_init(|| detect_zip(ctx))
+}
+
+fn detect_zip(ctx: &ScanContext) -> Option<bool> {
     let len = ctx.file_len?;
-    if len >= 4 && ctx.read_at(0, 4)? == b"PK\x03\x04" {
+    let head = ctx.read_range(0, len.min(4) as usize)?;
+    if head.starts_with(b"PK\x03\x04") {
         return Some(true);
     }
-    if len >= ZIP_EOCD_LEN {
-        let eocd = ctx.read_at(len - ZIP_EOCD_LEN, ZIP_EOCD_LEN as usize)?;
-        let has_entries = eocd[10..12] != [0, 0];
-        return Some(&eocd[..4] == b"PK\x05\x06" && eocd[20..] == [0, 0] && has_entries);
+    let last_len = len.min(22);
+    let last = ctx.read_range(len - last_len, last_len as usize)?;
+    if let Some(decided) = zip::decided_by_last_end(&last) {
+        return Some(decided);
     }
-    Some(false)
+    let tail_len = len.min(zip::END_SEARCH_LEN as u64);
+    let tail = ctx.read_range(len - tail_len, tail_len as usize)?;
+    Some(zip::is_zip_format(&head, &tail))
 }
 
 /// True for a real file at `<...>/X.app/Contents/...` (§6.2): apps ship ZIP
 /// resources, so those are not flagged. Embedded content is never exempt.
-fn inside_app_bundle(ctx: &ScanContext) -> bool {
+pub(super) fn inside_app_bundle(ctx: &ScanContext) -> bool {
     if ctx.source != ContentSource::File {
         return false;
     }
@@ -97,6 +105,14 @@ fn inside_app_bundle(ctx: &ScanContext) -> bool {
         }
     }
     false
+}
+
+/// Gaps shown in the description before the rest are counted.
+const SHOWN_GAPS: usize = 3;
+
+fn not_fully_inspected(gaps: &zip_member::Listing) -> String {
+    let shown = gaps.join(SHOWN_GAPS);
+    format!("ZIP-format file not fully inspected ({shown}) — extract it and scan the files")
 }
 
 impl UninspectedContainerRule {
@@ -140,11 +156,15 @@ impl Rule for UninspectedContainerRule {
                 None => Err(RuleOutcome::NotApplicable),
                 Some(false) => Ok(None),
                 Some(true) if inside_app_bundle(ctx) => Ok(None),
-                Some(true) => Ok(Some(self.signal(
-                    ctx,
-                    "ZIP-format file (archive or document) not inspected — extract it and scan the files"
-                        .to_string(),
-                ))),
+                Some(true) => match zip_member::inspection(ctx) {
+                    None => Ok(Some(self.signal(
+                        ctx,
+                        "ZIP-format file (archive or document) over the read limit, not inspected — extract it and scan the files"
+                            .to_string(),
+                    ))),
+                    Some(read) if read.gaps.is_empty() => Ok(None),
+                    Some(read) => Ok(Some(self.signal(ctx, not_fully_inspected(&read.gaps)))),
+                },
             },
         }
     }
@@ -308,6 +328,13 @@ mod tests {
     }
 
     #[test]
+    fn zip_end_record_with_a_comment_reaching_the_end_fires() {
+        let mut commented = eocd(5, 100);
+        commented.extend(b"hello");
+        assert!(fires(&embedded(commented)));
+    }
+
+    #[test]
     fn zip_end_record_with_a_comment_or_elsewhere_does_not_fire() {
         assert!(!fires(&embedded(eocd(5, 100))));
         let mut late = eocd(0, 100);
@@ -378,18 +405,6 @@ mod tests {
         assert!(!fires(&embedded(
             b"PK\x05\x06".iter().copied().chain([0; 18]).collect()
         )));
-    }
-
-    #[test]
-    fn fixture_zip_scans_partial() {
-        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("fixtures/suspicious/dropper_in_zip.zip");
-        let result = crate::scan::scan_file(&path);
-        assert!(result
-            .signals
-            .iter()
-            .any(|s| s.id == "uninspected-container"));
-        assert_eq!(result.completeness, ScanCompleteness::Partial);
     }
 
     #[test]

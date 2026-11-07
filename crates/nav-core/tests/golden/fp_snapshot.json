@@ -87,12 +87,24 @@
     "rule_ids": [],
     "completeness": "complete"
   },
+  "benign/ditto_streamed_ordinary.zip": {
+    "score": 0,
+    "recommendation": "no-action",
+    "rule_ids": [],
+    "completeness": "complete"
+  },
   "benign/docs_install_instructions.html": {
     "score": 4,
     "recommendation": "no-action",
     "rule_ids": [
       "suspicious-strings"
     ],
+    "completeness": "complete"
+  },
+  "benign/document_ordinary.docx": {
+    "score": 0,
+    "recommendation": "no-action",
+    "rule_ids": [],
     "completeness": "complete"
   },
   "benign/formula.rb": {
@@ -234,6 +246,12 @@
     "rule_ids": [],
     "completeness": "complete"
   },
+  "benign/nested_archive_ordinary.zip": {
+    "score": 0,
+    "recommendation": "no-action",
+    "rule_ids": [],
+    "completeness": "complete"
+  },
   "benign/openstep_store_init.plist": {
     "score": 0,
     "recommendation": "no-action",
@@ -294,6 +312,14 @@
     "score": 0,
     "recommendation": "no-action",
     "rule_ids": [],
+    "completeness": "complete"
+  },
+  "benign/unsigned_tools_ordinary.zip": {
+    "score": 4,
+    "recommendation": "no-action",
+    "rule_ids": [
+      "zip-member-unsigned"
+    ],
     "completeness": "complete"
   },
   "suspicious/adhoc_named_flags=0x20000": {
@@ -397,13 +423,29 @@
     ],
     "completeness": "partial"
   },
-  "suspicious/dropper_in_zip.zip": {
+  "suspicious/dropper_in_encrypted_zip.zip": {
     "score": 0,
     "recommendation": "no-action",
     "rule_ids": [
       "uninspected-container"
     ],
     "completeness": "partial"
+  },
+  "suspicious/dropper_in_nested_zip.zip": {
+    "score": 20,
+    "recommendation": "notify",
+    "rule_ids": [
+      "zip-member-suspicious"
+    ],
+    "completeness": "complete"
+  },
+  "suspicious/dropper_in_zip.zip": {
+    "score": 20,
+    "recommendation": "notify",
+    "rule_ids": [
+      "zip-member-suspicious"
+    ],
+    "completeness": "complete"
   },
   "suspicious/dropper_osascript_fetch.sh": {
     "score": 19,

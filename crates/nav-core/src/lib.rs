@@ -10,6 +10,7 @@
 //! mapping, so `navctl` and `navd` render one contract instead of two.
 
 pub(crate) mod base64;
+pub(crate) mod budget;
 pub mod bundle;
 pub mod bzip2;
 pub mod context;
@@ -28,6 +29,7 @@ pub(crate) mod test_support;
 pub(crate) mod textclass;
 pub mod xar;
 pub mod xml;
+pub mod zip;
 
 pub use bundle::BundleLayout;
 pub use context::{ContentSource, ScanContext};

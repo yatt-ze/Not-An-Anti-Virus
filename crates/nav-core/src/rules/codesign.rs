@@ -110,6 +110,10 @@ fn classify_dv(success: bool, stderr: &str) -> Result<DvStatus, RuleOutcome> {
     }
 }
 
+/// Weight for a binary with no code signature: small and generic (§5.1).
+const UNSIGNED_WEIGHT: i32 = 4;
+const UNSIGNED_DESCRIPTION: &str = "binary is not code-signed";
+
 pub struct UnsignedBinaryRule;
 
 impl Default for UnsignedBinaryRule {
@@ -148,8 +152,8 @@ impl Rule for UnsignedBinaryRule {
         if run_codesign_dv(ctx)? == DvStatus::Unsigned {
             Ok(Some(MatchedSignal {
                 id: "unsigned-binary".to_string(),
-                weight: 4,
-                description: "binary is not code-signed".to_string(),
+                weight: UNSIGNED_WEIGHT,
+                description: UNSIGNED_DESCRIPTION.to_string(),
                 category: SignalCategory::ProvenanceConcern,
             }))
         } else {
@@ -186,6 +190,42 @@ fn slice_status(image: &MachOImage) -> Option<DvStatus> {
     }
     let status = status_from_flags(image.code_directory_flags?);
     (status != DvStatus::Signed || image.has_cms_signature).then_some(status)
+}
+
+/// How a Mach-O held only as bytes (a container member) is signed, from the
+/// parser alone: `codesign` cannot run on it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct MemberSignature {
+    /// Some slice is unsigned, else hand-signed ad-hoc: the weight and
+    /// wording `unsigned-binary` / `adhoc-signed-binary` give a file.
+    /// Linker-signed scores nothing, as for a file.
+    pub(crate) finding: Option<(i32, &'static str)>,
+    /// Some slice carries a real (CMS) signature, which only `codesign` can
+    /// verify, or could not be classified.
+    pub(crate) unverified: bool,
+}
+
+/// [`MemberSignature`] of a parsed member. Unlike the file rules, every
+/// slice counts: there is no native slice to prefer.
+pub(crate) fn member_signature(scan: &crate::macho::MachOScan) -> MemberSignature {
+    let statuses: Vec<Option<DvStatus>> = scan.images.iter().map(slice_status).collect();
+    let any = |status| statuses.contains(&Some(status));
+    let finding = if any(DvStatus::Unsigned) {
+        Some((UNSIGNED_WEIGHT, UNSIGNED_DESCRIPTION))
+    } else if any(DvStatus::AdHocManual) {
+        Some((ADHOC_MANUAL_WEIGHT, ADHOC_MANUAL_DESCRIPTION))
+    } else {
+        None
+    };
+    let unverified = statuses.is_empty()
+        || scan.skipped_slices > 0
+        || statuses
+            .iter()
+            .any(|s| matches!(s, None | Some(DvStatus::Signed)));
+    MemberSignature {
+        finding,
+        unverified,
+    }
 }
 
 /// True if the native slice (`codesign -dv`'s `native`) has `status`, or, in
@@ -248,6 +288,8 @@ fn unanchored_fires(ctx: &ScanContext, native: DvStatus) -> Result<bool, RuleOut
 /// Weight for a binary carrying a hand-applied ad-hoc signature — no real
 /// identity, but not as bare as `unsigned-binary`'s "no signature at all".
 const ADHOC_MANUAL_WEIGHT: i32 = 3;
+const ADHOC_MANUAL_DESCRIPTION: &str =
+    "binary carries a hand-applied ad-hoc signature (no identity)";
 
 /// Notes a binary signed ad-hoc *by hand* (`codesign -s -`), as distinct
 /// from the linker-applied ad-hoc signature every Apple Silicon binary
@@ -295,7 +337,7 @@ impl Rule for AdHocSignedRule {
         Ok(Some(MatchedSignal {
             id: "adhoc-signed-binary".to_string(),
             weight: ADHOC_MANUAL_WEIGHT,
-            description: "binary carries a hand-applied ad-hoc signature (no identity)".to_string(),
+            description: ADHOC_MANUAL_DESCRIPTION.to_string(),
             category: SignalCategory::ProvenanceConcern,
         }))
     }

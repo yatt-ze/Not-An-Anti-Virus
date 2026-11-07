@@ -174,6 +174,24 @@ pub fn inflate_to(data: &[u8], budget: usize, sink: &mut Sink) -> Result<(), Inf
     result
 }
 
+/// Raw DEFLATE, metered as [`gzip_decompress_metered_to`]: output capped at
+/// `budget`, output plus block work at `max_paid`. Returns the input consumed
+/// (to the end of the final block, or where it stopped), the work and the result.
+pub(crate) fn inflate_metered_to(
+    data: &[u8],
+    budget: usize,
+    max_paid: usize,
+    sink: &mut Sink,
+) -> (usize, Paid, Result<(), InflateError>) {
+    let mut work = Work::metered(budget, max_paid);
+    let mut out = Output::new(sink, Check::None);
+    let mut r = BitReader::new(data);
+    let result = inflate_blocks(&mut r, budget, &mut work, &mut out);
+    let used = r.bytes_consumed();
+    out.flush_all();
+    (used, work.paid_report(&out), result)
+}
+
 /// Runs a streaming decode into a `Vec`.
 fn collect<T>(decode: impl FnOnce(&mut Sink) -> T) -> (Vec<u8>, T) {
     let mut out = Vec::new();
@@ -1045,6 +1063,12 @@ impl<'a> BitReader<'a> {
 #[cfg(test)]
 pub(crate) fn crc32(data: &[u8]) -> u32 {
     !crc32_update(CRC32_INIT, data)
+}
+
+/// CRC-32 of `data` continued from `crc`, the CRC of the bytes before it
+/// (0 for none), as zlib's `crc32()` chains.
+pub(crate) fn crc32_extend(crc: u32, data: &[u8]) -> u32 {
+    !crc32_update(!crc, data)
 }
 
 /// The CRC-32 register before any input.
