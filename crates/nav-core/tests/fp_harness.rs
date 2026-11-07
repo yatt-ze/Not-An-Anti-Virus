@@ -128,6 +128,10 @@ const SUB_THRESHOLD_ALLOWLIST: &[(&str, &str)] = &[
         "disk image contents not inspected until #86 part 2; must scan Partial, never clean",
     ),
     (
+        "suspicious/installer_scripts_disk_image_member.pkg",
+        "a disk image in a pkg's Scripts is not inspected until #86 part 2; must scan Partial, never clean",
+    ),
+    (
         "suspicious/dropper_in_encrypted_zip.zip",
         "an encrypted member cannot be inspected (§6.2); must scan Partial, never clean",
     ),

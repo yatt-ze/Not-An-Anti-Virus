@@ -4,7 +4,7 @@
 //! `uninspected-container` reports what could not be read.
 
 use super::codesign::member_signature;
-use super::container::{disk_image_format, inside_app_bundle, is_zip};
+use super::container::{inside_app_bundle, is_zip, unread_container_reasons};
 use super::{embedded_content_ruleset, Rule, RuleOutcome};
 use crate::context::ScanContext;
 use crate::model::{MatchedSignal, ScanCompleteness, SignalCategory};
@@ -68,14 +68,23 @@ pub(crate) struct ZipInspection {
     unsigned_weight: i32,
     /// Each as `member: reason`, or the reason alone for the archive.
     pub(super) gaps: Listing,
+    /// Read budget charged ([`zip::ZipRead::spent`]).
+    pub(super) spent: usize,
 }
 
 /// The zip read of `ctx`, made once per scan. `None` when it was not read:
 /// not ZIP-format, a truncated capture, or under `X.app/Contents/`.
 pub(super) fn inspection(ctx: &ScanContext) -> Option<&ZipInspection> {
-    ctx.zip_cache
-        .get_or_init(|| inspect(ctx, &ZipLimits::default()))
-        .as_ref()
+    inspection_with(ctx, &ZipLimits::default())
+}
+
+/// [`inspection`] read under `limits` if this is the first read of `ctx`;
+/// later calls, and the zip rules, return that same read.
+pub(super) fn inspection_with<'c>(
+    ctx: &'c ScanContext,
+    limits: &ZipLimits,
+) -> Option<&'c ZipInspection> {
+    ctx.zip_cache.get_or_init(|| inspect(ctx, limits)).as_ref()
 }
 
 fn inspect(ctx: &ScanContext, limits: &ZipLimits) -> Option<ZipInspection> {
@@ -91,14 +100,10 @@ fn inspect(ctx: &ScanContext, limits: &ZipLimits) -> Option<ZipInspection> {
     let mut member_gaps = Listing::default();
     let read = zip::read(content, limits, &mut |m: Member| {
         let label = format!("{}!{}", ctx.path.display(), m.path);
-        let xar = crate::xar::has_xar_magic(&m.bytes);
         let member = ScanContext::from_embedded_bytes(label, m.bytes, m.cut);
         let mut gap = |reason: &str| member_gaps.push(format!("{}: {reason}", m.path));
-        if let Some(Some(format)) = disk_image_format(&member) {
-            gap(&format!("disk image ({format}) not inspected"));
-        }
-        if xar {
-            gap("installer package not inspected");
+        for reason in unread_container_reasons(&member) {
+            gap(&reason);
         }
         let macho = member.macho();
         if macho.is_macho {
@@ -137,6 +142,7 @@ fn inspect(ctx: &ScanContext, limits: &ZipLimits) -> Option<ZipInspection> {
         unsigned,
         unsigned_weight,
         gaps,
+        spent: read.spent,
     })
 }
 

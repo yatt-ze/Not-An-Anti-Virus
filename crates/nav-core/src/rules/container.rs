@@ -5,7 +5,7 @@ use super::{zip_member, Rule, RuleOutcome};
 use crate::context::{ContentSource, ScanContext};
 use crate::macho::ByteSource;
 use crate::model::{MatchedSignal, SignalCategory};
-use crate::zip;
+use crate::{xar, zip};
 
 /// Id of the signal [`UninspectedContainerRule`] emits.
 pub const UNINSPECTED_CONTAINER_ID: &str = "uninspected-container";
@@ -58,6 +58,20 @@ pub(super) fn disk_image_format(ctx: &ScanContext) -> Option<Option<&'static str
         }
     }
     Some(None)
+}
+
+/// Why `ctx`, as a member of another container, is not inspected: one reason
+/// per kind nothing here reads (a disk image, an installer package). Empty
+/// otherwise.
+pub(super) fn unread_container_reasons(ctx: &ScanContext) -> Vec<String> {
+    let mut reasons = Vec::new();
+    if let Some(Some(format)) = disk_image_format(ctx) {
+        reasons.push(format!("disk image ({format}) not inspected"));
+    }
+    if ctx.content.as_deref().is_some_and(xar::has_xar_magic) {
+        reasons.push("installer package not inspected".to_string());
+    }
+    reasons
 }
 
 /// True when `ctx` is ZIP-format ([`zip::is_zip_format`]): a local file

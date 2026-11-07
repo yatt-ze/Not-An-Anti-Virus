@@ -189,6 +189,8 @@ pub struct ZipRead {
     /// Distinct gaps past those.
     pub more_gaps: usize,
     pub members: usize,
+    /// Budget charged, at most `max_read_back_bytes`.
+    pub spent: usize,
 }
 
 /// True for ZIP-format bytes: a local header at offset 0, or an end record
@@ -235,6 +237,7 @@ pub fn read(data: &[u8], limits: &ZipLimits, visit: &mut dyn FnMut(Member)) -> Z
         gaps: reader.gaps,
         more_gaps: reader.more_gaps,
         members: reader.members,
+        spent: limits.max_read_back_bytes - shares.remaining(),
     }
 }
 
