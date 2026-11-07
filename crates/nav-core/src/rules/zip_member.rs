@@ -10,6 +10,7 @@ use crate::context::ScanContext;
 use crate::model::{MatchedSignal, ScanCompleteness, SignalCategory};
 use crate::scan::scan_context;
 use crate::zip::{self, Member, ZipLimits};
+use std::collections::HashMap;
 
 /// Ceiling on what the member rule contributes; Phase 0a scoring is a plain
 /// sum (§12), and many members with weak hits must not add up to an alert.
@@ -59,9 +60,9 @@ impl Listing {
 
 /// A zip's members, scored, and what could not be inspected.
 pub(crate) struct ZipInspection {
-    /// Content-rule findings and their summed weight.
+    /// Content-rule findings, and each rule's strongest weight in any member.
     findings: Listing,
-    findings_total: i32,
+    strongest: HashMap<String, i32>,
     /// Unsigned / hand-ad-hoc Mach-O members and the strongest weight.
     unsigned: Listing,
     unsigned_weight: i32,
@@ -84,7 +85,7 @@ fn inspect(ctx: &ScanContext, limits: &ZipLimits) -> Option<ZipInspection> {
     }
     let rules = embedded_content_ruleset();
     let mut findings = Listing::default();
-    let mut findings_total = 0i32;
+    let mut strongest: HashMap<String, i32> = HashMap::new();
     let mut unsigned = Listing::default();
     let mut unsigned_weight = 0;
     let mut member_gaps = Listing::default();
@@ -112,7 +113,8 @@ fn inspect(ctx: &ScanContext, limits: &ZipLimits) -> Option<ZipInspection> {
         }
         let result = scan_context(&member, &rules);
         for signal in &result.signals {
-            findings_total = findings_total.saturating_add(signal.weight);
+            let best = strongest.entry(signal.id.clone()).or_insert(signal.weight);
+            *best = (*best).max(signal.weight);
             findings.push(format!("{}: {}", m.path, signal.description));
         }
         if !m.cut && result.completeness != ScanCompleteness::Complete {
@@ -130,7 +132,7 @@ fn inspect(ctx: &ScanContext, limits: &ZipLimits) -> Option<ZipInspection> {
     gaps.push_all(member_gaps);
     Some(ZipInspection {
         findings,
-        findings_total,
+        strongest,
         unsigned,
         unsigned_weight,
         gaps,
@@ -138,7 +140,8 @@ fn inspect(ctx: &ScanContext, limits: &ZipLimits) -> Option<ZipInspection> {
 }
 
 /// Scores the members of a ZIP-format file with the embedded-content rules,
-/// as one signal (§6.2).
+/// as one signal: each rule counts once, at its strongest member, and the
+/// sum is capped (§6.2).
 pub struct ZipMemberRule;
 
 impl Rule for ZipMemberRule {
@@ -159,12 +162,16 @@ impl Rule for ZipMemberRule {
         let Some(inspection) = inspection(ctx) else {
             return Ok(None);
         };
-        if inspection.findings.is_empty() || inspection.findings_total <= 0 {
+        let total = inspection
+            .strongest
+            .values()
+            .fold(0i32, |sum, &w| sum.saturating_add(w));
+        if inspection.findings.is_empty() || total <= 0 {
             return Ok(None);
         }
         Ok(Some(MatchedSignal {
             id: self.id().to_string(),
-            weight: inspection.findings_total.min(MAX_ZIP_MEMBER_WEIGHT),
+            weight: total.min(MAX_ZIP_MEMBER_WEIGHT),
             description: inspection.findings.join(MAX_LISTED),
             category: self.category(),
         }))
@@ -280,11 +287,49 @@ mod tests {
         );
     }
 
+    fn simd_macho() -> Vec<u8> {
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/fixtures/benign/macho_dense_simd_text"
+        );
+        std::fs::read(path).unwrap()
+    }
+
+    #[test]
+    fn copies_of_one_finding_count_once() {
+        let bin = simd_macho();
+        let specs: Vec<Spec> = (0..5)
+            .map(|i| Spec::stored(&format!("bin{i}"), &bin))
+            .collect();
+        let ctx = ctx(plain(&specs));
+        let sig = member_signal(&ctx).unwrap();
+        assert_eq!(sig.weight, 4);
+        assert_eq!(
+            sig.description.matches("bin").count(),
+            5,
+            "{}",
+            sig.description
+        );
+        let result = scan_context(&ctx, &default_ruleset());
+        assert_eq!(result.recommendation, Recommendation::NoAction);
+    }
+
+    #[test]
+    fn different_findings_add_up_to_the_cap() {
+        let one = |specs: &[Spec]| member_signal(&ctx(plain(specs))).unwrap().weight;
+        let dropper = Spec::deflated("setup.sh", DROPPER);
+        let simd = Spec::stored("bin", &simd_macho());
+        assert_eq!(one(std::slice::from_ref(&dropper)), 17);
+        assert_eq!(one(std::slice::from_ref(&simd)), 4);
+        assert_eq!(one(&[dropper, simd]), MAX_ZIP_MEMBER_WEIGHT);
+    }
+
     #[test]
     fn many_findings_are_capped_in_one_category() {
-        let specs: Vec<Spec> = (0..10)
+        let mut specs: Vec<Spec> = (0..10)
             .map(|i| Spec::deflated(&format!("s{i}.sh"), DROPPER))
             .collect();
+        specs.push(Spec::stored("bin", &simd_macho()));
         let ctx = ctx(plain(&specs));
         assert_eq!(member_signal(&ctx).unwrap().weight, MAX_ZIP_MEMBER_WEIGHT);
         let result = scan_context(&ctx, &default_ruleset());
