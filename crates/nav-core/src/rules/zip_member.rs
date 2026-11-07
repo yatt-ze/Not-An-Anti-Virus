@@ -4,7 +4,7 @@
 //! `uninspected-container` reports what could not be read.
 
 use super::codesign::member_signature;
-use super::container::{disk_image_format, inside_app_bundle};
+use super::container::{disk_image_format, inside_app_bundle, is_zip};
 use super::{embedded_content_ruleset, Rule, RuleOutcome};
 use crate::context::ScanContext;
 use crate::model::{MatchedSignal, ScanCompleteness, SignalCategory};
@@ -79,8 +79,7 @@ pub(super) fn inspection(ctx: &ScanContext) -> Option<&ZipInspection> {
 
 fn inspect(ctx: &ScanContext, limits: &ZipLimits) -> Option<ZipInspection> {
     let content = ctx.content.as_deref()?;
-    let tail = &content[content.len().saturating_sub(zip::END_SEARCH_LEN)..];
-    if ctx.truncated || !zip::is_zip_format(content, tail) || inside_app_bundle(ctx) {
+    if ctx.truncated || is_zip(ctx) != Some(true) || inside_app_bundle(ctx) {
         return None;
     }
     let rules = embedded_content_ruleset();
@@ -89,14 +88,15 @@ fn inspect(ctx: &ScanContext, limits: &ZipLimits) -> Option<ZipInspection> {
     let mut unsigned = Listing::default();
     let mut unsigned_weight = 0;
     let mut member_gaps = Listing::default();
-    let read = zip::read(content, limits, &mut |m: &Member| {
+    let read = zip::read(content, limits, &mut |m: Member| {
         let label = format!("{}!{}", ctx.path.display(), m.path);
-        let member = ScanContext::from_embedded_bytes(label, m.bytes.to_vec(), m.cut);
+        let xar = crate::xar::has_xar_magic(&m.bytes);
+        let member = ScanContext::from_embedded_bytes(label, m.bytes, m.cut);
         let mut gap = |reason: &str| member_gaps.push(format!("{}: {reason}", m.path));
         if let Some(Some(format)) = disk_image_format(&member) {
             gap(&format!("disk image ({format}) not inspected"));
         }
-        if crate::xar::has_xar_magic(m.bytes) {
+        if xar {
             gap("installer package not inspected");
         }
         let macho = member.macho();

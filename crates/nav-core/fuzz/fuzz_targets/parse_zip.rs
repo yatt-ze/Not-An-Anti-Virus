@@ -23,7 +23,7 @@ fuzz_target!(|data: &[u8]| {
     };
     let mut total = 0usize;
     let mut cut = 0usize;
-    let result = zip::read(data, &limits, &mut |m: &Member| {
+    let result = zip::read(data, &limits, &mut |m: Member| {
         assert!(
             m.bytes.len() <= limits.max_member_bytes,
             "member of {} bytes against a cap of {}",

@@ -62,13 +62,26 @@ pub(super) fn disk_image_format(ctx: &ScanContext) -> Option<Option<&'static str
 
 /// True when `ctx` is ZIP-format ([`zip::is_zip_format`]): a local file
 /// header at 0, or an end record with entries whose comment reaches the end
-/// of the file (prefixed, self-extracting and commented zips). Reads the
-/// last 64 KiB from the file. `None` if an in-range probe could not be read.
-fn is_zip(ctx: &ScanContext) -> Option<bool> {
+/// of the file (prefixed, self-extracting and commented zips). Reads up to
+/// the last 64 KiB from the file; memoized per scan. `None` if an in-range
+/// probe could not be read.
+pub(super) fn is_zip(ctx: &ScanContext) -> Option<bool> {
+    *ctx.zip_format_cache.get_or_init(|| detect_zip(ctx))
+}
+
+fn detect_zip(ctx: &ScanContext) -> Option<bool> {
     let len = ctx.file_len?;
-    let head = ctx.read_at(0, len.min(4) as usize)?;
+    let head = ctx.read_range(0, len.min(4) as usize)?;
+    if head.starts_with(b"PK\x03\x04") {
+        return Some(true);
+    }
+    let last_len = len.min(22);
+    let last = ctx.read_range(len - last_len, last_len as usize)?;
+    if let Some(decided) = zip::decided_by_last_end(&last) {
+        return Some(decided);
+    }
     let tail_len = len.min(zip::END_SEARCH_LEN as u64);
-    let tail = ctx.read_at(len - tail_len, tail_len as usize)?;
+    let tail = ctx.read_range(len - tail_len, tail_len as usize)?;
     Some(zip::is_zip_format(&head, &tail))
 }
 

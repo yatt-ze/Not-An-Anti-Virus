@@ -130,6 +130,8 @@ pub struct ScanContext {
     /// Memoized ZIP read (§6.2, #86): the member rule and the container rule
     /// both use it. `None` inside: not read.
     pub(crate) zip_cache: OnceLock<Option<crate::rules::ZipInspection>>,
+    /// Memoized ZIP-format detection, shared by the same two rules.
+    pub(crate) zip_format_cache: OnceLock<Option<bool>>,
     /// Ids of rules that evaluated but could not cover everything they should
     /// have this scan (§10/§11.8). Keyed per rule so one rule's gap can't
     /// clobber another's.
@@ -217,6 +219,7 @@ impl ScanContext {
             signer_check_cache: OnceLock::new(),
             macho_cache: OnceLock::new(),
             zip_cache: OnceLock::new(),
+            zip_format_cache: OnceLock::new(),
             incomplete_rules: std::sync::Mutex::new(Vec::new()),
             bytes_read: AtomicU64::new(0),
         }

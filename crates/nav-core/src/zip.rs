@@ -177,7 +177,7 @@ pub struct Gap {
 pub struct Member<'a> {
     /// Its name, with any nested zips' names before it joined by `!`.
     pub path: &'a str,
-    pub bytes: &'a [u8],
+    pub bytes: Vec<u8>,
     /// `bytes` stops short of the whole member.
     pub cut: bool,
 }
@@ -196,17 +196,31 @@ pub struct ZipRead {
 /// with entries whose comment ends exactly at the end of `tail`. `head` is
 /// the first bytes, `tail` the last [`END_SEARCH_LEN`] (or all) bytes.
 pub fn is_zip_format(head: &[u8], tail: &[u8]) -> bool {
-    head.starts_with(LOCAL_SIG)
-        || end_candidates(tail)
-            .find(|&p| comment_end(tail, p) == Some(tail.len()))
-            .is_some_and(|p| le_u16(tail, p + 10) != Some(0))
+    if head.starts_with(LOCAL_SIG) {
+        return true;
+    }
+    if let Some(decided) = decided_by_last_end(tail) {
+        return decided;
+    }
+    end_candidates(tail)
+        .find(|&p| comment_end(tail, p) == Some(tail.len()))
+        .is_some_and(|p| le_u16(tail, p + 10) != Some(0))
+}
+
+/// [`is_zip_format`]'s answer from the last [`END_LEN`] bytes of `tail`
+/// alone, when they are an end record with no comment (the nearest one that
+/// reaches the end); `None` when the wider search is needed.
+pub fn decided_by_last_end(tail: &[u8]) -> Option<bool> {
+    let pos = tail.len().checked_sub(END_LEN)?;
+    (sig_at(tail, pos, END_SIG) && le_u16(tail, pos + 20) == Some(0))
+        .then(|| le_u16(tail, pos + 10) != Some(0))
 }
 
 /// Reads every member of the zip in `data` under `limits`, passing each
 /// decoded member to `visit`. A nested zip is read in place of being
 /// visited (also visited when its zip data does not start at offset 0, or
 /// when it is past the depth limit).
-pub fn read(data: &[u8], limits: &ZipLimits, visit: &mut dyn FnMut(&Member)) -> ZipRead {
+pub fn read(data: &[u8], limits: &ZipLimits, visit: &mut dyn FnMut(Member)) -> ZipRead {
     let mut reader = Reader {
         limits: *limits,
         entries: 0,
@@ -489,7 +503,7 @@ struct Reader<'v> {
     /// Hashes of (member, kind) already reported.
     seen_gaps: HashSet<u64>,
     members: usize,
-    visit: &'v mut dyn FnMut(&Member),
+    visit: &'v mut dyn FnMut(Member),
 }
 
 impl Reader<'_> {
@@ -923,7 +937,7 @@ impl Reader<'_> {
             }
         }
         if !bytes.is_empty() {
-            self.deliver(&label, &bytes, cut, depth, shares);
+            self.deliver(&label, bytes, cut, depth, shares);
         }
         resume
     }
@@ -932,30 +946,37 @@ impl Reader<'_> {
     fn deliver(
         &mut self,
         label: &str,
-        bytes: &[u8],
+        mut bytes: Vec<u8>,
         cut: bool,
         depth: usize,
         shares: &mut ShareBudget,
     ) {
         let tail = &bytes[bytes.len().saturating_sub(END_SEARCH_LEN)..];
-        let nested = is_zip_format(bytes, tail);
+        let nested = is_zip_format(&bytes, tail);
         let past_depth = nested && depth >= self.limits.max_depth;
         if past_depth {
             self.gap(label, GapKind::Limit(Limit::Depth));
         }
         let at_start = bytes.starts_with(LOCAL_SIG) || bytes.starts_with(END_SIG);
-        if !nested || past_depth || !at_start {
+        let read_nested = nested && !past_depth;
+        if !read_nested || !at_start {
             self.members += 1;
-            (self.visit)(&Member {
+            // Only a prefixed nested zip is both visited and read.
+            let bytes = if read_nested {
+                bytes.clone()
+            } else {
+                std::mem::take(&mut bytes)
+            };
+            (self.visit)(Member {
                 path: label,
                 bytes,
                 cut,
             });
         }
-        if nested && !past_depth {
+        if read_nested {
             let mut inner = ShareBudget::new(shares.entry_remaining());
             let before = inner.remaining();
-            self.archive(bytes, depth + 1, &format!("{label}!"), &mut inner);
+            self.archive(&bytes, depth + 1, &format!("{label}!"), &mut inner);
             shares.charge(before - inner.remaining());
         }
     }
@@ -1415,8 +1436,8 @@ mod tests {
 
     fn read_with(data: &[u8], limits: &ZipLimits) -> (Seen, ZipRead) {
         let mut seen = Vec::new();
-        let result = read(data, limits, &mut |m: &Member| {
-            seen.push((m.path.to_string(), m.bytes.to_vec(), m.cut))
+        let result = read(data, limits, &mut |m: Member| {
+            seen.push((m.path.to_string(), m.bytes, m.cut))
         });
         assert_eq!(result.members, seen.len());
         (seen, result)
