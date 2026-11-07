@@ -282,9 +282,9 @@ fn range_key(entry: &xar::XarFile) -> (bool, Option<u64>, Option<u64>) {
 
 /// Signal descriptions and summed weight collected across scanned script text.
 #[derive(Default)]
-pub(super) struct ScriptFindings {
-    pub(super) descriptions: Vec<String>,
-    pub(super) total: i32,
+struct ScriptFindings {
+    descriptions: Vec<String>,
+    total: i32,
 }
 
 impl ScriptFindings {
@@ -300,7 +300,7 @@ impl ScriptFindings {
     }
 
     /// Records a finding that did not come from a content-rule signal.
-    pub(super) fn add(&mut self, weight: i32, description: String) {
+    fn add(&mut self, weight: i32, description: String) {
         self.total = self.total.saturating_add(weight);
         self.descriptions.push(description);
     }
