@@ -7,6 +7,8 @@
 //! `scan` prints one terse line per file, except a `.app` bundle, which gets
 //! one line for the bundle (per-file lines with `--verbose`);
 //! `rules test` prints the worst file's full breakdown plus a roll-up.
+//! A disk image is mounted and rendered like a bundle (§6.2,
+//! [`crate::diskimage`]).
 
 use std::path::{Path, PathBuf};
 
@@ -19,7 +21,41 @@ use nav_core::{
     SCAN_JSON_SCHEMA_VERSION, UNINSPECTED_CONTAINER_ID,
 };
 
+use crate::diskimage::{self, ImageReport, ImageScan};
 use crate::exit;
+
+/// What to do with the named target after trying to mount it.
+enum Prepared {
+    /// Scan it the usual way; `Some(reason)` when it is a disk image that
+    /// was not mounted.
+    Plain(Option<String>),
+    Image(ImageReport),
+    Done(ExitCode),
+}
+
+fn prepare(path: &Path, budget: &ScanBudget, no_mount: bool) -> Prepared {
+    if no_mount {
+        return Prepared::Plain(None);
+    }
+    match diskimage::scan_image(path, budget) {
+        ImageScan::NotImage => Prepared::Plain(None),
+        ImageScan::Unmounted(reason) => {
+            eprintln!(
+                "navctl: {}: disk image not mounted: {reason}",
+                path.display()
+            );
+            Prepared::Plain(Some(reason))
+        }
+        ImageScan::Scanned(report) => Prepared::Image(report),
+        ImageScan::Interrupted(signal) => {
+            eprintln!(
+                "navctl: {}: scan interrupted; scratch mounts detached",
+                path.display()
+            );
+            Prepared::Done(exit::code(128u8.saturating_add(signal as u8)))
+        }
+    }
+}
 
 pub fn run_scan(
     path: &Path,
@@ -27,7 +63,13 @@ pub fn run_scan(
     json: bool,
     verbose: bool,
     budget: &ScanBudget,
+    no_mount: bool,
 ) -> ExitCode {
+    match prepare(path, budget, no_mount) {
+        Prepared::Plain(_) => {}
+        Prepared::Image(report) => return render_image_scan(&report, json, verbose),
+        Prepared::Done(code) => return code,
+    }
     let scan = match scan_target_with_budget(path, recursive, budget) {
         Ok(s) => s,
         Err(e) => {
@@ -78,11 +120,22 @@ pub fn run_scan(
     exit::code(exit::for_target(&scan))
 }
 
-pub fn run_rules_test(path: &Path, recursive: bool, json: bool, budget: &ScanBudget) -> ExitCode {
+pub fn run_rules_test(
+    path: &Path,
+    recursive: bool,
+    json: bool,
+    budget: &ScanBudget,
+    no_mount: bool,
+) -> ExitCode {
     if !path.exists() {
         eprintln!("navctl: {} does not exist", path.display());
         return exit::code(exit::OPERATIONAL_ERROR);
     }
+    let unmounted = match prepare(path, budget, no_mount) {
+        Prepared::Plain(reason) => reason,
+        Prepared::Image(report) => return render_image_rules_test(&report, json),
+        Prepared::Done(code) => return code,
+    };
 
     let scan = match scan_target_with_budget(path, recursive, budget) {
         Ok(s) => s,
@@ -101,6 +154,10 @@ pub fn run_rules_test(path: &Path, recursive: bool, json: bool, budget: &ScanBud
                 Err(e) => return json_error(&e),
             }
         } else {
+            if let Some(reason) = &unmounted {
+                println!("Disk image not mounted: {reason}");
+                println!();
+            }
             print_rules_test(result);
         }
         return exit::code(exit::for_result(result));
@@ -120,7 +177,7 @@ pub fn run_rules_test(path: &Path, recursive: bool, json: bool, budget: &ScanBud
         // `results`, `coverage_complete: false`). `print_rules_test_multi`
         // needs a non-empty `results` to pick a worst file from.
         if json && !notes.is_empty() {
-            return match print_multi_json(&scan) {
+            return match print_multi_json(&scan, None) {
                 Ok(()) => exit::code(exit::INDETERMINATE),
                 Err(e) => json_error(&e),
             };
@@ -130,14 +187,110 @@ pub fn run_rules_test(path: &Path, recursive: bool, json: bool, budget: &ScanBud
     }
 
     if json {
-        if let Err(e) = print_multi_json(&scan) {
+        if let Err(e) = print_multi_json(&scan, None) {
             return json_error(&e);
         }
     } else {
-        print_rules_test_multi(&scan);
+        print_rules_test_multi(&scan, None);
     }
 
     exit::code(exit::for_target(&scan))
+}
+
+/// `navctl scan` for a mounted image: one line, member lines with
+/// `--verbose`, one JSON object per member with `--json`.
+fn render_image_scan(report: &ImageReport, json: bool, verbose: bool) -> ExitCode {
+    let scan = &report.scan;
+    for result in &scan.results {
+        if json {
+            match with_schema_version(result) {
+                Ok(v) => println!("{v}"),
+                Err(e) => return json_error(&e),
+            }
+        } else if verbose {
+            print_scan_summary(result);
+        }
+    }
+    if scan.results.is_empty() {
+        eprintln!("navctl: no files found in {}", scan.root.display());
+    } else if !json {
+        println!("{}", image_summary_line(report));
+    }
+    print_image_warnings(report, !json);
+    exit::code(image_exit_code(report))
+}
+
+/// `navctl rules test` for a mounted image: the bundle breakdown, or the
+/// multi-target JSON envelope.
+fn render_image_rules_test(report: &ImageReport, json: bool) -> ExitCode {
+    let scan = &report.scan;
+    if json {
+        if let Err(e) = print_multi_json(scan, Some(report)) {
+            return json_error(&e);
+        }
+    } else if scan.results.is_empty() {
+        eprintln!("navctl: no files found in {}", scan.root.display());
+    } else {
+        print_rules_test_multi(scan, Some(report));
+    }
+    print_image_warnings(report, false);
+    exit::code(image_exit_code(report))
+}
+
+/// Stderr notes for a mounted image: mount gaps, budget, unreadable
+/// directories and (with `nested`) uninspected members.
+fn print_image_warnings(report: &ImageReport, nested: bool) {
+    let scan = &report.scan;
+    for gap in &report.gaps {
+        eprintln!("navctl: partial coverage — {}: {gap}", scan.root.display());
+    }
+    if let Some(note) = budget_warning(scan, &scan.root) {
+        eprintln!("{note}");
+    }
+    if nested {
+        for note in uninspected_notes(&scan.results) {
+            eprintln!("{note}");
+        }
+    }
+    if let Some(note) = unreadable_note(scan) {
+        eprintln!("{note}");
+    }
+}
+
+/// [`exit::for_target`], raised from clean to indeterminate by a mount gap
+/// or an image with no files.
+fn image_exit_code(report: &ImageReport) -> u8 {
+    let code = exit::for_target(&report.scan);
+    let incomplete = !report.gaps.is_empty() || report.scan.results.is_empty();
+    if code == exit::CLEAN && incomplete {
+        exit::INDETERMINATE
+    } else {
+        code
+    }
+}
+
+/// One line for a mounted image, as [`bundle_summary_line`] for a bundle.
+fn image_summary_line(report: &ImageReport) -> String {
+    unit_summary_line(
+        &report.scan,
+        "disk image",
+        report.gaps.is_empty(),
+        |p: &Path| image_member(&report.scan.root, p),
+    )
+}
+
+/// A member label `<image>!path` shortened to `<image file name>!path`.
+fn image_member(image: &Path, label: &Path) -> String {
+    let label = label.display().to_string();
+    let full = image.display().to_string();
+    let name = image
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| full.clone());
+    match label.strip_prefix(&full) {
+        Some(rest) => format!("{name}{rest}"),
+        None => label,
+    }
 }
 
 pub fn run_rules_list() -> ExitCode {
@@ -177,10 +330,13 @@ fn summary_line(
 }
 
 /// `worst`'s completeness, raised to `Partial` when it was `Complete` but
-/// `scan`'s coverage was not. `worst` must be `scan.worst()`.
-fn target_completeness(scan: &TargetScan, worst: &ScanResult) -> ScanCompleteness {
+/// `scan`'s coverage (or, with `covered` false, something outside it) was
+/// not. `worst` must be `scan.worst()`.
+fn target_completeness(scan: &TargetScan, worst: &ScanResult, covered: bool) -> ScanCompleteness {
     match worst.completeness {
-        ScanCompleteness::Complete if !scan.coverage_complete() => ScanCompleteness::Partial,
+        ScanCompleteness::Complete if !(covered && scan.coverage_complete()) => {
+            ScanCompleteness::Partial
+        }
         c => c,
     }
 }
@@ -188,8 +344,21 @@ fn target_completeness(scan: &TargetScan, worst: &ScanResult) -> ScanCompletenes
 /// One line for a bundle: the worst file's verdict plus a file-count suffix.
 /// Precondition: `scan.results` is non-empty.
 fn bundle_summary_line(scan: &TargetScan) -> String {
+    unit_summary_line(scan, "bundle", true, |p: &Path| {
+        display_relative(&scan.root, p)
+    })
+}
+
+/// [`bundle_summary_line`] for any one-unit target: `unit` names it in the
+/// suffix, `covered` false forces `Partial`, `member` renders the worst path.
+fn unit_summary_line(
+    scan: &TargetScan,
+    unit: &str,
+    covered: bool,
+    member: impl Fn(&Path) -> String,
+) -> String {
     let worst = scan.worst().expect("non-empty results");
-    let completeness = target_completeness(scan, worst);
+    let completeness = target_completeness(scan, worst, covered);
     let line = summary_line(
         &scan.root.display().to_string(),
         worst.score,
@@ -203,7 +372,7 @@ fn bundle_summary_line(scan: &TargetScan) -> String {
         && worst.recommendation == Recommendation::NoAction
         && worst.score <= 0;
     if all_clean {
-        return format!("{line}  (bundle: {n} files)");
+        return format!("{line}  ({unit}: {n} files)");
     }
     let star = if scan.primary.as_deref() == Some(worst.path.as_path()) {
         "*"
@@ -211,8 +380,8 @@ fn bundle_summary_line(scan: &TargetScan) -> String {
         ""
     };
     format!(
-        "{line}  (bundle: {n} files; worst: {}{star})",
-        display_relative(&scan.root, &worst.path)
+        "{line}  ({unit}: {n} files; worst: {}{star})",
+        member(&worst.path)
     )
 }
 
@@ -243,10 +412,21 @@ fn print_rules_test(result: &ScanResult) {
 /// Directory / bundle breakdown: full detail for the worst file, a
 /// one-line-per-file roll-up, then the target verdict (the worst file's —
 /// scores are never summed).
-fn print_rules_test_multi(scan: &TargetScan) {
+fn print_rules_test_multi(scan: &TargetScan, image: Option<&ImageReport>) {
     let worst = scan.worst().expect("non-empty results");
+    let member = |p: &Path| match image {
+        Some(_) => image_member(&scan.root, p),
+        None => display_relative(&scan.root, p),
+    };
 
-    if scan.kind == TargetKind::Bundle {
+    if let Some(report) = image {
+        println!("Disk image: {}", scan.root.display());
+        println!("Volumes scanned: {}", report.volumes);
+        println!("Files scanned: {}", scan.results.len());
+        for gap in &report.gaps {
+            println!("  [PARTIAL COVERAGE: {gap}]");
+        }
+    } else if scan.kind == TargetKind::Bundle {
         println!("Bundle: {}", scan.root.display());
         match &scan.primary {
             Some(p) => println!("Main executable: {}", display_relative(&scan.root, p)),
@@ -271,10 +451,7 @@ fn print_rules_test_multi(scan: &TargetScan) {
         println!("{note}");
     }
     println!();
-    println!(
-        "Worst finding — {}",
-        display_relative(&scan.root, &worst.path)
-    );
+    println!("Worst finding — {}", member(&worst.path));
     println!("  Threat score:        {}", worst.score);
     println!(
         "  Evidence confidence: {}",
@@ -303,7 +480,7 @@ fn print_rules_test_multi(scan: &TargetScan) {
         };
         println!(
             "{marker} {:<48} score={:<4} completeness={:<13} -> {}",
-            display_relative(&scan.root, &result.path),
+            member(&result.path),
             result.score,
             completeness_str(result.completeness),
             recommendation_str(result.recommendation, result.completeness),
@@ -313,9 +490,13 @@ fn print_rules_test_multi(scan: &TargetScan) {
         println!("  (* = bundle main executable)");
     }
     println!();
+    let covered = image.map_or(true, |r| r.gaps.is_empty());
     println!(
         "Recommendation: {}",
-        recommendation_str(worst.recommendation, target_completeness(scan, worst))
+        recommendation_str(
+            worst.recommendation,
+            target_completeness(scan, worst, covered)
+        )
     );
 }
 
@@ -325,29 +506,47 @@ fn json_error(e: &serde_json::Error) -> ExitCode {
     exit::code(exit::OPERATIONAL_ERROR)
 }
 
-fn print_multi_json(scan: &TargetScan) -> Result<(), serde_json::Error> {
-    println!("{}", serde_json::to_string_pretty(&multi_json(scan)?)?);
+fn print_multi_json(
+    scan: &TargetScan,
+    image: Option<&ImageReport>,
+) -> Result<(), serde_json::Error> {
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&multi_json(scan, image)?)?
+    );
     Ok(())
 }
 
-fn multi_json(scan: &TargetScan) -> Result<serde_json::Value, serde_json::Error> {
-    let kind = match scan.kind {
-        TargetKind::Bundle => "bundle",
+/// The multi-target `rules test --json` envelope; an image adds `volumes`
+/// and `mount_gaps`, which also clear `coverage_complete`.
+fn multi_json(
+    scan: &TargetScan,
+    image: Option<&ImageReport>,
+) -> Result<serde_json::Value, serde_json::Error> {
+    let kind = match (image, scan.kind) {
+        (Some(_), _) => "disk-image",
+        (None, TargetKind::Bundle) => "bundle",
         _ => "directory",
     };
+    let gaps_ok = image.map_or(true, |r| r.gaps.is_empty());
     let paths = |ps: &[PathBuf]| ps.iter().map(lossy_path::to_value).collect::<Vec<_>>();
-    Ok(serde_json::json!({
+    let mut v = serde_json::json!({
         "schema_version": SCAN_JSON_SCHEMA_VERSION,
         "target": lossy_path::to_value(&scan.root),
         "kind": kind,
         "primary": scan.primary.as_ref().map(lossy_path::to_value),
         "skipped_resources": paths(&scan.skipped),
-        "coverage_complete": scan.coverage_complete(),
+        "coverage_complete": scan.coverage_complete() && gaps_ok,
         "budget_limit": budget_limit_str(scan),
         "unreadable": paths(&scan.unreadable),
         "recommendation": serde_json::to_value(scan.recommendation())?,
         "results": serde_json::to_value(&scan.results)?,
-    }))
+    });
+    if let (Some(report), serde_json::Value::Object(map)) = (image, &mut v) {
+        map.insert("volumes".into(), report.volumes.into());
+        map.insert("mount_gaps".into(), report.gaps.clone().into());
+    }
+    Ok(v)
 }
 
 /// A human-readable warning when a scan budget cut the target short, or `None`
@@ -551,7 +750,7 @@ mod tests {
             results: vec![sample_result()],
             budget: nav_core::BudgetOutcome::Within,
         };
-        let value = multi_json(&scan).unwrap();
+        let value = multi_json(&scan, None).unwrap();
         assert_eq!(value["schema_version"], SCAN_JSON_SCHEMA_VERSION);
     }
 
@@ -624,7 +823,7 @@ mod tests {
     #[test]
     fn multi_json_on_empty_results_reports_incomplete_coverage() {
         let scan = empty_scan(vec![PathBuf::from("/tmp/locked")]);
-        let value = multi_json(&scan).unwrap();
+        let value = multi_json(&scan, None).unwrap();
         assert_eq!(value["results"], serde_json::json!([]));
         assert_eq!(value["coverage_complete"], false);
         assert_eq!(value["unreadable"], serde_json::json!(["/tmp/locked"]));
@@ -648,7 +847,8 @@ mod tests {
             results: vec![result],
             budget: nav_core::BudgetOutcome::Within,
         };
-        let text = serde_json::to_string_pretty(&multi_json(&scan).expect("serializes")).unwrap();
+        let text =
+            serde_json::to_string_pretty(&multi_json(&scan, None).expect("serializes")).unwrap();
         let v: serde_json::Value = serde_json::from_str(&text).unwrap();
         assert_eq!(v["target"], "/tmp/root\u{FFFD}");
         assert_eq!(v["primary"], "/tmp/root\u{FFFD}/p\u{FFFD}");
@@ -727,9 +927,15 @@ mod tests {
         assert!(line.contains("not fully checked"), "{line}");
         assert!(!line.contains("(clean)"), "{line}");
         let worst = scan.worst().unwrap();
-        assert_eq!(target_completeness(&scan, worst), ScanCompleteness::Partial);
         assert_eq!(
-            recommendation_str(worst.recommendation, target_completeness(&scan, worst)),
+            target_completeness(&scan, worst, true),
+            ScanCompleteness::Partial
+        );
+        assert_eq!(
+            recommendation_str(
+                worst.recommendation,
+                target_completeness(&scan, worst, true)
+            ),
             "no action (not fully checked)"
         );
     }

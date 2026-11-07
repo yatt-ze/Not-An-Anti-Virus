@@ -170,7 +170,7 @@ tolerate IDs they don't recognise as the ruleset evolves.
 | **Scripts** | Shell, AppleScript, JavaScript and `.command` files with `curl \| sh`, base64 piped into an interpreter, and similar loader patterns |
 | **Persistence** | LaunchAgent/LaunchDaemon plists in staging locations, unusual run-at-load + keep-alive + short-interval combinations, or an inline downloader as the program to run |
 | **Installer packages** | `.pkg` structure, signature, Distribution scripts and install-script contents, inspected without executing installer scripts or payloads |
-| **Archives** | ZIP files (documents such as `.docx` included) are read in memory and their contents scanned; a disk image, or anything NAV could not read, is reported as not fully checked rather than clean |
+| **Archives** | ZIP files (documents such as `.docx` included) are read in memory and their contents scanned; `navctl` mounts a disk image read-only in a private scratch directory and scans its volumes (`--no-mount` to skip); anything NAV could not read is reported as not fully checked rather than clean |
 
 Run `navctl rules list` for the full set of rule IDs.
 
