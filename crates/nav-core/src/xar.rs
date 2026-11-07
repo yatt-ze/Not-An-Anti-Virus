@@ -306,16 +306,15 @@ pub fn parse(data: &[u8], limits: &XarLimits) -> Option<XarArchive> {
 
 /// Read one entry's bytes back out of the heap, decompressing under budget.
 ///
-/// `src` must be the source whose prefix was handed to [`parse`]. Reads only
-/// what `src` holds in memory (an entry past it is `OutOfRange`); disk-backed
-/// reads go through [`ReadBudget`].
+/// `data` must be the buffer handed to [`parse`]; an entry past it is
+/// `OutOfRange`. Reads past an in-memory prefix go through [`ReadBudget`].
 pub fn read_entry(
-    src: &(impl ByteSource + ?Sized),
+    data: &[u8],
     archive: &XarArchive,
     file: &XarFile,
     limits: &XarLimits,
 ) -> Result<Vec<u8>, XarEntryError> {
-    match read_entry_partial(src, archive, file, limits)? {
+    match read_entry_partial(data, archive, file, limits)? {
         (bytes, None) => Ok(bytes),
         (_, Some(e)) => Err(e),
     }
@@ -328,12 +327,12 @@ pub fn read_entry(
 /// non-empty partial one. Callers must treat the latter as incomplete
 /// evidence, never as a clean read.
 pub fn read_entry_partial(
-    src: &(impl ByteSource + ?Sized),
+    data: &[u8],
     archive: &XarArchive,
     file: &XarFile,
     limits: &XarLimits,
 ) -> Result<(Vec<u8>, Option<XarEntryError>), XarEntryError> {
-    decode_entry(&held_entry(src, archive, file)?, limits)
+    decode_entry(&held_entry(data, archive, file)?, limits)
 }
 
 /// Where `file`'s bytes lie in `src`: absolute start and length. `OutOfRange`
@@ -462,13 +461,13 @@ fn is_xz(raw: &[u8]) -> bool {
 /// What [`ReadBudget::read_entry_partial`] charges for `file`'s input: its heap
 /// length, or for a bzip2 stream at least one block of its declared size.
 /// `Err` for an entry that cannot be located, or is xz (reading it costs
-/// nothing). Reads only what `src` holds in memory, as [`read_entry`].
+/// nothing). `data` as for [`read_entry`].
 pub fn entry_cost(
-    src: &(impl ByteSource + ?Sized),
+    data: &[u8],
     archive: &XarArchive,
     file: &XarFile,
 ) -> Result<usize, XarEntryError> {
-    let raw = held_entry(src, archive, file)?;
+    let raw = held_entry(data, archive, file)?;
     raw_cost(&raw, raw.len())
 }
 
@@ -496,15 +495,15 @@ fn may_nest(raw: &[u8]) -> bool {
 
 /// The allowance a read of `file` needs to take all its input: [`entry_cost`]
 /// times 3 for a [`ReadBudget::read_entry_nested`] read of a zlib entry
-/// (`nested`), else times 2. Errors as `entry_cost`; reads only what `src`
-/// holds in memory ([`ReadBudget::entry_allowance`] probes past it).
+/// (`nested`), else times 2. Errors as `entry_cost`; `data` as for
+/// [`read_entry`] ([`ReadBudget::entry_allowance`] probes past a prefix).
 pub fn entry_allowance(
-    src: &(impl ByteSource + ?Sized),
+    data: &[u8],
     archive: &XarArchive,
     file: &XarFile,
     nested: bool,
 ) -> Result<usize, XarEntryError> {
-    let raw = held_entry(src, archive, file)?;
+    let raw = held_entry(data, archive, file)?;
     allowance(&raw, raw.len(), nested)
 }
 

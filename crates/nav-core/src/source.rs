@@ -56,6 +56,7 @@ impl ByteSource for [u8] {
     }
 }
 
+#[cfg(test)]
 impl ByteSource for Vec<u8> {
     fn source_len(&self) -> u64 {
         self.as_slice().source_len()
