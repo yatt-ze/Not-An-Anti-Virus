@@ -753,7 +753,8 @@ impl Reader<'_> {
                 let limit = shares.remaining();
                 let (found, scanned) = find_stored_end(data, local.start, local.zip64, limit);
                 shares.charge(scanned);
-                if found.is_none() && scanned >= limit {
+                let stopped = data.len().saturating_sub(local.start) > limit;
+                if found.is_none() && stopped {
                     let label = member_label(archive, local.name);
                     self.gap(&label, GapKind::Limit(Limit::Budget));
                     return;
@@ -2276,6 +2277,27 @@ mod tests {
         assert!(kinds(&r).contains(&GapKind::Limit(Limit::Budget)), "{r:?}");
         let (_, r) = read_all(&zip);
         assert!(!kinds(&r).contains(&GapKind::Limit(Limit::Budget)), "{r:?}");
+    }
+
+    #[test]
+    fn a_descriptor_search_ending_at_the_limit_is_unsized_not_budget() {
+        let mut s = Spec::stored("s", &[b'p'; 4000]).streamed();
+        s.descriptor = false;
+        let zip = build(
+            &[s],
+            &Layout {
+                no_end: true,
+                ..Layout::default()
+            },
+        );
+        let limits = ZipLimits {
+            max_read_back_bytes: zip.len() - (LOCAL_LEN + 1),
+            ..ZipLimits::default()
+        };
+        let (_, r) = read_with(&zip, &limits);
+        assert!(!kinds(&r).contains(&GapKind::Limit(Limit::Budget)), "{r:?}");
+        let unknown = GapKind::Disagree(Disagreement::UnknownSize);
+        assert!(kinds(&r).contains(&unknown), "{r:?}");
     }
 
     #[test]
