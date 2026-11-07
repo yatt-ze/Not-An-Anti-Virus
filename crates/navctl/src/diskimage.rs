@@ -27,6 +27,11 @@ pub const MOUNT_TIMEOUT: Duration = Duration::from_secs(60);
 const QUERY_TIMEOUT: Duration = Duration::from_secs(30);
 /// Bytes kept from each of an `hdiutil` call's stdout and stderr.
 const MAX_CAPTURE: usize = 1024 * 1024;
+/// How long the main thread waits for the worker after a cancel signal.
+const CANCEL_GRACE: Duration = Duration::from_secs(2);
+/// How long output is collected once hdiutil exits; a helper holding the
+/// pipe open must not hang navctl.
+const PIPE_GRACE: Duration = Duration::from_secs(2);
 const SCRATCH_DIR_NAME: &str = "navctl-scratch";
 
 /// Signal number received (SIGINT/SIGTERM/SIGHUP), or 0.
@@ -100,8 +105,11 @@ fn mount_on_worker(path: &Path, budget: &ScanBudget) -> Result<ImageReport, Stri
                 break r;
             }
             Err(mpsc::RecvTimeoutError::Timeout) if CANCEL.load(Ordering::SeqCst) != 0 => {
-                // Let the worker's poll loop kill its hdiutil child first.
-                thread::sleep(Duration::from_millis(200));
+                // Give the worker time to kill its hdiutil child and stop; a
+                // scan still walking the volume is cut off by the detach.
+                if rx.recv_timeout(CANCEL_GRACE).is_ok() {
+                    let _ = worker.join();
+                }
                 break Err("interrupted".into());
             }
             Err(mpsc::RecvTimeoutError::Timeout) => {}
@@ -161,7 +169,9 @@ fn mount_and_scan(
         )));
     }
 
-    let attached_before = devices_of_image(&attachments(), image);
+    // Without a real snapshot, cleanup could take an existing attachment for ours.
+    let info = query_plist(&[os("info"), os("-plist")])?;
+    let attached_before = devices_of_image(&parse_info(&info), image);
     if let Ok(mut b) = before.lock() {
         *b = Some(attached_before);
     }
@@ -270,13 +280,15 @@ fn relabel(scan: &mut TargetScan, image: &Path, volumes: &[PathBuf]) {
         }
         PathBuf::from(format!("{image_str}!"))
     };
-    // Longest form first: `<mount>/x` -> `image!x`, then a bare `<mount>`.
+    // `<mount>/x` -> `image!x`, and a bare `<mount>`; longest first, so one
+    // mount name that prefixes another can't rewrite the other's paths.
     let mut prefixes: Vec<(String, String)> = Vec::new();
     for v in volumes {
         let to = label(v).display().to_string();
         prefixes.push((format!("{}/", v.display()), to.clone()));
         prefixes.push((v.display().to_string(), to.trim_end_matches('/').into()));
     }
+    prefixes.sort_by_key(|(from, _)| std::cmp::Reverse(from.len()));
     for r in &mut scan.results {
         r.path = label(&r.path);
         for s in &mut r.signals {
@@ -622,8 +634,11 @@ fn run_capped(
     let stderr = drain(child.stderr.take());
     let deadline = Instant::now() + timeout;
     let (status, timed_out) = wait_until(&mut child, deadline, cancellable)?;
-    let (stdout, stdout_cut) = stdout.join().unwrap_or_default();
-    let (stderr, _) = stderr.join().unwrap_or_default();
+    // Not received in time counts as cut, so the output is not trusted.
+    let (stdout, stdout_cut) = stdout
+        .recv_timeout(PIPE_GRACE)
+        .unwrap_or((Vec::new(), true));
+    let (stderr, _) = stderr.recv_timeout(PIPE_GRACE).unwrap_or_default();
     Ok(Captured {
         status,
         stdout,
@@ -654,12 +669,14 @@ fn wait_until(
 
 /// Reads `pipe` to EOF on a thread, keeping the first [`MAX_CAPTURE`] bytes;
 /// the flag is true if more was discarded.
-fn drain<R: Read + Send + 'static>(pipe: Option<R>) -> thread::JoinHandle<(Vec<u8>, bool)> {
+fn drain<R: Read + Send + 'static>(pipe: Option<R>) -> mpsc::Receiver<(Vec<u8>, bool)> {
+    let (tx, rx) = mpsc::channel();
     thread::spawn(move || {
         let mut kept = Vec::new();
         let mut cut = false;
         let Some(mut pipe) = pipe else {
-            return (kept, cut);
+            let _ = tx.send((kept, cut));
+            return;
         };
         let mut buf = [0u8; 8192];
         loop {
@@ -673,8 +690,9 @@ fn drain<R: Read + Send + 'static>(pipe: Option<R>) -> thread::JoinHandle<(Vec<u
                 }
             }
         }
-        (kept, cut)
-    })
+        let _ = tx.send((kept, cut));
+    });
+    rx
 }
 
 extern "C" fn on_signal(sig: libc::c_int) {
