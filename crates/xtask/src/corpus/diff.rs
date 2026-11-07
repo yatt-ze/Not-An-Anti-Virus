@@ -107,7 +107,7 @@ impl DiffReport {
     }
 }
 
-fn rec_rank(r: Recommendation) -> usize {
+pub(crate) fn rec_rank(r: Recommendation) -> usize {
     match r {
         Recommendation::NoAction => 0,
         Recommendation::Notify => 1,
@@ -115,7 +115,7 @@ fn rec_rank(r: Recommendation) -> usize {
     }
 }
 
-fn comp_rank(c: ScanCompleteness) -> usize {
+pub(crate) fn comp_rank(c: ScanCompleteness) -> usize {
     match c {
         ScanCompleteness::Complete => 0,
         ScanCompleteness::Partial => 1,
@@ -123,15 +123,37 @@ fn comp_rank(c: ScanCompleteness) -> usize {
     }
 }
 
-const REC_LABELS: [&str; 3] = ["no-action", "notify", "notify-and-suggest-quarantine"];
-const COMP_LABELS: [&str; 3] = ["complete", "partial", "indeterminate"];
+pub(crate) const REC_LABELS: [&str; 3] = ["no-action", "notify", "notify-and-suggest-quarantine"];
+pub(crate) const COMP_LABELS: [&str; 3] = ["complete", "partial", "indeterminate"];
 
-fn rec_label(r: Recommendation) -> &'static str {
+pub(crate) fn rec_label(r: Recommendation) -> &'static str {
     REC_LABELS[rec_rank(r)]
 }
 
-fn comp_label(c: ScanCompleteness) -> &'static str {
+pub(crate) fn comp_label(c: ScanCompleteness) -> &'static str {
     COMP_LABELS[comp_rank(c)]
+}
+
+/// The recommendation whose [`rec_label`] is `s`.
+pub(crate) fn parse_rec(s: &str) -> Option<Recommendation> {
+    [
+        Recommendation::NoAction,
+        Recommendation::Notify,
+        Recommendation::NotifyAndSuggestQuarantine,
+    ]
+    .into_iter()
+    .find(|r| rec_label(*r) == s)
+}
+
+/// The completeness whose [`comp_label`] is `s`.
+pub(crate) fn parse_comp(s: &str) -> Option<ScanCompleteness> {
+    [
+        ScanCompleteness::Complete,
+        ScanCompleteness::Partial,
+        ScanCompleteness::Indeterminate,
+    ]
+    .into_iter()
+    .find(|c| comp_label(*c) == s)
 }
 
 /// Keys results by path, keeping the last of any duplicates; returns the map

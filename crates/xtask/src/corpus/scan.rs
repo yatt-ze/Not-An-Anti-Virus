@@ -63,6 +63,8 @@ pub struct Summary {
     pub files: usize,
     /// Chunks that exited outside 0–3 (including death by signal).
     pub failed: usize,
+    /// The paths of those chunks.
+    pub failed_paths: Vec<PathBuf>,
     pub with_stderr: usize,
 }
 
@@ -222,6 +224,9 @@ fn run_chunk(navctl: &Path, budget: &[String], chunk: &Chunk, sink: &Mutex<Sink>
     let has_stderr = !stderr.trim().is_empty();
     if failed || has_stderr {
         s.summary.failed += usize::from(failed);
+        if failed {
+            s.summary.failed_paths.push(chunk.path.clone());
+        }
         s.summary.with_stderr += usize::from(has_stderr);
         let code = code.map_or_else(|| "signal".to_string(), |c| c.to_string());
         writeln!(

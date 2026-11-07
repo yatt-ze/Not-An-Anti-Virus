@@ -3,10 +3,10 @@
 //! Exit status: 0 gate passed, 2 gate failed (see `diff`), 1 tool error.
 
 mod compare;
-mod diff;
-mod parse;
-mod plan;
-mod scan;
+pub(crate) mod diff;
+pub(crate) mod parse;
+pub(crate) mod plan;
+pub(crate) mod scan;
 
 use std::path::PathBuf;
 use std::process::ExitCode;
