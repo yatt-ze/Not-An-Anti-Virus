@@ -77,6 +77,15 @@ on functional boundaries.**
   force-add them. `Cargo.lock` **is** tracked (this workspace ships
   binaries) — commit it when it changes.
 
+## Versioning
+
+One workspace version (`[workspace.package] version` in `Cargo.toml`),
+pre-1.0 SemVer (§13): bump the **minor** when a batch of features or
+behavior changes lands, the **patch** for fix-only work. The minor is not
+tied to the roadmap phase. Bump in its own commit, with `Cargo.lock` and
+the README status line, rather than letting merged work pile up unversioned.
+This is separate from `docs/design.md`'s `**Status:**` doc revision.
+
 ## Before every commit
 
 Run, in order, and fix everything before committing — this is exactly what
