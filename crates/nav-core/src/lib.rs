@@ -23,6 +23,7 @@ pub mod plist;
 pub mod presentation;
 pub mod rules;
 pub mod scan;
+pub mod source;
 pub mod target;
 #[cfg(test)]
 pub(crate) mod test_support;

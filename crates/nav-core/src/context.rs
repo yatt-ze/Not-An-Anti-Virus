@@ -468,7 +468,7 @@ impl Default for ScanContext {
     }
 }
 
-impl crate::macho::ByteSource for ScanContext {
+impl crate::source::ByteSource for ScanContext {
     fn source_len(&self) -> u64 {
         self.file_len.unwrap_or(0)
     }
@@ -596,7 +596,7 @@ mod tests {
     /// small header/signature reads (§5.2).
     #[test]
     fn read_range_inside_content_borrows_without_copying() {
-        use crate::macho::ByteSource;
+        use crate::source::ByteSource;
 
         let path = write_temp_file("read-range-borrowed", b"hello world");
         let ctx = ScanContext::load(&path);
@@ -609,7 +609,7 @@ mod tests {
     /// A range past `content` has to be read for real, so it comes back owned.
     #[test]
     fn read_range_past_content_is_owned() {
-        use crate::macho::ByteSource;
+        use crate::source::ByteSource;
 
         let total_len = MAX_CONTENT_BYTES as u64 + 4096;
         let path = sparse_temp_file("read-range-owned", total_len);
