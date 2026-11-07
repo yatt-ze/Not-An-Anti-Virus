@@ -442,12 +442,12 @@ impl ScanContext {
         self.bytes_read.load(Ordering::Relaxed)
     }
 
-    /// Number of distinct rules marked incomplete this scan.
-    pub fn incomplete_rule_count(&self) -> usize {
+    /// Distinct rules marked incomplete this scan, in marking order.
+    pub fn incomplete_rules(&self) -> Vec<&'static str> {
         self.incomplete_rules
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .len()
+            .clone()
     }
 
     /// Whether `rule_id` was marked incomplete this scan.

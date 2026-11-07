@@ -91,6 +91,7 @@ mod tests {
             score: 0,
             confidence: EvidenceConfidence::Low,
             completeness: ScanCompleteness::Complete,
+            coverage_gaps: Vec::new(),
             signals: Vec::new(),
             recommendation: Recommendation::NoAction,
             engine_version: "test".to_string(),

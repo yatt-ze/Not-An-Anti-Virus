@@ -346,6 +346,7 @@ mod tests {
             score,
             confidence: EvidenceConfidence::Low,
             completeness: comp,
+            coverage_gaps: vec![],
             signals: signals.iter().map(|(i, w)| sig(i, *w)).collect(),
             recommendation: rec,
             engine_version: "e".into(),
