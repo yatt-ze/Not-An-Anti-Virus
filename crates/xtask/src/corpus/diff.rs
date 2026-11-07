@@ -123,8 +123,8 @@ pub(crate) fn comp_rank(c: ScanCompleteness) -> usize {
     }
 }
 
-const REC_LABELS: [&str; 3] = ["no-action", "notify", "notify-and-suggest-quarantine"];
-const COMP_LABELS: [&str; 3] = ["complete", "partial", "indeterminate"];
+pub(crate) const REC_LABELS: [&str; 3] = ["no-action", "notify", "notify-and-suggest-quarantine"];
+pub(crate) const COMP_LABELS: [&str; 3] = ["complete", "partial", "indeterminate"];
 
 pub(crate) fn rec_label(r: Recommendation) -> &'static str {
     REC_LABELS[rec_rank(r)]
