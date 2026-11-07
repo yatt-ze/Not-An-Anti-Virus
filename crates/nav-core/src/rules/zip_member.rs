@@ -577,7 +577,12 @@ mod tests {
         let fixture = |p: &str| {
             crate::scan::scan_file(&std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(p))
         };
-        let complete = ScanCompleteness::Complete;
+        // Off macOS the quarantine-xattr rule can't run, so every file is Partial.
+        let complete = if cfg!(target_os = "macos") {
+            ScanCompleteness::Complete
+        } else {
+            ScanCompleteness::Partial
+        };
         for p in [
             "fixtures/benign/document_ordinary.docx",
             "fixtures/benign/nested_archive_ordinary.zip",
