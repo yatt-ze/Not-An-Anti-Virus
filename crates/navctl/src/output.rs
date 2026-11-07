@@ -385,6 +385,15 @@ fn unit_summary_line(
     )
 }
 
+/// One `<indent>- <gap>` line per `result.coverage_gaps` entry; none for a
+/// `Complete` result.
+fn gap_lines<'a>(result: &'a ScanResult, indent: &'a str) -> impl Iterator<Item = String> + 'a {
+    result
+        .coverage_gaps
+        .iter()
+        .map(move |gap| format!("{indent}- {gap}"))
+}
+
 fn print_rules_test(result: &ScanResult) {
     println!("Threat score:        {}", result.score);
     println!("Evidence confidence: {}", confidence_str(result.confidence));
@@ -392,8 +401,8 @@ fn print_rules_test(result: &ScanResult) {
         "Scan completeness:   {}",
         completeness_str(result.completeness)
     );
-    for gap in &result.coverage_gaps {
-        println!("  - {gap}");
+    for line in gap_lines(result, "  ") {
+        println!("{line}");
     }
     println!();
 
@@ -464,6 +473,9 @@ fn print_rules_test_multi(scan: &TargetScan, image: Option<&ImageReport>) {
         "  Scan completeness:   {}",
         completeness_str(worst.completeness)
     );
+    for line in gap_lines(worst, "    ") {
+        println!("{line}");
+    }
     if worst.signals.is_empty() {
         println!("  Signals matched: (none)");
     } else {
@@ -488,6 +500,9 @@ fn print_rules_test_multi(scan: &TargetScan, image: Option<&ImageReport>) {
             completeness_str(result.completeness),
             recommendation_str(result.recommendation, result.completeness),
         );
+        for line in gap_lines(result, "        ") {
+            println!("{line}");
+        }
     }
     if scan.primary.is_some() {
         println!("  (* = bundle main executable)");
