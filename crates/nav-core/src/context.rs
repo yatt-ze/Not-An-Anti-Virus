@@ -261,23 +261,28 @@ impl ScanContext {
     /// so a caller making many small ranged reads (`macho::scan_ranged`)
     /// doesn't copy on every one of them (§5.2).
     fn read_range_cow(&self, offset: u64, len: usize) -> Option<Cow<'_, [u8]>> {
+        match self.locate(offset, len)? {
+            Some(held) => Some(Cow::Borrowed(held)),
+            None => self.read_at_file(offset, len).map(Cow::Owned),
+        }
+    }
+
+    /// Validates `[offset, offset + len)` for a ranged read: `None` if `len >
+    /// MAX_RANGE_READ`, it overflows or passes `file_len`; else the held
+    /// bytes, or `Some(None)` when the range must be read from the file.
+    fn locate(&self, offset: u64, len: usize) -> Option<Option<&[u8]>> {
         if len > MAX_RANGE_READ {
             return None;
         }
-        let file_len = self.file_len?;
         let end = offset.checked_add(len as u64)?;
-        if end > file_len {
+        if end > self.file_len? {
             return None;
         }
-
-        if let Some(content) = &self.content {
-            if end <= content.len() as u64 {
-                let start = offset as usize;
-                return Some(Cow::Borrowed(&content[start..start + len]));
-            }
-        }
-
-        self.read_at_file(offset, len).map(Cow::Owned)
+        let held = self.content.as_deref().and_then(|c| {
+            let start = usize::try_from(offset).ok()?;
+            c.get(start..start.checked_add(len)?)
+        });
+        Some(held)
     }
 
     fn read_at_file(&self, offset: u64, len: usize) -> Option<Vec<u8>> {
@@ -496,21 +501,13 @@ impl crate::source::ByteSource for ScanContext {
     }
 
     fn read_exact_at(&self, off: u64, buf: &mut [u8]) -> Option<()> {
-        if buf.len() > MAX_RANGE_READ {
-            return None;
-        }
-        let end = off.checked_add(buf.len() as u64)?;
-        if end > self.file_len? {
-            return None;
-        }
-        if let Some(content) = &self.content {
-            if end <= content.len() as u64 {
-                let start = off as usize;
-                buf.copy_from_slice(&content[start..start + buf.len()]);
-                return Some(());
+        match self.locate(off, buf.len())? {
+            Some(held) => {
+                buf.copy_from_slice(held);
+                Some(())
             }
+            None => self.read_file_into(off, buf),
         }
-        self.read_file_into(off, buf)
     }
 }
 
