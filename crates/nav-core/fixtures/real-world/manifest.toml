@@ -1,0 +1,1310 @@
+# Real-world malware benchmark manifest (§11.1a). Samples are never committed;
+# `cargo xtask malware fetch` builds the git-ignored store/ inside the VM.
+# `expected` is the last accepted baseline ("<recommendation>/<completeness>");
+# raise it in the PR that earns the improvement.
+
+[source]
+repo = "objective-see/Malware"
+commit = "16c4f3bf685b1ed95e83d39d6b92c6af64315531"
+password = "infect3d"
+
+[[sample]]
+id = "amnesiastealer-01"
+category = "stealer"
+scope = "in"
+family = "AmnesiaStealer"
+archive = "AmnesiaStealer.zip"
+archive_sha256 = "5cabc30fd1bd2f902b0f10810feeb11678392d734cce3ee574e6f1678012de92"
+member = "AmnesiaStealer/macos-hybrid-stealer"
+kind = "macho"
+sha256 = "de5748aac4a4d4cb48cf050652679e6bc49eda33d9ffaa0d280b578122fab55a"
+bytes = 5088944
+expected = "notify/complete"
+
+[[sample]]
+id = "atomicstealer-01"
+category = "stealer"
+scope = "in"
+family = "AtomicStealer"
+archive = "AtomicStealer.zip"
+archive_sha256 = "957a4433d057ddfac7861e2fdedde7bcffdc8e2d887720528ce6bf8a1c0a644d"
+member = "AtomicStealer/BrewApp.dmg"
+kind = "dmg"
+sha256 = "2958dfe9251c6bf997ceb94f2eea1b808a8e53bd5e79b7152f79379f441ede83"
+bytes = 558096
+expected = "no-action/partial"
+
+[[sample]]
+id = "banshee-01"
+category = "stealer"
+scope = "in"
+family = "Banshee"
+archive = "Banshee.zip"
+archive_sha256 = "5aac4d558554a895e260fcf9f2bb3b8ea450d114bb932a06e9a4f8c1318ba972"
+member = "Banshee/install_setup_v1.2.0.dmg"
+kind = "dmg"
+sha256 = "1dcf3b607d2c9e181643dd6bf1fd85e39d3dc4f95b6992e5a435d0d900333416"
+bytes = 471953
+expected = "no-action/partial"
+
+[[sample]]
+id = "crashstealer-01"
+category = "stealer"
+scope = "in"
+family = "CrashStealer"
+archive = "CrashStealer.zip"
+archive_sha256 = "7573484e8d7ddd6b8a36641c9ffb4d3f038c400c88b2a8c44461ff5bfca28aa6"
+member = "CrashStealer/Werkbit.dmg"
+kind = "dmg"
+sha256 = "3a9d703ba7f7564399365db7ab8b04238806ef7a53df0b6822f32b80bf0f5a80"
+bytes = 14017636
+expected = "no-action/partial"
+
+[[sample]]
+id = "cuckoo-01"
+category = "stealer"
+scope = "in"
+family = "Cuckoo"
+archive = "Cuckoo.zip"
+archive_sha256 = "733d921ad84f05baa10b47537925a3a3fbb1150845823e9c50449cf69dbe0631"
+member = "Cuckoo/B/Cuckoo.dmg"
+kind = "dmg"
+sha256 = "463af62034c5a05ab3cf2eba09e36955328028b62ba9ee894cdd8e50e2d1af81"
+bytes = 40843590
+expected = "no-action/partial"
+
+[[sample]]
+id = "digitstealer-01"
+category = "stealer"
+scope = "in"
+family = "DigitStealer"
+archive = "DigitStealer.zip"
+archive_sha256 = "9e50bc286877d27523438ce6e077d818f5a5123922036016e41030bb9c7fab50"
+member = "DigitStealer/DynamicLake.dmg"
+kind = "dmg"
+sha256 = "da99f7570b37ddb3d4ed650bc33fa9fbfb883753b2c212704c10f2df12c19f63"
+bytes = 781605
+expected = "no-action/partial"
+
+[[sample]]
+id = "electrumstealer-01"
+category = "stealer"
+scope = "in"
+family = "ElectrumStealer"
+archive = "ElectrumStealer.zip"
+archive_sha256 = "1c2aa370007ff12607d75706283310c137e4a0219094fff606b2b3a03e07fbae"
+member = "ElectrumStealer/electrum-4.0.9.dmg"
+kind = "dmg"
+sha256 = "313efd27555f2d024e56d88a31ffda045e0e0d13db868867e416f0330e3ba773"
+bytes = 43113241
+expected = "no-action/partial"
+
+[[sample]]
+id = "koistealer-01"
+category = "stealer"
+scope = "in"
+family = "KoiStealer"
+archive = "KoiStealer.zip"
+archive_sha256 = "83bb2328002335affedb0df26725856bfe02e755550750be73a3f7ba62409eec"
+member = "KoiStealer/VisualStudioHelper"
+kind = "macho"
+sha256 = "adde2970b40634e91b9ef8520f8e50eaa7901a65f9230e65d7995ac1a47700ef"
+bytes = 5636672
+expected = "no-action/complete"
+
+[[sample]]
+id = "mac-c-01"
+category = "stealer"
+scope = "in"
+family = "Mac.c"
+archive = "Mac.c.zip"
+archive_sha256 = "327dc7e90ce3570f30915c9943b33aadd96ef4994a4a669d533b0e8daec04de4"
+member = "Mac.c/e9a3ed810c5f4411a3978a160391aaf1"
+kind = "macho"
+sha256 = "37364c17e1bedbcf2d6fa4cde5195f00fc5b328383173a931d568ab74b3893ed"
+bytes = 50096
+expected = "no-action/complete"
+
+[[sample]]
+id = "macstealer-01"
+category = "stealer"
+scope = "in"
+family = "MacStealer"
+archive = "MacStealer.zip"
+archive_sha256 = "618b85cc79c947c0160776fc950e9fa5a468b26f1ec65130c7dbf3a8b62fe4ae"
+member = "MacStealer/weed.dmg"
+kind = "dmg"
+sha256 = "9b17aee4c8a5c6e069fbb123578410c0a7f44b438a4c988be2b65ab4296cff5e"
+bytes = 20300577
+expected = "no-action/partial"
+
+[[sample]]
+id = "macsync-01"
+category = "stealer"
+scope = "in"
+family = "MacSync"
+archive = "MacSync.zip"
+archive_sha256 = "e47c1fa5191ce64f238f6c91b24e2f321663d355074e4716e1a6a118f2b32f9b"
+member = "MacSync/stealer"
+kind = "zip"
+sha256 = "cfd338c16249e9bcae69b3c3a334e6deafd5a22a84935a76b390a9d02ed2d032"
+bytes = 3210032
+expected = "no-action/partial"
+
+[[sample]]
+id = "metastealer-01"
+category = "stealer"
+scope = "in"
+family = "MetaStealer"
+archive = "MetaStealer.zip"
+archive_sha256 = "0e16b391c316843f5992ad510275f7c190c2d00a22a7c790ebf6cbf18dcecb89"
+member = "MetaStealer/AdobeOfficialBriefDescription.dmg"
+kind = "dmg"
+sha256 = "50427037543eb5d8be12940c8fac6b4710e15125ee2b77b0743b017eafd8af9f"
+bytes = 11745007
+expected = "no-action/partial"
+
+[[sample]]
+id = "modstealer-01"
+category = "stealer"
+scope = "in"
+family = "ModStealer"
+archive = "ModStealer.zip"
+archive_sha256 = "ef519a3563b58fa2642dd7018f589d7107bbcc218221b77f4c6f50962017cf79"
+member = "ModStealer/com.apple.system.session.plist"
+kind = "plist"
+sha256 = "8a14beee48720c81c9d1c63c1734353aee7bf50b6171f280543c9e29450ef3e7"
+bytes = 809
+expected = "no-action/partial"
+
+[[sample]]
+id = "odyssey-01"
+category = "stealer"
+scope = "in"
+family = "Odyssey"
+archive = "Odyssey.zip"
+archive_sha256 = "6253a627124d04af561aaf0baa449f80b5638edfe39c5582a70211a3ecdaeb4d"
+member = "Odyssey/Launcher.dmg"
+kind = "dmg"
+sha256 = "21c072e2aa9037295f656dc0a5d2d6daa64cae4f7c71b91cf1facd78ef9ef012"
+bytes = 296619
+expected = "no-action/partial"
+
+[[sample]]
+id = "pamstealer-01"
+category = "stealer"
+scope = "in"
+family = "PamStealer"
+archive = "PamStealer.zip"
+archive_sha256 = "a149325ec7771f578278fe4503d33ead3687854d095f508f7f618e40ce97ff44"
+member = "PamStealer/Maccy.dmg"
+kind = "dmg"
+sha256 = "2b512f6c393edad89a89ecafe26cd23b71cfdd271c10522f8dba98997ebf39bb"
+bytes = 307332
+expected = "no-action/partial"
+
+[[sample]]
+id = "poseidon-01"
+category = "stealer"
+scope = "in"
+family = "Poseidon"
+archive = "Poseidon.zip"
+archive_sha256 = "124fa60e18f83c998e49eb2ad356b34a3ffa2dcad698b5e9e7d3900f9083be1c"
+member = "Poseidon/rodrigo_Base32Encoded"
+kind = "macho"
+sha256 = "9760043ad36a34d6548cafe1e89cb53f6af76a28d492da37517d7cb1912eb154"
+bytes = 248352
+expected = "no-action/complete"
+
+[[sample]]
+id = "pystealer-01"
+category = "stealer"
+scope = "in"
+family = "PyStealer"
+archive = "PyStealer.zip"
+archive_sha256 = "42e2d49c091548623661a484c8c39ebe871ae8b51cc0be87a43977aaf6808850"
+member = "PyStealer/Empire Transfer 12.3.23.dmg"
+kind = "dmg"
+sha256 = "a7cdc1565197a7bc7bfc5c14ab2de4db3617007681faf93661b950dc0bf3a2b5"
+bytes = 69870628
+expected = "no-action/partial"
+
+[[sample]]
+id = "rnstealer-01"
+category = "stealer"
+scope = "in"
+family = "RNStealer"
+archive = "RNStealer.zip"
+archive_sha256 = "7f9c81421c34f1b8603e422f9ee78bcf48b1ddb91a6e702de1b759fb8e9a475d"
+member = "RNStealer/RN Loader"
+kind = "script"
+sha256 = "937c533bddb8bbcd908b62f2bf48e5bc11160505df20fea91d9600d999eafa79"
+bytes = 3436
+expected = "no-action/complete"
+
+[[sample]]
+id = "pokerstealer-01"
+category = "stealer"
+scope = "in"
+family = "PokerStealer (CorPref)"
+archive = "PokerStealer (CorPref).zip"
+archive_sha256 = "6947750b3c84a933d88d9ef794494b47a6fd3dfe2c8c9cc0c5e27d10a2d6e400"
+member = "PokerStealer (CorPref)/Pokerstealer.sh"
+kind = "script"
+sha256 = "2cbb404c723382af5075054756456ec1a6792f2c2da425781920b21e8d2afddf"
+bytes = 7587
+expected = "no-action/complete"
+
+[[sample]]
+id = "cookieminer-01"
+category = "stealer"
+scope = "in"
+family = "CookieMiner"
+archive = "CookieMiner.zip"
+archive_sha256 = "1dd6f7c642abdea07a086055cca5317e405d4cffa68d75a2ce2a1ed7a517b790"
+member = "CookieMiner/xmrig2"
+kind = "macho"
+sha256 = "ede858683267c61e710e367993f5e589fcb4b4b57b09d023a67ea63084c54a05"
+bytes = 402812
+expected = "no-action/complete"
+
+[[sample]]
+id = "cthulhu-01"
+category = "stealer"
+scope = "in"
+family = "Cthulhu"
+archive = "Cthulhu.zip"
+archive_sha256 = "0e966edb1734ca086554f74df678058476b799a0eb3ce98918a2d27c6da3d283"
+member = "Cthulhu/CleanMyMac.dmg"
+kind = "dmg"
+sha256 = "96f80fef3323e5bc0ce067cd7a93b9739174e29f786b09357125550a033b0288"
+bytes = 21660330
+expected = "no-action/partial"
+
+[[sample]]
+id = "cointhief-01"
+category = "stealer"
+scope = "in"
+family = "CoinThief"
+archive = "CoinThief.zip"
+archive_sha256 = "01dcad8ac313a9c19f417ef4256ffad42bd4750d66df70fab207ab191611e5ef"
+member = "CoinThief/CoinThief"
+kind = "macho"
+sha256 = "7f32fdcaefee42f93590f9490ab735ac9dfeb22a951ff06d721145baf563d53b"
+bytes = 66508
+expected = "no-action/complete"
+
+[[sample]]
+id = "cryptodrainer-01"
+category = "stealer"
+scope = "in"
+family = "CryptoDrainer"
+archive = "CryptoDrainer.zip"
+archive_sha256 = "be20f00420e81143ea78d1726b1c437f00cc46a84eb5af11979b57835f7e2bec"
+member = "CryptoDrainer/com.apple.verified"
+kind = "macho"
+sha256 = "f0062f7e70e61493684a2f60748a475168e155bc2502163c844c42e87692abd0"
+bytes = 36364178
+expected = "no-action/complete"
+
+[[sample]]
+id = "keysteal-01"
+category = "stealer"
+scope = "in"
+family = "KeySteal"
+archive = "KeySteal.zip"
+archive_sha256 = "88e38541f497f413ea5f89b14811b35a490adcaa1fffe0529e985682bed4c40e"
+member = "KeySteal/archive.pkg"
+kind = "pkg"
+sha256 = "7593ec1357315431b04a17a55f01bd1295ca4b00ce8b910f8854a7e414e8f2cc"
+bytes = 262487
+expected = "no-action/complete"
+
+[[sample]]
+id = "shaihulud-01"
+category = "stealer"
+scope = "in"
+family = "ShaiHulud"
+archive = "ShaiHulud.zip"
+archive_sha256 = "aea87eb8060274b828f1170633068e87f9529428b2ea95bb682a0eaa008e7a8b"
+member = "ShaiHulud/nrwl.angular-console-18.95.0.vsix/extension/nxls/bin/nxls"
+kind = "script"
+sha256 = "18aeceadad3c7f2947d1d0c161a8e28a70054906883efc917231838b4eedce10"
+bytes = 44
+expected = "no-action/complete"
+
+[[sample]]
+id = "amnesiastealer-02"
+category = "stealer"
+scope = "in"
+family = "AmnesiaStealer"
+archive = "AmnesiaStealer.zip"
+archive_sha256 = "5cabc30fd1bd2f902b0f10810feeb11678392d734cce3ee574e6f1678012de92"
+member = "AmnesiaStealer/stream_module"
+kind = "macho"
+sha256 = "e853748ca8f9a5a9168263617409a9039ab09f4ffc7d860374c1e3b0b67b31a5"
+bytes = 5385088
+expected = "no-action/complete"
+
+[[sample]]
+id = "atomicstealer-02"
+category = "stealer"
+scope = "in"
+family = "AtomicStealer"
+archive = "AtomicStealer.zip"
+archive_sha256 = "957a4433d057ddfac7861e2fdedde7bcffdc8e2d887720528ce6bf8a1c0a644d"
+member = "AtomicStealer/CardGame.dmg"
+kind = "dmg"
+sha256 = "6152e233795fa52b5ee2c0283636c76d6389c9dfad5413408ea26fd7aa42fa23"
+bytes = 8205551
+expected = "no-action/partial"
+
+[[sample]]
+id = "banshee-02"
+category = "stealer"
+scope = "in"
+family = "Banshee"
+archive = "Banshee.zip"
+archive_sha256 = "5aac4d558554a895e260fcf9f2bb3b8ea450d114bb932a06e9a4f8c1318ba972"
+member = "Banshee/banshee"
+kind = "macho"
+sha256 = "11aa6eeca2547fcf807129787bec0d576de1a29b56945c5a8fb16ed8bf68f782"
+bytes = 920200
+expected = "no-action/complete"
+
+[[sample]]
+id = "crashstealer-02"
+category = "stealer"
+scope = "in"
+family = "CrashStealer"
+archive = "CrashStealer.zip"
+archive_sha256 = "7573484e8d7ddd6b8a36641c9ffb4d3f038c400c88b2a8c44461ff5bfca28aa6"
+member = "CrashStealer/CrashReporter"
+kind = "macho"
+sha256 = "a1966a6d6f54a025f30d55571d21d6537977ca73ffa734c13494b9c806cd7007"
+bytes = 3190128
+expected = "no-action/complete"
+
+[[sample]]
+id = "cuckoo-02"
+category = "stealer"
+scope = "in"
+family = "Cuckoo"
+archive = "Cuckoo.zip"
+archive_sha256 = "733d921ad84f05baa10b47537925a3a3fbb1150845823e9c50449cf69dbe0631"
+member = "Cuckoo/A/Cuckoo"
+kind = "macho"
+sha256 = "6662576e48a44418beee861499346b037c23ec0a91fb05c2d9ae3dc42650ab82"
+bytes = 370704
+expected = "no-action/complete"
+
+[[sample]]
+id = "digitstealer-02"
+category = "stealer"
+scope = "in"
+family = "DigitStealer"
+archive = "DigitStealer.zip"
+archive_sha256 = "9e50bc286877d27523438ce6e077d818f5a5123922036016e41030bb9c7fab50"
+member = "DigitStealer/1ststage.scpt"
+kind = "source"
+sha256 = "498d271d695e424bfd7f9ad1ead187ef0ac62fa8908c6e1f239db495371ff237"
+bytes = 8478
+expected = "notify/complete"
+
+[[sample]]
+id = "mac-c-02"
+category = "stealer"
+scope = "in"
+family = "Mac.c"
+archive = "Mac.c.zip"
+archive_sha256 = "327dc7e90ce3570f30915c9943b33aadd96ef4994a4a669d533b0e8daec04de4"
+member = "Mac.c/stealer.scpt"
+kind = "source"
+sha256 = "393acc8ef94ab8ba0abf7a769e451d5434d4acdbda0b60966bfac4b40e4d6875"
+bytes = 16308
+expected = "no-action/complete"
+
+[[sample]]
+id = "macstealer-02"
+category = "stealer"
+scope = "in"
+family = "MacStealer"
+archive = "MacStealer.zip"
+archive_sha256 = "618b85cc79c947c0160776fc950e9fa5a468b26f1ec65130c7dbf3a8b62fe4ae"
+member = "MacStealer/weed"
+kind = "macho"
+sha256 = "6a4f8b65a568a779801b72bce215036bea298e2c08ec54906bb3ebbe5c16c712"
+bytes = 551360
+expected = "no-action/complete"
+
+[[sample]]
+id = "bundlore-01"
+category = "adware"
+scope = "in"
+family = "Bundlore"
+archive = "Bundlore.zip"
+archive_sha256 = "da6233ed73419fca8d90e8f0c63f6ed3d90f8a93799a03b04b1ae5d20c1bdb4f"
+member = "Bundlore/Bundlore.dmg"
+kind = "dmg"
+sha256 = "003a2e2e5d618af62aef7249eaa51b9ef14b61160f37382bac3748a0dbf0b331"
+bytes = 392588
+expected = "no-action/partial"
+
+[[sample]]
+id = "shlayer-01"
+category = "adware"
+scope = "in"
+family = "Shlayer"
+archive = "Shlayer.zip"
+archive_sha256 = "0bea02b1531a9814c89bbb8185a615379e44514c68294024675ff071ed886912"
+member = "Shlayer/notarized/Player.pkg"
+kind = "pkg"
+sha256 = "e530ea35295e9b990e536297637c532e98f32a2de58514cbce0fee625ccc8da6"
+bytes = 18427
+expected = "no-action/complete"
+
+[[sample]]
+id = "vsearch-01"
+category = "adware"
+scope = "in"
+family = "VSearch (Pirrit)"
+archive = "VSearch (Pirrit).zip"
+archive_sha256 = "d9d068f4916782b1f4c4389038bc9f03f047cef24bc01670e87f5e5fc08a5980"
+member = "VSearch (Pirrit)/VSearch"
+kind = "macho"
+sha256 = "008cc1f4dcd6db615f7cdf02039aefcff60913e057bbbaeb0fed75a39440f912"
+bytes = 100872
+expected = "no-action/complete"
+
+[[sample]]
+id = "genieo-01"
+category = "adware"
+scope = "in"
+family = "Genieo (InstallMac)"
+archive = "Genieo (InstallMac).zip"
+archive_sha256 = "1e9cae56f295c79cc4f6e10960337d02b6c582e1309aa5f8eb1ad500cf124741"
+member = "Genieo (InstallMac)/Genieo.dmg"
+kind = "dmg"
+sha256 = "7e7ce5c157960695774688d41446772ee0bb35329d1f2b4b853f2a45883a7dea"
+bytes = 550619
+expected = "no-action/partial"
+
+[[sample]]
+id = "installcore-01"
+category = "adware"
+scope = "in"
+family = "InstallCore"
+archive = "InstallCore.zip"
+archive_sha256 = "c7c6da4840fa79e6682b3de0701bf42bd5d7f9b41e9824b7f0d9b2452c45e984"
+member = "InstallCore/installCore.dmg"
+kind = "dmg"
+sha256 = "61c941280e3f49e176361a1696200ab304a7c10b529e418bf14fae0642d18118"
+bytes = 1787406
+expected = "no-action/partial"
+
+[[sample]]
+id = "conduit-01"
+category = "adware"
+scope = "in"
+family = "Conduit (Trovi, VSearch)"
+archive = "Conduit (Trovi, VSearch).zip"
+archive_sha256 = "8754c04e4848d2f37c90f24d30f1cda1329baaeb0d8c281fa80b648bd7b92076"
+member = "Conduit (Trovi, VSearch)/SearchProtect.app"
+kind = "app"
+tree_sha256 = "cdaad173ba0431f9858274f5d080d5a4b529cb432e95dabd995b14affb0db8e0"
+bytes = 280771
+expected = "no-action/complete"
+
+[[sample]]
+id = "yontoo-01"
+category = "adware"
+scope = "in"
+family = "Yontoo"
+archive = "Yontoo.zip"
+archive_sha256 = "a8e73989ec83f35e598601ad7ab81c0b4f97b156fbf970e4ce9333f13990eb3e"
+member = "Yontoo/Yontoo"
+kind = "macho"
+sha256 = "b5e6e8ff57d66512feec1790a0494c198be39dafd720c354c7b760d5edd9ca7d"
+bytes = 386000
+expected = "no-action/complete"
+
+[[sample]]
+id = "spigot-01"
+category = "adware"
+scope = "in"
+family = "Spigot"
+archive = "Spigot.zip"
+archive_sha256 = "ce6457e4f63821afd5e59d879540f07544fc49f285be8c8d9c851a0fbaa1ca1a"
+member = "Spigot/FileZilla-Installer.app"
+kind = "app"
+tree_sha256 = "80410bd4a9d69cd6061eef16c19d35dd7b4ce31d02099d7185262b6d1e2dc217"
+bytes = 712694
+expected = "notify/partial"
+
+[[sample]]
+id = "chatzum-01"
+category = "adware"
+scope = "in"
+family = "ChatZum (Okaz, Zako)"
+archive = "ChatZum (Okaz, Zako).zip"
+archive_sha256 = "c5d05e532d9f98cf693a7956819281556b6886fb53139495e3034e08b1f1c794"
+member = "ChatZum (Okaz, Zako)/ChatZum"
+kind = "macho"
+sha256 = "458a9ac086116fa011c1a7bd49ac15f386cd95e39eb6b7cd5c5125aef516c78c"
+bytes = 39456
+expected = "no-action/complete"
+
+[[sample]]
+id = "mackeeper-01"
+category = "adware"
+scope = "in"
+family = "MacKeeper"
+archive = "MacKeeper.zip"
+archive_sha256 = "266620c9b1a300cb260290ce9ef3c6ac83e1f90f7361b06335d6d63bcdecaec3"
+member = "MacKeeper/MacKeeper"
+kind = "macho"
+sha256 = "70d33519281fa5ffda7e40ef4b14a4014a13268a337e7e3c67f2f34944b6b0e6"
+bytes = 837600
+expected = "no-action/complete"
+
+[[sample]]
+id = "mughthesec-01"
+category = "adware"
+scope = "in"
+family = "Mughthesec"
+archive = "Mughthesec.zip"
+archive_sha256 = "e845b3e63dde6d47b37dd0c91fd1ad67f7b01e4e08956ee5759d7fbdbc97055a"
+member = "Mughthesec/Player.dmg"
+kind = "dmg"
+sha256 = "f5d76324cb8fcae7f00b6825e4c110ddfd6b32db452f1eca0f4cff958316869c"
+bytes = 621930
+expected = "no-action/partial"
+
+[[sample]]
+id = "opinionspy-01"
+category = "adware"
+scope = "in"
+family = "OpinionSpy (Premier Opinion)"
+archive = "OpinionSpy (Premier Opinion).zip"
+archive_sha256 = "4d2b851ff4888733efbbb5a9c35e1afe04d0bba9617145841fa8bc39773dca08"
+member = "OpinionSpy (Premier Opinion)/7art_Crystal_Clock.app"
+kind = "app"
+tree_sha256 = "171502e21481d53afca1835224c316be99f69432113bb9b8c580b82308c6b1a0"
+bytes = 4006573
+expected = "no-action/complete"
+
+[[sample]]
+id = "installcap-01"
+category = "adware"
+scope = "in"
+family = "InstallCap"
+archive = "InstallCap.zip"
+archive_sha256 = "618757634dbcb373b672a2f507011c9f4b195dac7f2b6238196cd511246507b7"
+member = "InstallCap/Little_Snitch_501__Pre-Cracked_For_Mac_CrackzSoft.zip"
+kind = "zip"
+sha256 = "73db41f31814c1a73548d0f1eefe03aaa789f09dc9a40279d64cca2dfb0e9817"
+bytes = 49881417
+expected = "no-action/partial"
+
+[[sample]]
+id = "macinstaller-01"
+category = "adware"
+scope = "in"
+family = "MacInstaller"
+archive = "MacInstaller.zip"
+archive_sha256 = "3a3679b5426254839432512bd23d1dfda1cbd66590d46b747b0b0052c34488fc"
+member = "MacInstaller/MacInstaller.dmg"
+kind = "dmg"
+sha256 = "6e22a1d9f931ac1c026f5ac953d88e84f507a9ca51dfd089f4f2539ce4369cb8"
+bytes = 430917
+expected = "no-action/partial"
+
+[[sample]]
+id = "gophoto-01"
+category = "adware"
+scope = "in"
+family = "GoPhoto"
+archive = "GoPhoto.zip"
+archive_sha256 = "ca4c839f9ab9975e73184762101b31bd53ee3a477eb6b3130f895b06267b43f3"
+member = "GoPhoto/GoPhoto"
+kind = "macho"
+sha256 = "a4d8367dc2df3a8539b9baf8ee48d09f5a8e9f9d2d58431909de0bb0816464a0"
+bytes = 478448
+expected = "no-action/complete"
+
+[[sample]]
+id = "mami-01"
+category = "adware"
+scope = "in"
+family = "MaMi"
+archive = "MaMi.zip"
+archive_sha256 = "be8bf9b7942006513579b0df1c619ca18d70f7379d4f50fb9ebd7ea306877e15"
+member = "MaMi/MaMi"
+kind = "macho"
+sha256 = "5586be30d505216bdc912605481f9c8c7bfd52748f66c5e212160f6b31fd8571"
+bytes = 565673
+expected = "no-action/complete"
+
+[[sample]]
+id = "qhost-01"
+category = "adware"
+scope = "in"
+family = "Qhost (HostMod)"
+archive = "Qhost (HostMod).zip"
+archive_sha256 = "c19ad0ab21dd18244b8a1fbe6ef691b0309f27f82cf4f41af32829238eede325"
+member = "Qhost (HostMod)/FlashPlayer.pkg/Contents/Resources/preinstall"
+kind = "script"
+sha256 = "4d2c0bce42dadfa61bd3269c9e53ab18162a9ca8375912fef164a6dd5a8b7fa3"
+bytes = 5550
+expected = "no-action/complete"
+
+[[sample]]
+id = "fkcodec-01"
+category = "adware"
+scope = "in"
+family = "FkCodec (Codecm, Vinstaller)"
+archive = "FkCodec (Codecm, Vinstaller).zip"
+archive_sha256 = "f757413fd6aa9a6d9c1cf4b724f5c7f94277e8c74c11296a065afb7e7ccad97c"
+member = "FkCodec (Codecm, Vinstaller)/FkCodec.dmg"
+kind = "dmg"
+sha256 = "11ceb909649b7ee08e82996b8917f18912de9d9d90d79b085dd70b270f3b217f"
+bytes = 550518
+expected = "no-action/partial"
+
+[[sample]]
+id = "iwebupdate-01"
+category = "adware"
+scope = "in"
+family = "iWebUpdate"
+archive = "iWebUpdate.zip"
+archive_sha256 = "91959fe6b5a5d0f687982177beff50a66f8dca9bd0b3eb3d93946a90f7ab7d49"
+member = "iWebUpdate/iWebUpdate"
+kind = "macho"
+sha256 = "3e66e664b05b695b0b018d3539412e6643d036c6d1000e03b399986252bddbfb"
+bytes = 161624
+expected = "no-action/complete"
+
+[[sample]]
+id = "clickagent-01"
+category = "adware"
+scope = "in"
+family = "ClickAgent"
+archive = "ClickAgent.zip"
+archive_sha256 = "917d95e285c8288c231a613b44d8a69cac7eba591b2bace0b3abefb600d9ccbb"
+member = "ClickAgent/ClickAgent.safariextz"
+kind = "pkg"
+sha256 = "12af7ae4815e095fd1f6852df07eccaec870c062ffcdf4c0edbe17312da2c37c"
+bytes = 5805
+expected = "no-action/complete"
+
+[[sample]]
+id = "silversparrow-01"
+category = "adware"
+scope = "in"
+family = "SilverSparrow"
+archive = "SilverSparrow.zip"
+archive_sha256 = "582c8fa15681839780ba771ccc0ffb2bbca571d079adb952a183caf92e187bcb"
+member = "SilverSparrow/update.pkg"
+kind = "pkg"
+sha256 = "c7dd06b20b64b64d3b155b6b77c2778a08ef6a6c0396d7537af411258e57af1e"
+bytes = 73805
+expected = "no-action/complete"
+
+[[sample]]
+id = "amcleaner-01"
+category = "adware"
+scope = "in"
+family = "AMCleaner"
+archive = "AMCleaner.zip"
+archive_sha256 = "71b4ffe3e14818cd78c83f8262c8f18a23bd2c95a5dcf3d26388a33309da402d"
+member = "AMCleaner/UnPackNw.app"
+kind = "app"
+tree_sha256 = "8a90f0dff808b8439b128ea5697eede43b64c52accb39ba03104e57d27d9ed34"
+bytes = 145470
+expected = "no-action/complete"
+
+[[sample]]
+id = "zuru-01"
+category = "trojanized"
+scope = "in"
+family = "ZuRu"
+archive = "ZuRu.zip"
+archive_sha256 = "8426b7aa21823bd63203c1a84c8ce7effab2a1a60efaa8f0fca7e38a0e1f08d2"
+member = "ZuRu/A/iTerm.dmg"
+kind = "dmg"
+sha256 = "e5126f74d430ff075d6f7edcae0c95b81a5e389bf47e4c742618a042f378a3fa"
+bytes = 26316055
+expected = "no-action/partial"
+
+[[sample]]
+id = "keranger-01"
+category = "trojanized"
+scope = "in"
+family = "KeRanger"
+archive = "KeRanger.zip"
+archive_sha256 = "6b592f84ab3121abc7f1111d18886c1819f85476b09759e8afba2088987617aa"
+member = "KeRanger/Transmission-2.90.dmg"
+kind = "dmg"
+sha256 = "d1ac55a4e610380f0ab239fcc1c5f5a42722e8ee1554cba8074bbae4a5f6dbe1"
+bytes = 5213026
+expected = "no-action/partial"
+
+[[sample]]
+id = "evilquest-01"
+category = "trojanized"
+scope = "in"
+family = "EvilQuest"
+archive = "EvilQuest.zip"
+archive_sha256 = "d71f49598c6865d54701fcda9b20b6224ec42e9d711e339d9b0b91ea12655b23"
+member = "EvilQuest/Mixed In Key 8.dmg"
+kind = "dmg"
+sha256 = "b34738e181a6119f23e930476ae949fc0c7c4ded6efa003019fa946c4e5b287a"
+bytes = 10880309
+expected = "no-action/partial"
+
+[[sample]]
+id = "eleanor-01"
+category = "trojanized"
+scope = "in"
+family = "Eleanor"
+archive = "Eleanor.zip"
+archive_sha256 = "6fe666ed0420e548a8ad177ca3df40fe1d5f7ddd4dfdbd1b99423d7d32c250c7"
+member = "Eleanor/EasyDoc Converter.app"
+kind = "app"
+tree_sha256 = "498a6defa61e045d3d0ee251e57ab7c324d0dd5cb785b0035d88ab0cfc5546cc"
+bytes = 9016741
+expected = "notify/complete"
+
+[[sample]]
+id = "proton-01"
+category = "trojanized"
+scope = "in"
+family = "Proton"
+archive = "Proton.zip"
+archive_sha256 = "73983011a961fcbdff5682986a3f871b6c1638fdc088edd21e368ba16912c7f5"
+member = "Proton/Proton.B/Handbrake.dmg"
+kind = "dmg"
+sha256 = "013623e5e50449bbdf6943549d8224a122aa6c42bd3300a1bd2b743b01ae6793"
+bytes = 16593112
+expected = "no-action/partial"
+
+[[sample]]
+id = "iworm-01"
+category = "trojanized"
+scope = "in"
+family = "iWorm"
+archive = "iWorm.zip"
+archive_sha256 = "ad8f82ff0012aabbd6e31f41cc828c4499130506240cc1a209d7e8356619359c"
+member = "iWorm/Install.app"
+kind = "app"
+tree_sha256 = "0cfc5411720762d3ce6391cc662213b3f77ae972e067e067e05ced758b16725d"
+bytes = 3377239
+expected = "no-action/partial"
+
+[[sample]]
+id = "wirelurker-01"
+category = "trojanized"
+scope = "in"
+family = "WireLurker (Machook)"
+archive = "WireLurker (Machook).zip"
+archive_sha256 = "8b9183d16a1028664567bb24c2adc6e8516d7ca9a25a586a5b4b35451742654d"
+member = "WireLurker (Machook)/WireLurker"
+kind = "macho"
+sha256 = "5d4f4fb2a663f1f79fb96edcd832374304af877938747b5844daacf4beba2427"
+bytes = 3293420
+expected = "no-action/complete"
+
+[[sample]]
+id = "dok-01"
+category = "trojanized"
+scope = "in"
+family = "Dok"
+archive = "Dok.zip"
+archive_sha256 = "7731de7c9fc9bc153c8849090f65f1d934b6c65d2026290c58c32bb4adfff369"
+member = "Dok/Dok.A/Dokument.app"
+kind = "app"
+tree_sha256 = "79dfba95aec080588a279b1e75f8409645ec5d647f9fba38cd352af533c9f310"
+bytes = 176363
+expected = "no-action/complete"
+
+[[sample]]
+id = "creativeupdate-01"
+category = "trojanized"
+scope = "in"
+family = "CreativeUpdate"
+archive = "CreativeUpdate.zip"
+archive_sha256 = "f78410c21e37713b8554c4358034d602ea2f8d8cac1cb6a39fe6db866abb7e39"
+member = "CreativeUpdate/Firefox 58.0.2.dmg"
+kind = "dmg"
+sha256 = "8cda44b55a98fb0cae11d613755a03c79cbf47d442960d6febd54f8ad3f12594"
+bytes = 59360047
+expected = "no-action/partial"
+
+[[sample]]
+id = "xcsset-01"
+category = "trojanized"
+scope = "in"
+family = "XCSSET"
+archive = "XCSSET.zip"
+archive_sha256 = "68359cf878364d6f372d6e9cc302f546491abe992ed3ef60e61b5a39ec27f97b"
+member = "XCSSET/A/Xcode.app"
+kind = "app"
+tree_sha256 = "7460db3151e63c7bb432922c833ad5c8aca048a94b6b590c2a18183c1ebe9cce"
+bytes = 113258
+expected = "no-action/complete"
+
+[[sample]]
+id = "xcodespy-01"
+category = "trojanized"
+scope = "in"
+family = "XcodeSpy"
+archive = "XcodeSpy.zip"
+archive_sha256 = "e0318520361451dd23ea4bf682e2784711a86fdfbed11c0fb31c187c1c6ab103"
+member = "XcodeSpy/update_0ae9d61185f793c6d53e560e91265583675abeb6"
+kind = "macho"
+sha256 = "cdad080d2caa5ca75b658ad102987338b15c7430c6f51792304ef06281a7e134"
+bytes = 326688
+expected = "no-action/complete"
+
+[[sample]]
+id = "iworkserv-01"
+category = "trojanized"
+scope = "in"
+family = "iWorkServ (iServices, Krowi)"
+archive = "iWorkServ (iServices, Krowi).zip"
+archive_sha256 = "f81f1e854e6152af52b0f151052507d230121ccb9e88fc11129b92723ada99e7"
+member = "iWorkServ (iServices, Krowi)/iWorkServ.A/iWorkServ"
+kind = "macho"
+sha256 = "43a929c2059440ea899baf47edcfb3ac764d3e0ef1bf4ba7917618e4821d9cb5"
+bytes = 200576
+expected = "no-action/complete"
+
+[[sample]]
+id = "jscorerunner-01"
+category = "trojanized"
+scope = "in"
+family = "JSCoreRunner"
+archive = "JSCoreRunner.zip"
+archive_sha256 = "33acf49d12ef79692884623903192393fc970ee76063fc7d8a3430fa900115be"
+member = "JSCoreRunner/FileRipple.pkg"
+kind = "pkg"
+sha256 = "3634d1333e958412814806a5d65f1d82536d94cac21ec44b8aba137921ae3709"
+bytes = 154914
+expected = "no-action/complete"
+
+[[sample]]
+id = "todoswift-01"
+category = "trojanized"
+scope = "in"
+family = "ToDoSwift"
+archive = "ToDoSwift.zip"
+archive_sha256 = "4e54b17b73fba53ad6f220b0df9fda8b62a1aecf4110912cb28c1bb11663ce7d"
+member = "ToDoSwift/Predicting Bitcoin and Altcoins Prices (2024-07-16).app"
+kind = "app"
+tree_sha256 = "9c71fc42f695cf2f8cb7a481ce9367c87e9eeed6c20c04675df4d21944abaaa4"
+bytes = 488894
+expected = "no-action/partial"
+
+[[sample]]
+id = "seaflower-01"
+category = "trojanized"
+scope = "in"
+family = "SeaFlower"
+archive = "SeaFlower.zip"
+archive_sha256 = "c86826bcbede0184e9e90d9f0a12279244934e7154d4720d055580955c89fa3e"
+member = "SeaFlower/2334E9FC13B6FE12A6DD92F8BD65467CF700F43FDB713A209A74174FDAABD2E2.ipa"
+kind = "zip"
+sha256 = "2334e9fc13b6fe12a6dd92f8bd65467cf700f43fdb713a209a74174fdaabd2e2"
+bytes = 37414964
+expected = "no-action/partial"
+
+[[sample]]
+id = "birdminer-01"
+category = "other"
+scope = "in"
+family = "BirdMiner"
+archive = "BirdMiner.zip"
+archive_sha256 = "8b66c31cc54ba92477bd59abb5a9ec2a2ec22afb8851b6a3aabe3d61849b6b76"
+member = "BirdMiner/arachnoidal"
+kind = "macho"
+sha256 = "904ad9bc506a09be0bb83079c07e9a93c99ba5d42ac89d444374d80efd7d8c11"
+bytes = 14733080
+expected = "no-action/complete"
+
+[[sample]]
+id = "lockbit-01"
+category = "other"
+scope = "in"
+family = "LockBit"
+archive = "LockBit.zip"
+archive_sha256 = "2e4a70c6f6c890fc03d8f745cf0a5ce35b4fe84337084cf40338d6bb10ba4a08"
+member = "LockBit/locker_Apple_M1_64"
+kind = "macho"
+sha256 = "3e4bbd21756ae30c24ff7d6942656be024139f8180b7bddd4e5c62a9dfbd8c79"
+bytes = 412227
+expected = "no-action/complete"
+
+[[sample]]
+id = "aobokeylogger-01"
+category = "other"
+scope = "in"
+family = "AoboKeylogger (Baoba)"
+archive = "AoboKeylogger (Baoba).zip"
+archive_sha256 = "7ee8801e033b886ba13e82719c9571d8aa033c12c9faabac5c26e38eb7cea1a5"
+member = "AoboKeylogger (Baoba)/AbkPro.app"
+kind = "app"
+tree_sha256 = "610dfe52df700d6a3d28d79dd0f99dbb87740445eef0933fe5a3d5f2d7950c17"
+bytes = 12828173
+expected = "no-action/complete"
+
+[[sample]]
+id = "coinminer-01"
+category = "other"
+scope = "in"
+family = "CoinMiner"
+archive = "CoinMiner.zip"
+archive_sha256 = "d3822e317c383afde363394eaf98527cb520985903713f5ac705a9197495e3da"
+member = "CoinMiner/com.adobe.acc.installer.v1"
+kind = "macho"
+sha256 = "b1fff5d501e552b535639aedaf4e5c7709b8405a9f063afcff3d6bbccffec725"
+bytes = 27568
+expected = "no-action/complete"
+
+[[sample]]
+id = "macransom-01"
+category = "other"
+scope = "in"
+family = "macRansom"
+archive = "macRansom.zip"
+archive_sha256 = "06c969a40d376b6173cf75bfe6656ca066cbf159b5127c6f5310f319371f829e"
+member = "MacRansom/MacRansom"
+kind = "macho"
+sha256 = "617f7301fd67e8b5d8ad42d4e94e02cb313fe5ad51770ef93323c6115e52fe98"
+bytes = 18492
+expected = "no-action/complete"
+
+[[sample]]
+id = "macspy-01"
+category = "other"
+scope = "in"
+family = "MacSpy"
+archive = "MacSpy.zip"
+archive_sha256 = "947e5f8020f5d4aa3928721c74b1e5f9c6aab300d02cff4382f561a80116c3c1"
+member = "MacSpy/MacSpy"
+kind = "macho"
+sha256 = "83e8eed911211eb45e09b7f9a5862ed0c01712cc4d922b510d2e9bf74b686bce"
+bytes = 5556068
+expected = "no-action/complete"
+
+[[sample]]
+id = "osaminer-01"
+category = "other"
+scope = "in"
+family = "OSAMiner"
+archive = "OSAMiner.zip"
+archive_sha256 = "4a14eca2cf6f930ad99a867e361090d9341e5fe037e36650215013a442d904d2"
+member = "OSAMiner/Install-LOL.app"
+kind = "app"
+tree_sha256 = "78cf22c715764ffaf1851d11bd0dd04d4839bdf23f001228c50c4906c6b4c0b6"
+bytes = 4112639
+expected = "no-action/complete"
+
+[[sample]]
+id = "turtle-01"
+category = "other"
+scope = "in"
+family = "Turtle"
+archive = "Turtle.zip"
+archive_sha256 = "d2ef58a8ece99e0117a2d728a5621274e8cb19c0d791fa53fe26a17db6b36e48"
+member = "Turtle/TurtleRansom-v0-macos-amd64-softfloat.pkg"
+kind = "macho"
+sha256 = "a48af4a62358831fe5376aa52db1a3555b0c93c1665b242c0c1f49462f614c56"
+bytes = 2093040
+expected = "no-action/complete"
+
+[[sample]]
+id = "realtimespy-01"
+category = "other"
+scope = "in"
+family = "RealTimeSpy"
+archive = "RealTimeSpy.zip"
+archive_sha256 = "11ce12eaa7740581c7ea8cfde45fd84c4255dbb201a5aafb4085bfcc3ea66aab"
+member = "RealTimeSpy/Exodus-MacOS-1.64.1-update.app"
+kind = "app"
+tree_sha256 = "19daa9d95ae5c341db1f140f03b207ae6f9e51c7e469d295f96ba7b5fe135516"
+bytes = 291148
+expected = "no-action/complete"
+
+[[sample]]
+id = "ipstorm-01"
+category = "other"
+scope = "in"
+family = "IPStorm"
+archive = "IPStorm.zip"
+archive_sha256 = "211c1c16002454526a77a7bcf72b8109d4ba4c283100c5028fba175845d16cd9"
+member = "IPStorm/IPStorm"
+kind = "macho"
+sha256 = "4cd7c5ee322e55b1c1ae49f152629bfbdc2f395e9d8c57ce65dbb5d901f61ac1"
+bytes = 8216592
+expected = "notify/complete"
+
+[[sample]]
+id = "applejeus-01"
+category = "apt"
+scope = "out"
+family = "AppleJeus"
+archive = "AppleJeus.zip"
+archive_sha256 = "a6ce433557f8e25a0df412a2ea26dab2b18de020e1f141695c9e5e2d14087194"
+member = "AppleJeus/A/CelasTradePro-Installer.dmg"
+kind = "dmg"
+sha256 = "7a52d986cfab16abd0c6197a3c1f10299124c1c8738a148898591bc8a717b29a"
+bytes = 15020544
+expected = "no-action/partial"
+
+[[sample]]
+id = "cloudmensis-01"
+category = "apt"
+scope = "out"
+family = "CloudMensis"
+archive = "CloudMensis.zip"
+archive_sha256 = "1c2ee16e7871be0ada7f12289d337e1305f86dd053312ecf1d5fe745787fd9ba"
+member = "CloudMensis/WindowServer"
+kind = "macho"
+sha256 = "317ce26cae14dc9a5e4d4667f00fee771b4543e91c944580bbb136e7fe339427"
+bytes = 1425456
+expected = "no-action/complete"
+
+[[sample]]
+id = "oceanlotus-01"
+category = "apt"
+scope = "out"
+family = "OceanLotus"
+archive = "OceanLotus.zip"
+archive_sha256 = "e63ffe97740b4abae9e07defbe84feadc5a024e33c2b984a6686729119b7fcd4"
+member = "OceanLotus/OceanLotus.A/FlashUpdate.app"
+kind = "app"
+tree_sha256 = "441f9285a53503d3d8e875482ba045419295516aced10bc763be475000efcc59"
+bytes = 573862
+expected = "no-action/complete"
+
+[[sample]]
+id = "xagent-01"
+category = "apt"
+scope = "out"
+family = "Xagent"
+archive = "Xagent.zip"
+archive_sha256 = "50c52228d058ae32a288180030c5ab7e0f676ef06095adb32f3674829d33cced"
+member = "XAgent/XAgent"
+kind = "macho"
+sha256 = "2a854997a44f4ba7e307d408ea2d9c1d84dde035c5dab830689aa45c5b5746ea"
+bytes = 385068
+expected = "no-action/complete"
+
+[[sample]]
+id = "kandykorn-01"
+category = "apt"
+scope = "out"
+family = "KandyKorn"
+archive = "KandyKorn.zip"
+archive_sha256 = "4694e335944522b257446394bef41c57b5af171aeb22d1efe6e4328b03a85946"
+member = "KandyKorn/Cross-Platform Bridges.zip"
+kind = "zip"
+sha256 = "42e1fd72bdb69c6fc6bb4256cc57412b5f750bcfb65b5f63413db61135e9fe92"
+bytes = 26184
+expected = "no-action/partial"
+
+[[sample]]
+id = "dazzlespy-01"
+category = "apt"
+scope = "out"
+family = "DazzleSpy"
+archive = "DazzleSpy.zip"
+archive_sha256 = "4537f8ebbc18524672c0f82d065c17e1b44c0caaaeabc9e857fe55a4cc717a52"
+member = "DazzleSpy/softwareupdate"
+kind = "macho"
+sha256 = "f9ad42a9bd9ade188e997845cae1b0587bf496a35c3bffacd20fefe07860a348"
+bytes = 708720
+expected = "no-action/complete"
+
+[[sample]]
+id = "windtail-01"
+category = "apt"
+scope = "out"
+family = "WindTail"
+archive = "WindTail.zip"
+archive_sha256 = "9f98a9ab0b964f35fbcfda6313faf788dd3173cab9950e8623bdcd0a1132c378"
+member = "WindTail/Final_Presentation.app"
+kind = "app"
+tree_sha256 = "345a002ff918725a2977577db94e17695ebbeca13c4db02b876e2240f61610cc"
+bytes = 278307
+expected = "no-action/complete"
+
+[[sample]]
+id = "jokerspy-01"
+category = "apt"
+scope = "out"
+family = "JokerSpy"
+archive = "JokerSpy.zip"
+archive_sha256 = "eddd84b54e9eac543e3f12c45ef726f417245e0488f558c19751308a15366720"
+member = "JokerSpy/xcc"
+kind = "macho"
+sha256 = "d895075057e491b34b0f8c0392b44e43ade425d19eaaacea6ef8c5c9bd3487d8"
+bytes = 202400
+expected = "no-action/complete"
+
+[[sample]]
+id = "beavertail-01"
+category = "apt"
+scope = "out"
+family = "BeaverTail"
+archive = "BeaverTail.zip"
+archive_sha256 = "8ed5456b7c0fe10d7e4a5b9114207839bcd65f66729d63d89f2196150eeddcf0"
+member = "BeaverTail/MiroTalk.dmg"
+kind = "dmg"
+sha256 = "9abf6b93eafb797a3556bea1fe8a3b7311d2864d5a9a3687fce84bc1ec4a428c"
+bytes = 20784310
+expected = "no-action/partial"
+
+[[sample]]
+id = "lightspy-01"
+category = "apt"
+scope = "out"
+family = "LightSpy"
+archive = "LightSpy.zip"
+archive_sha256 = "b18411e9e4a6422e87386a827bfd6dca9770e5a5aee8fc064b05ad60bcaf068a"
+member = "LightSpy/20004312341.png"
+kind = "macho"
+sha256 = "87cd75344a6826feac6d21b053f6816700b4b349ffd397addb4e244633edcc42"
+bytes = 8652
+expected = "no-action/complete"
+
+[[sample]]
+id = "cdds-01"
+category = "apt"
+scope = "out"
+family = "CDDS"
+archive = "CDDS.zip"
+archive_sha256 = "537d77fcb6364f8f156f6febc07acb3a5540faf0279a3422e80178caf0e97085"
+member = "CDDS/install_flash_player_osx.dmg"
+kind = "dmg"
+sha256 = "f0b12413c9d291e3b9edd1ed1496af7712184a63c066e1d5b2bb528376d66ebc"
+bytes = 1194193
+expected = "no-action/partial"
+
+[[sample]]
+id = "finspy-01"
+category = "apt"
+scope = "out"
+family = "FinSpy"
+archive = "FinSpy.zip"
+archive_sha256 = "a8626b9447fe0eef4370c2a3d47760b8f162e67dc09659e16d4abae90c35ced8"
+member = "FinSpy/caglayan-macos.dmg"
+kind = "dmg"
+sha256 = "d20fcffe09bcfbcd5b69f8fa506a614d1580fce14d23abe288e632e83936095a"
+bytes = 9142784
+expected = "no-action/partial"
+
+[[sample]]
+id = "rustbucket-01"
+category = "apt"
+scope = "out"
+family = "RustBucket"
+archive = "RustBucket.zip"
+archive_sha256 = "33119747bf65bd36cbd4cce4eb3834d7da1be4d323de3fa1eb1330d0ce6127d9"
+member = "RustBucket/Internal PDF Viewer (Stage 1).app"
+kind = "app"
+tree_sha256 = "a60faf388de46c49f9dd796aef4dc52b102da3bdd72df41818395510fc20e31c"
+bytes = 276688
+expected = "no-action/complete"
+
+[[sample]]
+id = "greenlambert-01"
+category = "apt"
+scope = "out"
+family = "GreenLambert"
+archive = "GreenLambert.zip"
+archive_sha256 = "a0f2593d895e0f5a9f72436468a16c1f1511ee7aed8de70ddb3b1afb80597a9a"
+member = "GreenLambert/GrowlHelper"
+kind = "macho"
+sha256 = "af7c395426649c57e44eac0bb6c6a109ac649763065ff5b2b23db71839bac655"
+bytes = 210964
+expected = "no-action/complete"
+
+[[sample]]
+id = "adwind-01"
+category = "format-gap"
+scope = "in"
+family = "Adwind"
+archive = "Adwind.zip"
+archive_sha256 = "b1ff01eb37739bc3614122510beded458f4200ed9a9c3539742c6f07cc5a0487"
+member = "AdWind/Adwind.jar"
+kind = "jar"
+sha256 = "7aa15bd505a240a8bf62735a5389a530322945eec6ce9d7b6ad299ca33b2b1b0"
+bytes = 262291
+expected = "no-action/partial"
+
+[[sample]]
+id = "minesteal-01"
+category = "format-gap"
+scope = "in"
+family = "MineSteal"
+archive = "MineSteal.zip"
+archive_sha256 = "5ac5728697d2f48481937d40af2a8d488bf7adf6898856f9e70250d538220e79"
+member = "MineSteal/MineSteal.jar"
+kind = "jar"
+sha256 = "b07a8eb99c448c3981e5dcce5145e8feb99163ac74348a513a9002905346d166"
+bytes = 551105
+expected = "no-action/partial"
+
+[[sample]]
+id = "badbunny-01"
+category = "format-gap"
+scope = "in"
+family = "BadBunny"
+archive = "BadBunny.zip"
+archive_sha256 = "1ad08c0c02d5ef4742a71db157a07c645668b226af27e757d362baff805b3e8d"
+member = "BadBunny/BadBunny.rb"
+kind = "source"
+sha256 = "3ca31b2adb859da61747f8c60c10afddde43b739482aeb104d992ef5764cac7c"
+bytes = 11566
+expected = "no-action/complete"
+
+[[sample]]
+id = "flasfa-01"
+category = "format-gap"
+scope = "in"
+family = "Flasfa (FlsplyDp)"
+archive = "Flasfa (FlsplyDp).zip"
+archive_sha256 = "462942d3c3a3cbec35dce4efa7456b0fbea197942e954f1c8176455ef954b878"
+member = "Flasfa (FlsplyDp)/Flasfa.py"
+kind = "source"
+sha256 = "d852ee72d27509a259c203e61f0487ecf791e7ef5ba315ad3ca70d64f1c27aff"
+bytes = 26829
+expected = "no-action/complete"
+
+[[sample]]
+id = "hovdy-01"
+category = "format-gap"
+scope = "in"
+family = "Hovdy (AsTHT)"
+archive = "Hovdy (AsTHT).zip"
+archive_sha256 = "a1027a250677110c3dacc08eb18d79db7fca636f6d4631f06cccb0770a4350bc"
+member = "Hovdy (AsTHT)/Hovdy.scpt"
+kind = "source"
+sha256 = "4f829c3b6ef36636da41362cfb1bfd5d682c4cfdce5da595b024d4fb19da56ed"
+bytes = 57747
+expected = "notify/complete"
+
+[[sample]]
+id = "inqtana-01"
+category = "format-gap"
+scope = "in"
+family = "Inqtana (Niqtana)"
+archive = "Inqtana (Niqtana).zip"
+archive_sha256 = "10611f818e49c7b86c93a1902ec3f345f2744031ce59441e526de76f0a01995b"
+member = "Inqtana (Niqtana)/Inqtana.tar"
+kind = "archive"
+sha256 = "83e4e13561e93ecbab350b0b8b2f3634f95185fb31876c1282521ba5747af92f"
+bytes = 675840
+expected = "no-action/complete"
+
