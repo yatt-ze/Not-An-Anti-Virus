@@ -553,6 +553,7 @@ impl Reader<'_> {
                     &mut walked,
                     &mut queue,
                     &mut blocked,
+                    shares,
                 );
             }
             let round = dedup(std::mem::take(&mut queue), &done);
@@ -706,6 +707,7 @@ impl Reader<'_> {
         walked: &mut HashSet<usize>,
         queue: &mut Vec<Item>,
         blocked: &mut Vec<Item>,
+        shares: &mut ShareBudget,
     ) {
         let mut pos = match walk.descriptor {
             Some(zip64) => skip_descriptor(data, walk.pos, zip64),
@@ -730,7 +732,15 @@ impl Reader<'_> {
                 usize = sizes.usize;
                 Some(sizes.csize)
             } else if local.method == STORED {
-                find_stored_end(data, local.start, local.zip64).map(|(n, crc)| {
+                let limit = shares.remaining();
+                let (found, scanned) = find_stored_end(data, local.start, local.zip64, limit);
+                shares.charge(scanned);
+                if found.is_none() && scanned >= limit {
+                    let label = member_label(archive, local.name);
+                    self.gap(&label, GapKind::Limit(Limit::Budget));
+                    return;
+                }
+                found.map(|(n, crc)| {
                     item.crc = Some(crc);
                     usize = n;
                     n
@@ -1023,10 +1033,20 @@ fn descriptor_crc(data: &[u8], at: usize) -> Option<u32> {
 
 /// A stored member with a data descriptor and no central entry: the first
 /// signed descriptor whose compressed size is its distance from `start`,
-/// as a streaming reader finds it. Returns that size and the CRC.
-fn find_stored_end(data: &[u8], start: usize, zip64: bool) -> Option<(u64, u32)> {
-    let rest = data.get(start..)?;
-    rest.windows(4)
+/// as a streaming reader finds it. Returns that size and the CRC, and the
+/// bytes searched, at most `limit`.
+fn find_stored_end(
+    data: &[u8],
+    start: usize,
+    zip64: bool,
+    limit: usize,
+) -> (Option<(u64, u32)>, usize) {
+    let Some(rest) = data.get(start..) else {
+        return (None, 0);
+    };
+    let rest = &rest[..rest.len().min(limit)];
+    let found = rest
+        .windows(4)
         .enumerate()
         .filter(|(_, w)| *w == DESCRIPTOR_SIG)
         .find_map(|(n, _)| {
@@ -1036,8 +1056,12 @@ fn find_stored_end(data: &[u8], start: usize, zip64: bool) -> Option<(u64, u32)>
             } else {
                 u64::from(le_u32(data, at + 8)?)
             };
-            (size == n as u64).then(|| (size, le_u32(data, at + 4).unwrap_or(0)))
-        })
+            (size == n as u64).then(|| (n, size, le_u32(data, at + 4).unwrap_or(0)))
+        });
+    match found {
+        Some((n, size, crc)) => (Some((size, crc)), n + 4),
+        None => (None, rest.len()),
+    }
 }
 
 fn member_label(archive: &str, name: &[u8]) -> String {
@@ -2056,6 +2080,28 @@ mod tests {
                 path.display()
             );
         }
+    }
+
+    #[test]
+    fn the_descriptor_search_is_charged_to_the_budget() {
+        // A streamed stored member with no descriptor is searched to the end.
+        let mut s = Spec::stored("s", &[b'p'; 4000]).streamed();
+        s.descriptor = false;
+        let zip = build(
+            &[s],
+            &Layout {
+                no_end: true,
+                ..Layout::default()
+            },
+        );
+        let limits = ZipLimits {
+            max_read_back_bytes: 1000,
+            ..ZipLimits::default()
+        };
+        let (_, r) = read_with(&zip, &limits);
+        assert!(kinds(&r).contains(&GapKind::Limit(Limit::Budget)), "{r:?}");
+        let (_, r) = read_all(&zip);
+        assert!(!kinds(&r).contains(&GapKind::Limit(Limit::Budget)), "{r:?}");
     }
 
     #[test]
