@@ -8,7 +8,8 @@ use std::time::SystemTime;
 
 use crate::context::ScanContext;
 use crate::model::{
-    EvidenceConfidence, MatchedSignal, Recommendation, ScanCompleteness, ScanResult, SignalCategory,
+    CoverageGap, EvidenceConfidence, MatchedSignal, Recommendation, ScanCompleteness, ScanResult,
+    SignalCategory,
 };
 use crate::rules::{default_ruleset, Rule, RuleOutcome};
 
@@ -50,6 +51,7 @@ pub fn scan_context(ctx: &ScanContext, rules: &[Box<dyn Rule>]) -> ScanResult {
     let mut evaluated_count = 0usize;
     let mut marked_evaluated_count = 0usize;
     let mut truncation_uncovered = false;
+    let mut not_applicable_rules: Vec<&'static str> = Vec::new();
 
     for rule in rules {
         let outcome = rule.evaluate(ctx);
@@ -74,6 +76,10 @@ pub fn scan_context(ctx: &ScanContext, rules: &[Box<dyn Rule>]) -> ScanResult {
             }
             Err(RuleOutcome::NotApplicable) => {
                 not_applicable_count += 1;
+                // A rule that also marked itself is reported once, as incomplete.
+                if !ctx.marked_incomplete(rule.id()) {
+                    not_applicable_rules.push(rule.id());
+                }
             }
             Err(RuleOutcome::Evaluated(_)) => {
                 // Rules never return this from `evaluate`; handle defensively.
@@ -88,16 +94,29 @@ pub fn scan_context(ctx: &ScanContext, rules: &[Box<dyn Rule>]) -> ScanResult {
     // Truncation degrades completeness unless every rule that ran covers it
     // (§5.5) — a rule that didn't opt in via `covers_truncation` may have
     // missed something in the unread bytes.
+    let coverage_gaps = if !ctx.readable() {
+        vec![CoverageGap::Unreadable]
+    } else {
+        let mut gaps: Vec<CoverageGap> = not_applicable_rules
+            .into_iter()
+            .map(|rule| CoverageGap::RuleNotApplicable { rule: rule.into() })
+            .collect();
+        gaps.extend(
+            ctx.incomplete_rules()
+                .into_iter()
+                .map(|rule| CoverageGap::RuleIncomplete { rule: rule.into() }),
+        );
+        if truncation_uncovered || (ctx.truncated && evaluated_count == 0) {
+            gaps.push(CoverageGap::Truncated);
+        }
+        gaps
+    };
     let completeness = if !ctx.readable() {
         ScanCompleteness::Indeterminate
-    } else if not_applicable_count > 0
-        || ctx.incomplete_rule_count() > 0
-        || truncation_uncovered
-        || (ctx.truncated && evaluated_count == 0)
-    {
-        ScanCompleteness::Partial
-    } else {
+    } else if coverage_gaps.is_empty() {
         ScanCompleteness::Complete
+    } else {
+        ScanCompleteness::Partial
     };
 
     let score: i32 = signals.iter().map(|s| s.weight).sum();
@@ -123,6 +142,7 @@ pub fn scan_context(ctx: &ScanContext, rules: &[Box<dyn Rule>]) -> ScanResult {
         score,
         confidence,
         completeness,
+        coverage_gaps,
         signals,
         recommendation,
         engine_version: ENGINE_VERSION.to_string(),
@@ -473,6 +493,43 @@ mod tests {
         assert_eq!(
             scan_context(&ctx(false), &rules).completeness,
             ScanCompleteness::Complete
+        );
+    }
+
+    /// Every non-Complete result lists why, each rule once (#146).
+    #[test]
+    fn a_result_that_is_not_complete_names_each_cause() {
+        let gaps =
+            |c: &ScanContext, rules: Vec<Box<dyn Rule>>| scan_context(c, &rules).coverage_gaps;
+        let rule = |r: &str| r.to_string();
+
+        assert!(gaps(&ctx(false), vec![Box::new(StubRule { covers: false })]).is_empty());
+        assert_eq!(
+            gaps(
+                &ctx(true),
+                vec![
+                    Box::new(NotApplicableCoveringStub),
+                    Box::new(MarkedAndNotApplicableStub),
+                    Box::new(StubRule { covers: false }),
+                ],
+            ),
+            vec![
+                CoverageGap::RuleNotApplicable {
+                    rule: rule("stub-not-applicable")
+                },
+                CoverageGap::RuleIncomplete {
+                    rule: rule("stub-marked-not-applicable")
+                },
+                CoverageGap::Truncated,
+            ]
+        );
+        let unreadable = ScanContext {
+            content: None,
+            ..ctx(false)
+        };
+        assert_eq!(
+            gaps(&unreadable, vec![Box::new(NotApplicableCoveringStub)]),
+            vec![CoverageGap::Unreadable]
         );
     }
 

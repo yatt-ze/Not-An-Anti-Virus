@@ -39,7 +39,8 @@ pub use inflate::{
     zlib_decompress_partial, InflateError,
 };
 pub use model::{
-    EvidenceConfidence, MatchedSignal, Recommendation, ScanCompleteness, ScanResult, SignalCategory,
+    CoverageGap, EvidenceConfidence, MatchedSignal, Recommendation, ScanCompleteness, ScanResult,
+    SignalCategory,
 };
 pub use plist::PlistValue;
 pub use presentation::{

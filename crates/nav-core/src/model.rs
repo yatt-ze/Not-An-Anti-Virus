@@ -31,6 +31,32 @@ pub enum ScanCompleteness {
     Indeterminate,
 }
 
+/// One reason a result is not `Complete` (§5.5). Serialized as an object
+/// tagged by `kind`; a `rule` is a rule `id()`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "kebab-case")]
+pub enum CoverageGap {
+    /// The content couldn't be read at all.
+    Unreadable,
+    /// The read stopped short and a rule that ran depends on the unread bytes.
+    Truncated,
+    /// The rule couldn't be evaluated on this file.
+    RuleNotApplicable { rule: String },
+    /// The rule ran but marked its own result incomplete.
+    RuleIncomplete { rule: String },
+}
+
+impl std::fmt::Display for CoverageGap {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            CoverageGap::Unreadable => f.write_str("content could not be read"),
+            CoverageGap::Truncated => f.write_str("content was only partly read"),
+            CoverageGap::RuleNotApplicable { rule } => write!(f, "{rule} could not run"),
+            CoverageGap::RuleIncomplete { rule } => write!(f, "{rule} did not finish"),
+        }
+    }
+}
+
 /// A single rule that fired during the scan, with its own weight and a
 /// human-readable explanation. Signals are never collapsed into the score
 /// silently — `navctl rules test` surfaces this list verbatim (§5.5).
@@ -77,6 +103,9 @@ pub struct ScanResult {
     pub score: i32,
     pub confidence: EvidenceConfidence,
     pub completeness: ScanCompleteness,
+    /// Why `completeness` isn't `Complete`; empty when it is.
+    #[serde(default)]
+    pub coverage_gaps: Vec<CoverageGap>,
     pub signals: Vec<MatchedSignal>,
     pub recommendation: Recommendation,
     /// Engine version this verdict was produced under, retained so rollback
@@ -143,6 +172,7 @@ mod tests {
             score: 78,
             confidence: EvidenceConfidence::Medium,
             completeness,
+            coverage_gaps: Vec::new(),
             signals: Vec::new(),
             recommendation: Recommendation::NotifyAndSuggestQuarantine,
             engine_version: "test".to_string(),
