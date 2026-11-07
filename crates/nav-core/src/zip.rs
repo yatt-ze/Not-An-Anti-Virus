@@ -11,7 +11,6 @@
 
 use std::collections::{HashMap, HashSet};
 use std::fmt;
-use std::hash::{Hash, Hasher};
 
 use crate::budget::ShareBudget;
 use crate::decode::DecodeError;
@@ -503,17 +502,15 @@ struct Reader<'v> {
     entries: usize,
     gaps: Vec<Gap>,
     more_gaps: usize,
-    /// Hashes of (member, kind) already reported.
-    seen_gaps: HashSet<u64>,
+    /// (member, kind) already reported.
+    seen_gaps: HashSet<(String, GapKind)>,
     members: usize,
     visit: &'v mut dyn FnMut(Member),
 }
 
 impl Reader<'_> {
     fn gap(&mut self, member: &str, kind: GapKind) {
-        let mut hasher = std::collections::hash_map::DefaultHasher::new();
-        (member, kind).hash(&mut hasher);
-        if !self.seen_gaps.insert(hasher.finish()) {
+        if !self.seen_gaps.insert((member.to_string(), kind)) {
             return;
         }
         if self.gaps.len() < MAX_GAPS {
