@@ -1033,10 +1033,12 @@ fn enqueue(queue: &mut Vec<Item>, item: Item, usize: u64) {
 }
 
 /// `items` without those already decoded, one per key; a merged item keeps
-/// every distinct name and checks its stream end if any copy does.
+/// every name that displays differently and checks its stream end if any
+/// copy does.
 fn dedup(items: Vec<Item>, done: &HashSet<Key>) -> Vec<Item> {
     let mut index: HashMap<Key, usize> = HashMap::new();
     let mut out: Vec<Item> = Vec::new();
+    let mut shown: Vec<HashSet<String>> = Vec::new();
     for item in items {
         let key = item.key();
         if done.contains(&key) {
@@ -1046,12 +1048,13 @@ fn dedup(items: Vec<Item>, done: &HashSet<Key>) -> Vec<Item> {
             Some(&i) => {
                 let kept = &mut out[i];
                 kept.verify_end |= item.verify_end;
-                if kept.name != item.name && !kept.aliases.contains(&item.name) {
+                if shown[i].insert(display_name(&item.name)) {
                     kept.aliases.push(item.name);
                 }
             }
             None => {
                 index.insert(key, out.len());
+                shown.push(HashSet::from([display_name(&item.name)]));
                 out.push(item);
             }
         }
@@ -1652,6 +1655,15 @@ mod tests {
                 ("hidden.sh", &b"payload"[..])
             ]
         );
+    }
+
+    #[test]
+    fn names_that_display_alike_are_visited_once() {
+        let mut spec = Spec::stored("a\x01", b"payload");
+        spec.local_name = b"a\x02".to_vec();
+        let (seen, r) = read_all(&plain(&[spec]));
+        assert_eq!(kinds(&r), vec![GapKind::Disagree(Disagreement::Headers)]);
+        assert_eq!(seen, vec![("a?".to_string(), b"payload".to_vec(), false)]);
     }
 
     #[test]
