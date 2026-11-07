@@ -12,11 +12,14 @@
 //! a `Distribution` that launches an interpreter. Only the named metadata
 //! entries are read; `Payload` is left for §6.2's Phase 0b path.
 
-use super::{embedded_content_ruleset, Rule, RuleOutcome};
+use super::container::unread_container_reasons;
+use super::zip_member::{inspection_with, ZipInspection};
+use super::{embedded_content_ruleset, Rule, RuleOutcome, UninspectedContainerRule, ZipMemberRule};
 use crate::context::ScanContext;
 use crate::macho::ByteSource;
 use crate::model::{MatchedSignal, SignalCategory};
-use crate::scan::scan_embedded_bytes;
+use crate::scan::{scan_context, scan_embedded_bytes};
+use crate::zip::ZipLimits;
 use crate::{cpio, xar, xml};
 use std::collections::{HashMap, HashSet};
 
@@ -71,6 +74,17 @@ impl InstallerScriptRule {
         &self,
         ctx: &ScanContext,
         limits: &xar::XarLimits,
+    ) -> Result<Option<MatchedSignal>, RuleOutcome> {
+        self.evaluate_limited(ctx, limits, &mut ZipAllowance::new(&ZipLimits::default()))
+    }
+
+    /// [`Rule::evaluate`] under xar `limits`, every ZIP among `Scripts`
+    /// members read from `zips`.
+    fn evaluate_limited(
+        &self,
+        ctx: &ScanContext,
+        limits: &xar::XarLimits,
+        zips: &mut ZipAllowance,
     ) -> Result<Option<MatchedSignal>, RuleOutcome> {
         let content = ctx.content.as_ref().ok_or(RuleOutcome::NotApplicable)?;
 
@@ -205,6 +219,7 @@ impl InstallerScriptRule {
                         entries[i].entry,
                         &mut budget,
                         limits.max_entry_bytes,
+                        zips,
                         &mut found,
                     );
                     // Reported once per package (§5.2, #112, #123).
@@ -292,7 +307,12 @@ impl ScriptFindings {
     /// as `"{prefix}: {description}"`. `truncated` if `bytes` is a prefix.
     fn scan(&mut self, label: String, bytes: Vec<u8>, prefix: &str, truncated: bool) {
         let result = scan_embedded_bytes(label, bytes, truncated, &embedded_content_ruleset());
-        for signal in &result.signals {
+        self.record(prefix, &result.signals);
+    }
+
+    /// Records each signal as `"{prefix}: {description}"`.
+    fn record(&mut self, prefix: &str, signals: &[MatchedSignal]) {
+        for signal in signals {
             self.total = self.total.saturating_add(signal.weight);
             self.descriptions
                 .push(format!("{prefix}: {}", signal.description));
@@ -313,12 +333,13 @@ impl ScriptFindings {
 }
 
 /// Reads the `Scripts` entry (gzip-wrapped cpio), scanning each regular member
-/// as it is decoded. Returns `NotApplicable` if any step can't be read in
-/// full, and whether the entry overran a limit Installer's scripts never come
-/// near: its share (unless its input alone is over a lone entry's) or a size cap
-/// stopped it before the cpio trailer, the walk
-/// hit the member-count or name limit, or a script is longer than
+/// as it is decoded; a ZIP member is read from `zips`. Returns `NotApplicable`
+/// if any step can't be read in full, and whether the entry overran a limit
+/// Installer's scripts never come near: its share (unless its input alone is
+/// over a lone entry's) or a size cap stopped it before the cpio trailer, the
+/// walk hit the member-count or name limit, or a script is longer than
 /// `max_member_bytes` (§5.2, #123).
+#[allow(clippy::too_many_arguments)]
 fn scan_scripts_entry(
     ctx: &ScanContext,
     content: &[u8],
@@ -326,6 +347,7 @@ fn scan_scripts_entry(
     entry: &xar::XarFile,
     budget: &mut xar::ReadBudget,
     max_member_bytes: usize,
+    zips: &mut ZipAllowance,
     findings: &mut ScriptFindings,
 ) -> (Result<(), RuleOutcome>, bool) {
     let total = max_member_bytes.saturating_mul(SCANNED_ENTRY_MULTIPLE);
@@ -333,6 +355,7 @@ fn scan_scripts_entry(
         label: format!("{}!{}", ctx.path.display(), entry.path),
         scan_left: total,
         later_scan_left: total,
+        zips,
         first: ScriptsPart::new(max_member_bytes, ""),
         later: vec![ScriptsPart::new(max_member_bytes, LATER_MEMBER_NOTE)],
     };
@@ -351,6 +374,7 @@ fn scan_scripts_entry(
         label,
         mut scan_left,
         mut later_scan_left,
+        zips,
         first,
         later,
     } = sink;
@@ -371,6 +395,7 @@ fn scan_scripts_entry(
         "install scripts (unparsed)",
         read.gap.is_some(),
         &mut scan_left,
+        zips,
     );
     findings.absorb(first.findings);
     // Installer never runs later members (#109): nothing there makes the
@@ -381,13 +406,19 @@ fn scan_scripts_entry(
             "install scripts (later gzip member, unparsed)",
             false,
             &mut later_scan_left,
+            zips,
         );
         findings.absorb(later.findings);
     }
 
     let script_over_cap = first.script_over_cap || (first.script_alias && first.over_cap);
     let overrun = (cut && !first.trailer) || first.limit_halt || script_over_cap;
-    let complete = first.trailer && !first.over_cap && !first.skipped && read.gap.is_none();
+    // A later member's nested gap is not one, like the rest of them (#109).
+    let complete = first.trailer
+        && !first.over_cap
+        && !first.skipped
+        && !first.nested_gap
+        && read.gap.is_none();
     let result = if complete {
         Ok(())
     } else {
@@ -436,7 +467,7 @@ const LATER_MEMBER_NOTE: &str = " (later gzip member, not run by Installer)";
 
 /// A [`xar::NestedSink`] that walks a `Scripts` entry's first member and its
 /// later members as cpio, scanning members as they complete.
-struct ScriptsSink {
+struct ScriptsSink<'z> {
     /// `{file}!{entry path}`.
     label: String,
     /// Bytes still to scan of the first member's members other than install
@@ -444,19 +475,21 @@ struct ScriptsSink {
     scan_left: usize,
     /// The same for later members, all sources together.
     later_scan_left: usize,
+    zips: &'z mut ZipAllowance,
     first: ScriptsPart,
     /// One walk per source of later members; the last is current.
     later: Vec<ScriptsPart>,
 }
 
-impl xar::NestedSink for ScriptsSink {
+impl xar::NestedSink for ScriptsSink<'_> {
     fn first(&mut self, bytes: &[u8]) {
-        self.first.push(&self.label, bytes, &mut self.scan_left);
+        self.first
+            .push(&self.label, bytes, &mut self.scan_left, self.zips);
     }
 
     fn later(&mut self, bytes: &[u8]) {
         if let Some(part) = self.later.last_mut() {
-            part.push(&self.label, bytes, &mut self.later_scan_left);
+            part.push(&self.label, bytes, &mut self.later_scan_left, self.zips);
         }
     }
 
@@ -492,6 +525,10 @@ struct ScriptsScanned {
     script_alias: bool,
     /// A member's body was not scanned: past the entry's scan total.
     skipped: bool,
+    /// A member, or bytes scanned raw, is a disk image, an installer package
+    /// or a ZIP not read in full, or the container rule could not tell
+    /// (§6.2, §11.8).
+    nested_gap: bool,
 }
 
 impl ScriptsPart {
@@ -509,9 +546,9 @@ impl ScriptsPart {
         }
     }
 
-    fn push(&mut self, label: &str, bytes: &[u8], scan_left: &mut usize) {
+    fn push(&mut self, label: &str, bytes: &[u8], scan_left: &mut usize, zips: &mut ZipAllowance) {
         let members = self.walk.push(bytes);
-        self.scanned.scan_members(label, members, scan_left);
+        self.scanned.scan_members(label, members, scan_left, zips);
     }
 
     /// Ends the walk: scans what is left (bytes that are not cpio are scanned
@@ -523,19 +560,21 @@ impl ScriptsPart {
         unparsed: &str,
         gap: bool,
         scan_left: &mut usize,
+        zips: &mut ZipAllowance,
     ) -> ScriptsScanned {
         let mut scanned = self.scanned;
         let (members, end) = self.walk.finish();
-        scanned.scan_members(label, members, scan_left);
+        scanned.scan_members(label, members, scan_left, zips);
         match end {
             cpio::StreamEnd::NotCpio { raw, more } => {
                 if !raw.is_empty() {
                     let cut = more || gap;
-                    scanned.findings.scan(label.to_string(), raw, unparsed, cut);
+                    scanned.scan_member(label.to_string(), raw, unparsed, cut, zips);
                 }
             }
             cpio::StreamEnd::Archive { halted, cut_short } => {
-                scanned.scan_members(label, cut_short.into_iter().collect(), scan_left);
+                let cut_short = cut_short.into_iter().collect();
+                scanned.scan_members(label, cut_short, scan_left, zips);
                 scanned.trailer = halted.is_none();
                 scanned.limit_halt = matches!(
                     halted,
@@ -557,6 +596,7 @@ impl ScriptsScanned {
         label: &str,
         members: Vec<cpio::StreamedMember>,
         scan_left: &mut usize,
+        zips: &mut ZipAllowance,
     ) {
         for member in members {
             let script = is_install_script(&member.name);
@@ -588,13 +628,81 @@ impl ScriptsScanned {
                 cpio::MemberEnd::Whole => "",
                 cpio::MemberEnd::OverCap | cpio::MemberEnd::CutShort => " (cut short)",
             };
-            self.findings.scan(
+            self.scan_member(
                 format!("{label}/{}", member.name),
                 member.data,
                 &format!("install script {}{}{cut_note}", member.name, self.note),
                 member.end != cpio::MemberEnd::Whole,
+                zips,
             );
         }
+    }
+
+    /// Scans `bytes` as [`ScriptFindings::scan`] does, except that a ZIP is
+    /// read from `zips` and scored through its members alone, as a standalone
+    /// zip's are. Sets `nested_gap` for what could not be read (§6.2).
+    fn scan_member(
+        &mut self,
+        label: String,
+        bytes: Vec<u8>,
+        prefix: &str,
+        truncated: bool,
+        zips: &mut ZipAllowance,
+    ) {
+        let ctx = ScanContext::from_embedded_bytes(label, bytes, truncated);
+        self.nested_gap |= !unread_container_reasons(&ctx).is_empty();
+        let read = zips.inspect(&ctx).is_some();
+        if read {
+            // Unsigned members stay unscored, as a bare Mach-O member is.
+            let signal = ZipMemberRule.evaluate(&ctx).ok().flatten();
+            self.findings.record(prefix, signal.as_slice());
+        }
+        // Text before a prefixed zip (a self-extracting script) is scanned too.
+        let starts_as_zip = ctx
+            .content
+            .as_deref()
+            .is_some_and(|c| c.starts_with(b"PK\x03\x04"));
+        if !read || !starts_as_zip {
+            let signals = scan_context(&ctx, &embedded_content_ruleset()).signals;
+            self.findings.record(prefix, &signals);
+        }
+        // Reads the zip cached by `zips.inspect`, never again.
+        self.nested_gap |= !matches!(UninspectedContainerRule.evaluate(&ctx), Ok(None));
+    }
+}
+
+/// The ZIP read budget of one package scan. Every ZIP among its `Scripts`
+/// members is read from what is left, so together they spend at most one
+/// standalone zip's `max_read_back_bytes`; one read once it is gone is a gap
+/// (§6.2, §11.12).
+struct ZipAllowance {
+    limits: ZipLimits,
+    left: usize,
+}
+
+impl ZipAllowance {
+    fn new(limits: &ZipLimits) -> Self {
+        ZipAllowance {
+            limits: *limits,
+            left: limits.max_read_back_bytes,
+        }
+    }
+
+    /// Reads `ctx` as a zip under what is left and charges what it spent.
+    /// `None` if it is not one that is read. Call before any zip rule
+    /// evaluates `ctx`, so they use this read.
+    fn inspect<'c>(&mut self, ctx: &'c ScanContext) -> Option<&'c ZipInspection> {
+        // Already read: charged then.
+        if let Some(read) = ctx.zip_cache.get() {
+            return read.as_ref();
+        }
+        let limits = ZipLimits {
+            max_read_back_bytes: self.left,
+            ..self.limits
+        };
+        let read = inspection_with(ctx, &limits)?;
+        self.left = self.left.saturating_sub(read.spent);
+        Some(read)
     }
 }
 
@@ -2326,6 +2434,263 @@ mod tests {
         }
     }
 
+    /// A pkg whose first `Scripts` member is `member`, beside an `exit 0`
+    /// preinstall (and a dropper postinstall if `dropper`).
+    fn pkg_with_script_member(member: (&str, &[u8]), dropper: bool) -> Vec<u8> {
+        let mut cpio = odc_member("preinstall", b"exit 0\n");
+        if dropper {
+            cpio.extend(odc_member("postinstall", SCRIPT_DROPPER));
+        }
+        cpio.extend(odc_member(member.0, member.1));
+        cpio.extend(odc_member("TRAILER!!!", b""));
+        pkg_with_scripts(&gzip_member(&cpio))
+    }
+
+    /// A UDIF image: `koly` trailer 512 bytes from the end.
+    fn udif() -> Vec<u8> {
+        let mut dmg = vec![0u8; 2048];
+        dmg[1536..1540].copy_from_slice(b"koly");
+        dmg
+    }
+
+    /// A ZIP of an LZMA member, which the reader cannot decode.
+    fn unreadable_zip() -> Vec<u8> {
+        use crate::zip::tests_support::{plain, Spec};
+        let mut lzma = Spec::stored("a.bin", b"lzma");
+        lzma.method = 14;
+        lzma.local_method = 14;
+        plain(&[lzma])
+    }
+
+    /// Scans `pkg` with only the script rule.
+    fn scan_script_rule(pkg: &[u8]) -> crate::model::ScanCompleteness {
+        let c = ctx("d.pkg", pkg);
+        let rules: Vec<Box<dyn Rule>> = vec![Box::new(InstallerScriptRule)];
+        crate::scan::scan_context(&c, &rules).completeness
+    }
+
+    /// A disk image in `Scripts` is a gap, not a clean read (§6.2, §11.8, #86).
+    #[test]
+    fn a_disk_image_in_scripts_is_not_applicable_and_partial() {
+        let pkg = pkg_with_script_member(("payload.dmg", &udif()), false);
+        let c = ctx("d.pkg", &pkg);
+        assert!(matches!(
+            InstallerScriptRule.evaluate(&c),
+            Err(RuleOutcome::NotApplicable)
+        ));
+        assert_eq!(
+            scan_script_rule(&pkg),
+            crate::model::ScanCompleteness::Partial
+        );
+    }
+
+    /// A finding outranks the gap, and the gap is still reported.
+    #[test]
+    fn a_disk_image_beside_a_script_finding_marks_incomplete() {
+        let pkg = pkg_with_script_member(("payload.dmg", &udif()), true);
+        let c = ctx("d.pkg", &pkg);
+        let signal = InstallerScriptRule
+            .evaluate(&c)
+            .expect("evaluates")
+            .expect("the dropper scores");
+        assert!(signal.description.contains("postinstall"));
+        assert!(c.marked_incomplete("installer-script-suspicious"));
+    }
+
+    /// A ZIP read in full inside `Scripts` stays a clean read.
+    #[test]
+    fn a_readable_zip_in_scripts_stays_complete() {
+        use crate::zip::tests_support::{plain, Spec};
+        let zip = plain(&[Spec::stored("readme.txt", b"hello")]);
+        let pkg = pkg_with_script_member(("data.zip", &zip), false);
+        let c = ctx("d.pkg", &pkg);
+        assert!(matches!(InstallerScriptRule.evaluate(&c), Ok(None)));
+        assert_eq!(
+            scan_script_rule(&pkg),
+            crate::model::ScanCompleteness::Complete
+        );
+    }
+
+    /// A dropper inside a readable ZIP in `Scripts` is scored, not dropped.
+    #[test]
+    fn a_dropper_in_a_zip_in_scripts_scores() {
+        use crate::zip::tests_support::{plain, Spec};
+        let zip = plain(&[Spec::stored("run.sh", SCRIPT_DROPPER)]);
+        let pkg = pkg_with_script_member(("data.zip", &zip), false);
+        let c = ctx("d.pkg", &pkg);
+        let sig = InstallerScriptRule.evaluate(&c).unwrap().unwrap();
+        assert!(sig.description.contains("run.sh"), "{}", sig.description);
+        assert!(!c.marked_incomplete("installer-script-suspicious"));
+    }
+
+    /// A package inside `Scripts` is not inspected, so it is a gap.
+    #[test]
+    fn a_package_in_scripts_is_partial() {
+        let inner = pkg_with_scripts(&gzip_member(&cpio_one("preinstall", b"exit 0\n")));
+        let pkg = pkg_with_script_member(("inner.pkg", &inner), false);
+        assert_eq!(
+            scan_script_rule(&pkg),
+            crate::model::ScanCompleteness::Partial
+        );
+    }
+
+    /// A ZIP the reader cannot decode in full inside `Scripts` is a gap.
+    #[test]
+    fn an_uninspectable_zip_in_scripts_is_partial() {
+        let pkg = pkg_with_script_member(("data.zip", &unreadable_zip()), false);
+        let c = ctx("d.pkg", &pkg);
+        assert!(matches!(
+            InstallerScriptRule.evaluate(&c),
+            Err(RuleOutcome::NotApplicable)
+        ));
+        assert_eq!(
+            scan_script_rule(&pkg),
+            crate::model::ScanCompleteness::Partial
+        );
+    }
+
+    /// Installer never runs later gzip members (#109): an image there is not
+    /// a gap, like any other content of theirs.
+    #[test]
+    fn a_disk_image_in_a_later_gzip_member_is_not_a_gap() {
+        let later = gzip_member(&cpio_one("payload.dmg", &udif()));
+        for pkg in later_member_pkgs(&later) {
+            let c = ctx("s.pkg", &pkg);
+            assert!(matches!(InstallerScriptRule.evaluate(&c), Ok(None)));
+        }
+    }
+
+    /// Neither is an unreadable ZIP or a package in a later gzip member.
+    #[test]
+    fn a_zip_and_a_package_in_a_later_gzip_member_are_not_gaps() {
+        let inner = pkg_with_scripts(&gzip_member(&cpio_one("preinstall", b"exit 0\n")));
+        let mut cpio = odc_member("data.zip", &unreadable_zip());
+        cpio.extend(odc_member("inner.pkg", &inner));
+        cpio.extend(odc_member("TRAILER!!!", b""));
+        for pkg in later_member_pkgs(&gzip_member(&cpio)) {
+            let c = ctx("s.pkg", &pkg);
+            assert!(matches!(InstallerScriptRule.evaluate(&c), Ok(None)));
+        }
+    }
+
+    /// A small stored zip, `n.zip`'s `readme.txt`.
+    fn small_zip() -> Vec<u8> {
+        use crate::zip::tests_support::{plain, Spec};
+        plain(&[Spec::stored("readme.txt", b"hello")])
+    }
+
+    /// What reading [`small_zip`] charges.
+    fn small_zip_cost() -> usize {
+        crate::zip::read(&small_zip(), &ZipLimits::default(), &mut |_| {}).spent
+    }
+
+    /// Gzipped cpio of `n` copies of [`small_zip`], all named `preinstall`
+    /// (exempt from the scan total) beside an `exit 0` one.
+    fn many_zips_scripts(n: usize) -> Vec<u8> {
+        let mut cpio = odc_member("postinstall", b"exit 0\n");
+        for _ in 0..n {
+            cpio.extend(odc_member("preinstall", &small_zip()));
+        }
+        cpio.extend(odc_member("TRAILER!!!", b""));
+        gzip_member(&cpio)
+    }
+
+    /// Evaluates `pkg` with a ZIP allowance of `zip_bytes`; returns the result
+    /// and what the zips spent.
+    fn evaluate_zips(
+        pkg: &[u8],
+        zip_bytes: usize,
+    ) -> (Result<Option<MatchedSignal>, RuleOutcome>, usize) {
+        let limits = ZipLimits {
+            max_read_back_bytes: zip_bytes,
+            ..ZipLimits::default()
+        };
+        let mut zips = ZipAllowance::new(&limits);
+        let c = ctx("z.pkg", pkg);
+        let r = InstallerScriptRule.evaluate_limited(&c, &xar::XarLimits::default(), &mut zips);
+        (r, zip_bytes - zips.left)
+    }
+
+    /// All the ZIPs in one package's `Scripts` entries draw from one
+    /// allowance; past it a zip is a gap, never a clean read (§6.2, §11.12).
+    #[test]
+    fn zips_in_scripts_share_one_allowance() {
+        let cost = small_zip_cost();
+        assert!(cost > 0);
+        let one = pkg_with_scripts(&many_zips_scripts(10));
+        let several = components_archive(&vec![many_zips_scripts(4); 3], true);
+        for (pkg, zips) in [(one, 10), (several, 12)] {
+            let (r, spent) = evaluate_zips(&pkg, zips * cost);
+            assert!(matches!(r, Ok(None)), "{r:?}");
+            assert_eq!(spent, zips * cost);
+            // Room for three and a half: the rest are budget gaps.
+            let bound = 3 * cost + cost / 2;
+            let (r, spent) = evaluate_zips(&pkg, bound);
+            assert!(matches!(r, Err(RuleOutcome::NotApplicable)), "{r:?}");
+            assert!(spent <= bound, "{spent} > {bound}");
+            // None left: no zip is read, and not reread at default limits.
+            let (r, spent) = evaluate_zips(&pkg, 0);
+            assert!(matches!(r, Err(RuleOutcome::NotApplicable)), "{r:?}");
+            assert_eq!(spent, 0);
+        }
+    }
+
+    /// A stored zip's script is scored through its member only, as the same
+    /// script is bare, not again in the zip's raw bytes.
+    #[test]
+    fn a_script_in_a_stored_zip_in_scripts_scores_once() {
+        use crate::zip::tests_support::{plain, Spec};
+        let weight = |member: (&str, &[u8])| {
+            let pkg = pkg_with_script_member(member, false);
+            let sig = InstallerScriptRule.evaluate(&ctx("d.pkg", &pkg));
+            sig.unwrap().expect("scores")
+        };
+        let zip = plain(&[Spec::stored("run.sh", SCRIPT_DROPPER)]);
+        let zipped = weight(("data.zip", &zip));
+        let bare = weight(("run.sh", SCRIPT_DROPPER));
+        assert!(bare.weight < MAX_SCRIPT_WEIGHT);
+        assert_eq!(zipped.weight, bare.weight);
+        assert_eq!(zipped.description.matches("install script").count(), 1);
+        assert!(
+            zipped
+                .description
+                .starts_with("install script data.zip: run.sh: "),
+            "{}",
+            zipped.description
+        );
+    }
+
+    /// A dropper script with a zip appended (self-extracting) is still
+    /// scanned as text, not only through the zip's members.
+    #[test]
+    fn a_script_with_a_zip_appended_is_scanned_as_text() {
+        use crate::zip::tests_support::{plain, Spec};
+        let mut sfx = SCRIPT_DROPPER.to_vec();
+        sfx.extend(plain(&[Spec::stored("readme.txt", b"hello")]));
+        let pkg = pkg_with_script_member(("postinstall", &sfx), false);
+        let sig = InstallerScriptRule.evaluate(&ctx("d.pkg", &pkg));
+        let sig = sig.unwrap().expect("the script text scores");
+        assert!(sig.description.contains("install script postinstall"));
+    }
+
+    /// A `Scripts` gzip whose content is a ZIP, not cpio, is scored through
+    /// its members and is still not a full read.
+    #[test]
+    fn a_zip_in_place_of_the_scripts_cpio_scores_its_members() {
+        use crate::zip::tests_support::{plain, Spec};
+        let zip = plain(&[Spec::stored("run.sh", SCRIPT_DROPPER)]);
+        let pkg = pkg_with_scripts(&gzip_member(&zip));
+        let c = ctx("d.pkg", &pkg);
+        let sig = InstallerScriptRule.evaluate(&c).unwrap().expect("scores");
+        assert!(
+            sig.description
+                .starts_with("install scripts (unparsed): run.sh: "),
+            "{}",
+            sig.description
+        );
+        assert!(c.marked_incomplete("installer-script-suspicious"));
+    }
+
     /// The members after the first are joined, as `gunzip` joins them, so a
     /// cpio split across two of them is read whole.
     #[test]
@@ -3334,7 +3699,17 @@ mod tests {
             let mut found = ScriptFindings::default();
             // The empty archive is not complete either way; only the charge matters.
             let max = limits.max_entry_bytes;
-            let _ = scan_scripts_entry(&c, &bytes, &archive, entry, &mut budget, max, &mut found);
+            let zips = &mut ZipAllowance::new(&ZipLimits::default());
+            let _ = scan_scripts_entry(
+                &c,
+                &bytes,
+                &archive,
+                entry,
+                &mut budget,
+                max,
+                zips,
+                &mut found,
+            );
             charged.push(before - budget.remaining());
         }
         // `k` full reads, then only cut ones from what is left.

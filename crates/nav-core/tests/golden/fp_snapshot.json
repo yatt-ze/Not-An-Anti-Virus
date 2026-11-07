@@ -590,6 +590,14 @@
     ],
     "completeness": "partial"
   },
+  "suspicious/installer_scripts_disk_image_member.pkg": {
+    "score": 6,
+    "recommendation": "no-action",
+    "rule_ids": [
+      "unsigned-installer-package"
+    ],
+    "completeness": "partial"
+  },
   "suspicious/installer_scripts_inner_gzip_past_work_cap.pkg": {
     "score": 26,
     "recommendation": "notify",
