@@ -20,7 +20,9 @@ pub use codesign::{
     AdHocSignedRule, InvalidSignatureRule, NotarizedRule, RevokedSignatureRule,
     UnanchoredIdentityRule, UnnotarizedSignedRule, UnsignedBinaryRule,
 };
-pub use container::{UninspectedContainerRule, UNINSPECTED_CONTAINER_ID};
+pub use container::{
+    disk_image_format_of_path, UninspectedContainerRule, UNINSPECTED_CONTAINER_ID,
+};
 pub use entropy::HighEntropyRule;
 pub use macho_structure::MachOStructureRule;
 pub use package::{InstallerScriptRule, UnsignedPackageRule};

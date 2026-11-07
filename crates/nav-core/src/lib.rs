@@ -47,7 +47,8 @@ pub use presentation::{
     INDETERMINATE, OPERATIONAL_ERROR, SCAN_JSON_SCHEMA_VERSION, SUSPICIOUS,
 };
 pub use rules::{
-    default_ruleset, embedded_content_ruleset, Rule, RuleOutcome, UNINSPECTED_CONTAINER_ID,
+    default_ruleset, disk_image_format_of_path, embedded_content_ruleset, Rule, RuleOutcome,
+    UNINSPECTED_CONTAINER_ID,
 };
 pub use scan::{
     scan_context, scan_embedded_bytes, scan_file, scan_file_with_rules, ENGINE_VERSION,

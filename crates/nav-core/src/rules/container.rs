@@ -1,6 +1,9 @@
 //! Containers the engine cannot look inside, or could not read in full
 //! (§6.2, §10, §11.8).
 
+use std::io;
+use std::path::Path;
+
 use super::{zip_member, Rule, RuleOutcome};
 use crate::context::{ContentSource, ScanContext};
 use crate::macho::ByteSource;
@@ -41,7 +44,15 @@ pub struct UninspectedContainerRule;
 /// in-range probe could not be read. Inner `None`: not a disk image. A probe
 /// that falls outside the file is "not this format", not a read failure.
 pub(super) fn disk_image_format(ctx: &ScanContext) -> Option<Option<&'static str>> {
-    let len = ctx.file_len?;
+    probe_image_format(ctx.file_len?, |offset, len| ctx.read_at(offset, len))
+}
+
+/// [`IMAGE_FORMATS`] probed against a source of `len` bytes; `read_at`
+/// returns `None` when an in-range read fails.
+fn probe_image_format(
+    len: u64,
+    mut read_at: impl FnMut(u64, usize) -> Option<Vec<u8>>,
+) -> Option<Option<&'static str>> {
     for &(name, anchor, magic) in IMAGE_FORMATS {
         let offset = match anchor {
             Anchor::Start(o) => o,
@@ -53,11 +64,36 @@ pub(super) fn disk_image_format(ctx: &ScanContext) -> Option<Option<&'static str
         if offset.saturating_add(magic.len() as u64) > len {
             continue;
         }
-        if ctx.read_at(offset, magic.len())? == magic {
+        if read_at(offset, magic.len())? == magic {
             return Some(Some(name));
         }
     }
     Some(None)
+}
+
+/// The disk-image format of the file at `path` (symlinks followed), as the
+/// `uninspected-container` rule detects it, or `None` if it is not one.
+/// Errors if the file cannot be opened or a probe cannot be read.
+pub fn disk_image_format_of_path(path: &Path) -> io::Result<Option<&'static str>> {
+    use std::os::unix::fs::FileExt;
+    let file = std::fs::File::open(path)?;
+    let len = file.metadata()?.len();
+    let mut err = None;
+    let found = probe_image_format(len, |offset, n| {
+        let mut buf = vec![0u8; n];
+        match file.read_exact_at(&mut buf, offset) {
+            Ok(()) => Some(buf),
+            Err(e) => {
+                err = Some(e);
+                None
+            }
+        }
+    });
+    match (found, err) {
+        (Some(format), _) => Ok(format),
+        (None, Some(e)) => Err(e),
+        (None, None) => Err(io::Error::other("disk-image probe failed")),
+    }
 }
 
 /// Why `ctx`, as a member of another container, is not inspected: one reason
@@ -419,6 +455,18 @@ mod tests {
         assert!(!fires(&embedded(
             b"PK\x05\x06".iter().copied().chain([0; 18]).collect()
         )));
+    }
+
+    #[test]
+    fn disk_image_format_of_path_matches_the_rule() {
+        let dmg = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("fixtures/suspicious/dropper_in_disk_image.dmg");
+        assert_eq!(disk_image_format_of_path(&dmg).unwrap(), Some("UDIF"));
+        let sh =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures/suspicious/dropper.sh");
+        assert_eq!(disk_image_format_of_path(&sh).unwrap(), None);
+        let tmp = temp_dir("probe-missing");
+        assert!(disk_image_format_of_path(&tmp.0.join("nope")).is_err());
     }
 
     #[test]

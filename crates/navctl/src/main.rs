@@ -5,6 +5,7 @@
 //! are listed so the surface is documented, but need `navd` (Phase 0b+) and
 //! say so plainly rather than pretending to work.
 
+mod diskimage;
 mod exit;
 mod output;
 mod service;
@@ -61,7 +62,7 @@ enum Command {
         #[command(subcommand)]
         command: ServiceCommand,
     },
-    /// Scan a file or directory and print a verdict.
+    /// Scan a file, directory, `.app` bundle or disk image and print a verdict.
     Scan {
         path: PathBuf,
         #[arg(long)]
@@ -75,6 +76,9 @@ enum Command {
         quick: bool,
         #[arg(long)]
         full: bool,
+        /// Scan a disk image as a file instead of mounting it (§6.2).
+        #[arg(long)]
+        no_mount: bool,
         #[command(flatten)]
         budget: BudgetArgs,
     },
@@ -127,7 +131,7 @@ enum ServiceCommand {
 
 #[derive(Subcommand)]
 enum RulesCommand {
-    /// Full signal breakdown for a file, directory, or `.app` bundle —
+    /// Full signal breakdown for a file, directory, `.app` bundle or disk image —
     /// dry-run, no action taken.
     Test {
         path: PathBuf,
@@ -135,6 +139,9 @@ enum RulesCommand {
         recursive: bool,
         #[arg(long)]
         json: bool,
+        /// Scan a disk image as a file instead of mounting it (§6.2).
+        #[arg(long)]
+        no_mount: bool,
         #[command(flatten)]
         budget: BudgetArgs,
     },
@@ -196,16 +203,18 @@ fn main() -> ExitCode {
             verbose,
             quick: _,
             full: _,
+            no_mount,
             budget,
-        } => output::run_scan(&path, recursive, json, verbose, &budget.budget()),
+        } => output::run_scan(&path, recursive, json, verbose, &budget.budget(), no_mount),
 
         Command::Rules { command } => match command {
             RulesCommand::Test {
                 path,
                 recursive,
                 json,
+                no_mount,
                 budget,
-            } => output::run_rules_test(&path, recursive, json, &budget.budget()),
+            } => output::run_rules_test(&path, recursive, json, &budget.budget(), no_mount),
             RulesCommand::List => output::run_rules_list(),
             RulesCommand::Reload => not_yet_implemented("rules reload", "Phase 3"),
             RulesCommand::Rollback => not_yet_implemented("rules rollback", "Phase 3"),
