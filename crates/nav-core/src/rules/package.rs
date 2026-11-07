@@ -106,7 +106,8 @@ impl InstallerScriptRule {
         for (toc_index, entry) in wanted.enumerate() {
             // `Scripts` holds a nested gzip: sorted and read as one.
             let nested = entry.name == "Scripts";
-            let cost = xar::entry_allowance(content, &archive, entry, nested).ok();
+            // Read through `ctx`, past `content` if need be (§6.2).
+            let cost = budget.entry_allowance(ctx, &archive, entry, nested).ok();
             unreadable |= cost.is_none();
             entries.push(Wanted {
                 toc_index,
@@ -160,7 +161,6 @@ impl InstallerScriptRule {
                 };
                 match scan_distribution_entry(
                     ctx,
-                    content,
                     &archive,
                     dist.entry,
                     &mut budget,
@@ -214,7 +214,6 @@ impl InstallerScriptRule {
                 let result = if entries[i].nested {
                     let (result, overrun) = scan_scripts_entry(
                         ctx,
-                        content,
                         &archive,
                         entries[i].entry,
                         &mut budget,
@@ -237,7 +236,6 @@ impl InstallerScriptRule {
                 } else {
                     scan_distribution_entry(
                         ctx,
-                        content,
                         &archive,
                         entries[i].entry,
                         &mut budget,
@@ -339,10 +337,8 @@ impl ScriptFindings {
 /// over a lone entry's) or a size cap stopped it before the cpio trailer, the
 /// walk hit the member-count or name limit, or a script is longer than
 /// `max_member_bytes` (§5.2, #123).
-#[allow(clippy::too_many_arguments)]
 fn scan_scripts_entry(
     ctx: &ScanContext,
-    content: &[u8],
     archive: &xar::XarArchive,
     entry: &xar::XarFile,
     budget: &mut xar::ReadBudget,
@@ -361,7 +357,7 @@ fn scan_scripts_entry(
     };
     // An entry we can't reach (bounded read stopped short) is unreadable, not
     // absent. A partial read is scanned, then reported unreadable below.
-    let read = budget.read_entry_nested(content, archive, entry, &mut sink);
+    let read = budget.read_entry_nested(ctx, archive, entry, &mut sink);
     // Hiding a script behind input alone takes a stream of over half a lone
     // entry's input share (64 MiB gzip, ~43 MiB zlib), and real installers
     // can carry big Scripts (§5.2).
@@ -972,7 +968,6 @@ struct RefQuery<'a> {
 /// `NotApplicable` if it can't be read or parsed in full.
 fn scan_distribution_entry(
     ctx: &ScanContext,
-    content: &[u8],
     archive: &xar::XarArchive,
     entry: &xar::XarFile,
     budget: &mut xar::ReadBudget,
@@ -980,7 +975,7 @@ fn scan_distribution_entry(
     refs: Option<&RefQuery>,
 ) -> Result<Option<Vec<usize>>, RuleOutcome> {
     let (raw, gap) = budget
-        .read_entry_partial(content, archive, entry)
+        .read_entry_partial(ctx, archive, entry)
         .map_err(|_| RuleOutcome::NotApplicable)?;
     // The `.js` suffix makes `classify_text` treat even a short buffer as script.
     let label = format!("{}!{}.js", ctx.path.display(), entry.path);
@@ -3700,16 +3695,7 @@ mod tests {
             // The empty archive is not complete either way; only the charge matters.
             let max = limits.max_entry_bytes;
             let zips = &mut ZipAllowance::new(&ZipLimits::default());
-            let _ = scan_scripts_entry(
-                &c,
-                &bytes,
-                &archive,
-                entry,
-                &mut budget,
-                max,
-                zips,
-                &mut found,
-            );
+            let _ = scan_scripts_entry(&c, &archive, entry, &mut budget, max, zips, &mut found);
             charged.push(before - budget.remaining());
         }
         // `k` full reads, then only cut ones from what is left.
@@ -4870,5 +4856,277 @@ mod tests {
         }
 
         fn later(&mut self, _: &[u8]) {}
+    }
+
+    // --- entries past the content read (#151) -----------------------------
+
+    use crate::context::{MAX_CONTENT_BYTES, MAX_RANGE_READ};
+    use crate::model::{CoverageGap, ScanCompleteness};
+
+    /// Stored `Payload` bytes that push later entries past the content read.
+    const PAD: usize = MAX_CONTENT_BYTES + (1 << 20);
+
+    /// A TOC entry for heap bytes `[off, off + n)`.
+    fn heap_entry(name: &str, off: u64, n: u64) -> String {
+        format!(
+            r#"<file><name>{name}</name><type>file</type><data><offset>{off}</offset><length>{n}</length><size>{n}</size></data></file>"#
+        )
+    }
+
+    /// A pkg laid out as `pkgbuild` does: a stored, zero `Payload` of `pad`
+    /// bytes first, then `tail`; `toc` describes `tail`'s entries.
+    fn padded_pkg_with(pad: usize, toc: &str, tail: &[u8]) -> Vec<u8> {
+        let toc = format!(
+            "<?xml version=\"1.0\"?><xar><toc>{}{toc}</toc></xar>",
+            heap_entry("Payload", 0, pad as u64)
+        );
+        let mut bytes = xar::xar_from_zlib_toc(&zlib_stored(toc.as_bytes()), toc.len() as u64);
+        bytes.resize(bytes.len() + pad, 0);
+        bytes.extend_from_slice(tail);
+        bytes
+    }
+
+    /// [`padded_pkg_with`] `PAD` bytes, then each `(name, blob)` in order.
+    fn padded_pkg(entries: &[(&str, &[u8])]) -> Vec<u8> {
+        let mut toc = String::new();
+        let mut tail = Vec::new();
+        for (name, blob) in entries {
+            let off = (PAD + tail.len()) as u64;
+            toc += &heap_entry(name, off, blob.len() as u64);
+            tail.extend_from_slice(blob);
+        }
+        padded_pkg_with(PAD, &toc, &tail)
+    }
+
+    /// `bytes` loaded through a real file, as a scan sees it.
+    fn load_pkg(bytes: &[u8]) -> ScanContext {
+        let path = crate::test_support::write_temp_file("pkg151", bytes);
+        let c = ScanContext::load(&path);
+        let _ = std::fs::remove_file(&path);
+        assert!(c.truncated);
+        c
+    }
+
+    /// Bytes `c` read from disk past its content read.
+    fn disk_read(c: &ScanContext) -> u64 {
+        c.bytes_read() - MAX_CONTENT_BYTES as u64
+    }
+
+    /// Completeness and gaps of a scan of `c` with only the script rule.
+    fn script_rule_coverage(c: &ScanContext) -> (ScanCompleteness, Vec<CoverageGap>) {
+        let rules: Vec<Box<dyn Rule>> = vec![Box::new(InstallerScriptRule)];
+        let result = crate::scan::scan_context(c, &rules);
+        (result.completeness, result.coverage_gaps)
+    }
+
+    fn clean_scripts() -> Vec<u8> {
+        gzip_member(&cpio_one("preinstall", b"echo hi\n"))
+    }
+
+    fn dropper_scripts() -> Vec<u8> {
+        gzip_member(&cpio_one("postinstall", SCRIPT_DROPPER))
+    }
+
+    fn same_signal(a: &MatchedSignal, b: &MatchedSignal) -> bool {
+        (&a.id, a.weight, &a.description) == (&b.id, b.weight, &b.description)
+    }
+
+    #[test]
+    fn a_suspicious_script_past_the_content_read_scores_as_in_memory() {
+        let bytes = padded_pkg(&[("Scripts", &dropper_scripts())]);
+        let disk = load_pkg(&bytes);
+        let memory = ctx(&disk.path.to_string_lossy(), &bytes);
+        let got = InstallerScriptRule
+            .evaluate(&disk)
+            .expect("ok")
+            .expect("fires");
+        let want = InstallerScriptRule
+            .evaluate(&memory)
+            .expect("ok")
+            .expect("fires");
+        assert!(same_signal(&got, &want), "{got:?} vs {want:?}");
+        assert!(got.description.contains("curl"), "{}", got.description);
+    }
+
+    #[test]
+    fn fully_read_metadata_in_a_truncated_pkg_leaves_only_the_truncated_gap() {
+        let bytes = padded_pkg(&[("Scripts", &dropper_scripts())]);
+        let c = load_pkg(&bytes);
+        assert_eq!(
+            script_rule_coverage(&c),
+            (ScanCompleteness::Partial, vec![CoverageGap::Truncated])
+        );
+    }
+
+    #[test]
+    fn clean_scripts_past_the_content_read_are_clean_and_partial() {
+        let c = load_pkg(&padded_pkg(&[("Scripts", &clean_scripts())]));
+        assert!(matches!(InstallerScriptRule.evaluate(&c), Ok(None)));
+        assert_eq!(
+            script_rule_coverage(&c),
+            (ScanCompleteness::Partial, vec![CoverageGap::Truncated])
+        );
+    }
+
+    /// The probe's bytes are reused by the entry read, not fetched again.
+    #[test]
+    fn a_header_probe_and_its_entry_read_fetch_no_byte_twice() {
+        let scripts = clean_scripts();
+        let c = load_pkg(&padded_pkg(&[("Scripts", &scripts)]));
+        assert!(matches!(InstallerScriptRule.evaluate(&c), Ok(None)));
+        assert_eq!(disk_read(&c), scripts.len() as u64);
+    }
+
+    #[test]
+    fn many_entries_sharing_one_heap_range_cost_one_probe_and_one_read() {
+        let scripts = clean_scripts();
+        let toc = heap_entry("Scripts", PAD as u64, scripts.len() as u64).repeat(3000);
+        let bytes = padded_pkg_with(PAD, &toc, &scripts);
+        let archive = xar::parse(&bytes, &xar::XarLimits::default()).expect("xar");
+        assert_eq!(archive.files.len(), 3001);
+        let c = load_pkg(&bytes);
+        assert!(matches!(InstallerScriptRule.evaluate(&c), Ok(None)));
+        assert_eq!(disk_read(&c), scripts.len() as u64);
+    }
+
+    /// A probe is paid for before it is read; one that empties the
+    /// allowance leaves nothing for the entry read.
+    #[test]
+    fn a_header_probe_the_allowance_cannot_cover_stops_the_entry() {
+        let bytes = padded_pkg(&[("Scripts", &clean_scripts())]);
+        for (budget, read) in [(8, 0), (16, 16)] {
+            let limits = xar::XarLimits {
+                max_read_back_bytes: budget,
+                ..xar::XarLimits::default()
+            };
+            let c = load_pkg(&bytes);
+            let r = InstallerScriptRule.evaluate_with(&c, &limits);
+            assert!(
+                matches!(r, Err(RuleOutcome::NotApplicable))
+                    || c.marked_incomplete("installer-script-suspicious"),
+                "{r:?}"
+            );
+            assert!(!matches!(r, Ok(None)));
+            assert_eq!(disk_read(&c), read, "budget {budget}");
+        }
+    }
+
+    /// One read past the content read is at most `MAX_RANGE_READ`; the rest
+    /// of a longer entry is a gap, never clean, and not a starved signal.
+    #[test]
+    fn an_entry_over_the_range_read_cap_is_cut_and_not_applicable() {
+        let big = MAX_RANGE_READ + (1 << 20);
+        let toc =
+            heap_entry("Payload", 0, PAD as u64) + &heap_entry("Scripts", PAD as u64, big as u64);
+        let head = xar::toc_xar_bytes(&toc);
+        let path =
+            crate::test_support::sparse_temp_file("pkg151-big", (head.len() + PAD + big) as u64);
+        crate::test_support::write_at(&path, 0, &head);
+        let c = ScanContext::load(&path);
+        let _ = std::fs::remove_file(&path);
+        assert!(matches!(
+            InstallerScriptRule.evaluate(&c),
+            Err(RuleOutcome::NotApplicable)
+        ));
+        assert_eq!(disk_read(&c), MAX_RANGE_READ as u64);
+    }
+
+    #[test]
+    fn declared_ranges_past_eof_or_overflowing_are_not_applicable() {
+        let max = u64::MAX;
+        for (off, n) in [(PAD as u64, 100), (max, 1), (0, max), (PAD as u64, max)] {
+            let c = load_pkg(&padded_pkg_with(PAD, &heap_entry("Scripts", off, n), b""));
+            assert!(
+                matches!(
+                    InstallerScriptRule.evaluate(&c),
+                    Err(RuleOutcome::NotApplicable)
+                ),
+                "{off}+{n}"
+            );
+            assert_eq!(disk_read(&c), 0, "{off}+{n}");
+        }
+    }
+
+    /// An embedded capture has no file to read past what it holds.
+    #[test]
+    fn scripts_past_a_truncated_embedded_capture_are_not_applicable() {
+        let scripts = dropper_scripts();
+        let toc = heap_entry("Scripts", 1000, scripts.len() as u64);
+        let bytes = padded_pkg_with(1000, &toc, &scripts);
+        let heap_start = xar::parse(&bytes, &xar::XarLimits::default())
+            .expect("xar")
+            .heap_start as usize;
+        let capture = bytes[..heap_start + 1010].to_vec();
+        let c = ScanContext::from_embedded_bytes("outer.zip!inner.pkg", capture, true);
+        assert!(matches!(
+            InstallerScriptRule.evaluate(&c),
+            Err(RuleOutcome::NotApplicable)
+        ));
+    }
+
+    #[test]
+    fn a_distribution_past_the_content_read_is_read_and_scored() {
+        let product = pkg!("distribution_dropper");
+        let archive = xar::parse(product, &xar::XarLimits::default()).expect("xar");
+        let entry = archive
+            .files
+            .iter()
+            .find(|f| f.name == "Distribution")
+            .expect("Distribution");
+        let dist = xar::read_entry(product, &archive, entry, &xar::XarLimits::default())
+            .expect("readable");
+        let bytes = padded_pkg(&[("Distribution", &dist)]);
+        let disk = load_pkg(&bytes);
+        let memory = ctx(&disk.path.to_string_lossy(), &bytes);
+        let got = InstallerScriptRule
+            .evaluate(&disk)
+            .expect("ok")
+            .expect("fires");
+        let want = InstallerScriptRule
+            .evaluate(&memory)
+            .expect("ok")
+            .expect("fires");
+        assert!(same_signal(&got, &want), "{got:?} vs {want:?}");
+        assert!(
+            got.description
+                .contains("system.run launches an interpreter (bash)"),
+            "{}",
+            got.description
+        );
+        assert_eq!(
+            script_rule_coverage(&disk),
+            (ScanCompleteness::Partial, vec![CoverageGap::Truncated])
+        );
+    }
+
+    /// Everything read from disk, probes included, is charged to the
+    /// archive's read-back budget.
+    #[test]
+    fn disk_reads_stay_within_the_read_back_budget() {
+        let limits = xar::XarLimits {
+            max_entry_bytes: 4096,
+            max_read_back_bytes: 64 * 1024,
+            ..xar::XarLimits::default()
+        };
+        let blob = vec![b'a'; 8 * 1024];
+        let mut toc = String::new();
+        let mut tail = Vec::new();
+        for i in 0..40 {
+            let name = if i % 4 == 0 {
+                "Distribution"
+            } else {
+                "Scripts"
+            };
+            toc += &format!(
+                "<file><name>c{i}</name><type>directory</type>{}</file>",
+                heap_entry(name, (PAD + tail.len()) as u64, blob.len() as u64)
+            );
+            tail.extend_from_slice(&blob);
+        }
+        let c = load_pkg(&padded_pkg_with(PAD, &toc, &tail));
+        let _ = InstallerScriptRule.evaluate_with(&c, &limits);
+        let read = disk_read(&c);
+        assert!(read > 0);
+        assert!(read <= limits.max_read_back_bytes as u64, "{read}");
     }
 }
