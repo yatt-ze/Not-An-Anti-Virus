@@ -923,7 +923,8 @@ impl Reader<'_> {
             if crc.is_some_and(|crc| inflate::crc32_extend(0, &bytes) != crc) {
                 self.gap(&label, GapKind::Damaged(Damage::CrcMismatch));
             }
-            if known.is_none() && bytes.len() > self.limits.max_ratio.saturating_mul(used.max(1)) {
+            // A known extent may overstate the input the decoder consumed.
+            if bytes.len() > self.limits.max_ratio.saturating_mul(used.max(1)) {
                 self.gap(&label, GapKind::Limit(Limit::Ratio));
             }
             let ends_early = item.verify_end && known.is_some_and(|n| n != used);
@@ -1822,6 +1823,26 @@ mod tests {
         assert_eq!(kinds(&r), vec![GapKind::Limit(Limit::Ratio)]);
         assert!(seen[0].2);
         assert_eq!(seen[0].1.len(), 100 * bomb.payload.len());
+    }
+
+    #[test]
+    fn an_overstated_size_does_not_lift_the_ratio_limit() {
+        let mut bomb = Spec::deflated("bomb", b"");
+        let stream = deflate_run(b'z', 1_000_000);
+        bomb.payload = stream.clone();
+        bomb.payload.resize(stream.len() * 10, 0);
+        bomb.csize = bomb.payload.len() as u64;
+        bomb.local_csize = bomb.csize;
+        bomb.usize = 1_000_000;
+        bomb.local_usize = bomb.usize;
+        bomb.crc = crc(&[b'z'; 1_000_000]);
+        bomb.local_crc = bomb.crc;
+        let strict = ZipLimits {
+            max_ratio: 100,
+            ..ZipLimits::default()
+        };
+        let (_, r) = read_with(&plain(&[bomb]), &strict);
+        assert!(kinds(&r).contains(&GapKind::Limit(Limit::Ratio)), "{r:?}");
     }
 
     #[test]
