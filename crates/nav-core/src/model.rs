@@ -186,4 +186,11 @@ mod tests {
         assert!(!result_with(ScanCompleteness::Partial).is_actionable());
         assert!(!result_with(ScanCompleteness::Indeterminate).is_actionable());
     }
+
+    #[test]
+    fn a_result_serialized_before_coverage_gaps_still_parses() {
+        let json = r#"{"completeness":"complete","confidence":"high","engine_version":"0.4.0","evaluated_at":1794054322,"path":"/tmp/notes.txt","recommendation":"no-action","schema_version":1,"score":0,"signals":[]}"#;
+        let result: ScanResult = serde_json::from_str(json).unwrap();
+        assert!(result.coverage_gaps.is_empty());
+    }
 }
