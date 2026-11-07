@@ -32,6 +32,12 @@ pub trait ByteSource {
     /// single slice's header/signature reads can number in the thousands on
     /// hostile input (§5.2).
     fn read_range(&self, off: u64, len: usize) -> Option<Cow<'_, [u8]>>;
+    /// Fills `buf` with the bytes at `off`, or `None` as [`Self::read_range`].
+    /// For callers assembling one buffer from several reads without a copy.
+    fn read_exact_at(&self, off: u64, buf: &mut [u8]) -> Option<()> {
+        buf.copy_from_slice(&self.read_range(off, buf.len())?);
+        Some(())
+    }
 }
 
 impl ByteSource for [u8] {
@@ -47,5 +53,19 @@ impl ByteSource for [u8] {
         let start = usize::try_from(off).ok()?;
         let end = start.checked_add(len)?;
         self.get(start..end).map(Cow::Borrowed)
+    }
+}
+
+impl ByteSource for Vec<u8> {
+    fn source_len(&self) -> u64 {
+        self.as_slice().source_len()
+    }
+
+    fn held_len(&self) -> u64 {
+        self.as_slice().held_len()
+    }
+
+    fn read_range(&self, off: u64, len: usize) -> Option<Cow<'_, [u8]>> {
+        self.as_slice().read_range(off, len)
     }
 }

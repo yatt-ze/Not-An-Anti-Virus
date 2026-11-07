@@ -280,19 +280,25 @@ impl ScanContext {
         self.read_at_file(offset, len).map(Cow::Owned)
     }
 
-    #[cfg(unix)]
     fn read_at_file(&self, offset: u64, len: usize) -> Option<Vec<u8>> {
-        use std::os::unix::fs::FileExt;
-        let file = self.file.as_ref()?;
+        self.file.as_ref()?;
         let mut buf = vec![0u8; len];
-        // Charged on attempt: a read that fails partway may still have read.
-        self.bytes_read.fetch_add(len as u64, Ordering::Relaxed);
-        file.read_exact_at(&mut buf, offset).ok()?;
+        self.read_file_into(offset, &mut buf)?;
         Some(buf)
     }
 
+    #[cfg(unix)]
+    fn read_file_into(&self, offset: u64, buf: &mut [u8]) -> Option<()> {
+        use std::os::unix::fs::FileExt;
+        let file = self.file.as_ref()?;
+        // Charged on attempt: a read that fails partway may still have read.
+        self.bytes_read
+            .fetch_add(buf.len() as u64, Ordering::Relaxed);
+        file.read_exact_at(buf, offset).ok()
+    }
+
     #[cfg(not(unix))]
-    fn read_at_file(&self, _offset: u64, _len: usize) -> Option<Vec<u8>> {
+    fn read_file_into(&self, _offset: u64, _buf: &mut [u8]) -> Option<()> {
         None
     }
 
@@ -487,6 +493,24 @@ impl crate::source::ByteSource for ScanContext {
 
     fn read_range(&self, off: u64, len: usize) -> Option<Cow<'_, [u8]>> {
         self.read_range_cow(off, len)
+    }
+
+    fn read_exact_at(&self, off: u64, buf: &mut [u8]) -> Option<()> {
+        if buf.len() > MAX_RANGE_READ {
+            return None;
+        }
+        let end = off.checked_add(buf.len() as u64)?;
+        if end > self.file_len? {
+            return None;
+        }
+        if let Some(content) = &self.content {
+            if end <= content.len() as u64 {
+                let start = off as usize;
+                buf.copy_from_slice(&content[start..start + buf.len()]);
+                return Some(());
+            }
+        }
+        self.read_file_into(off, buf)
     }
 }
 

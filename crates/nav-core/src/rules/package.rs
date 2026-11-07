@@ -4851,7 +4851,7 @@ mod tests {
         for entry in [scripts[0], scripts[2047]] {
             let mut sink = FirstBytes::default();
             let read = xar::ReadBudget::new(&limits)
-                .read_entry_nested(pkg, &archive, entry, &mut sink)
+                .read_entry_nested(&pkg[..], &archive, entry, &mut sink)
                 .expect("reads");
             assert_eq!(read.gap, None);
             let members = cpio::parse(&sink.0, &cpio::CpioLimits::default()).expect("cpio");
