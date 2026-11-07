@@ -971,29 +971,31 @@ impl Reader<'_> {
         let at_start = bytes.starts_with(LOCAL_SIG) || bytes.starts_with(END_SIG);
         let read_nested = nested && !past_depth;
         if !read_nested || !at_start {
-            self.members += 1;
-            // Only a prefixed nested zip is both visited and read.
-            let first = if read_nested || !aliases.is_empty() {
-                bytes.clone()
-            } else {
-                std::mem::take(&mut bytes)
-            };
-            (self.visit)(Member {
-                path: label,
-                bytes: first,
-                cut,
-            });
-            for alias in aliases {
-                let cost = ENTRY_COST.saturating_add(bytes.len());
-                if shares.entry_remaining() < cost {
-                    self.gap(alias, GapKind::Limit(Limit::Budget));
-                    continue;
+            let cost = ENTRY_COST.saturating_add(bytes.len());
+            let mut names = std::iter::once(label)
+                .chain(aliases.iter().map(String::as_str))
+                .peekable();
+            let mut first = true;
+            while let Some(name) = names.next() {
+                if !std::mem::take(&mut first) {
+                    if shares.entry_remaining() < cost {
+                        self.gap(name, GapKind::Limit(Limit::Budget));
+                        continue;
+                    }
+                    shares.charge(cost);
                 }
-                shares.charge(cost);
+                // No later visit fits once one alias does not: costs are equal.
+                let last = names.peek().is_none() || shares.entry_remaining() < cost;
+                // Only a prefixed nested zip is both visited and read.
+                let bytes = if last && !read_nested {
+                    std::mem::take(&mut bytes)
+                } else {
+                    bytes.clone()
+                };
                 self.members += 1;
                 (self.visit)(Member {
-                    path: alias,
-                    bytes: bytes.clone(),
+                    path: name,
+                    bytes,
                     cut,
                 });
             }
@@ -1131,17 +1133,20 @@ fn member_label(archive: &str, name: &[u8]) -> String {
 /// a name cannot forge report lines. Over [`MAX_NAME_CHARS`], the middle is
 /// replaced by `…`, keeping the extension.
 fn display_name(name: &[u8]) -> String {
-    let chars: Vec<char> = String::from_utf8_lossy(name)
-        .chars()
-        .map(|c| if c.is_control() { '?' } else { c })
-        .collect();
-    if chars.len() <= MAX_NAME_CHARS {
-        return chars.into_iter().collect();
+    fn clean(s: &str) -> impl Iterator<Item = char> + '_ {
+        s.chars().map(|c| if c.is_control() { '?' } else { c })
+    }
+    let text = String::from_utf8_lossy(name);
+    let count = text.chars().count();
+    if count <= MAX_NAME_CHARS {
+        return clean(&text).collect();
     }
     let half = MAX_NAME_CHARS / 2;
-    let head = chars[..half].iter();
-    let tail = chars[chars.len() - half..].iter();
-    head.chain(['…'].iter()).chain(tail).collect()
+    let at = |n: usize| text.char_indices().nth(n).map_or(text.len(), |(i, _)| i);
+    clean(&text[..at(half)])
+        .chain(['…'])
+        .chain(clean(&text[at(count - half)..]))
+        .collect()
 }
 
 fn sig_at(data: &[u8], at: usize, sig: &[u8]) -> bool {
@@ -2315,6 +2320,12 @@ mod tests {
         let shown = display_name(long.as_bytes());
         assert_eq!(shown.chars().count(), MAX_NAME_CHARS + 1);
         assert!(shown.starts_with("aaa") && shown.ends_with(".command"));
+        let wide = format!("{}\u{1}é.sh", "é".repeat(400));
+        let shown = display_name(wide.as_bytes());
+        assert_eq!(shown.chars().count(), MAX_NAME_CHARS + 1);
+        let half = MAX_NAME_CHARS / 2;
+        let tail = format!("{}?é.sh", "é".repeat(half - 5));
+        assert_eq!(shown, format!("{}…{tail}", "é".repeat(half)));
         let specs: Vec<Spec> = (0..100)
             .map(|i| {
                 let mut s = Spec::stored(&format!("e{i}"), b"x");
