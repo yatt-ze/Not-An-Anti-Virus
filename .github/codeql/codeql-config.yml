@@ -1,0 +1,13 @@
+# CodeQL config for the advanced setup in workflows/codeql.yml.
+# Test, fixture and dev-tooling code is not shipped; alerts there were all
+# false positives (triaged 2026-11-07). Inline #[cfg(test)] modules can't be
+# excluded by path and are dismissed by hand.
+name: NAV CodeQL config
+
+paths-ignore:
+  - crates/*/tests
+  - crates/*/fixtures
+  - crates/*/testdata
+  - crates/*/fuzz
+  - crates/xtask
+  - crates/nav-core/src/test_support.rs
