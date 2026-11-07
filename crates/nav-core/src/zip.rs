@@ -432,6 +432,8 @@ enum Extent {
 #[derive(Debug, Clone)]
 struct Item {
     name: Vec<u8>,
+    /// Other names merged readings of the same bytes carry (§11.8).
+    aliases: Vec<Vec<u8>>,
     header: usize,
     start: usize,
     method: u16,
@@ -471,6 +473,7 @@ impl Item {
     fn from_local(header: usize, local: &Local) -> Self {
         Item {
             name: local.name.to_vec(),
+            aliases: Vec::new(),
             header,
             start: local.start,
             method: local.method,
@@ -939,15 +942,22 @@ impl Reader<'_> {
             }
         }
         if !bytes.is_empty() {
-            self.deliver(&label, bytes, cut, depth, shares);
+            let aliases: Vec<String> = item
+                .aliases
+                .iter()
+                .map(|name| format!("{prefix}{}", display_name(name)))
+                .collect();
+            self.deliver(&label, &aliases, bytes, cut, depth, shares);
         }
         resume
     }
 
-    /// Visits a decoded member, or reads it as a nested zip.
+    /// Visits a decoded member under `label` and each alias, or reads it as a
+    /// nested zip once, under `label`. Each alias visit is charged its bytes.
     fn deliver(
         &mut self,
         label: &str,
+        aliases: &[String],
         mut bytes: Vec<u8>,
         cut: bool,
         depth: usize,
@@ -964,16 +974,29 @@ impl Reader<'_> {
         if !read_nested || !at_start {
             self.members += 1;
             // Only a prefixed nested zip is both visited and read.
-            let bytes = if read_nested {
+            let first = if read_nested || !aliases.is_empty() {
                 bytes.clone()
             } else {
                 std::mem::take(&mut bytes)
             };
             (self.visit)(Member {
                 path: label,
-                bytes,
+                bytes: first,
                 cut,
             });
+            for alias in aliases {
+                if shares.remaining() < bytes.len() {
+                    self.gap(alias, GapKind::Limit(Limit::Budget));
+                    continue;
+                }
+                shares.charge(bytes.len());
+                self.members += 1;
+                (self.visit)(Member {
+                    path: alias,
+                    bytes: bytes.clone(),
+                    cut,
+                });
+            }
         }
         if read_nested {
             let mut inner = ShareBudget::new(shares.entry_remaining());
@@ -1006,8 +1029,8 @@ fn enqueue(queue: &mut Vec<Item>, item: Item, usize: u64) {
     queue.extend(alternative);
 }
 
-/// `items` without those already decoded, one per key; a merged item checks
-/// its stream end if any copy does.
+/// `items` without those already decoded, one per key; a merged item keeps
+/// every distinct name and checks its stream end if any copy does.
 fn dedup(items: Vec<Item>, done: &HashSet<Key>) -> Vec<Item> {
     let mut index: HashMap<Key, usize> = HashMap::new();
     let mut out: Vec<Item> = Vec::new();
@@ -1017,7 +1040,13 @@ fn dedup(items: Vec<Item>, done: &HashSet<Key>) -> Vec<Item> {
             continue;
         }
         match index.get(&key) {
-            Some(&i) => out[i].verify_end |= item.verify_end,
+            Some(&i) => {
+                let kept = &mut out[i];
+                kept.verify_end |= item.verify_end;
+                if kept.name != item.name && !kept.aliases.contains(&item.name) {
+                    kept.aliases.push(item.name);
+                }
+            }
             None => {
                 index.insert(key, out.len());
                 out.push(item);
@@ -1607,12 +1636,19 @@ mod tests {
     }
 
     #[test]
-    fn a_name_disagreement_is_partial_but_decoded_once() {
+    fn a_name_disagreement_is_partial_and_seen_under_both_names() {
         let mut spec = Spec::stored("shown.txt", b"payload");
         spec.local_name = b"hidden.sh".to_vec();
         let (seen, r) = read_all(&plain(&[spec]));
         assert_eq!(kinds(&r), vec![GapKind::Disagree(Disagreement::Headers)]);
-        assert_eq!(seen.len(), 1);
+        let names: Vec<(&str, &[u8])> = seen.iter().map(|s| (s.0.as_str(), &s.1[..])).collect();
+        assert_eq!(
+            names,
+            [
+                ("shown.txt", &b"payload"[..]),
+                ("hidden.sh", &b"payload"[..])
+            ]
+        );
     }
 
     #[test]
@@ -1911,6 +1947,37 @@ mod tests {
         let (seen, r) = read_all(&many);
         assert!(r.gaps.is_empty(), "{:?}", r.gaps);
         assert_eq!(seen.len(), 1);
+    }
+
+    #[test]
+    fn names_for_one_header_are_visited_within_the_budget() {
+        let zip = plain(&[Spec::stored("a", &[b'q'; 1000])]);
+        let cd = zip.windows(4).position(|w| w == CENTRAL_SIG).unwrap();
+        let end = zip.len() - END_LEN;
+        let entry = zip[cd..end].to_vec();
+        let mut many = zip[..cd].to_vec();
+        for i in 0..50u8 {
+            let mut e = entry.clone();
+            e[CENTRAL_LEN] = b'A' + i;
+            many.extend(e);
+        }
+        let mut eocd = zip[end..].to_vec();
+        eocd[8..10].copy_from_slice(&50u16.to_le_bytes());
+        eocd[10..12].copy_from_slice(&50u16.to_le_bytes());
+        eocd[12..16].copy_from_slice(&((50 * entry.len()) as u32).to_le_bytes());
+        many.extend(eocd);
+        let (seen, r) = read_all(&many);
+        let headers = GapKind::Disagree(Disagreement::Headers);
+        assert!(kinds(&r).iter().all(|&k| k == headers), "{r:?}");
+        // The local name, `a`, is one of the 50.
+        assert_eq!(seen.len(), 50);
+        let limits = ZipLimits {
+            max_read_back_bytes: 20_000,
+            ..ZipLimits::default()
+        };
+        let (seen, r) = read_with(&many, &limits);
+        assert!(kinds(&r).contains(&GapKind::Limit(Limit::Budget)), "{r:?}");
+        assert!(seen.len() < 50, "{}", seen.len());
     }
 
     /// Crafted zips where views or readers may disagree, by name.

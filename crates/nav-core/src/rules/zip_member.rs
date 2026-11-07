@@ -276,6 +276,21 @@ mod tests {
     }
 
     #[test]
+    fn a_local_name_the_directory_hides_is_scanned_by_that_name() {
+        // Name markers count only in a script, and only the extension says so.
+        let mut spec = Spec::stored("notes.txt", b"osascript; curl x");
+        spec.local_name = b"run.command".to_vec();
+        let ctx = ctx(plain(&[spec]));
+        let sig = member_signal(&ctx).expect("finding");
+        assert!(
+            sig.description.starts_with("run.command: "),
+            "{}",
+            sig.description
+        );
+        assert!(container_signal(&ctx).is_some_and(|s| s.description.contains("notes.txt")));
+    }
+
+    #[test]
     fn a_nested_member_is_labelled_with_its_path() {
         let inner = plain(&[Spec::deflated("setup.sh", DROPPER)]);
         let ctx = ctx(plain(&[Spec::stored("payload.zip", &inner)]));
