@@ -4,6 +4,7 @@
 //! under sudo. Both modes exercise one code path so they can't drift apart.
 //! `corpus` scans real files with two navctl builds and diffs the verdicts.
 
+mod build;
 mod corpus;
 mod malware;
 
