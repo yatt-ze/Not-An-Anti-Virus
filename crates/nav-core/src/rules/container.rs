@@ -23,9 +23,12 @@ enum Anchor {
 
 /// Mountable disk-image formats and their magics, probed in order. UDIF's
 /// 4-byte `koly` is deliberately not version-checked; HFS+/HFSX include the
-/// version word because the bare signature false-matches other files.
+/// version word because the bare signature false-matches other files. An
+/// encrypted image's `koly` is inside the ciphertext; `hdiutil` writes only
+/// the v2 `encrcdsa` header.
 const IMAGE_FORMATS: &[(&str, Anchor, &[u8])] = &[
     ("UDIF", Anchor::End(512), b"koly"),
+    ("encrypted", Anchor::Start(0), b"encrcdsa"),
     ("sparse", Anchor::Start(0), b"sprs"),
     ("raw GPT", Anchor::Start(512), b"EFI PART"),
     ("raw APFS", Anchor::Start(32), b"NXSB"),
@@ -272,6 +275,7 @@ mod tests {
     fn each_format_is_detected_and_named() {
         let cases: &[(&str, usize, &[u8])] = &[
             ("UDIF", 0x9000 - 512, b"koly"),
+            ("encrypted", 0, b"encrcdsa"),
             ("sparse", 0, b"sprs"),
             ("raw GPT", 512, b"EFI PART"),
             ("raw APFS", 32, b"NXSB"),
@@ -290,6 +294,7 @@ mod tests {
     #[test]
     fn near_misses_are_not_disk_images() {
         let cases: &[(usize, &[u8])] = &[
+            (0, b"encrcdsb"),
             (0, b"spro"),
             (512, b"EFI PARU"),
             (32, b"NXSC"),
@@ -462,6 +467,12 @@ mod tests {
         let dmg = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("fixtures/suspicious/dropper_in_disk_image.dmg");
         assert_eq!(disk_image_format_of_path(&dmg).unwrap(), Some("UDIF"));
+        let encrypted = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("fixtures/suspicious/dropper_in_encrypted_disk_image.dmg");
+        assert_eq!(
+            disk_image_format_of_path(&encrypted).unwrap(),
+            Some("encrypted")
+        );
         let sh =
             std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures/suspicious/dropper.sh");
         assert_eq!(disk_image_format_of_path(&sh).unwrap(), None);

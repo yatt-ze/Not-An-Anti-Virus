@@ -327,10 +327,9 @@ fn a_corrupted_image_is_partial_with_a_reason() {
     sb.assert_clean();
 }
 
-/// An encrypted image never reaches `hdiutil imageinfo` or `attach`, so no
-/// passphrase prompt can appear. nav-core does not recognise one as a disk
-/// image (its `encrcdsa` header hides the UDIF trailer), so navctl scans
-/// it as a file without creating a scratch directory.
+/// An encrypted image stops at `hdiutil isencrypted`, never reaching
+/// `imageinfo` or `attach`, so no passphrase prompt can appear; it scans
+/// `Partial` through `uninspected-container`.
 #[test]
 fn an_encrypted_image_is_never_attached() {
     let sb = Sandbox::new("encrypted");
@@ -352,9 +351,13 @@ fn an_encrypted_image_is_never_attached() {
     let start = Instant::now();
     let out = sb.navctl(&["scan"], &image);
     assert!(start.elapsed() < Duration::from_secs(20));
-    assert!(out.status.code().is_some(), "{}", stderr(&out));
-    assert!(!stderr(&out).contains("not mounted"), "{}", stderr(&out));
-    assert!(!sb.scratch().exists(), "hdiutil path was entered");
+    assert_eq!(out.status.code(), Some(3), "{}", stderr(&out));
+    let err = stderr(&out);
+    assert!(err.contains("not mounted: image is encrypted"), "{err}");
+    assert!(
+        err.contains("disk image (encrypted) not inspected"),
+        "{err}"
+    );
     sb.assert_clean();
 }
 
