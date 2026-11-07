@@ -32,7 +32,7 @@ member = "AtomicStealer/BrewApp.dmg"
 kind = "dmg"
 sha256 = "2958dfe9251c6bf997ceb94f2eea1b808a8e53bd5e79b7152f79379f441ede83"
 bytes = 558096
-expected = "no-action/partial"
+expected = "no-action/complete"
 
 [[sample]]
 id = "banshee-01"
@@ -45,7 +45,7 @@ member = "Banshee/install_setup_v1.2.0.dmg"
 kind = "dmg"
 sha256 = "1dcf3b607d2c9e181643dd6bf1fd85e39d3dc4f95b6992e5a435d0d900333416"
 bytes = 471953
-expected = "no-action/partial"
+expected = "no-action/complete"
 
 [[sample]]
 id = "crashstealer-01"
@@ -71,7 +71,7 @@ member = "Cuckoo/B/Cuckoo.dmg"
 kind = "dmg"
 sha256 = "463af62034c5a05ab3cf2eba09e36955328028b62ba9ee894cdd8e50e2d1af81"
 bytes = 40843590
-expected = "no-action/partial"
+expected = "no-action/complete"
 
 [[sample]]
 id = "digitstealer-01"
@@ -84,7 +84,7 @@ member = "DigitStealer/DynamicLake.dmg"
 kind = "dmg"
 sha256 = "da99f7570b37ddb3d4ed650bc33fa9fbfb883753b2c212704c10f2df12c19f63"
 bytes = 781605
-expected = "no-action/partial"
+expected = "notify/complete"
 
 [[sample]]
 id = "electrumstealer-01"
@@ -97,7 +97,7 @@ member = "ElectrumStealer/electrum-4.0.9.dmg"
 kind = "dmg"
 sha256 = "313efd27555f2d024e56d88a31ffda045e0e0d13db868867e416f0330e3ba773"
 bytes = 43113241
-expected = "no-action/partial"
+expected = "notify/partial"
 
 [[sample]]
 id = "koistealer-01"
@@ -136,7 +136,7 @@ member = "MacStealer/weed.dmg"
 kind = "dmg"
 sha256 = "9b17aee4c8a5c6e069fbb123578410c0a7f44b438a4c988be2b65ab4296cff5e"
 bytes = 20300577
-expected = "no-action/partial"
+expected = "no-action/complete"
 
 [[sample]]
 id = "macsync-01"
@@ -149,7 +149,7 @@ member = "MacSync/stealer"
 kind = "zip"
 sha256 = "cfd338c16249e9bcae69b3c3a334e6deafd5a22a84935a76b390a9d02ed2d032"
 bytes = 3210032
-expected = "no-action/partial"
+expected = "no-action/complete"
 
 [[sample]]
 id = "metastealer-01"
@@ -162,7 +162,7 @@ member = "MetaStealer/AdobeOfficialBriefDescription.dmg"
 kind = "dmg"
 sha256 = "50427037543eb5d8be12940c8fac6b4710e15125ee2b77b0743b017eafd8af9f"
 bytes = 11745007
-expected = "no-action/partial"
+expected = "no-action/complete"
 
 [[sample]]
 id = "modstealer-01"
@@ -188,7 +188,7 @@ member = "Odyssey/Launcher.dmg"
 kind = "dmg"
 sha256 = "21c072e2aa9037295f656dc0a5d2d6daa64cae4f7c71b91cf1facd78ef9ef012"
 bytes = 296619
-expected = "no-action/partial"
+expected = "no-action/complete"
 
 [[sample]]
 id = "pamstealer-01"
@@ -201,7 +201,7 @@ member = "PamStealer/Maccy.dmg"
 kind = "dmg"
 sha256 = "2b512f6c393edad89a89ecafe26cd23b71cfdd271c10522f8dba98997ebf39bb"
 bytes = 307332
-expected = "no-action/partial"
+expected = "no-action/complete"
 
 [[sample]]
 id = "poseidon-01"
@@ -227,7 +227,7 @@ member = "PyStealer/Empire Transfer 12.3.23.dmg"
 kind = "dmg"
 sha256 = "a7cdc1565197a7bc7bfc5c14ab2de4db3617007681faf93661b950dc0bf3a2b5"
 bytes = 69870628
-expected = "no-action/partial"
+expected = "no-action/complete"
 
 [[sample]]
 id = "rnstealer-01"
@@ -279,7 +279,7 @@ member = "Cthulhu/CleanMyMac.dmg"
 kind = "dmg"
 sha256 = "96f80fef3323e5bc0ce067cd7a93b9739174e29f786b09357125550a033b0288"
 bytes = 21660330
-expected = "no-action/partial"
+expected = "no-action/complete"
 
 [[sample]]
 id = "cointhief-01"
@@ -357,7 +357,7 @@ member = "AtomicStealer/CardGame.dmg"
 kind = "dmg"
 sha256 = "6152e233795fa52b5ee2c0283636c76d6389c9dfad5413408ea26fd7aa42fa23"
 bytes = 8205551
-expected = "no-action/partial"
+expected = "no-action/complete"
 
 [[sample]]
 id = "banshee-02"
@@ -500,7 +500,7 @@ member = "InstallCore/installCore.dmg"
 kind = "dmg"
 sha256 = "61c941280e3f49e176361a1696200ab304a7c10b529e418bf14fae0642d18118"
 bytes = 1787406
-expected = "no-action/partial"
+expected = "notify/complete"
 
 [[sample]]
 id = "conduit-01"
@@ -578,7 +578,7 @@ member = "Mughthesec/Player.dmg"
 kind = "dmg"
 sha256 = "f5d76324cb8fcae7f00b6825e4c110ddfd6b32db452f1eca0f4cff958316869c"
 bytes = 621930
-expected = "no-action/partial"
+expected = "no-action/complete"
 
 [[sample]]
 id = "opinionspy-01"
@@ -617,7 +617,7 @@ member = "MacInstaller/MacInstaller.dmg"
 kind = "dmg"
 sha256 = "6e22a1d9f931ac1c026f5ac953d88e84f507a9ca51dfd089f4f2539ce4369cb8"
 bytes = 430917
-expected = "no-action/partial"
+expected = "no-action/complete"
 
 [[sample]]
 id = "gophoto-01"
@@ -669,7 +669,7 @@ member = "FkCodec (Codecm, Vinstaller)/FkCodec.dmg"
 kind = "dmg"
 sha256 = "11ceb909649b7ee08e82996b8917f18912de9d9d90d79b085dd70b270f3b217f"
 bytes = 550518
-expected = "no-action/partial"
+expected = "no-action/complete"
 
 [[sample]]
 id = "iwebupdate-01"
@@ -734,7 +734,7 @@ member = "ZuRu/A/iTerm.dmg"
 kind = "dmg"
 sha256 = "e5126f74d430ff075d6f7edcae0c95b81a5e389bf47e4c742618a042f378a3fa"
 bytes = 26316055
-expected = "no-action/partial"
+expected = "notify/complete"
 
 [[sample]]
 id = "keranger-01"
@@ -747,7 +747,7 @@ member = "KeRanger/Transmission-2.90.dmg"
 kind = "dmg"
 sha256 = "d1ac55a4e610380f0ab239fcc1c5f5a42722e8ee1554cba8074bbae4a5f6dbe1"
 bytes = 5213026
-expected = "no-action/partial"
+expected = "notify/partial"
 
 [[sample]]
 id = "evilquest-01"
@@ -786,7 +786,7 @@ member = "Proton/Proton.B/Handbrake.dmg"
 kind = "dmg"
 sha256 = "013623e5e50449bbdf6943549d8224a122aa6c42bd3300a1bd2b743b01ae6793"
 bytes = 16593112
-expected = "no-action/partial"
+expected = "no-action/complete"
 
 [[sample]]
 id = "iworm-01"
@@ -838,7 +838,7 @@ member = "CreativeUpdate/Firefox 58.0.2.dmg"
 kind = "dmg"
 sha256 = "8cda44b55a98fb0cae11d613755a03c79cbf47d442960d6febd54f8ad3f12594"
 bytes = 59360047
-expected = "no-action/partial"
+expected = "no-action/complete"
 
 [[sample]]
 id = "xcsset-01"
@@ -1111,7 +1111,7 @@ member = "KandyKorn/Cross-Platform Bridges.zip"
 kind = "zip"
 sha256 = "42e1fd72bdb69c6fc6bb4256cc57412b5f750bcfb65b5f63413db61135e9fe92"
 bytes = 26184
-expected = "no-action/partial"
+expected = "no-action/complete"
 
 [[sample]]
 id = "dazzlespy-01"
@@ -1163,7 +1163,7 @@ member = "BeaverTail/MiroTalk.dmg"
 kind = "dmg"
 sha256 = "9abf6b93eafb797a3556bea1fe8a3b7311d2864d5a9a3687fce84bc1ec4a428c"
 bytes = 20784310
-expected = "no-action/partial"
+expected = "no-action/complete"
 
 [[sample]]
 id = "lightspy-01"
@@ -1189,7 +1189,7 @@ member = "CDDS/install_flash_player_osx.dmg"
 kind = "dmg"
 sha256 = "f0b12413c9d291e3b9edd1ed1496af7712184a63c066e1d5b2bb528376d66ebc"
 bytes = 1194193
-expected = "no-action/partial"
+expected = "no-action/complete"
 
 [[sample]]
 id = "finspy-01"
@@ -1241,7 +1241,7 @@ member = "AdWind/Adwind.jar"
 kind = "jar"
 sha256 = "7aa15bd505a240a8bf62735a5389a530322945eec6ce9d7b6ad299ca33b2b1b0"
 bytes = 262291
-expected = "no-action/partial"
+expected = "no-action/complete"
 
 [[sample]]
 id = "minesteal-01"
@@ -1254,7 +1254,7 @@ member = "MineSteal/MineSteal.jar"
 kind = "jar"
 sha256 = "b07a8eb99c448c3981e5dcce5145e8feb99163ac74348a513a9002905346d166"
 bytes = 551105
-expected = "no-action/partial"
+expected = "no-action/complete"
 
 [[sample]]
 id = "badbunny-01"
