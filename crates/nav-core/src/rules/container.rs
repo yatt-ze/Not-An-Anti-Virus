@@ -97,11 +97,8 @@ pub(super) fn inside_app_bundle(ctx: &ScanContext) -> bool {
 /// Gaps shown in the description before the rest are counted.
 const SHOWN_GAPS: usize = 3;
 
-fn not_fully_inspected(gaps: &[String]) -> String {
-    let mut shown = gaps[..gaps.len().min(SHOWN_GAPS)].join("; ");
-    if gaps.len() > SHOWN_GAPS {
-        shown.push_str(&format!("; {} more", gaps.len() - SHOWN_GAPS));
-    }
+fn not_fully_inspected(gaps: &zip_member::Listing) -> String {
+    let shown = gaps.join(SHOWN_GAPS);
     format!("ZIP-format file not fully inspected ({shown}) — extract it and scan the files")
 }
 

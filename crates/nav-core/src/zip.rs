@@ -11,6 +11,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::fmt;
+use std::hash::{Hash, Hasher};
 
 use crate::budget::ShareBudget;
 use crate::decode::DecodeError;
@@ -50,6 +51,11 @@ const U32_MAX: u64 = 0xFFFF_FFFF;
 
 /// Budget charged for each member started, decoded or not.
 const ENTRY_COST: usize = 1024;
+
+/// Gaps kept in [`ZipRead::gaps`]; the rest are only counted (§11.12).
+const MAX_GAPS: usize = 64;
+/// Characters of a member name shown; longer names keep both ends.
+const MAX_NAME_CHARS: usize = 256;
 
 /// Ceilings for one [`read`] (§6.2). Hitting any of them is a gap, never a
 /// finding.
@@ -179,7 +185,10 @@ pub struct Member<'a> {
 /// What [`read`] could not inspect, and how many members it visited.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct ZipRead {
+    /// The first [`MAX_GAPS`] distinct gaps.
     pub gaps: Vec<Gap>,
+    /// Distinct gaps past those.
+    pub more_gaps: usize,
     pub members: usize,
 }
 
@@ -202,6 +211,7 @@ pub fn read(data: &[u8], limits: &ZipLimits, visit: &mut dyn FnMut(&Member)) -> 
         limits: *limits,
         entries: 0,
         gaps: Vec::new(),
+        more_gaps: 0,
         seen_gaps: HashSet::new(),
         members: 0,
         visit,
@@ -210,6 +220,7 @@ pub fn read(data: &[u8], limits: &ZipLimits, visit: &mut dyn FnMut(&Member)) -> 
     reader.archive(data, 1, "", &mut shares);
     ZipRead {
         gaps: reader.gaps,
+        more_gaps: reader.more_gaps,
         members: reader.members,
     }
 }
@@ -474,18 +485,27 @@ struct Reader<'v> {
     limits: ZipLimits,
     entries: usize,
     gaps: Vec<Gap>,
-    seen_gaps: HashSet<(String, GapKind)>,
+    more_gaps: usize,
+    /// Hashes of (member, kind) already reported.
+    seen_gaps: HashSet<u64>,
     members: usize,
     visit: &'v mut dyn FnMut(&Member),
 }
 
 impl Reader<'_> {
     fn gap(&mut self, member: &str, kind: GapKind) {
-        if self.seen_gaps.insert((member.to_string(), kind)) {
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        (member, kind).hash(&mut hasher);
+        if !self.seen_gaps.insert(hasher.finish()) {
+            return;
+        }
+        if self.gaps.len() < MAX_GAPS {
             self.gaps.push(Gap {
                 member: member.to_string(),
                 kind,
             });
+        } else {
+            self.more_gaps += 1;
         }
     }
 
@@ -1029,12 +1049,20 @@ fn member_label(archive: &str, name: &[u8]) -> String {
 }
 
 /// A member name for display: lossy UTF-8, control characters replaced, so
-/// a name cannot forge report lines.
+/// a name cannot forge report lines. Over [`MAX_NAME_CHARS`], the middle is
+/// replaced by `…`, keeping the extension.
 fn display_name(name: &[u8]) -> String {
-    String::from_utf8_lossy(name)
+    let chars: Vec<char> = String::from_utf8_lossy(name)
         .chars()
         .map(|c| if c.is_control() { '?' } else { c })
-        .collect()
+        .collect();
+    if chars.len() <= MAX_NAME_CHARS {
+        return chars.into_iter().collect();
+    }
+    let half = MAX_NAME_CHARS / 2;
+    let head = chars[..half].iter();
+    let tail = chars[chars.len() - half..].iter();
+    head.chain(['…'].iter()).chain(tail).collect()
 }
 
 fn sig_at(data: &[u8], at: usize, sig: &[u8]) -> bool {
@@ -2028,6 +2056,24 @@ mod tests {
                 path.display()
             );
         }
+    }
+
+    #[test]
+    fn long_names_and_many_gaps_are_bounded() {
+        let long = format!("{}.command", "a".repeat(70_000));
+        let shown = display_name(long.as_bytes());
+        assert_eq!(shown.chars().count(), MAX_NAME_CHARS + 1);
+        assert!(shown.starts_with("aaa") && shown.ends_with(".command"));
+        let specs: Vec<Spec> = (0..100)
+            .map(|i| {
+                let mut s = Spec::stored(&format!("e{i}"), b"x");
+                s.flags = FLAG_ENCRYPTED;
+                s.local_flags = FLAG_ENCRYPTED;
+                s
+            })
+            .collect();
+        let (_, r) = read_all(&plain(&specs));
+        assert_eq!((r.gaps.len(), r.more_gaps), (MAX_GAPS, 100 - MAX_GAPS));
     }
 
     #[test]

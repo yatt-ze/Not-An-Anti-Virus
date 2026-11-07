@@ -5,7 +5,6 @@
 
 use super::codesign::member_signature;
 use super::container::{disk_image_format, inside_app_bundle};
-use super::package::ScriptFindings;
 use super::{embedded_content_ruleset, Rule, RuleOutcome};
 use crate::context::ScanContext;
 use crate::model::{MatchedSignal, ScanCompleteness, SignalCategory};
@@ -16,14 +15,58 @@ use crate::zip::{self, Member, ZipLimits};
 /// sum (§12), and many members with weak hits must not add up to an alert.
 const MAX_ZIP_MEMBER_WEIGHT: i32 = 20;
 
+/// Descriptions kept per list; the rest are only counted (§11.12).
+const MAX_LISTED: usize = 10;
+
+/// A bounded list of descriptions for one signal.
+#[derive(Default)]
+pub(super) struct Listing {
+    kept: Vec<String>,
+    more: usize,
+}
+
+impl Listing {
+    fn push(&mut self, item: String) {
+        if self.kept.len() < MAX_LISTED {
+            self.kept.push(item);
+        } else {
+            self.more += 1;
+        }
+    }
+
+    fn push_all(&mut self, other: Listing) {
+        for item in other.kept {
+            self.push(item);
+        }
+        self.more += other.more;
+    }
+
+    pub(super) fn is_empty(&self) -> bool {
+        self.kept.is_empty() && self.more == 0
+    }
+
+    /// The first `shown` items joined by `; `, then `(+N more)` if any.
+    pub(super) fn join(&self, shown: usize) -> String {
+        let shown = shown.min(self.kept.len());
+        let mut out = self.kept[..shown].join("; ");
+        let more = self.more + self.kept.len() - shown;
+        if more > 0 {
+            out.push_str(&format!("; (+{more} more)"));
+        }
+        out
+    }
+}
+
 /// A zip's members, scored, and what could not be inspected.
 pub(crate) struct ZipInspection {
-    /// Content-rule findings.
-    findings: ScriptFindings,
-    /// Unsigned / hand-ad-hoc Mach-O members, as (weight, description).
-    unsigned: Vec<(i32, String)>,
+    /// Content-rule findings and their summed weight.
+    findings: Listing,
+    findings_total: i32,
+    /// Unsigned / hand-ad-hoc Mach-O members and the strongest weight.
+    unsigned: Listing,
+    unsigned_weight: i32,
     /// Each as `member: reason`, or the reason alone for the archive.
-    pub(super) gaps: Vec<String>,
+    pub(super) gaps: Listing,
 }
 
 /// The zip read of `ctx`, made once per scan. `None` when it was not read:
@@ -41,9 +84,11 @@ fn inspect(ctx: &ScanContext, limits: &ZipLimits) -> Option<ZipInspection> {
         return None;
     }
     let rules = embedded_content_ruleset();
-    let mut findings = ScriptFindings::default();
-    let mut unsigned = Vec::new();
-    let mut member_gaps = Vec::new();
+    let mut findings = Listing::default();
+    let mut findings_total = 0i32;
+    let mut unsigned = Listing::default();
+    let mut unsigned_weight = 0;
+    let mut member_gaps = Listing::default();
     let read = zip::read(content, limits, &mut |m: &Member| {
         let label = format!("{}!{}", ctx.path.display(), m.path);
         let member = ScanContext::from_embedded_bytes(label, m.bytes.to_vec(), m.cut);
@@ -58,7 +103,8 @@ fn inspect(ctx: &ScanContext, limits: &ZipLimits) -> Option<ZipInspection> {
         if macho.is_macho {
             let signature = member_signature(macho);
             if let Some((weight, description)) = signature.finding {
-                unsigned.push((weight, format!("{}: {description}", m.path)));
+                unsigned_weight = unsigned_weight.max(weight);
+                unsigned.push(format!("{}: {description}", m.path));
             }
             if signature.unverified {
                 gap("signature not verified — extract and scan");
@@ -66,24 +112,27 @@ fn inspect(ctx: &ScanContext, limits: &ZipLimits) -> Option<ZipInspection> {
         }
         let result = scan_context(&member, &rules);
         for signal in &result.signals {
-            findings.add(signal.weight, format!("{}: {}", m.path, signal.description));
+            findings_total = findings_total.saturating_add(signal.weight);
+            findings.push(format!("{}: {}", m.path, signal.description));
         }
         if !m.cut && result.completeness != ScanCompleteness::Complete {
             gap("member not fully scanned");
         }
     });
-    let mut gaps: Vec<String> = read
-        .gaps
-        .iter()
-        .map(|g| match g.member.as_str() {
+    let mut gaps = Listing::default();
+    for g in &read.gaps {
+        gaps.push(match g.member.as_str() {
             "" => g.kind.to_string(),
             member => format!("{member}: {}", g.kind),
-        })
-        .collect();
-    gaps.extend(member_gaps);
+        });
+    }
+    gaps.more += read.more_gaps;
+    gaps.push_all(member_gaps);
     Some(ZipInspection {
         findings,
+        findings_total,
         unsigned,
+        unsigned_weight,
         gaps,
     })
 }
@@ -110,14 +159,13 @@ impl Rule for ZipMemberRule {
         let Some(inspection) = inspection(ctx) else {
             return Ok(None);
         };
-        let findings = &inspection.findings;
-        if findings.descriptions.is_empty() || findings.total <= 0 {
+        if inspection.findings.is_empty() || inspection.findings_total <= 0 {
             return Ok(None);
         }
         Ok(Some(MatchedSignal {
             id: self.id().to_string(),
-            weight: findings.total.min(MAX_ZIP_MEMBER_WEIGHT),
-            description: findings.descriptions.join("; "),
+            weight: inspection.findings_total.min(MAX_ZIP_MEMBER_WEIGHT),
+            description: inspection.findings.join(MAX_LISTED),
             category: self.category(),
         }))
     }
@@ -149,14 +197,13 @@ impl Rule for ZipMemberUnsignedRule {
         let Some(inspection) = inspection(ctx) else {
             return Ok(None);
         };
-        let Some(weight) = inspection.unsigned.iter().map(|u| u.0).max() else {
+        if inspection.unsigned.is_empty() {
             return Ok(None);
-        };
-        let descriptions: Vec<&str> = inspection.unsigned.iter().map(|u| u.1.as_str()).collect();
+        }
         Ok(Some(MatchedSignal {
             id: self.id().to_string(),
-            weight,
-            description: descriptions.join("; "),
+            weight: inspection.unsigned_weight,
+            description: inspection.unsigned.join(MAX_LISTED),
             category: self.category(),
         }))
     }
@@ -351,6 +398,29 @@ mod tests {
         assert!(sig.description.contains("bin5: ") && sig.description.contains("adhoc: "));
         let result = scan_context(&ctx, &default_ruleset());
         assert_eq!(result.recommendation, Recommendation::NoAction);
+    }
+
+    #[test]
+    fn listed_findings_and_gaps_are_capped() {
+        let mut specs: Vec<Spec> = (0..30)
+            .map(|i| Spec::deflated(&format!("s{i}.sh"), DROPPER))
+            .collect();
+        for i in 0..30 {
+            let mut enc = Spec::stored(&format!("e{i}"), b"x");
+            enc.flags = 1;
+            enc.local_flags = 1;
+            specs.push(enc);
+        }
+        let ctx = ctx(plain(&specs));
+        let sig = member_signal(&ctx).unwrap();
+        assert_eq!(sig.description.matches(".sh: ").count(), MAX_LISTED);
+        assert!(
+            sig.description.ends_with("; (+20 more)"),
+            "{}",
+            sig.description
+        );
+        let gaps = container_signal(&ctx).unwrap().description;
+        assert!(gaps.contains("; (+27 more)"), "{gaps}");
     }
 
     #[test]
