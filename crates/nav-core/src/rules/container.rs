@@ -6,8 +6,8 @@ use std::path::Path;
 
 use super::{zip_member, Rule, RuleOutcome};
 use crate::context::{ContentSource, ScanContext};
-use crate::macho::ByteSource;
 use crate::model::{MatchedSignal, SignalCategory};
+use crate::source::ByteSource;
 use crate::{xar, zip};
 
 /// Id of the signal [`UninspectedContainerRule`] emits.

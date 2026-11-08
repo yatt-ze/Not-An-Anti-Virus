@@ -17,8 +17,9 @@ use std::ops::Range;
 use super::{Rule, RuleOutcome};
 use crate::base64;
 use crate::context::{ScanContext, MAX_STREAM_BYTES};
-use crate::macho::{self, ByteSource};
+use crate::macho;
 use crate::model::{MatchedSignal, SignalCategory};
+use crate::source::ByteSource;
 use crate::textclass::{classify_text, TextClass, BINARY_MAGICS, MIN_SAMPLE_BYTES};
 
 /// Entry gate (bits/byte, max 8.0) for the script/text and base64 paths and

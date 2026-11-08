@@ -261,38 +261,49 @@ impl ScanContext {
     /// so a caller making many small ranged reads (`macho::scan_ranged`)
     /// doesn't copy on every one of them (§5.2).
     fn read_range_cow(&self, offset: u64, len: usize) -> Option<Cow<'_, [u8]>> {
+        match self.locate(offset, len)? {
+            Some(held) => Some(Cow::Borrowed(held)),
+            None => self.read_at_file(offset, len).map(Cow::Owned),
+        }
+    }
+
+    /// Validates `[offset, offset + len)` for a ranged read: `None` if `len >
+    /// MAX_RANGE_READ`, it overflows or passes `file_len`; else the held
+    /// bytes, or `Some(None)` when the range must be read from the file.
+    fn locate(&self, offset: u64, len: usize) -> Option<Option<&[u8]>> {
         if len > MAX_RANGE_READ {
             return None;
         }
-        let file_len = self.file_len?;
         let end = offset.checked_add(len as u64)?;
-        if end > file_len {
+        if end > self.file_len? {
             return None;
         }
-
-        if let Some(content) = &self.content {
-            if end <= content.len() as u64 {
-                let start = offset as usize;
-                return Some(Cow::Borrowed(&content[start..start + len]));
-            }
-        }
-
-        self.read_at_file(offset, len).map(Cow::Owned)
+        let held = self.content.as_deref().and_then(|c| {
+            let start = usize::try_from(offset).ok()?;
+            c.get(start..start.checked_add(len)?)
+        });
+        Some(held)
     }
 
-    #[cfg(unix)]
     fn read_at_file(&self, offset: u64, len: usize) -> Option<Vec<u8>> {
-        use std::os::unix::fs::FileExt;
-        let file = self.file.as_ref()?;
+        self.file.as_ref()?;
         let mut buf = vec![0u8; len];
-        // Charged on attempt: a read that fails partway may still have read.
-        self.bytes_read.fetch_add(len as u64, Ordering::Relaxed);
-        file.read_exact_at(&mut buf, offset).ok()?;
+        self.read_file_into(offset, &mut buf)?;
         Some(buf)
     }
 
+    #[cfg(unix)]
+    fn read_file_into(&self, offset: u64, buf: &mut [u8]) -> Option<()> {
+        use std::os::unix::fs::FileExt;
+        let file = self.file.as_ref()?;
+        // Charged on attempt: a read that fails partway may still have read.
+        self.bytes_read
+            .fetch_add(buf.len() as u64, Ordering::Relaxed);
+        file.read_exact_at(buf, offset).ok()
+    }
+
     #[cfg(not(unix))]
-    fn read_at_file(&self, _offset: u64, _len: usize) -> Option<Vec<u8>> {
+    fn read_file_into(&self, _offset: u64, _buf: &mut [u8]) -> Option<()> {
         None
     }
 
@@ -468,7 +479,7 @@ impl Default for ScanContext {
     }
 }
 
-impl crate::macho::ByteSource for ScanContext {
+impl crate::source::ByteSource for ScanContext {
     fn source_len(&self) -> u64 {
         self.file_len.unwrap_or(0)
     }
@@ -487,6 +498,16 @@ impl crate::macho::ByteSource for ScanContext {
 
     fn read_range(&self, off: u64, len: usize) -> Option<Cow<'_, [u8]>> {
         self.read_range_cow(off, len)
+    }
+
+    fn read_exact_at(&self, off: u64, buf: &mut [u8]) -> Option<()> {
+        match self.locate(off, buf.len())? {
+            Some(held) => {
+                buf.copy_from_slice(held);
+                Some(())
+            }
+            None => self.read_file_into(off, buf),
+        }
     }
 }
 
@@ -596,7 +617,7 @@ mod tests {
     /// small header/signature reads (§5.2).
     #[test]
     fn read_range_inside_content_borrows_without_copying() {
-        use crate::macho::ByteSource;
+        use crate::source::ByteSource;
 
         let path = write_temp_file("read-range-borrowed", b"hello world");
         let ctx = ScanContext::load(&path);
@@ -609,7 +630,7 @@ mod tests {
     /// A range past `content` has to be read for real, so it comes back owned.
     #[test]
     fn read_range_past_content_is_owned() {
-        use crate::macho::ByteSource;
+        use crate::source::ByteSource;
 
         let total_len = MAX_CONTENT_BYTES as u64 + 4096;
         let path = sparse_temp_file("read-range-owned", total_len);
