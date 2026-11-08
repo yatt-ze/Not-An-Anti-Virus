@@ -336,7 +336,7 @@ pub fn read_entry_partial(
 }
 
 /// Where `file`'s bytes lie in `src`: absolute start and length. `OutOfRange`
-/// if the range overflows or runs past `src.source_len()`.
+/// if the range overflows or runs past the source's end (held bytes count).
 fn entry_span(
     src: &(impl ByteSource + ?Sized),
     archive: &XarArchive,
@@ -352,7 +352,7 @@ fn entry_span(
         .ok_or(XarEntryError::OutOfRange)?;
     let end = start.checked_add(length).ok_or(XarEntryError::OutOfRange)?;
     let len = usize::try_from(length).map_err(|_| XarEntryError::OutOfRange)?;
-    if end > src.source_len() {
+    if end > src.source_len().max(src.held_len()) {
         return Err(XarEntryError::OutOfRange);
     }
     Ok((start, len))
@@ -396,6 +396,16 @@ impl Probe {
     fn get(&self) -> &[u8] {
         &self.bytes[..self.len]
     }
+}
+
+/// A probe read from disk at one entry start.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CachedProbe {
+    probe: Probe,
+    /// Shortest probe length whose read failed; no longer one is retried.
+    failed_at: Option<usize>,
+    /// Probe disk bytes charged but not yet netted from an input charge.
+    credit: usize,
 }
 
 /// An entry's span and its probed leading bytes.
@@ -767,8 +777,8 @@ pub struct ReadBudget {
     cut_by_share: bool,
     cut_at_limit: bool,
     input_over_share: bool,
-    /// Probes read from disk, by entry start; `None` if the read failed.
-    probes: HashMap<u64, Option<Probe>>,
+    /// Probes read from disk, by entry start.
+    probes: HashMap<u64, CachedProbe>,
 }
 
 impl ReadBudget {
@@ -811,29 +821,48 @@ impl ReadBudget {
     ) -> Result<Head, XarEntryError> {
         let (start, len) = entry_span(src, archive, file)?;
         let want = len.min(PROBE_LEN);
-        let known = match self.probes.get(&start) {
-            Some(None) => return Err(XarEntryError::OutOfRange),
-            Some(Some(p)) if p.len >= want => {
-                return Ok(Head {
-                    start,
-                    len,
-                    probe: *p,
-                })
-            }
-            Some(Some(p)) => *p,
-            None => Probe::new(&[]),
-        };
+        let head = |probe| Ok(Head { start, len, probe });
+        if want == 0 {
+            return head(Probe::new(&[]));
+        }
+        let cached = self.probes.get(&start).copied();
+        let known = cached.map_or(Probe::new(&[]), |c| c.probe);
+        if known.len >= want {
+            return head(known);
+        }
+        if cached.and_then(|c| c.failed_at).is_some_and(|f| want >= f) {
+            return Err(XarEntryError::OutOfRange);
+        }
         let disk = disk_bytes(src, start, want, known.len);
         if disk > self.shares.entry_remaining() {
             return Err(XarEntryError::BUDGET_EXCEEDED);
         }
         self.charge(disk);
-        let probe = fetch(src, start, want, known.get()).map(|b| Probe::new(&b));
+        let read = fetch(src, start, want, known.get()).map(|b| Probe::new(&b));
         if disk > 0 {
-            self.probes.insert(start, probe);
+            let mut c = cached.unwrap_or(CachedProbe {
+                probe: known,
+                failed_at: None,
+                credit: 0,
+            });
+            c.credit += disk;
+            match read {
+                Some(p) => c.probe = p,
+                None => c.failed_at = Some(c.failed_at.map_or(want, |f| f.min(want))),
+            }
+            self.probes.insert(start, c);
         }
-        let probe = probe.ok_or(XarEntryError::OutOfRange)?;
-        Ok(Head { start, len, probe })
+        read.map_or(Err(XarEntryError::OutOfRange), head)
+    }
+
+    /// Takes up to `max` of the probe charge at `start` not yet netted out.
+    fn take_probe_credit(&mut self, start: u64, max: usize) -> usize {
+        let Some(c) = self.probes.get_mut(&start) else {
+            return 0;
+        };
+        let taken = c.credit.min(max);
+        c.credit -= taken;
+        taken
     }
 
     /// Whether the last entry read stopped at its allowance before reaching
@@ -1091,6 +1120,8 @@ impl ReadBudget {
             self.cut_by_share = true;
             return Err(over);
         }
+        // One read past the prefix is at most `MAX_RANGE_READ`; a cut there is
+        // a gap (unreadable), never a share cut.
         let readable = usize::try_from(src.held_len().saturating_sub(head.start))
             .unwrap_or(usize::MAX)
             .saturating_add(MAX_RANGE_READ);
@@ -1114,8 +1145,11 @@ impl ReadBudget {
                 (input, input, head.len > input, capped)
             }
         };
-        // Charged before the read: a failed read still counts.
-        self.charge(cost);
+        // Charged before the read, so a failed read still counts; probe bytes
+        // inside the input were already charged by `head`.
+        let probed = disk_bytes(src, head.start, input_len.min(head.probe.len), 0);
+        let billed = self.take_probe_credit(head.start, probed);
+        self.charge(cost - billed);
         let input =
             fetch(src, head.start, input_len, head.probe.get()).ok_or(XarEntryError::OutOfRange)?;
         // Output and block work; a nested entry leaves half for its inner layer.
@@ -1155,7 +1189,7 @@ impl ReadBudget {
             nested && err == Some(DecodeError::BudgetExceeded) && !self.cut_by_share;
         // Half a lone entry's input share: a stream must itself be that long.
         let lone_share = self.limits.max_read_back_bytes / divisor;
-        self.input_over_share = cut && decoded.consumed > lone_share / 2;
+        self.input_over_share = cut && !capped && decoded.consumed > lone_share / 2;
         self.charge(decoded.written);
         self.charge(decoded.blocks);
         let read = |gap| Read {
@@ -2990,5 +3024,202 @@ mod tests {
                 "{body}"
             );
         }
+    }
+
+    /// `data` with only its first `held` bytes in memory: reads past them
+    /// are counted in `read`, and fail once they reach `fail_from`.
+    struct Disk<'a> {
+        data: &'a [u8],
+        held: u64,
+        fail_from: u64,
+        read: std::cell::Cell<u64>,
+    }
+
+    impl<'a> Disk<'a> {
+        fn new(data: &'a [u8], held: u64, fail_from: u64) -> Self {
+            Disk {
+                data,
+                held,
+                fail_from,
+                read: std::cell::Cell::new(0),
+            }
+        }
+    }
+
+    impl ByteSource for Disk<'_> {
+        fn source_len(&self) -> u64 {
+            self.data.len() as u64
+        }
+
+        fn held_len(&self) -> u64 {
+            self.held
+        }
+
+        fn read_range(&self, off: u64, len: usize) -> Option<Cow<'_, [u8]>> {
+            let end = off.checked_add(len as u64)?;
+            if end > self.held {
+                self.read.set(self.read.get() + end - off.max(self.held));
+                if end > self.fail_from {
+                    return None;
+                }
+            }
+            self.data.read_range(off, len)
+        }
+    }
+
+    /// The probe's disk bytes are charged once, not again as input (#151).
+    #[test]
+    fn a_disk_entry_is_charged_its_probe_and_the_rest_of_its_input_once() {
+        let blob = vec![b'a'; 100];
+        let bytes = single_entry(&blob);
+        let a = parse(&bytes, &XarLimits::default()).expect("xar");
+        let f = &a.files[0];
+        let src = Disk::new(&bytes, a.heap_start, u64::MAX);
+        let mut budget = ReadBudget::new(&XarLimits::default());
+        let total = budget.remaining();
+        assert_eq!(budget.entry_allowance(&src, &a, f, false), Ok(200));
+        assert_eq!(total - budget.remaining(), PROBE_LEN);
+        budget.start_entry(1);
+        assert_eq!(budget.read_entry_partial(&src, &a, f), Ok((blob, None)));
+        // 100 input (16 of it as the probe) and 100 output.
+        assert_eq!(total - budget.remaining(), 200);
+        assert_eq!(src.read.get(), 100);
+    }
+
+    /// A failed probe refuses only probes at least as long; a shorter entry
+    /// at the same start still reads, in either order (#151).
+    #[test]
+    fn a_failed_probe_does_not_fail_a_shorter_entry_at_the_same_start() {
+        let bytes = entries_over(&[b'a'; 16], &[(0, 5), (0, 16)]);
+        let a = parse(&bytes, &XarLimits::default()).expect("xar");
+        let (short, long) = (&a.files[0], &a.files[1]);
+        for long_first in [true, false] {
+            let src = Disk::new(&bytes, a.heap_start, a.heap_start + 5);
+            let mut budget = ReadBudget::new(&XarLimits::default());
+            let mut order = [short, long];
+            if long_first {
+                order.reverse();
+            }
+            for f in order {
+                let want = if f.length == Some(5) {
+                    Ok(10)
+                } else {
+                    Err(XarEntryError::OutOfRange)
+                };
+                assert_eq!(budget.entry_allowance(&src, &a, f, false), want);
+            }
+            let read = src.read.get();
+            assert_eq!(budget.entry_allowance(&src, &a, short, false), Ok(10));
+            assert_eq!(
+                budget.entry_allowance(&src, &a, long, false),
+                Err(XarEntryError::OutOfRange)
+            );
+            assert_eq!(src.read.get(), read, "nothing retried");
+        }
+    }
+
+    #[test]
+    fn an_empty_entry_needs_no_probe() {
+        let bytes = entries_over(b"", &[(0, 0)]);
+        let a = parse(&bytes, &XarLimits::default()).expect("xar");
+        let src = Disk::new(&bytes, a.heap_start, a.heap_start);
+        let mut budget = ReadBudget::new(&XarLimits::default());
+        assert_eq!(budget.entry_allowance(&src, &a, &a.files[0], false), Ok(0));
+        assert_eq!(src.read.get(), 0);
+        assert!(budget.probes.is_empty());
+    }
+
+    /// Reads every entry of `a` from `src` in order, one share each, and
+    /// returns what each read charged.
+    fn read_all(src: &Disk<'_>, a: &XarArchive, budget: &mut ReadBudget) -> Vec<usize> {
+        for f in &a.files {
+            let _ = budget.entry_allowance(src, a, f, false);
+        }
+        let n = a.files.len();
+        let mut charged = Vec::new();
+        for (i, f) in a.files.iter().enumerate() {
+            budget.start_entry(n - i);
+            let before = budget.remaining();
+            let _ = budget.read_entry_partial(src, a, f);
+            charged.push(before - budget.remaining());
+        }
+        charged
+    }
+
+    /// Two reads of one range: one probe, whose credit only the first takes.
+    #[test]
+    fn a_range_read_twice_is_probed_once_and_credited_once() {
+        let bytes = entries_over(&[b'a'; 100], &[(0, 100), (0, 100)]);
+        let a = parse(&bytes, &XarLimits::default()).expect("xar");
+        let src = Disk::new(&bytes, a.heap_start, u64::MAX);
+        let mut budget = ReadBudget::new(&XarLimits::default());
+        let total = budget.remaining();
+        // Input (less the probe's 16) and output, then input and output.
+        assert_eq!(read_all(&src, &a, &mut budget), vec![84 + 100, 100 + 100]);
+        assert_eq!(total - budget.remaining(), PROBE_LEN + 384);
+        // The probe once, then each read's bytes past it.
+        assert_eq!(src.read.get(), 16 + 84 + 84);
+    }
+
+    /// A short and a long entry at one start share a probe charged in two
+    /// steps (5, then 11); its 16-byte credit is claimed once in all.
+    #[test]
+    fn a_short_and_a_long_entry_at_one_start_claim_the_probe_credit_once() {
+        let bytes = entries_over(&[b'a'; 100], &[(0, 5), (0, 100)]);
+        let a = parse(&bytes, &XarLimits::default()).expect("xar");
+        let src = Disk::new(&bytes, a.heap_start, u64::MAX);
+        let mut budget = ReadBudget::new(&XarLimits::default());
+        let total = budget.remaining();
+        assert_eq!(read_all(&src, &a, &mut budget), vec![5, 89 + 100]);
+        assert_eq!(total - budget.remaining(), 16 + 5 + 189);
+        assert_eq!(src.read.get(), 100);
+    }
+
+    /// A read that fails after its probe still pays for its input, and the
+    /// credit it took is not claimed again by the next entry there.
+    #[test]
+    fn a_failed_read_spends_the_probe_credit_once() {
+        let bytes = entries_over(&[b'a'; 100], &[(0, 100), (0, 50)]);
+        let a = parse(&bytes, &XarLimits::default()).expect("xar");
+        let src = Disk::new(&bytes, a.heap_start, a.heap_start + 60);
+        let mut budget = ReadBudget::new(&XarLimits::default());
+        let total = budget.remaining();
+        assert_eq!(read_all(&src, &a, &mut budget), vec![84, 50 + 50]);
+        assert_eq!(total - budget.remaining(), 16 + 84 + 100);
+        assert_eq!(src.read.get(), 16 + 84 + 34);
+    }
+
+    /// A stream cut at `MAX_RANGE_READ` is a gap, but neither a cut by its
+    /// share nor input over the share, though it read more than half of it.
+    #[test]
+    fn a_read_capped_at_the_range_limit_is_not_a_share_cut() {
+        let body = vec![0u8; MAX_RANGE_READ + (1 << 20)];
+        let mut zlib = vec![0x78, 0x01];
+        let chunks: Vec<&[u8]> = body.chunks(usize::from(u16::MAX)).collect();
+        for (i, chunk) in chunks.iter().enumerate() {
+            let n = u16::try_from(chunk.len()).expect("chunked");
+            zlib.push(u8::from(i + 1 == chunks.len()));
+            zlib.extend_from_slice(&n.to_le_bytes());
+            zlib.extend_from_slice(&(!n).to_le_bytes());
+            zlib.extend_from_slice(chunk);
+        }
+        zlib.extend_from_slice(&inflate::adler32(&body).to_be_bytes());
+        // Share 20 MiB, over the 16 MiB cap; half a lone share is 10 MiB.
+        let limits = XarLimits {
+            max_entry_bytes: 64 << 20,
+            max_read_back_bytes: 40 << 20,
+            ..XarLimits::default()
+        };
+        let bytes = single_entry(&zlib);
+        let a = parse(&bytes, &limits).expect("xar");
+        let src = Disk::new(&bytes, a.heap_start, u64::MAX);
+        let mut budget = ReadBudget::new(&limits);
+        let (out, gap) = budget
+            .read_entry_partial(&src, &a, &a.files[0])
+            .expect("a prefix");
+        assert!(!out.is_empty() && gap == Some(BUDGET_ERR));
+        assert!(!budget.last_cut_by_share());
+        assert!(!budget.last_input_over_share());
+        assert_eq!(src.read.get(), MAX_RANGE_READ as u64);
     }
 }
