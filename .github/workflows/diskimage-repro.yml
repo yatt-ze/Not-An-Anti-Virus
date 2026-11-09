@@ -1,0 +1,32 @@
+# Runs scripts/diskimage-lifecycle-repro.sh on a macOS runner: adversarial
+# reproductions for navctl's disk-image mount lifecycle (§6.2). Evidence
+# only: the script asserts nothing, so this job passes whatever it observes.
+name: diskimage lifecycle repro
+
+on:
+  push:
+    branches: ["yatt-ze/amazing-maxwell-zgtbea"]
+    paths:
+      - ".github/workflows/diskimage-repro.yml"
+      - "scripts/diskimage-lifecycle-repro.sh"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  repro:
+    runs-on: macos-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --locked -p navctl
+      - name: reproductions
+        run: bash scripts/diskimage-lifecycle-repro.sh target/debug/navctl 2>&1 | tee repro.log
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: diskimage-repro-log
+          path: repro.log
