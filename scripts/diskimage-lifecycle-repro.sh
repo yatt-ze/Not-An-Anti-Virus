@@ -66,7 +66,7 @@ for r in rs[:int(sys.argv[2]) if len(sys.argv) > 2 else 0]:
 EOF
 
 say() { printf '%s\n' "$*"; }
-attached() { python3 "$WORK/attached.py" "${1:-$C}"; }
+attached() { python3 "$WORK/attached.py" "$WORK"; }
 state() {
     local s
     s=$(attached)
@@ -77,7 +77,7 @@ state() {
 }
 detach_all() {
     local d
-    attached "${1:-$C}" | cut -f1 | cut -d, -f1 | while read -r d; do
+    attached | cut -f1 | cut -d, -f1 | while read -r d; do
         [ -n "$d" ] && $HD detach "$d" -force -quiet
     done
 }
@@ -95,6 +95,7 @@ end_case() {
     pkill -KILL -f "hdiutil .*$C" 2>/dev/null
     sleep 1
 }
+# Foreground only: `nav ... &` would background a subshell, not navctl.
 nav() { env TMPDIR="$C/tmp" "$NAVCTL" "$@"; }
 scratch() { echo "$C/tmp/navctl-scratch"; }
 mounted() { mount | grep -F "$(scratch)/" | head -1; }
@@ -170,7 +171,7 @@ case_signal_during_walk() {
     local sig
     for sig in INT TERM HUP; do
         new_case "sig$sig-walk" "SIG$sig while the walker is on the mounted volume"
-        nav scan "$BIG" >"$C/out" 2>"$C/err" &
+        env TMPDIR="$C/tmp" "$NAVCTL" scan "$BIG" >"$C/out" 2>"$C/err" &
         local pid=$!
         if wait_mount $pid; then
             kill -$sig $pid
@@ -197,7 +198,7 @@ case_signal_during_walk() {
 
 case_sigint_during_attach() {
     new_case sigint-attach "SIGINT while hdiutil attach is running"
-    nav scan "$BIG" >"$C/out" 2>"$C/err" &
+    env TMPDIR="$C/tmp" "$NAVCTL" scan "$BIG" >"$C/out" 2>"$C/err" &
     local pid=$!
     if wait_child $pid attach >/dev/null; then
         kill -INT $pid
@@ -217,7 +218,7 @@ case_sigint_during_attach() {
 # SIGKILL, and what the next run's stale sweep recovers.
 case_sigkill() {
     new_case sigkill-walk "SIGKILL during the walk, then a second run"
-    nav scan "$BIG" >"$C/out" 2>"$C/err" &
+    env TMPDIR="$C/tmp" "$NAVCTL" scan "$BIG" >"$C/out" 2>"$C/err" &
     local pid=$!
     if wait_mount $pid; then
         kill -KILL $pid
@@ -234,7 +235,7 @@ case_sigkill() {
     end_case
 
     new_case sigkill-unmounted "SIGKILL during the walk, volume unmounted (device kept), second run"
-    nav scan "$BIG" >"$C/out" 2>"$C/err" &
+    env TMPDIR="$C/tmp" "$NAVCTL" scan "$BIG" >"$C/out" 2>"$C/err" &
     pid=$!
     if wait_mount $pid; then
         kill -KILL $pid
@@ -255,7 +256,7 @@ case_sigkill() {
     end_case
 
     new_case sigkill-attach "SIGKILL while hdiutil attach is running"
-    nav scan "$BIG" >"$C/out" 2>"$C/err" &
+    env TMPDIR="$C/tmp" "$NAVCTL" scan "$BIG" >"$C/out" 2>"$C/err" &
     pid=$!
     if wait_child $pid attach >/dev/null; then
         kill -KILL $pid
@@ -278,7 +279,7 @@ case_sigkill() {
 # hdiutil hangs, simulated by SIGSTOPping navctl's child.
 case_hang_attach() {
     new_case hang-attach "hdiutil attach hangs (SIGSTOP) until the 60 s timeout"
-    nav scan "$SMALL" >"$C/out" 2>"$C/err" &
+    env TMPDIR="$C/tmp" "$NAVCTL" scan "$SMALL" >"$C/out" 2>"$C/err" &
     local pid=$! c
     if c=$(wait_child $pid attach); then
         kill -STOP "$c"
@@ -298,7 +299,7 @@ case_hang_attach() {
 
 case_hang_detach() {
     new_case hang-detach "every hdiutil detach hangs (SIGSTOP)"
-    nav scan "$SMALL" >"$C/out" 2>"$C/err" &
+    env TMPDIR="$C/tmp" "$NAVCTL" scan "$SMALL" >"$C/out" 2>"$C/err" &
     local pid=$! c n=0
     while kill -0 $pid 2>/dev/null; do
         for c in $(pgrep -P $pid -f "hdiutil detach"); do
@@ -318,7 +319,7 @@ case_hang_detach() {
 
 case_hang_info() {
     new_case hang-info "hdiutil info hangs (SIGSTOP) during cleanup only"
-    nav scan "$SMALL" >"$C/out" 2>"$C/err" &
+    env TMPDIR="$C/tmp" "$NAVCTL" scan "$SMALL" >"$C/out" 2>"$C/err" &
     local pid=$! c
     wait_child $pid attach >/dev/null
     while kill -0 $pid 2>/dev/null; do
@@ -348,7 +349,7 @@ case_already_attached() {
     end_case
 
     new_case pre-nomount "image already attached with -nomount by someone else"
-    $HD attach -quiet -nomount "$SMALL"
+    $HD attach -nomount "$SMALL" 2>&1 | sed 's/^/    foreign attach: /'
     state "before navctl"
     nav scan "$SMALL" >"$C/out" 2>"$C/err"
     say "  rc=$?"
@@ -358,12 +359,35 @@ case_already_attached() {
     end_case
 }
 
+# A foreign -nomount attach landing between navctl's `hdiutil info` snapshot
+# and its own attach, held open by stopping navctl's attach child.
+case_race_nomount() {
+    new_case race-nomount "foreign -nomount attach between navctl's snapshot and its attach"
+    env TMPDIR="$C/tmp" "$NAVCTL" scan "$SMALL" >"$C/out" 2>"$C/err" &
+    local pid=$! c
+    if c=$(wait_child $pid attach); then
+        kill -STOP "$c"
+        $HD attach -nomount "$SMALL" 2>&1 | sed 's/^/    foreign attach: /'
+        state "foreign attachment in place, navctl's attach still stopped"
+        kill -CONT "$c"
+        reap $pid 150
+        say "  navctl rc=$RC"
+        show out "$C/out"
+        show err "$C/err"
+        state "after navctl (is the foreign attachment still there?)"
+    else
+        wait $pid
+        say "  inconclusive"
+    fi
+    end_case
+}
+
 case_concurrent() {
     new_case two-navctl "two navctl runs on the same image at once"
-    nav rules test --json "$BIG" >"$C/json1" 2>"$C/err1" &
+    env TMPDIR="$C/tmp" "$NAVCTL" rules test --json "$BIG" >"$C/json1" 2>"$C/err1" &
     local a=$!
     wait_mount $a
-    nav rules test --json "$BIG" >"$C/json2" 2>"$C/err2" &
+    env TMPDIR="$C/tmp" "$NAVCTL" rules test --json "$BIG" >"$C/json2" 2>"$C/err2" &
     local b=$!
     wait $b
     say "  second (started during the first's walk): rc=$?"
@@ -377,7 +401,7 @@ case_concurrent() {
     end_case
 
     new_case foreign-attach "another process attaches the image during the walk"
-    nav scan "$BIG" >"$C/out" 2>"$C/err" &
+    env TMPDIR="$C/tmp" "$NAVCTL" scan "$BIG" >"$C/out" 2>"$C/err" &
     a=$!
     if wait_mount $a; then
         $HD attach -nobrowse "$BIG" >"$C/foreign" 2>&1
@@ -395,7 +419,7 @@ case_foreign_detach() {
     local delay
     for delay in 0 0.3 1; do
         new_case "foreign-detach-$delay" "volume force-detached $delay s into the walk"
-        nav rules test --json "$BIG" >"$C/json" 2>"$C/err" &
+        env TMPDIR="$C/tmp" "$NAVCTL" rules test --json "$BIG" >"$C/json" 2>"$C/err" &
         local pid=$!
         if wait_mount $pid; then
             sleep "$delay"
@@ -408,7 +432,7 @@ case_foreign_detach() {
         say "  rc=$RC after ${SECS} s (20000 files on the image)"
         show err "$C/err" 6
         python3 "$WORK/summary.py" "$C/json"
-        nav scan "$BIG" >"$C/out2" 2>"$C/err2" &
+        env TMPDIR="$C/tmp" "$NAVCTL" scan "$BIG" >"$C/out2" 2>"$C/err2" &
         pid=$!
         if wait_mount $pid; then
             sleep "$delay"
@@ -429,7 +453,7 @@ case_replace() {
     cp "$DROPPER" "$C/other-src/swapped-in.sh"
     mk_image "$C/other.dmg" "$C/other-src"
     cp "$SMALL" "$C/target.dmg"
-    nav scan --verbose "$C/target.dmg" >"$C/out" 2>"$C/err" &
+    env TMPDIR="$C/tmp" "$NAVCTL" scan --verbose "$C/target.dmg" >"$C/out" 2>"$C/err" &
     local pid=$!
     if wait_child $pid imageinfo >/dev/null; then
         mv -f "$C/other.dmg" "$C/target.dmg"
@@ -449,7 +473,7 @@ case_replace() {
     sleep 1
     detach_all "$WORK"
     cp "$SMALL" "$C/target.dmg"
-    nav scan "$C/target.dmg" >"$C/out" 2>"$C/err" &
+    env TMPDIR="$C/tmp" "$NAVCTL" scan "$C/target.dmg" >"$C/out" 2>"$C/err" &
     pid=$!
     if wait_child $pid imageinfo >/dev/null; then
         mv -f "$C/enc.dmg" "$C/target.dmg"
@@ -622,7 +646,7 @@ EOF
 }
 
 ALL="baseline signal_during_walk sigint_during_attach sigkill hang_attach hang_detach
-hang_info already_attached concurrent foreign_detach replace scratch multi_volume
+hang_info already_attached race_nomount concurrent foreign_detach replace scratch multi_volume
 mountrandom_missing group_sigint"
 for name in ${*:-$ALL}; do
     "case_$name"
