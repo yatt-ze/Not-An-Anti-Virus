@@ -280,13 +280,6 @@ pub fn local_name(name: &str) -> &str {
     }
 }
 
-/// [`attr`], matching attribute names by [`local_name`].
-pub fn attr_local(attr_region: &[u8], want: &str) -> Option<String> {
-    attrs(attr_region)
-        .find(|(name, _)| std::str::from_utf8(name).is_ok_and(|n| local_name(n) == want))
-        .map(|(_, value)| decode_entities(value))
-}
-
 // --- event scanning ------------------------------------------------------
 
 #[derive(Debug, Clone, PartialEq, Eq)]

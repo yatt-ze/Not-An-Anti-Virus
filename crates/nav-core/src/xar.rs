@@ -1275,6 +1275,7 @@ fn walk_toc(toc: &[u8], limits: &XarLimits, archive: &mut XarArchive) {
     // can't decode as libxar would leaves the TOC incomplete (#180).
     let mut name_b64 = false;
     let mut bad_name = false;
+    let mut ns = Prefixes::default();
 
     loop {
         match sc.next_event() {
@@ -1294,7 +1295,8 @@ fn walk_toc(toc: &[u8], limits: &XarLimits, archive: &mut XarArchive) {
                 attrs,
                 self_closing,
             }) => {
-                let name = xml::local_name(name);
+                ns.declare(attrs, elems.len() + 1);
+                let name = ns.local(name);
                 let parent_elem = elems.last().copied();
 
                 match name {
@@ -1323,36 +1325,38 @@ fn walk_toc(toc: &[u8], limits: &XarLimits, archive: &mut XarArchive) {
                         }
                     }
                     "name" if parent_elem == Some("file") => {
-                        name_b64 = xml::attr_local(attrs, "enctype").as_deref() == Some("base64");
+                        name_b64 = ns.attr(attrs, "enctype").as_deref() == Some("base64");
                     }
                     "encoding" if parent_elem == Some("data") => {
                         if let Some(i) = open_files.last().copied() {
                             if let Some(n) = nodes.get_mut(i) {
-                                n.encoding = xml::attr_local(attrs, "style");
+                                n.encoding = ns.attr(attrs, "style");
                             }
                         }
                     }
                     "signature" if sig.is_none() && elems.as_slice() == ["xar", "toc"] => {
                         sig = Some(XarSignature {
-                            style: xml::attr_local(attrs, "style").unwrap_or_default(),
+                            style: ns.attr(attrs, "style").unwrap_or_default(),
                             offset: None,
                             size: None,
                         });
                         in_sig = !self_closing;
                     }
                     "checksum" if archive.checksum_style.is_none() => {
-                        archive.checksum_style = xml::attr_local(attrs, "style");
+                        archive.checksum_style = ns.attr(attrs, "style");
                     }
                     "toc" => saw_toc = true,
                     _ => {}
                 }
 
-                if !self_closing {
+                if self_closing {
+                    ns.close(elems.len());
+                } else {
                     elems.push(name);
                 }
             }
             Next::Event(Event::Close { name }) => {
-                let name = xml::local_name(name);
+                let name = ns.local(name);
                 if name == "file" {
                     open_files.pop();
                 }
@@ -1362,6 +1366,7 @@ fn walk_toc(toc: &[u8], limits: &XarLimits, archive: &mut XarArchive) {
                 // Tolerate a stray close — entries collected so far are evidence.
                 if elems.last() == Some(&name) {
                     elems.pop();
+                    ns.close(elems.len());
                 }
             }
             // libxar sets a value from text nodes only: CDATA and
@@ -1486,6 +1491,49 @@ fn base64_name(text: &str) -> Option<String> {
         crate::base64::decode_bounded(t.as_bytes(), t.len(), crate::base64::OnInvalid::Stop);
     let name = bytes.split(|&b| b == 0).next().unwrap_or(&[]);
     Some(String::from_utf8_lossy(name).into_owned())
+}
+
+/// Namespace prefixes declared on the open elements, with the element depth
+/// each was declared at. libxml2 strips only a prefix declared in scope, so an
+/// undeclared `<x:name>` is a different element to libxar (#181).
+#[derive(Default)]
+struct Prefixes(Vec<(String, usize)>);
+
+impl Prefixes {
+    /// Record `xmlns:p` declarations in an element's attributes, at `depth`.
+    fn declare(&mut self, attrs: &[u8], depth: usize) {
+        for (name, _) in xml::attrs(attrs) {
+            if let Some(p) = name.strip_prefix(b"xmlns:") {
+                self.0
+                    .push((String::from_utf8_lossy(p).into_owned(), depth));
+            }
+        }
+    }
+
+    /// Drop declarations made deeper than `depth` (their element closed).
+    fn close(&mut self, depth: usize) {
+        self.0.retain(|(_, d)| *d <= depth);
+    }
+
+    /// `name`'s local name if its prefix is in scope (`xml` and `xmlns`
+    /// always are), else `name` whole.
+    fn local<'a>(&self, name: &'a str) -> &'a str {
+        let local = xml::local_name(name);
+        let prefix = name.split_once(':').map_or("", |(p, _)| p);
+        let declared = matches!(prefix, "xml" | "xmlns") || self.0.iter().any(|(p, _)| p == prefix);
+        if declared {
+            local
+        } else {
+            name
+        }
+    }
+
+    /// The decoded value of the attribute whose name resolves to `want`.
+    fn attr(&self, attrs: &[u8], want: &str) -> Option<String> {
+        xml::attrs(attrs)
+            .find(|(n, _)| std::str::from_utf8(n).is_ok_and(|n| self.local(n) == want))
+            .map(|(_, v)| xml::decode_entities(v))
+    }
 }
 
 /// True if `raw` decodes to XML whitespace only, which libxml2 reports as a
@@ -3103,11 +3151,12 @@ mod tests {
         assert_eq!((sig.offset, sig.size), (Some(5), Some(6)));
     }
 
-    /// Elements and attributes match by local name, as libxar does (#181).
+    /// A prefix declared in scope is dropped from element and attribute
+    /// names; an undeclared one is not, as libxar does (#181).
     #[test]
-    fn toc_names_match_without_a_namespace_prefix() {
+    fn toc_names_drop_only_a_declared_prefix() {
         let a = toc_archive(
-            r#"<n:file xmlns:n="urn:x" id="1"><n:name>Scripts</n:name><n:type>file</n:type><n:data><n:offset>7</n:offset><n:length>3</n:length><n:encoding n:style="application/x-gzip"/></n:data></n:file><signature style="RSA"><n:offset>1</n:offset><size>2</size></signature>"#,
+            r#"<n:file xmlns:n="urn:x" id="1"><n:name>Scripts</n:name><n:type>file</n:type><n:data><n:offset>7</n:offset><n:length>3</n:length><n:encoding n:style="application/x-gzip"/></n:data></n:file><signature style="RSA"><offset>1</offset><size>2</size><n:offset>9</n:offset></signature>"#,
         );
         assert!(a.is_complete());
         let f = a.files.first().expect("file");
@@ -3117,6 +3166,20 @@ mod tests {
         assert_eq!(f.encoding.as_deref(), Some("application/x-gzip"));
         let sig = a.signature.expect("signature");
         assert_eq!((sig.offset, sig.size), (Some(1), Some(2)));
+
+        // Undeclared, declared on a sibling, and the built-in `xml` prefix.
+        let b = toc_archive(
+            r#"<file id="1"><name>Scripts</name><x:name>readme</x:name><data><x:offset>9</x:offset><offset>7</offset></data></file><a xmlns:n="urn:x"/><file id="2"><n:name>Scripts</n:name></file><file id="3"><xml:name>Scripts</xml:name></file>"#,
+        );
+        let got: Vec<_> = b
+            .files
+            .iter()
+            .map(|f| (f.path.as_str(), f.offset))
+            .collect();
+        assert_eq!(
+            got,
+            [("Scripts", Some(7)), ("<unnamed>", None), ("Scripts", None)]
+        );
     }
 
     /// A value is its last non-blank text node: CDATA and whitespace-only
@@ -3146,11 +3209,20 @@ mod tests {
         let a = toc_archive(
             r#"<file id="1"><name enctype="base64">
 	U2NyaXB0cw==
-</name></file><file id="2"><name n:enctype="base64">U2NyaXB0cwB4eHg=</name></file><file id="3"><name enctype="BASE64">U2NyaXB0cw==</name></file>"#,
+</name></file><file id="2" xmlns:n="urn:x"><name n:enctype="base64">U2NyaXB0cwB4eHg=</name></file><file id="3"><name enctype="BASE64">U2NyaXB0cw==</name></file><file id="4"><name x:enctype="base64">U2NyaXB0cw==</name></file><file id="5"><name xmlns:enctype="base64">U2NyaXB0cw==</name></file>"#,
         );
         assert!(a.is_complete());
         let paths: Vec<_> = a.files.iter().map(|f| f.path.as_str()).collect();
-        assert_eq!(paths, ["Scripts", "Scripts", "U2NyaXB0cw=="]);
+        assert_eq!(
+            paths,
+            [
+                "Scripts",
+                "Scripts",
+                "U2NyaXB0cw==",
+                "U2NyaXB0cw==",
+                "Scripts"
+            ]
+        );
         assert!(a.files.first().is_some_and(XarFile::is_metadata_entry));
 
         for bad in [
