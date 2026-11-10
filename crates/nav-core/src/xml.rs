@@ -271,6 +271,22 @@ pub fn attr(attr_region: &[u8], want: &str) -> Option<String> {
         .map(|(_, value)| decode_entities(value))
 }
 
+/// `name` without its namespace prefix (`n:file` → `file`), as libxml2's
+/// local name. A name without a non-empty prefix and local part is returned whole.
+pub fn local_name(name: &str) -> &str {
+    match name.split_once(':') {
+        Some((prefix, local)) if !prefix.is_empty() && !local.is_empty() => local,
+        _ => name,
+    }
+}
+
+/// [`attr`], matching attribute names by [`local_name`].
+pub fn attr_local(attr_region: &[u8], want: &str) -> Option<String> {
+    attrs(attr_region)
+        .find(|(name, _)| std::str::from_utf8(name).is_ok_and(|n| local_name(n) == want))
+        .map(|(_, value)| decode_entities(value))
+}
+
 // --- event scanning ------------------------------------------------------
 
 #[derive(Debug, Clone, PartialEq, Eq)]

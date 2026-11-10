@@ -1289,6 +1289,7 @@ fn walk_toc(toc: &[u8], limits: &XarLimits, archive: &mut XarArchive) {
                 attrs,
                 self_closing,
             }) => {
+                let name = xml::local_name(name);
                 let parent_elem = elems.last().copied();
 
                 match name {
@@ -1319,20 +1320,20 @@ fn walk_toc(toc: &[u8], limits: &XarLimits, archive: &mut XarArchive) {
                     "encoding" if parent_elem == Some("data") => {
                         if let Some(i) = open_files.last().copied() {
                             if let Some(n) = nodes.get_mut(i) {
-                                n.encoding = xml::attr(attrs, "style");
+                                n.encoding = xml::attr_local(attrs, "style");
                             }
                         }
                     }
                     "signature" if sig.is_none() && elems.as_slice() == ["xar", "toc"] => {
                         sig = Some(XarSignature {
-                            style: xml::attr(attrs, "style").unwrap_or_default(),
+                            style: xml::attr_local(attrs, "style").unwrap_or_default(),
                             offset: None,
                             size: None,
                         });
                         in_sig = !self_closing;
                     }
                     "checksum" if archive.checksum_style.is_none() => {
-                        archive.checksum_style = xml::attr(attrs, "style");
+                        archive.checksum_style = xml::attr_local(attrs, "style");
                     }
                     "toc" => saw_toc = true,
                     _ => {}
@@ -1343,6 +1344,7 @@ fn walk_toc(toc: &[u8], limits: &XarLimits, archive: &mut XarArchive) {
                 }
             }
             Next::Event(Event::Close { name }) => {
+                let name = xml::local_name(name);
                 if name == "file" {
                     open_files.pop();
                 }
@@ -2987,6 +2989,22 @@ mod tests {
         );
         let sig = both.signature.expect("top-level signature");
         assert_eq!((sig.offset, sig.size), (Some(5), Some(6)));
+    }
+
+    /// Elements and attributes match by local name, as libxar does (#181).
+    #[test]
+    fn toc_names_match_without_a_namespace_prefix() {
+        let a = toc_archive(
+            r#"<n:file xmlns:n="urn:x" id="1"><n:name>Scripts</n:name><n:type>file</n:type><n:data><n:offset>7</n:offset><n:length>3</n:length><n:encoding n:style="application/x-gzip"/></n:data></n:file><signature style="RSA"><n:offset>1</n:offset><size>2</size></signature>"#,
+        );
+        assert!(a.is_complete());
+        let f = a.files.first().expect("file");
+        assert!(f.is_metadata_entry());
+        assert_eq!((f.path.as_str(), &f.kind), ("Scripts", &XarKind::File));
+        assert_eq!((f.offset, f.length), (Some(7), Some(3)));
+        assert_eq!(f.encoding.as_deref(), Some("application/x-gzip"));
+        let sig = a.signature.expect("signature");
+        assert_eq!((sig.offset, sig.size), (Some(1), Some(2)));
     }
 
     /// Recording is by depth (`<xar><toc>`), not by parent name, and a later

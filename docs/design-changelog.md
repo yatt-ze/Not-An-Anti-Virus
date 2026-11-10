@@ -5,6 +5,10 @@ for the current document map. Newest first.
 
 ---
 
+**Changelog from v0.91 (2026-11-10):** The xar TOC is read as libxar reads it (§6.2, §11.8, parser conformance audit). Elements and attributes now match by local name: a `Scripts` entry written `<n:name>Scripts</n:name>` under a declared prefix was `<unnamed>` to NAV, so it was never read and the package came out `Complete` and clean while Installer ran its scripts (#181).
+
+---
+
 **Changelog from v0.90 (2026-11-08):** A standalone zip is scored through its members alone (§6.2, §5.1, #140). `suspicious-strings` and `high-entropy` also ran on the raw zip bytes, so a stored member's script counted twice: a stored zip holding one `run.sh` with a download piped to a shell scored `suspicious-strings` 15 plus `zip-member-suspicious` 17, 32 → Notify, while the deflated zip scored the member alone. Now both rules skip a real file that starts with a local header and was read with no gaps, as PR #139 already did for a ZIP in a package's `Scripts`. A prefixed (self-extracting) zip, a zip with a gap, a truncated one and one under `X.app/Contents/` keep the raw scan. No new rule, id or weight. New fixture `suspicious/dropper_in_stored_zip.zip` (`zip -0` of `dropper.sh`; 20, Notify, the same as the deflated `dropper_in_zip.zip`).
 
 ---
