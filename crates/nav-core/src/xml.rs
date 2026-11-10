@@ -271,6 +271,15 @@ pub fn attr(attr_region: &[u8], want: &str) -> Option<String> {
         .map(|(_, value)| decode_entities(value))
 }
 
+/// `name` without its namespace prefix (`n:file` → `file`), as libxml2's
+/// local name. A name without a non-empty prefix and local part is returned whole.
+pub fn local_name(name: &str) -> &str {
+    match name.split_once(':') {
+        Some((prefix, local)) if !prefix.is_empty() && !local.is_empty() => local,
+        _ => name,
+    }
+}
+
 // --- event scanning ------------------------------------------------------
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -284,6 +293,8 @@ pub enum Event<'a> {
         name: &'a str,
     },
     Text(&'a [u8]),
+    /// A CDATA section's contents, verbatim.
+    CData(&'a [u8]),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -342,7 +353,7 @@ impl<'a> Scanner<'a> {
                     Some(i) => {
                         let text = rest.get(9..i).unwrap_or(&[]);
                         self.pos = self.pos.saturating_add(i + 3);
-                        return Next::Event(Event::Text(text));
+                        return Next::Event(Event::CData(text));
                     }
                     None => return Next::Bad,
                 }
