@@ -1493,26 +1493,43 @@ fn base64_name(text: &str) -> Option<String> {
     Some(String::from_utf8_lossy(name).into_owned())
 }
 
-/// Namespace prefixes declared on the open elements, with the element depth
-/// each was declared at. libxml2 strips only a prefix declared in scope, so an
-/// undeclared `<x:name>` is a different element to libxar (#181).
+/// Namespace prefixes declared on the open elements. libxml2 strips only a
+/// prefix declared in scope, so an undeclared `<x:name>` is a different
+/// element to libxar (#181).
 #[derive(Default)]
-struct Prefixes(Vec<(String, usize)>);
+struct Prefixes {
+    /// Declarations in document order, with the depth each was made at.
+    stack: Vec<(String, usize)>,
+    /// How many in-scope declarations each prefix has.
+    count: HashMap<String, usize>,
+}
 
 impl Prefixes {
-    /// Record `xmlns:p` declarations in an element's attributes, at `depth`.
+    /// Record an element's `xmlns:p` declarations at `depth`. An empty
+    /// namespace is an error to libxml2 and declares nothing.
     fn declare(&mut self, attrs: &[u8], depth: usize) {
-        for (name, _) in xml::attrs(attrs) {
-            if let Some(p) = name.strip_prefix(b"xmlns:") {
-                self.0
-                    .push((String::from_utf8_lossy(p).into_owned(), depth));
+        for (name, value) in xml::attrs(attrs) {
+            let Some(p) = name.strip_prefix(b"xmlns:") else {
+                continue;
+            };
+            if xml::decode_entities(value).is_empty() {
+                continue;
             }
+            let p = String::from_utf8_lossy(p).into_owned();
+            *self.count.entry(p.clone()).or_default() += 1;
+            self.stack.push((p, depth));
         }
     }
 
     /// Drop declarations made deeper than `depth` (their element closed).
     fn close(&mut self, depth: usize) {
-        self.0.retain(|(_, d)| *d <= depth);
+        while self.stack.last().is_some_and(|(_, d)| *d > depth) {
+            if let Some((p, _)) = self.stack.pop() {
+                if let Some(n) = self.count.get_mut(&p) {
+                    *n = n.saturating_sub(1);
+                }
+            }
+        }
     }
 
     /// `name`'s local name if its prefix is in scope (`xml` and `xmlns`
@@ -1520,7 +1537,8 @@ impl Prefixes {
     fn local<'a>(&self, name: &'a str) -> &'a str {
         let local = xml::local_name(name);
         let prefix = name.split_once(':').map_or("", |(p, _)| p);
-        let declared = matches!(prefix, "xml" | "xmlns") || self.0.iter().any(|(p, _)| p == prefix);
+        let declared =
+            matches!(prefix, "xml" | "xmlns") || self.count.get(prefix).is_some_and(|&n| n > 0);
         if declared {
             local
         } else {
@@ -3167,9 +3185,10 @@ mod tests {
         let sig = a.signature.expect("signature");
         assert_eq!((sig.offset, sig.size), (Some(1), Some(2)));
 
-        // Undeclared, declared on a sibling, and the built-in `xml` prefix.
+        // Undeclared, declared on a sibling, the built-in `xml` prefix, and
+        // an empty declaration (declares nothing, unbinds nothing).
         let b = toc_archive(
-            r#"<file id="1"><name>Scripts</name><x:name>readme</x:name><data><x:offset>9</x:offset><offset>7</offset></data></file><a xmlns:n="urn:x"/><file id="2"><n:name>Scripts</n:name></file><file id="3"><xml:name>Scripts</xml:name></file>"#,
+            r#"<file id="1"><name>Scripts</name><x:name>readme</x:name><data><x:offset>9</x:offset><offset>7</offset></data></file><a xmlns:n="urn:x"/><file id="2"><n:name>Scripts</n:name></file><file id="3"><xml:name>Scripts</xml:name></file><file id="4" xmlns:n="urn:x"><name>Scripts</name><x:name xmlns:x="">readme</x:name><n:name xmlns:n="">kept</n:name></file>"#,
         );
         let got: Vec<_> = b
             .files
@@ -3178,7 +3197,12 @@ mod tests {
             .collect();
         assert_eq!(
             got,
-            [("Scripts", Some(7)), ("<unnamed>", None), ("Scripts", None)]
+            [
+                ("Scripts", Some(7)),
+                ("<unnamed>", None),
+                ("Scripts", None),
+                ("kept", None)
+            ]
         );
     }
 
