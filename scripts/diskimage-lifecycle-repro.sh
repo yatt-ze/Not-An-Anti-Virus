@@ -6,7 +6,9 @@
 #
 # Everything it creates lives in one work directory under /tmp. On exit,
 # however it ends, it kills its navctl/hdiutil children, detaches every
-# image attached from or mounted in that directory, and removes it.
+# image attached from or mounted in that directory, and removes it. The
+# cases that kill an `hdiutil attach` can leave an idle diskimages-helper
+# process behind; it holds nothing and goes away at logout.
 #
 # Each case runs navctl with a private TMPDIR, so its scratch root is
 # <work>/<case>/tmp/navctl-scratch. `STATE` lines list what `hdiutil info`
@@ -144,6 +146,8 @@ reap() {
     wait "$1"
     RC=$?
     SECS=$((SECONDS - start))
+    # The sleep is the watchdog's child and would otherwise outlive it.
+    pkill -P "$dog" 2>/dev/null
     kill "$dog" 2>/dev/null
     wait "$dog" 2>/dev/null
 }
