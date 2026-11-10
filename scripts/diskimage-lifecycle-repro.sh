@@ -4,6 +4,10 @@
 #
 #   scripts/diskimage-lifecycle-repro.sh target/debug/navctl [case ...]
 #
+# Everything it creates lives in one work directory under /tmp. On exit,
+# however it ends, it kills its navctl/hdiutil children, detaches every
+# image attached from or mounted in that directory, and removes it.
+#
 # Each case runs navctl with a private TMPDIR, so its scratch root is
 # <work>/<case>/tmp/navctl-scratch. `STATE` lines list what `hdiutil info`
 # still shows for the case afterwards; an empty STATE is a clean exit.
@@ -18,6 +22,23 @@ DROPPER=$REPO/crates/nav-core/fixtures/suspicious/dropper.sh
 WORK=$(cd "$(mktemp -d /tmp/navrepro.XXXXXX)" && pwd -P)
 HD=/usr/bin/hdiutil
 C=
+
+# Runs once on any exit. Stopped (SIGSTOP) children still die on SIGKILL.
+cleanup() {
+    trap - EXIT INT TERM HUP
+    local j d
+    for j in $(jobs -p); do kill -KILL "$j" 2>/dev/null; done
+    pkill -KILL -f "$WORK" 2>/dev/null
+    sleep 1
+    for d in $(python3 "$WORK/attached.py" "$WORK" 2>/dev/null | cut -f1 | cut -d, -f1); do
+        $HD detach "$d" -force -quiet
+    done
+    left=$(python3 "$WORK/attached.py" "$WORK" 2>/dev/null)
+    [ -n "$left" ] && printf 'still attached, detach by hand:\n%s\n' "$left" >&2
+    rm -rf "$WORK"
+}
+trap cleanup EXIT
+trap 'exit 130' INT TERM HUP
 
 cat >"$WORK/attached.py" <<'EOF'
 import plistlib, subprocess, sys
@@ -656,6 +677,4 @@ C=$WORK
 say
 say "=== leftovers under the work dir before final cleanup"
 state final
-detach_all "$WORK"
-rm -rf "$WORK" 2>/dev/null
 exit 0
