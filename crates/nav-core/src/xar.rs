@@ -1414,8 +1414,8 @@ fn walk_toc(toc: &[u8], limits: &XarLimits, archive: &mut XarArchive) {
                             other => XarKind::Other(other.to_string()),
                         }
                     }
-                    (Some("data"), "offset") => node.offset = parse_u64(raw),
-                    (Some("data"), "length") => node.length = parse_u64(raw),
+                    (Some("data"), "offset") => node.offset = strtoll(raw, 0),
+                    (Some("data"), "length") => node.length = strtoll(raw, 10),
                     (Some("data"), "size") => node.size = parse_u64(raw),
                     _ => {}
                 }
@@ -1494,6 +1494,40 @@ fn is_blank(raw: &[u8]) -> bool {
     xml::decode_entities(raw)
         .bytes()
         .all(|c| matches!(c, b' ' | b'\t' | b'\n' | b'\r'))
+}
+
+/// Parse element text as C `strtoll` does, as libxar reads `<offset>`
+/// (`radix` 0: `0x` hex, a leading `0` octal) and `<length>` (`radix` 10):
+/// leading whitespace and a sign allowed, stopping at the first non-digit.
+/// `None` with no digits, a negative value, or past `i64::MAX`.
+fn strtoll(raw: &[u8], radix: u32) -> Option<u64> {
+    let start = raw
+        .iter()
+        .position(|c| !matches!(c, b' ' | b'\t' | b'\n' | b'\r' | 0x0b | 0x0c))
+        .unwrap_or(raw.len());
+    let mut t = raw.get(start..)?;
+    let negative = t.first() == Some(&b'-');
+    if matches!(t.first(), Some(b'-' | b'+')) {
+        t = t.get(1..)?;
+    }
+    let (radix, digits) = match (radix, t) {
+        (0, [b'0', b'x' | b'X', rest @ ..]) if rest.first().is_some_and(u8::is_ascii_hexdigit) => {
+            (16, rest)
+        }
+        (0, [b'0', ..]) => (8, t),
+        (0, _) => (10, t),
+        (r, _) => (r, t),
+    };
+    let mut v: u64 = 0;
+    let mut any = false;
+    for &c in digits {
+        let Some(d) = char::from(c).to_digit(radix) else {
+            break;
+        };
+        v = v.checked_mul(u64::from(radix))?.checked_add(u64::from(d))?;
+        any = true;
+    }
+    (any && v <= i64::MAX as u64 && !(negative && v != 0)).then_some(v)
 }
 
 /// Parse element text as a decimal `u64`, rejecting anything else.
@@ -3008,6 +3042,37 @@ mod tests {
         assert_eq!(parse_u64(b"12a"), None);
         assert_eq!(parse_u64(b"-1"), None);
         assert_eq!(parse_u64(b"99999999999999999999999"), None);
+    }
+
+    /// `<offset>` reads as C `strtoll` base 0 and `<length>` base 10, as
+    /// libxar reads them; cases checked against /usr/bin/xar (#179).
+    #[test]
+    fn heap_numbers_parse_as_libxar_does() {
+        let base0 = [
+            ("20", Some(20)),
+            ("024", Some(20)),
+            ("0X14", Some(20)),
+            (" +20 ", Some(20)),
+            ("20abc", Some(20)),
+            ("0800", Some(0)),
+            ("0x", Some(0)),
+            ("-0", Some(0)),
+            ("-5", None),
+            ("", None),
+            ("x", None),
+            ("9223372036854775808", None),
+        ];
+        for (text, want) in base0 {
+            assert_eq!(strtoll(text.as_bytes(), 0), want, "{text:?}");
+        }
+        for (text, want) in [("015", Some(15)), ("0x0d", Some(0)), ("13abc", Some(13))] {
+            assert_eq!(strtoll(text.as_bytes(), 10), want, "{text:?}");
+        }
+        let a = toc_archive(
+            r#"<file id="1"><name>Scripts</name><data><offset>01000</offset><length>010</length></data></file>"#,
+        );
+        let f = a.files.first().expect("file");
+        assert_eq!((f.offset, f.length), (Some(512), Some(10)));
     }
 
     use super::toc_xar_bytes;
