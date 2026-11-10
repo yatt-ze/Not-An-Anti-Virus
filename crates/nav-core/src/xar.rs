@@ -143,7 +143,8 @@ pub enum XarHalt {
     TocTooLarge,
     /// The TOC is not a valid zlib stream.
     TocUndecodable,
-    /// The TOC inflated but is not well-formed XML we can walk.
+    /// The TOC inflated but is not well-formed XML we can walk, or holds a
+    /// base64 `<name>` that can't be decoded as libxar would.
     TocMalformed,
     /// Hit `max_entries`.
     EntryLimit,
@@ -1270,6 +1271,10 @@ fn walk_toc(toc: &[u8], limits: &XarLimits, archive: &mut XarArchive) {
     // A TOC with no `<toc>` element must halt, not come back "complete, zero
     // files" (which reads as "package contains nothing").
     let mut saw_toc = false;
+    // The open `<file>`'s `<name>` is `enctype="base64"`; a base64 name NAV
+    // can't decode as libxar would leaves the TOC incomplete (#180).
+    let mut name_b64 = false;
+    let mut bad_name = false;
 
     loop {
         match sc.next_event() {
@@ -1316,6 +1321,9 @@ fn walk_toc(toc: &[u8], limits: &XarLimits, archive: &mut XarArchive) {
                         if !self_closing {
                             open_files.push(idx);
                         }
+                    }
+                    "name" if parent_elem == Some("file") => {
+                        name_b64 = xml::attr_local(attrs, "enctype").as_deref() == Some("base64");
                     }
                     "encoding" if parent_elem == Some("data") => {
                         if let Some(i) = open_files.last().copied() {
@@ -1389,7 +1397,16 @@ fn walk_toc(toc: &[u8], limits: &XarLimits, archive: &mut XarArchive) {
                 };
 
                 match (parent, elem) {
-                    (Some("file"), "name") => node.name = Some(xml::decode_entities(raw)),
+                    (Some("file"), "name") => {
+                        let text = xml::decode_entities(raw);
+                        node.name = if name_b64 {
+                            let decoded = base64_name(&text);
+                            bad_name |= decoded.is_none();
+                            decoded.filter(|n| !n.is_empty())
+                        } else {
+                            Some(text)
+                        };
+                    }
                     (Some("file"), "type") => {
                         node.kind = match xml::decode_entities(raw).as_str() {
                             "file" => XarKind::File,
@@ -1406,7 +1423,7 @@ fn walk_toc(toc: &[u8], limits: &XarLimits, archive: &mut XarArchive) {
         }
     }
 
-    if !saw_toc && archive.halted.is_none() {
+    if (bad_name || !saw_toc) && archive.halted.is_none() {
         archive.halted = Some(XarHalt::TocMalformed);
     }
 
@@ -1451,6 +1468,24 @@ fn resolve_paths(nodes: &[Node], limits: &XarLimits) -> Vec<XarFile> {
         });
     }
     out
+}
+
+/// A `<name enctype="base64">` value decoded and cut at a NUL, as libxar
+/// does, or `None` unless it is canonical base64 (padded, no inner spaces):
+/// libxar misreads or refuses anything else.
+fn base64_name(text: &str) -> Option<String> {
+    let t = text.trim_matches([' ', '\t', '\n', '\r']);
+    let body = t.trim_end_matches('=');
+    let canonical = t.len() % 4 == 0
+        && t.len() - body.len() <= 2
+        && body.bytes().all(|b| crate::base64::char_value(b).is_some());
+    if !canonical {
+        return None;
+    }
+    let (bytes, _) =
+        crate::base64::decode_bounded(t.as_bytes(), t.len(), crate::base64::OnInvalid::Stop);
+    let name = bytes.split(|&b| b == 0).next().unwrap_or(&[]);
+    Some(String::from_utf8_lossy(name).into_owned())
 }
 
 /// True if `raw` decodes to XML whitespace only, which libxml2 reports as a
@@ -3037,6 +3072,34 @@ mod tests {
             got,
             [("Scripts", Some(7)), ("<unnamed>", None), ("ipts", None)]
         );
+    }
+
+    /// A base64 `<name>` is decoded and cut at a NUL, as libxar does; one
+    /// that isn't canonical base64 is unnamed and the TOC incomplete (#180).
+    #[test]
+    fn toc_base64_names_decode_as_libxar_does() {
+        let a = toc_archive(
+            r#"<file id="1"><name enctype="base64">
+	U2NyaXB0cw==
+</name></file><file id="2"><name n:enctype="base64">U2NyaXB0cwB4eHg=</name></file><file id="3"><name enctype="BASE64">U2NyaXB0cw==</name></file>"#,
+        );
+        assert!(a.is_complete());
+        let paths: Vec<_> = a.files.iter().map(|f| f.path.as_str()).collect();
+        assert_eq!(paths, ["Scripts", "Scripts", "U2NyaXB0cw=="]);
+        assert!(a.files.first().is_some_and(XarFile::is_metadata_entry));
+
+        for bad in [
+            "U2Ny cmlwdHM=",
+            "U2Ny*cmlwdHM=",
+            "U2NyaXB0cw",
+            "U2NyaXB0cw=",
+        ] {
+            let a = toc_archive(&format!(
+                r#"<file id="1"><name enctype="base64">{bad}</name></file>"#
+            ));
+            assert_eq!(a.halted, Some(XarHalt::TocMalformed), "{bad}");
+            assert_eq!(a.files.first().map(|f| f.path.as_str()), Some("<unnamed>"));
+        }
     }
 
     /// Recording is by depth (`<xar><toc>`), not by parent name, and a later
