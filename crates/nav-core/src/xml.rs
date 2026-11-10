@@ -300,6 +300,8 @@ pub enum Event<'a> {
         name: &'a str,
     },
     Text(&'a [u8]),
+    /// A CDATA section's contents, verbatim.
+    CData(&'a [u8]),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -358,7 +360,7 @@ impl<'a> Scanner<'a> {
                     Some(i) => {
                         let text = rest.get(9..i).unwrap_or(&[]);
                         self.pos = self.pos.saturating_add(i + 3);
-                        return Next::Event(Event::Text(text));
+                        return Next::Event(Event::CData(text));
                     }
                     None => return Next::Bad,
                 }

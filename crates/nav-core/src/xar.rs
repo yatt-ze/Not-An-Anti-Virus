@@ -1356,6 +1356,10 @@ fn walk_toc(toc: &[u8], limits: &XarLimits, archive: &mut XarArchive) {
                     elems.pop();
                 }
             }
+            // libxar sets a value from text nodes only: CDATA and
+            // whitespace-only text leave it as it was (#182).
+            Next::Event(Event::CData(_)) => {}
+            Next::Event(Event::Text(raw)) if is_blank(raw) => {}
             Next::Event(Event::Text(raw)) => {
                 let Some(&elem) = elems.last() else { continue };
                 let parent = elems
@@ -1447,6 +1451,14 @@ fn resolve_paths(nodes: &[Node], limits: &XarLimits) -> Vec<XarFile> {
         });
     }
     out
+}
+
+/// True if `raw` decodes to XML whitespace only, which libxml2 reports as a
+/// whitespace node rather than text.
+fn is_blank(raw: &[u8]) -> bool {
+    xml::decode_entities(raw)
+        .bytes()
+        .all(|c| matches!(c, b' ' | b'\t' | b'\n' | b'\r'))
 }
 
 /// Parse element text as a decimal `u64`, rejecting anything else.
@@ -3005,6 +3017,26 @@ mod tests {
         assert_eq!(f.encoding.as_deref(), Some("application/x-gzip"));
         let sig = a.signature.expect("signature");
         assert_eq!((sig.offset, sig.size), (Some(1), Some(2)));
+    }
+
+    /// A value is its last non-blank text node: CDATA and whitespace-only
+    /// text are ignored, as libxar does (#182).
+    #[test]
+    fn toc_values_ignore_cdata_and_blank_text() {
+        let a = toc_archive(
+            r#"<file id="1"><name>Scripts<![CDATA[x]]><x/>&#32;
+</name><data><offset>7<![CDATA[9]]><x/> </offset></data></file><file id="2"><name><![CDATA[Scripts]]></name></file><file id="3"><name>Scr<!--c-->ipts</name></file>"#,
+        );
+        assert!(a.is_complete());
+        let got: Vec<_> = a
+            .files
+            .iter()
+            .map(|f| (f.path.as_str(), f.offset))
+            .collect();
+        assert_eq!(
+            got,
+            [("Scripts", Some(7)), ("<unnamed>", None), ("ipts", None)]
+        );
     }
 
     /// Recording is by depth (`<xar><toc>`), not by parent name, and a later

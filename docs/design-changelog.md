@@ -5,7 +5,7 @@ for the current document map. Newest first.
 
 ---
 
-**Changelog from v0.91 (2026-11-10):** The xar TOC is read as libxar reads it (§6.2, §11.8, parser conformance audit). Elements and attributes now match by local name: a `Scripts` entry written `<n:name>Scripts</n:name>` under a declared prefix was `<unnamed>` to NAV, so it was never read and the package came out `Complete` and clean while Installer ran its scripts (#181).
+**Changelog from v0.91 (2026-11-10):** The xar TOC is read as libxar reads it (§6.2, §11.8, parser conformance audit). Elements and attributes now match by local name: a `Scripts` entry written `<n:name>Scripts</n:name>` under a declared prefix was `<unnamed>` to NAV, so it was never read and the package came out `Complete` and clean while Installer ran its scripts (#181). A value is now the last text node that is not whitespace only, as libxar sets it: a CDATA section overwrote it, so `<name>Scripts<![CDATA[x]]></name>` was `x` to NAV and the package read clean (#182).
 
 ---
 

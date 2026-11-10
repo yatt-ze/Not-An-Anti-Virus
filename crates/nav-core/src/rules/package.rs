@@ -1095,7 +1095,7 @@ fn pkg_ref_paths(text: &[u8], query: &RefQuery) -> Option<Vec<usize>> {
                 },
                 None,
             ) => wiring.open(name, attrs, self_closing),
-            (xml::Event::Text(t), Some(_)) => content.extend_from_slice(t),
+            (xml::Event::Text(t) | xml::Event::CData(t), Some(_)) => content.extend_from_slice(t),
             (xml::Event::Close { name }, Some(_)) if !inner.is_empty() => {
                 if inner.pop() != Some(name) {
                     return None;
