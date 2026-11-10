@@ -441,7 +441,7 @@ impl HighEntropyRule {
         anchored: impl FnOnce() -> bool,
     ) -> Result<Option<MatchedSignal>, RuleOutcome> {
         let content = ctx.content.as_ref().ok_or(RuleOutcome::NotApplicable)?;
-        if content.is_empty() {
+        if content.is_empty() || super::zip_member::scored_through_members(ctx) {
             return Ok(None);
         }
 

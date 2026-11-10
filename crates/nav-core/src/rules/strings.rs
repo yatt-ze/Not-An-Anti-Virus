@@ -748,6 +748,9 @@ impl Rule for SuspiciousStringsRule {
     }
 
     fn evaluate(&self, ctx: &ScanContext) -> Result<Option<MatchedSignal>, RuleOutcome> {
+        if super::zip_member::scored_through_members(ctx) {
+            return Ok(None);
+        }
         let mut hits = Hits::new();
 
         if ctx.truncated && can_stream(ctx) {

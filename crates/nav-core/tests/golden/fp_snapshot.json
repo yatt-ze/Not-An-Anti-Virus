@@ -447,6 +447,14 @@
     ],
     "completeness": "complete"
   },
+  "suspicious/dropper_in_stored_zip.zip": {
+    "score": 20,
+    "recommendation": "notify",
+    "rule_ids": [
+      "zip-member-suspicious"
+    ],
+    "completeness": "complete"
+  },
   "suspicious/dropper_in_zip.zip": {
     "score": 20,
     "recommendation": "notify",
