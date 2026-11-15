@@ -119,7 +119,8 @@ fn is_real_file(path: &Path) -> bool {
 /// Bundle members that are compiled UI/localization resources or the code
 /// signature — never a code payload, so traversed but not *scored* (§1, §5.8).
 /// Narrow on purpose: scripts, dylibs, non-`Info.plist` plists and nested apps
-/// are still scanned.
+/// are still scanned. `path` is relative to the bundle root, so the bundle's
+/// own ancestors can't match.
 pub fn is_inert_bundle_resource(path: &Path) -> bool {
     for component in path.components() {
         if let Component::Normal(c) = component {
@@ -309,30 +310,24 @@ mod tests {
 
     #[test]
     fn inert_resources_are_recognized() {
+        assert!(is_inert_bundle_resource(Path::new("Contents/Info.plist")));
+        assert!(is_inert_bundle_resource(Path::new("Contents/PkgInfo")));
         assert!(is_inert_bundle_resource(Path::new(
-            "Foo.app/Contents/Info.plist"
+            "Contents/_CodeSignature/CodeResources"
         )));
         assert!(is_inert_bundle_resource(Path::new(
-            "Foo.app/Contents/PkgInfo"
+            "Contents/Resources/en.lproj/Main.strings"
         )));
         assert!(is_inert_bundle_resource(Path::new(
-            "Foo.app/Contents/_CodeSignature/CodeResources"
-        )));
-        assert!(is_inert_bundle_resource(Path::new(
-            "Foo.app/Contents/Resources/en.lproj/Main.strings"
-        )));
-        assert!(is_inert_bundle_resource(Path::new(
-            "Foo.app/Contents/Resources/Assets.car"
+            "Contents/Resources/Assets.car"
         )));
 
+        assert!(!is_inert_bundle_resource(Path::new("Contents/MacOS/Foo")));
         assert!(!is_inert_bundle_resource(Path::new(
-            "Foo.app/Contents/MacOS/Foo"
+            "Contents/Resources/update.sh"
         )));
         assert!(!is_inert_bundle_resource(Path::new(
-            "Foo.app/Contents/Resources/update.sh"
-        )));
-        assert!(!is_inert_bundle_resource(Path::new(
-            "Foo.app/Contents/Library/LaunchServices/helper.plist"
+            "Contents/Library/LaunchServices/helper.plist"
         )));
     }
 }

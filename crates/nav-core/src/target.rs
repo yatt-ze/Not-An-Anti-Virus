@@ -196,9 +196,10 @@ pub fn scan_target_with_budget(
     if let Some(layout) = BundleLayout::detect(path) {
         // A bundle is always traversed in full; `recursive` doesn't apply.
         let (all, collect_limit, unreadable) = collect_files(path, true, budget)?;
-        let (to_scan, skipped): (Vec<PathBuf>, Vec<PathBuf>) = all
-            .into_iter()
-            .partition(|p| !bundle::is_inert_bundle_resource(p));
+        let (to_scan, skipped): (Vec<PathBuf>, Vec<PathBuf>) = all.into_iter().partition(|p| {
+            let rel = p.strip_prefix(path).unwrap_or(p);
+            !bundle::is_inert_bundle_resource(rel)
+        });
         let (results, byte_limit) = scan_within_bytes(&to_scan, budget);
         return Ok(TargetScan {
             root: path.to_path_buf(),
@@ -470,6 +471,20 @@ mod tests {
         assert!(skipped.contains(&"Contents/_CodeSignature/CodeResources".to_string()));
 
         assert!(scan.primary_result().is_some());
+    }
+
+    #[test]
+    fn bundle_under_an_lproj_ancestor_still_scores_its_members() {
+        let dir = TempDir::new("lproj-ancestor");
+        let app = dir.path().join("x.lproj/Widget.app");
+        fs::create_dir_all(app.join("Contents/MacOS")).unwrap();
+        fs::write(app.join("Contents/Info.plist"), b"<plist/>").unwrap();
+        fs::write(app.join("Contents/MacOS/Widget"), b"#!/bin/sh\necho hi\n").unwrap();
+
+        let scan = scan_target(&app, false).unwrap();
+        assert_eq!(scan.kind, TargetKind::Bundle);
+        assert_eq!(scan.results.len(), 1);
+        assert!(scan.results[0].path.ends_with("Contents/MacOS/Widget"));
     }
 
     #[test]
