@@ -55,6 +55,15 @@ impl PlistValue {
             .map(|(_, v)| v)
     }
 
+    /// Every value for `key`, in document order, if this is a dict.
+    pub fn get_all<'a>(&'a self, key: &'a str) -> impl Iterator<Item = &'a PlistValue> + 'a {
+        self.as_dict()
+            .unwrap_or_default()
+            .iter()
+            .filter(move |(k, _)| k == key)
+            .map(|(_, v)| v)
+    }
+
     pub fn as_str(&self) -> Option<&str> {
         match self {
             PlistValue::String(s) => Some(s),
@@ -828,6 +837,8 @@ mod tests {
         for blob in [&xml[..], &binary[..]] {
             let v = parse(blob).expect("parses");
             assert_eq!(v.get("RunAtLoad").and_then(|x| x.as_bool()), Some(true));
+            let all: Vec<_> = v.get_all("RunAtLoad").filter_map(|x| x.as_bool()).collect();
+            assert_eq!(all, [false, true]);
         }
     }
 
