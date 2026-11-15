@@ -73,7 +73,7 @@ fn executable_from_info_plist(contents: &Path) -> Option<PathBuf> {
     let key = "CFBundleExecutable";
     // CoreFoundation keeps the first of a repeated key in a binary plist and
     // the last in XML (#183); `get` is last-wins.
-    let exe = if buf.starts_with(b"bplist") {
+    let exe = if buf.starts_with(b"bplist00") {
         info.as_dict()?
             .iter()
             .find(|(k, _)| k == key)

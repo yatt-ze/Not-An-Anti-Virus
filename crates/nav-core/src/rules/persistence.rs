@@ -494,7 +494,7 @@ mod tests {
 
     #[test]
     fn repeated_keys_are_read_as_launchd_reads_them() {
-        // launchd runs the last of a repeated key, XML or binary (#183).
+        // launchd runs the last of a repeated key (#183); plist.rs covers binary.
         let path = "/Users/x/Library/LaunchAgents/com.example.helper.plist";
         let last_only = br#"<plist version="1.0"><dict>
             <key>Label</key><string>com.example.helper</string>
