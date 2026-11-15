@@ -26,6 +26,13 @@ enum DvStatus {
     Signed,
 }
 
+/// System tools run by absolute path, so a hostile `PATH` cannot substitute
+/// them (§11.10).
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))] // only the macOS spawns use them
+const CODESIGN: &str = "/usr/bin/codesign";
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+const SPCTL: &str = "/usr/sbin/spctl";
+
 /// False if `path`'s string form contains a newline or carriage return. Both
 /// `codesign` and `spctl` echo the scanned path back into the stderr we parse
 /// line-anchored; a path containing a line break could forge an extra line
@@ -669,7 +676,7 @@ fn spawn_codesign_verify(path: &std::path::Path) -> Result<String, RuleOutcome> 
 
     // `--verify` writes its report to stderr too; exit status alone doesn't
     // distinguish "revoked" from "tampered" from "missing resource".
-    let output = Command::new("codesign")
+    let output = Command::new(CODESIGN)
         .arg("--verify")
         .arg("--deep")
         .arg("--strict")
@@ -709,7 +716,7 @@ const SIGNER_ANCHOR_FLAGS: &[&str] = &["--ignore-resources", "--all-architecture
 /// `None` if it was killed by a signal or failed to spawn.
 #[cfg(target_os = "macos")]
 fn spawn_strict_anchor_check(path: &std::path::Path) -> Option<i32> {
-    std::process::Command::new("codesign")
+    std::process::Command::new(CODESIGN)
         .arg("--verify")
         .args(STRICT_ANCHOR_FLAGS)
         .arg("-R=anchor apple generic")
@@ -731,7 +738,7 @@ fn spawn_strict_anchor_check(_path: &std::path::Path) -> Option<i32> {
 /// if it failed to spawn.
 #[cfg(target_os = "macos")]
 fn spawn_signer_check(path: &std::path::Path) -> Option<(Option<i32>, String)> {
-    let output = std::process::Command::new("codesign")
+    let output = std::process::Command::new(CODESIGN)
         .arg("--verify")
         .args(SIGNER_ANCHOR_FLAGS)
         .arg("-R=anchor apple generic")
@@ -907,7 +914,7 @@ fn spawn_spctl_assess(path: &std::path::Path) -> Result<String, RuleOutcome> {
     use std::process::Command;
 
     // `spctl -a` writes its assessment (including `source=`) to stderr.
-    let output = Command::new("spctl")
+    let output = Command::new(SPCTL)
         .arg("-a")
         .arg("-t")
         .arg("exec")
@@ -944,7 +951,7 @@ fn spawn_codesign_dv(path: &std::path::Path) -> Result<(bool, String), RuleOutco
     use std::process::Command;
 
     // `codesign -dv` writes its report to stderr regardless of exit status.
-    let output = Command::new("codesign")
+    let output = Command::new(CODESIGN)
         .arg("-dv")
         .arg("--verbose=4")
         .arg(path)
