@@ -891,6 +891,14 @@
     ],
     "completeness": "complete"
   },
+  "suspicious/persistence_repeated_keys.plist": {
+    "score": 20,
+    "recommendation": "notify",
+    "rule_ids": [
+      "launchd-persistence-plist"
+    ],
+    "completeness": "complete"
+  },
   "suspicious/tcc_keychain_exfil.sh": {
     "score": 24,
     "recommendation": "notify",
