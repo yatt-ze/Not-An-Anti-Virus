@@ -5,10 +5,17 @@
 //! Per §5.1, "unsigned" alone is a small generic signal — significant only in
 //! combination, which is the caller's job.
 
+#[cfg(target_os = "macos")]
+use std::ffi::OsStr;
+use std::time::Duration;
+
 use super::{Rule, RuleOutcome};
 use crate::context::ScanContext;
 use crate::macho::{MachOImage, CS_ADHOC, CS_LINKER_SIGNED};
 use crate::model::{MatchedSignal, SignalCategory};
+#[cfg(target_os = "macos")]
+use crate::process;
+use crate::process::Captured;
 
 /// What `codesign -dv` says about a code object's signature. Doesn't yet say
 /// anything about revocation or notarization — those are separate checks
@@ -24,6 +31,72 @@ enum DvStatus {
     AdHocLinkerSigned,
     /// A real (non-ad-hoc) identity — Developer ID, Apple, or otherwise.
     Signed,
+}
+
+/// System tools run by absolute path, so a hostile `PATH` cannot substitute
+/// them (§11.10).
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))] // only the macOS spawns use them
+const CODESIGN: &str = "/usr/bin/codesign";
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+const SPCTL: &str = "/usr/sbin/spctl";
+
+/// Wall-clock limit on each `codesign`/`spctl` spawn (§11.12). Slowest
+/// measured run was 10.3 s (Xcode, `--verify --deep`); the rest is headroom
+/// for parallel jobs and a cold revocation cache.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+const TOOL_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Runs `program` with [`TOOL_TIMEOUT`] and the capture cap; `None` if it
+/// could not be spawned.
+#[cfg(target_os = "macos")]
+fn run_tool(program: &str, args: &[&OsStr]) -> Option<Captured> {
+    process::run_capped(program, args, TOOL_TIMEOUT, None).ok()
+}
+
+/// A tool's stderr, or `None` ("couldn't check", §11.8) if it timed out or
+/// its stderr was cut: a partial report must never be classified.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn complete_stderr(out: &Captured) -> Option<String> {
+    if out.timed_out || out.stderr_cut {
+        return None;
+    }
+    Some(String::from_utf8_lossy(&out.stderr).into_owned())
+}
+
+/// `codesign --verify` / `spctl` report: the whole stderr or `NotApplicable`.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn stderr_report(out: Option<Captured>) -> Result<String, RuleOutcome> {
+    out.as_ref()
+        .and_then(complete_stderr)
+        .ok_or(RuleOutcome::NotApplicable)
+}
+
+/// `codesign -dv` report: exit success plus the whole stderr, or `NotApplicable`.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn dv_report(out: Option<Captured>) -> Result<(bool, String), RuleOutcome> {
+    let out = out.ok_or(RuleOutcome::NotApplicable)?;
+    let stderr = complete_stderr(&out).ok_or(RuleOutcome::NotApplicable)?;
+    Ok((out.success(), stderr))
+}
+
+/// Signer-check report: exit code (`None` if signalled) plus the whole
+/// stderr. Outer `None` is "couldn't check" (§11.8).
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn signer_report(out: Option<Captured>) -> Option<(Option<i32>, String)> {
+    let out = out?;
+    let stderr = complete_stderr(&out)?;
+    Some((out.status.and_then(|s| s.code()), stderr))
+}
+
+/// Exit code of the strict anchor check; `None` (not verified) on a timeout
+/// or a signal. Only the exit code is read, so a cut stderr doesn't matter.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+fn anchor_exit_code(out: Option<Captured>) -> Option<i32> {
+    let out = out?;
+    if out.timed_out {
+        return None;
+    }
+    out.status?.code()
 }
 
 /// False if `path`'s string form contains a newline or carriage return. Both
@@ -665,20 +738,17 @@ fn indicates_revocation(stderr: &str) -> bool {
 
 #[cfg(target_os = "macos")]
 fn spawn_codesign_verify(path: &std::path::Path) -> Result<String, RuleOutcome> {
-    use std::process::Command;
-
+    let arg = process::path_arg(path);
     // `--verify` writes its report to stderr too; exit status alone doesn't
     // distinguish "revoked" from "tampered" from "missing resource".
-    let output = Command::new("codesign")
-        .arg("--verify")
-        .arg("--deep")
-        .arg("--strict")
-        .arg("-v")
-        .arg(path)
-        .output()
-        .map_err(|_| RuleOutcome::NotApplicable)?;
-
-    Ok(String::from_utf8_lossy(&output.stderr).into_owned())
+    let args: [&OsStr; 5] = [
+        "--verify".as_ref(),
+        "--deep".as_ref(),
+        "--strict".as_ref(),
+        "-v".as_ref(),
+        arg.as_os_str(),
+    ];
+    stderr_report(run_tool(CODESIGN, &args))
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -707,18 +777,20 @@ const SIGNER_ANCHOR_FLAGS: &[&str] = &["--ignore-resources", "--all-architecture
 
 /// Exit code of `codesign --verify --strict -R="anchor apple generic" <path>`;
 /// `None` if it was killed by a signal or failed to spawn.
+/// Runs `codesign --verify <flags> -R="anchor apple generic" <path>`.
+#[cfg(target_os = "macos")]
+fn run_anchor_verify(flags: &[&str], path: &std::path::Path) -> Option<Captured> {
+    let arg = process::path_arg(path);
+    let mut args: Vec<&OsStr> = vec!["--verify".as_ref()];
+    args.extend(flags.iter().map(OsStr::new));
+    args.push("-R=anchor apple generic".as_ref());
+    args.push(arg.as_os_str());
+    run_tool(CODESIGN, &args)
+}
+
 #[cfg(target_os = "macos")]
 fn spawn_strict_anchor_check(path: &std::path::Path) -> Option<i32> {
-    std::process::Command::new("codesign")
-        .arg("--verify")
-        .args(STRICT_ANCHOR_FLAGS)
-        .arg("-R=anchor apple generic")
-        .arg(path)
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .ok()?
-        .code()
+    anchor_exit_code(run_anchor_verify(STRICT_ANCHOR_FLAGS, path))
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -731,18 +803,7 @@ fn spawn_strict_anchor_check(_path: &std::path::Path) -> Option<i32> {
 /// if it failed to spawn.
 #[cfg(target_os = "macos")]
 fn spawn_signer_check(path: &std::path::Path) -> Option<(Option<i32>, String)> {
-    let output = std::process::Command::new("codesign")
-        .arg("--verify")
-        .args(SIGNER_ANCHOR_FLAGS)
-        .arg("-R=anchor apple generic")
-        .arg(path)
-        .stdout(std::process::Stdio::null())
-        .output()
-        .ok()?;
-    Some((
-        output.status.code(),
-        String::from_utf8_lossy(&output.stderr).into_owned(),
-    ))
+    signer_report(run_anchor_verify(SIGNER_ANCHOR_FLAGS, path))
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -904,19 +965,16 @@ fn parse_spctl_source(output: &str) -> Option<&str> {
 
 #[cfg(target_os = "macos")]
 fn spawn_spctl_assess(path: &std::path::Path) -> Result<String, RuleOutcome> {
-    use std::process::Command;
-
+    let arg = process::path_arg(path);
     // `spctl -a` writes its assessment (including `source=`) to stderr.
-    let output = Command::new("spctl")
-        .arg("-a")
-        .arg("-t")
-        .arg("exec")
-        .arg("-vv")
-        .arg(path)
-        .output()
-        .map_err(|_| RuleOutcome::NotApplicable)?;
-
-    Ok(String::from_utf8_lossy(&output.stderr).into_owned())
+    let args: [&OsStr; 5] = [
+        "-a".as_ref(),
+        "-t".as_ref(),
+        "exec".as_ref(),
+        "-vv".as_ref(),
+        arg.as_os_str(),
+    ];
+    stderr_report(run_tool(SPCTL, &args))
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -941,20 +999,10 @@ fn run_codesign_dv(ctx: &ScanContext) -> Result<DvStatus, RuleOutcome> {
 
 #[cfg(target_os = "macos")]
 fn spawn_codesign_dv(path: &std::path::Path) -> Result<(bool, String), RuleOutcome> {
-    use std::process::Command;
-
+    let arg = process::path_arg(path);
     // `codesign -dv` writes its report to stderr regardless of exit status.
-    let output = Command::new("codesign")
-        .arg("-dv")
-        .arg("--verbose=4")
-        .arg(path)
-        .output()
-        .map_err(|_| RuleOutcome::NotApplicable)?;
-
-    Ok((
-        output.status.success(),
-        String::from_utf8_lossy(&output.stderr).into_owned(),
-    ))
+    let args: [&OsStr; 3] = ["-dv".as_ref(), "--verbose=4".as_ref(), arg.as_os_str()];
+    dv_report(run_tool(CODESIGN, &args))
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -1659,5 +1707,83 @@ mod tests {
         let out = "source=Notarized Developer ID: rejected\n\
              source=Unnotarized Developer ID\n";
         assert_eq!(parse_spctl_source(out), Some("Unnotarized Developer ID"));
+    }
+
+    #[cfg(unix)]
+    mod tool_captures {
+        use super::*;
+        use std::os::unix::process::ExitStatusExt;
+        use std::process::ExitStatus;
+
+        fn exited(code: i32, stderr: &str) -> Captured {
+            Captured {
+                status: Some(ExitStatus::from_raw(code << 8)),
+                stdout: Vec::new(),
+                stdout_cut: false,
+                stderr: stderr.as_bytes().to_vec(),
+                stderr_cut: false,
+                timed_out: false,
+            }
+        }
+
+        fn timed_out() -> Captured {
+            Captured {
+                status: None,
+                timed_out: true,
+                ..exited(0, "partial")
+            }
+        }
+
+        fn cut() -> Captured {
+            Captured {
+                stderr_cut: true,
+                ..exited(0, "partial")
+            }
+        }
+
+        #[test]
+        fn a_timeout_or_cut_stderr_is_not_a_report() {
+            assert!(stderr_report(Some(timed_out())).is_err());
+            assert!(stderr_report(Some(cut())).is_err());
+            assert!(stderr_report(None).is_err());
+            assert!(dv_report(Some(timed_out())).is_err());
+            assert!(dv_report(Some(cut())).is_err());
+            assert!(dv_report(None).is_err());
+            assert_eq!(signer_report(Some(timed_out())), None);
+            assert_eq!(signer_report(Some(cut())), None);
+            assert_eq!(signer_report(None), None);
+            assert_eq!(anchor_exit_code(Some(timed_out())), None);
+            assert_eq!(anchor_exit_code(None), None);
+            // Exit code only: a cut stderr still counts.
+            assert_eq!(anchor_exit_code(Some(cut())), Some(0));
+        }
+
+        #[test]
+        fn a_finished_tool_passes_status_and_stderr_through() {
+            assert_eq!(stderr_report(Some(exited(1, "x\n"))), Ok("x\n".into()));
+            assert_eq!(
+                dv_report(Some(exited(0, "ok"))),
+                Ok((true, "ok".to_string()))
+            );
+            assert_eq!(
+                dv_report(Some(exited(1, "bad"))),
+                Ok((false, "bad".to_string()))
+            );
+            assert_eq!(
+                signer_report(Some(exited(3, "unmet"))),
+                Some((Some(3), "unmet".to_string()))
+            );
+            assert_eq!(anchor_exit_code(Some(exited(0, ""))), Some(0));
+            assert_eq!(anchor_exit_code(Some(exited(3, ""))), Some(3));
+        }
+
+        #[test]
+        fn a_signalled_tool_has_no_exit_code() {
+            let killed = Captured {
+                status: Some(ExitStatus::from_raw(9)),
+                ..exited(0, "")
+            };
+            assert_eq!(anchor_exit_code(Some(killed)), None);
+        }
     }
 }

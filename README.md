@@ -53,7 +53,7 @@ macOS's built-in defences turned on.
 
 ## Status
 
-NAV is in **early development** (v0.7.1).
+NAV is in **early development** (v0.7.2).
 
 - [x] `navctl scan`: a verdict for a file, a folder or a `.app` bundle
 - [x] `navctl rules test`: the full signal-by-signal breakdown, as text or JSON

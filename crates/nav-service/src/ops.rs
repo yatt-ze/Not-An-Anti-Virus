@@ -12,6 +12,12 @@ use std::path::{Path, PathBuf};
 
 use anyhow::Result;
 
+/// System tools run by absolute path, so a hostile `PATH` cannot substitute
+/// them (§11.10).
+const LAUNCHCTL: &str = "/bin/launchctl";
+const CODESIGN: &str = "/usr/bin/codesign";
+const TCCUTIL: &str = "/usr/bin/tccutil";
+
 /// Privileged operations that a temp-dir prefix cannot fake.
 ///
 /// Implementors either perform them ([`RealSystemOps`], sudo) or record and
@@ -74,9 +80,7 @@ pub struct RealSystemOps;
 
 impl RealSystemOps {
     fn launchctl(args: &[&str]) -> Result<std::process::Output> {
-        Ok(std::process::Command::new("launchctl")
-            .args(args)
-            .output()?)
+        Ok(std::process::Command::new(LAUNCHCTL).args(args).output()?)
     }
 }
 
@@ -88,7 +92,7 @@ impl SystemOps for RealSystemOps {
     }
 
     fn codesign_adhoc(&self, path: &Path, identifier: &str) -> Result<()> {
-        let out = std::process::Command::new("codesign")
+        let out = std::process::Command::new(CODESIGN)
             .args(["-f", "-s", "-", "-i", identifier])
             .arg(path)
             .output()?;
@@ -101,7 +105,7 @@ impl SystemOps for RealSystemOps {
     }
 
     fn bootstrap(&self, plist: &Path) -> Result<()> {
-        let out = std::process::Command::new("launchctl")
+        let out = std::process::Command::new(LAUNCHCTL)
             .args(["bootstrap", "system"])
             .arg(plist)
             .output()?;
@@ -141,7 +145,7 @@ impl SystemOps for RealSystemOps {
         // Best-effort: a non-zero exit (e.g. no such grant) is not a failure —
         // only a failure to *run* tccutil is. This is the one artifact with no
         // guaranteed removal, reported by the residue check, not asserted clean.
-        std::process::Command::new("tccutil")
+        std::process::Command::new(TCCUTIL)
             .args(["reset", service, identifier])
             .output()?;
         Ok(())

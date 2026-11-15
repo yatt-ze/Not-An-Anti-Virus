@@ -7,12 +7,12 @@ use std::ffi::OsStr;
 use std::io::{self, Read};
 use std::os::unix::fs::{DirBuilderExt, MetadataExt};
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicI32, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
+use nav_core::process::{path_arg, run_capped, Captured};
 use nav_core::{plist, scan_target_with_budget, PlistValue, ScanBudget, TargetScan};
 
 const HDIUTIL: &str = "/usr/bin/hdiutil";
@@ -25,13 +25,8 @@ pub const MAX_VOLUME_BYTES: u64 = 64 * 1024 * 1024 * 1024;
 pub const MOUNT_TIMEOUT: Duration = Duration::from_secs(60);
 /// Wall-clock limit on every other `hdiutil` call.
 const QUERY_TIMEOUT: Duration = Duration::from_secs(30);
-/// Bytes kept from each of an `hdiutil` call's stdout and stderr.
-const MAX_CAPTURE: usize = 1024 * 1024;
 /// How long the main thread waits for the worker after a cancel signal.
 const CANCEL_GRACE: Duration = Duration::from_secs(2);
-/// How long output is collected once hdiutil exits; a helper holding the
-/// pipe open must not hang navctl.
-const PIPE_GRACE: Duration = Duration::from_secs(2);
 const SCRATCH_DIR_NAME: &str = "navctl-scratch";
 
 /// Signal number received (SIGINT/SIGTERM/SIGHUP), or 0.
@@ -143,9 +138,10 @@ fn mount_and_scan(
             MAX_IMAGE_BYTES >> 30
         )));
     }
+    let image_arg = path_arg(image);
     // Before anything else reads the image: `imageinfo` on an encrypted
     // image without `-stdinpass` raises a GUI passphrase prompt.
-    let enc = query_plist(&[os("isencrypted"), os("-plist"), image.as_os_str()])?;
+    let enc = query_plist(&[os("isencrypted"), os("-plist"), image_arg.as_os_str()])?;
     match enc.get("encrypted").and_then(PlistValue::as_bool) {
         Some(false) => {}
         Some(true) => return Err("image is encrypted".into()),
@@ -155,7 +151,7 @@ fn mount_and_scan(
         os("imageinfo"),
         os("-plist"),
         os("-stdinpass"),
-        image.as_os_str(),
+        image_arg.as_os_str(),
     ])?;
     let logical = info
         .get("Size Information")
@@ -187,7 +183,7 @@ fn mount_and_scan(
             os("-plist"),
             os("-mountrandom"),
             run.as_os_str(),
-            image.as_os_str(),
+            image_arg.as_os_str(),
         ],
         MOUNT_TIMEOUT,
     )
@@ -199,11 +195,9 @@ fn mount_and_scan(
         )));
     }
     if !out.success() {
-        return Err(format!("mount failed: {}", out.error_line()));
+        return Err(format!("mount failed: {}", error_line(&out)));
     }
-    let attached = out
-        .plist()
-        .ok_or("mount failed: unreadable hdiutil output")?;
+    let attached = captured_plist(&out).ok_or("mount failed: unreadable hdiutil output")?;
     let entities = parse_attach(&attached, run);
     if entities.volumes.is_empty() {
         return Err("no volume on the image mounted".into());
@@ -537,36 +531,22 @@ fn detach(a: &Attachment) {
     }
 }
 
-/// Captured result of one `hdiutil` call.
-struct Captured {
-    status: Option<ExitStatus>,
-    stdout: Vec<u8>,
-    stdout_cut: bool,
-    stderr: Vec<u8>,
-    timed_out: bool,
+/// `out`'s stdout as a plist, or `None` if it was cut or unparseable.
+fn captured_plist(out: &Captured) -> Option<PlistValue> {
+    if out.stdout_cut {
+        return None;
+    }
+    plist::parse(&out.stdout)
 }
 
-impl Captured {
-    fn success(&self) -> bool {
-        !self.timed_out && self.status.is_some_and(|s| s.success())
-    }
-
-    fn plist(&self) -> Option<PlistValue> {
-        if self.stdout_cut {
-            return None;
-        }
-        plist::parse(&self.stdout)
-    }
-
-    /// The last stderr line that is not a deprecation warning.
-    fn error_line(&self) -> String {
-        String::from_utf8_lossy(&self.stderr)
-            .lines()
-            .rev()
-            .find(|l| !l.trim().is_empty() && !l.contains("deprecated"))
-            .map(|l| l.trim().trim_start_matches("hdiutil: ").to_string())
-            .unwrap_or_else(|| "hdiutil reported no reason".into())
-    }
+/// The last stderr line that is not a deprecation warning.
+fn error_line(out: &Captured) -> String {
+    String::from_utf8_lossy(&out.stderr)
+        .lines()
+        .rev()
+        .find(|l| !l.trim().is_empty() && !l.contains("deprecated"))
+        .map(|l| l.trim().trim_start_matches("hdiutil: ").to_string())
+        .unwrap_or_else(|| "hdiutil reported no reason".into())
 }
 
 fn query_plist(args: &[&OsStr]) -> Result<PlistValue, String> {
@@ -576,10 +556,9 @@ fn query_plist(args: &[&OsStr]) -> Result<PlistValue, String> {
         return Err(format!("hdiutil {verb} timed out"));
     }
     if !out.success() {
-        return Err(format!("hdiutil {verb} failed: {}", out.error_line()));
+        return Err(format!("hdiutil {verb} failed: {}", error_line(&out)));
     }
-    out.plist()
-        .ok_or_else(|| format!("hdiutil {verb}: unreadable output"))
+    captured_plist(&out).ok_or_else(|| format!("hdiutil {verb}: unreadable output"))
 }
 
 fn run_hdiutil(args: &[&OsStr], timeout: Duration) -> io::Result<Captured> {
@@ -587,12 +566,12 @@ fn run_hdiutil(args: &[&OsStr], timeout: Duration) -> io::Result<Captured> {
         if CANCEL.load(Ordering::SeqCst) != 0 {
             return Err(io::Error::new(io::ErrorKind::Interrupted, "interrupted"));
         }
-        run_capped(HDIUTIL, args, timeout, true)
+        run_capped(HDIUTIL, args, timeout, Some(&CANCEL))
     })
 }
 
 fn run_hdiutil_uncancellable(args: &[&OsStr], timeout: Duration) -> io::Result<Captured> {
-    retry_busy(|| run_capped(HDIUTIL, args, timeout, false))
+    retry_busy(|| run_capped(HDIUTIL, args, timeout, None))
 }
 
 /// Extra attempts for an hdiutil call failing with EAGAIN (about 14 s).
@@ -613,86 +592,6 @@ fn retry_busy(mut call: impl FnMut() -> io::Result<Captured>) -> io::Result<Capt
         }
         thread::sleep(Duration::from_millis(250 * u64::from(attempt)));
     }
-}
-
-/// Runs `program` with empty stdin, keeping up to [`MAX_CAPTURE`] of each
-/// output stream (drained concurrently so the child never blocks), killed
-/// at `timeout` or, when `cancellable`, on a cancel signal.
-fn run_capped(
-    program: &str,
-    args: &[&OsStr],
-    timeout: Duration,
-    cancellable: bool,
-) -> io::Result<Captured> {
-    let mut child = Command::new(program)
-        .args(args)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()?;
-    let stdout = drain(child.stdout.take());
-    let stderr = drain(child.stderr.take());
-    let deadline = Instant::now() + timeout;
-    let (status, timed_out) = wait_until(&mut child, deadline, cancellable)?;
-    // Not received in time counts as cut, so the output is not trusted.
-    let (stdout, stdout_cut) = stdout
-        .recv_timeout(PIPE_GRACE)
-        .unwrap_or((Vec::new(), true));
-    let (stderr, _) = stderr.recv_timeout(PIPE_GRACE).unwrap_or_default();
-    Ok(Captured {
-        status,
-        stdout,
-        stdout_cut,
-        stderr,
-        timed_out,
-    })
-}
-
-fn wait_until(
-    child: &mut Child,
-    deadline: Instant,
-    cancellable: bool,
-) -> io::Result<(Option<ExitStatus>, bool)> {
-    loop {
-        if let Some(status) = child.try_wait()? {
-            return Ok((Some(status), false));
-        }
-        let cancelled = cancellable && CANCEL.load(Ordering::SeqCst) != 0;
-        if cancelled || Instant::now() >= deadline {
-            let _ = child.kill();
-            let _ = child.wait();
-            return Ok((None, true));
-        }
-        thread::sleep(Duration::from_millis(20));
-    }
-}
-
-/// Reads `pipe` to EOF on a thread, keeping the first [`MAX_CAPTURE`] bytes;
-/// the flag is true if more was discarded.
-fn drain<R: Read + Send + 'static>(pipe: Option<R>) -> mpsc::Receiver<(Vec<u8>, bool)> {
-    let (tx, rx) = mpsc::channel();
-    thread::spawn(move || {
-        let mut kept = Vec::new();
-        let mut cut = false;
-        let Some(mut pipe) = pipe else {
-            let _ = tx.send((kept, cut));
-            return;
-        };
-        let mut buf = [0u8; 8192];
-        loop {
-            match pipe.read(&mut buf) {
-                Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
-                Ok(0) | Err(_) => break,
-                Ok(n) => {
-                    let room = MAX_CAPTURE - kept.len();
-                    kept.extend_from_slice(&buf[..n.min(room)]);
-                    cut |= n > room;
-                }
-            }
-        }
-        let _ = tx.send((kept, cut));
-    });
-    rx
 }
 
 extern "C" fn on_signal(sig: libc::c_int) {
@@ -797,29 +696,5 @@ mod tests {
         assert!(is_whole_disk("/dev/disk12"));
         assert!(!is_whole_disk("/dev/disk12s1"));
         assert!(!is_whole_disk("/dev/disk"));
-    }
-
-    #[test]
-    fn capture_is_capped_and_drained() {
-        let out = run_capped(
-            "/bin/sh",
-            &[os("-c"), os("head -c 3000000 /dev/zero; echo err >&2")],
-            Duration::from_secs(30),
-            false,
-        )
-        .unwrap();
-        assert!(out.success());
-        assert_eq!(out.stdout.len(), MAX_CAPTURE);
-        assert!(out.stdout_cut);
-        assert_eq!(out.stderr, b"err\n");
-    }
-
-    #[test]
-    fn a_slow_child_is_killed_at_the_timeout() {
-        let start = Instant::now();
-        let out = run_capped("/bin/sleep", &[os("30")], Duration::from_millis(200), false).unwrap();
-        assert!(out.timed_out);
-        assert!(!out.success());
-        assert!(start.elapsed() < Duration::from_secs(10));
     }
 }
