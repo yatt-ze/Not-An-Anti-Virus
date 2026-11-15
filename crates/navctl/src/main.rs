@@ -28,7 +28,7 @@ struct Cli {
 #[derive(Args)]
 struct BudgetArgs {
     /// Most files collected in one directory or bundle scan, including
-    /// bundle resources that are then skipped.
+    /// bundle signature manifests that are then skipped.
     #[arg(long, value_name = "N")]
     max_files: Option<usize>,
     /// Byte budget for one directory or bundle scan (§11.12). The first

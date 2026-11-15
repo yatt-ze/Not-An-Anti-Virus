@@ -322,6 +322,14 @@
     ],
     "completeness": "complete"
   },
+  "suspicious/DisguisedResources.app": {
+    "score": 19,
+    "recommendation": "notify",
+    "rule_ids": [
+      "suspicious-strings"
+    ],
+    "completeness": "complete"
+  },
   "suspicious/adhoc_named_flags=0x20000": {
     "score": 8,
     "recommendation": "no-action",
