@@ -12,7 +12,7 @@ use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
-use nav_core::process::{run_capped, Captured};
+use nav_core::process::{path_arg, run_capped, Captured};
 use nav_core::{plist, scan_target_with_budget, PlistValue, ScanBudget, TargetScan};
 
 const HDIUTIL: &str = "/usr/bin/hdiutil";
@@ -138,9 +138,10 @@ fn mount_and_scan(
             MAX_IMAGE_BYTES >> 30
         )));
     }
+    let image_arg = path_arg(image);
     // Before anything else reads the image: `imageinfo` on an encrypted
     // image without `-stdinpass` raises a GUI passphrase prompt.
-    let enc = query_plist(&[os("isencrypted"), os("-plist"), image.as_os_str()])?;
+    let enc = query_plist(&[os("isencrypted"), os("-plist"), image_arg.as_os_str()])?;
     match enc.get("encrypted").and_then(PlistValue::as_bool) {
         Some(false) => {}
         Some(true) => return Err("image is encrypted".into()),
@@ -150,7 +151,7 @@ fn mount_and_scan(
         os("imageinfo"),
         os("-plist"),
         os("-stdinpass"),
-        image.as_os_str(),
+        image_arg.as_os_str(),
     ])?;
     let logical = info
         .get("Size Information")
@@ -182,7 +183,7 @@ fn mount_and_scan(
             os("-plist"),
             os("-mountrandom"),
             run.as_os_str(),
-            image.as_os_str(),
+            image_arg.as_os_str(),
         ],
         MOUNT_TIMEOUT,
     )

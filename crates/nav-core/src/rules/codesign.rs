@@ -738,6 +738,7 @@ fn indicates_revocation(stderr: &str) -> bool {
 
 #[cfg(target_os = "macos")]
 fn spawn_codesign_verify(path: &std::path::Path) -> Result<String, RuleOutcome> {
+    let arg = process::path_arg(path);
     // `--verify` writes its report to stderr too; exit status alone doesn't
     // distinguish "revoked" from "tampered" from "missing resource".
     let args: [&OsStr; 5] = [
@@ -745,7 +746,7 @@ fn spawn_codesign_verify(path: &std::path::Path) -> Result<String, RuleOutcome> 
         "--deep".as_ref(),
         "--strict".as_ref(),
         "-v".as_ref(),
-        path.as_os_str(),
+        arg.as_os_str(),
     ];
     stderr_report(run_tool(CODESIGN, &args))
 }
@@ -778,10 +779,11 @@ const SIGNER_ANCHOR_FLAGS: &[&str] = &["--ignore-resources", "--all-architecture
 /// `None` if it was killed by a signal or failed to spawn.
 #[cfg(target_os = "macos")]
 fn spawn_strict_anchor_check(path: &std::path::Path) -> Option<i32> {
+    let arg = process::path_arg(path);
     let mut args: Vec<&OsStr> = vec!["--verify".as_ref()];
     args.extend(STRICT_ANCHOR_FLAGS.iter().map(|f| OsStr::new(*f)));
     args.push("-R=anchor apple generic".as_ref());
-    args.push(path.as_os_str());
+    args.push(arg.as_os_str());
     anchor_exit_code(run_tool(CODESIGN, &args))
 }
 
@@ -795,10 +797,11 @@ fn spawn_strict_anchor_check(_path: &std::path::Path) -> Option<i32> {
 /// if it failed to spawn.
 #[cfg(target_os = "macos")]
 fn spawn_signer_check(path: &std::path::Path) -> Option<(Option<i32>, String)> {
+    let arg = process::path_arg(path);
     let mut args: Vec<&OsStr> = vec!["--verify".as_ref()];
     args.extend(SIGNER_ANCHOR_FLAGS.iter().map(|f| OsStr::new(*f)));
     args.push("-R=anchor apple generic".as_ref());
-    args.push(path.as_os_str());
+    args.push(arg.as_os_str());
     signer_report(run_tool(CODESIGN, &args))
 }
 
@@ -961,13 +964,14 @@ fn parse_spctl_source(output: &str) -> Option<&str> {
 
 #[cfg(target_os = "macos")]
 fn spawn_spctl_assess(path: &std::path::Path) -> Result<String, RuleOutcome> {
+    let arg = process::path_arg(path);
     // `spctl -a` writes its assessment (including `source=`) to stderr.
     let args: [&OsStr; 5] = [
         "-a".as_ref(),
         "-t".as_ref(),
         "exec".as_ref(),
         "-vv".as_ref(),
-        path.as_os_str(),
+        arg.as_os_str(),
     ];
     stderr_report(run_tool(SPCTL, &args))
 }
@@ -994,8 +998,9 @@ fn run_codesign_dv(ctx: &ScanContext) -> Result<DvStatus, RuleOutcome> {
 
 #[cfg(target_os = "macos")]
 fn spawn_codesign_dv(path: &std::path::Path) -> Result<(bool, String), RuleOutcome> {
+    let arg = process::path_arg(path);
     // `codesign -dv` writes its report to stderr regardless of exit status.
-    let args: [&OsStr; 3] = ["-dv".as_ref(), "--verbose=4".as_ref(), path.as_os_str()];
+    let args: [&OsStr; 3] = ["-dv".as_ref(), "--verbose=4".as_ref(), arg.as_os_str()];
     dv_report(run_tool(CODESIGN, &args))
 }
 

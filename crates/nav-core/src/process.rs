@@ -3,6 +3,7 @@
 
 use std::ffi::OsStr;
 use std::io::{self, Read};
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicI32, Ordering};
 use std::sync::mpsc;
@@ -33,6 +34,16 @@ impl Captured {
     /// Exited with status 0 before the timeout.
     pub fn success(&self) -> bool {
         !self.timed_out && self.status.is_some_and(|s| s.success())
+    }
+}
+
+/// `path` as a tool argument that cannot be parsed as an option: a relative
+/// path gets a `./` prefix, so `-x` becomes `./-x` (§11.9).
+pub fn path_arg(path: &Path) -> PathBuf {
+    if path.is_relative() {
+        Path::new(".").join(path)
+    } else {
+        path.to_path_buf()
     }
 }
 
@@ -122,6 +133,23 @@ fn drain<R: Read + Send + 'static>(pipe: Option<R>) -> mpsc::Receiver<(Vec<u8>, 
         let _ = tx.send((kept, cut));
     });
     rx
+}
+
+#[cfg(test)]
+mod path_arg_tests {
+    use super::*;
+
+    #[test]
+    fn a_relative_path_cannot_start_with_a_dash() {
+        assert_eq!(path_arg(Path::new("-x")), Path::new("./-x"));
+        assert_eq!(path_arg(Path::new("rel/x")), Path::new("./rel/x"));
+        assert_eq!(path_arg(Path::new("/abs/-x")), Path::new("/abs/-x"));
+        assert_eq!(path_arg(Path::new("/abs")), Path::new("/abs"));
+        assert!(path_arg(Path::new("-x"))
+            .as_os_str()
+            .to_string_lossy()
+            .starts_with("./"));
+    }
 }
 
 #[cfg(all(test, unix))]

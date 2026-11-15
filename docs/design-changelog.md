@@ -5,7 +5,7 @@ for the current document map. Newest first.
 
 ---
 
-**Changelog from v0.94 (2026-11-15):** The `codesign`/`spctl` spawns are bounded and run by absolute path (§5.2, §11.8, §11.10, §11.12, #157, #158). They ran by bare name, so a `PATH` entry could substitute them; they now use `/usr/bin/codesign` and `/usr/sbin/spctl` (nav-service's `launchctl`, `codesign` and `tccutil` likewise). They also had no timeout or output cap: a hung tool stalled the scan and a chatty one grew memory. Each spawn now goes through `nav_core::process::run_capped` (moved from navctl's disk-image code), is killed after 60 s and keeps 1 MiB per stream, and a timeout, spawn failure or cut stderr makes the rule `NotApplicable`. Slowest measured run was 10.3 s; worst-case stall is 6 spawns x 60 s per file, with a whole-target limit left to #166.
+**Changelog from v0.94 (2026-11-15):** The `codesign`/`spctl` spawns are bounded and run by absolute path (§5.2, §11.8, §11.10, §11.9, §11.12, #157, #158, #162). They ran by bare name, so a `PATH` entry could substitute them; they now use `/usr/bin/codesign` and `/usr/sbin/spctl` (nav-service's `launchctl`, `codesign` and `tccutil` likewise). They also had no timeout or output cap: a hung tool stalled the scan and a chatty one grew memory. Each spawn now goes through `nav_core::process::run_capped` (moved from navctl's disk-image code), is killed after 60 s and keeps 1 MiB per stream, and a timeout, spawn failure or cut stderr makes the rule `NotApplicable`. Slowest measured run was 10.3 s; worst-case stall is 6 spawns x 60 s per file, with a whole-target limit left to #166. A relative target path now reaches `codesign`, `spctl` and `hdiutil` as `./<path>`, so a name starting with `-` is never parsed as an option (#162).
 
 ---
 
