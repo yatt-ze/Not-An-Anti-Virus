@@ -116,39 +116,33 @@ fn is_real_file(path: &Path) -> bool {
     std::fs::symlink_metadata(path).is_ok_and(|m| m.is_file())
 }
 
-/// Bundle members that are compiled UI/localization resources or the code
-/// signature — never a code payload, so traversed but not *scored* (§1, §5.8).
-/// Narrow on purpose: scripts, dylibs, non-`Info.plist` plists and nested apps
-/// are still scanned.
-pub fn is_inert_bundle_resource(path: &Path) -> bool {
-    for component in path.components() {
-        if let Component::Normal(c) = component {
-            let c = c.to_string_lossy();
-            if c == "_CodeSignature"
-                || c.ends_with(".lproj")
-                || c.ends_with(".storyboardc")
-                || c.ends_with(".momd")
-            {
-                return true;
-            }
-        }
-    }
+/// Whether a bundle member is a code-signature manifest, the one member
+/// traversed but not scored (§5.8): `rel` (relative to the bundle root) ends
+/// in `_CodeSignature/CodeResources`, and `abs` is a regular file, not a
+/// symlink, whose content starts `<?xml` or `bplist00`. Anything unreadable
+/// or mismatched returns `false`, so it is scored (§11.8).
+pub fn is_signature_manifest(rel: &Path, abs: &Path) -> bool {
+    let mut tail = rel.components().rev();
+    let named = matches!(
+        (tail.next(), tail.next()),
+        (Some(Component::Normal(f)), Some(Component::Normal(d)))
+            if f == "CodeResources" && d == "_CodeSignature"
+    );
+    named && starts_as_plist(abs)
+}
 
-    let file_name = match path.file_name().and_then(|n| n.to_str()) {
-        Some(n) => n,
-        None => return false,
+fn starts_as_plist(path: &Path) -> bool {
+    if !is_real_file(path) {
+        return false;
+    }
+    let Ok(file) = std::fs::File::open(path) else {
+        return false;
     };
-    if file_name == "Info.plist" || file_name == "PkgInfo" {
-        return true;
+    let mut head = Vec::with_capacity(8);
+    if file.take(8).read_to_end(&mut head).is_err() {
+        return false;
     }
-
-    matches!(
-        path.extension()
-            .and_then(|e| e.to_str())
-            .map(|e| e.to_ascii_lowercase())
-            .as_deref(),
-        Some("nib" | "car" | "strings" | "xcprivacy" | "icns")
-    )
+    head.starts_with(b"<?xml") || head.starts_with(b"bplist00")
 }
 
 #[cfg(test)]
@@ -308,31 +302,41 @@ mod tests {
     }
 
     #[test]
-    fn inert_resources_are_recognized() {
-        assert!(is_inert_bundle_resource(Path::new(
-            "Foo.app/Contents/Info.plist"
-        )));
-        assert!(is_inert_bundle_resource(Path::new(
-            "Foo.app/Contents/PkgInfo"
-        )));
-        assert!(is_inert_bundle_resource(Path::new(
-            "Foo.app/Contents/_CodeSignature/CodeResources"
-        )));
-        assert!(is_inert_bundle_resource(Path::new(
-            "Foo.app/Contents/Resources/en.lproj/Main.strings"
-        )));
-        assert!(is_inert_bundle_resource(Path::new(
-            "Foo.app/Contents/Resources/Assets.car"
-        )));
+    fn only_a_plist_code_resources_is_a_signature_manifest() {
+        let tmp = TempDir::new();
+        let sig = tmp.0.join("Contents/_CodeSignature");
+        fs::create_dir_all(&sig).unwrap();
+        let rel = Path::new("Contents/_CodeSignature/CodeResources");
+        let abs = sig.join("CodeResources");
 
-        assert!(!is_inert_bundle_resource(Path::new(
-            "Foo.app/Contents/MacOS/Foo"
-        )));
-        assert!(!is_inert_bundle_resource(Path::new(
-            "Foo.app/Contents/Resources/update.sh"
-        )));
-        assert!(!is_inert_bundle_resource(Path::new(
-            "Foo.app/Contents/Library/LaunchServices/helper.plist"
-        )));
+        fs::write(&abs, b"<?xml version=\"1.0\"?><plist/>").unwrap();
+        assert!(is_signature_manifest(rel, &abs));
+        fs::write(&abs, b"bplist00\xd0\x08").unwrap();
+        assert!(is_signature_manifest(rel, &abs));
+
+        // Named right but not a plist: scored.
+        fs::write(&abs, b"#!/bin/sh\necho hi\n").unwrap();
+        assert!(!is_signature_manifest(rel, &abs));
+        fs::write(&abs, b"<?xm").unwrap();
+        assert!(!is_signature_manifest(rel, &abs));
+
+        // A plist under any other name or directory: scored.
+        let other = sig.join("CodeDirectory");
+        fs::write(&other, b"<?xml version=\"1.0\"?>").unwrap();
+        assert!(!is_signature_manifest(
+            Path::new("Contents/_CodeSignature/CodeDirectory"),
+            &other
+        ));
+        assert!(!is_signature_manifest(
+            Path::new("Contents/Info.plist"),
+            &abs
+        ));
+
+        // A symlink to a real manifest, and a missing file: scored.
+        fs::write(&other, b"<?xml version=\"1.0\"?>").unwrap();
+        fs::remove_file(&abs).unwrap();
+        assert!(!is_signature_manifest(rel, &abs));
+        std::os::unix::fs::symlink(&other, &abs).unwrap();
+        assert!(!is_signature_manifest(rel, &abs));
     }
 }

@@ -1,0 +1,3 @@
+#!/bin/sh
+# Benign stub executable for the DisguisedResources fixture.
+echo "Disguised 1.0"

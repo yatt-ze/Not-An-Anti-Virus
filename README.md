@@ -53,7 +53,7 @@ macOS's built-in defences turned on.
 
 ## Status
 
-NAV is in **early development** (v0.6.0).
+NAV is in **early development** (v0.7.0).
 
 - [x] `navctl scan`: a verdict for a file, a folder or a `.app` bundle
 - [x] `navctl rules test`: the full signal-by-signal breakdown, as text or JSON
@@ -117,9 +117,9 @@ navctl rules test ./suspicious.app --json
 navctl rules list
 ```
 
-A `.app` bundle is scanned as one unit. NAV finds its main executable, skips
-compiled resources (nibs, asset catalogs), and gives the bundle the verdict of
-the worst file inside it.
+A `.app` bundle is scanned as one unit. NAV finds its main executable, scores
+every file inside (only plist `_CodeSignature/CodeResources` manifests are not
+scored), and gives the bundle the verdict of the worst one.
 
 ### Recommendations
 

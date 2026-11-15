@@ -223,6 +223,27 @@ fn suspicious_fixtures_reach_notify_unless_allowlisted() {
     }
 }
 
+/// Each disguised member reaches Notify on its own, so no one of them can
+/// carry the bundle verdict for the others (§5.8, #155).
+#[test]
+fn disguised_bundle_members_are_each_scored() {
+    let app = fixtures_dir("suspicious").join("DisguisedResources.app");
+    let scan = scan(&app);
+    assert!(scan.skipped.is_empty(), "skipped: {:?}", scan.skipped);
+    for member in [
+        "Contents/Resources/AppIcon.icns",
+        "Contents/Resources/en.lproj/helper",
+        "Contents/_CodeSignature/CodeResources",
+    ] {
+        let r = scan
+            .results
+            .iter()
+            .find(|r| r.path == app.join(member))
+            .unwrap_or_else(|| panic!("{member} was not scanned"));
+        assert_ne!(r.recommendation, Recommendation::NoAction, "{member}");
+    }
+}
+
 #[test]
 fn scoring_is_deterministic() {
     // Run every fixture twice; require identical signal sets and scores (§11.1).

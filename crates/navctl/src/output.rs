@@ -446,7 +446,7 @@ fn print_rules_test_multi(scan: &TargetScan, image: Option<&ImageReport>) {
         }
         print!("Files scanned: {}", scan.results.len());
         if !scan.skipped.is_empty() {
-            print!(" ({} compiled resource(s) not scored)", scan.skipped.len());
+            print!(" ({} signature manifest(s) not scored)", scan.skipped.len());
         }
         println!();
     } else {

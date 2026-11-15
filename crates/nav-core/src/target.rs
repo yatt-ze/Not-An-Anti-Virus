@@ -94,7 +94,7 @@ pub struct TargetScan {
     /// For a `Bundle` target: the resolved main executable, if any.
     pub primary: Option<PathBuf>,
     /// Bundle members traversed but not scored (see
-    /// [`bundle::is_inert_bundle_resource`]).
+    /// [`bundle::is_signature_manifest`]).
     pub skipped: Vec<PathBuf>,
     /// Directories whose listing failed in whole or in part (permission
     /// denied, race), sorted and deduped (§11.1). Traversal continues past
@@ -157,7 +157,7 @@ fn severity_rank(r: &ScanResult) -> u8 {
 ///
 /// - A file scans as itself.
 /// - An `.app` bundle (§5.8) is scanned as one unit: every member is
-///   traversed regardless of `recursive`, compiled resources are skipped
+///   traversed regardless of `recursive`, signature manifests are skipped
 ///   from scoring, and the main executable is resolved for context.
 /// - Any other directory scans every file under it (recursively when
 ///   `recursive`), in sorted order.
@@ -196,9 +196,10 @@ pub fn scan_target_with_budget(
     if let Some(layout) = BundleLayout::detect(path) {
         // A bundle is always traversed in full; `recursive` doesn't apply.
         let (all, collect_limit, unreadable) = collect_files(path, true, budget)?;
-        let (to_scan, skipped): (Vec<PathBuf>, Vec<PathBuf>) = all
-            .into_iter()
-            .partition(|p| !bundle::is_inert_bundle_resource(p));
+        let (to_scan, skipped): (Vec<PathBuf>, Vec<PathBuf>) = all.into_iter().partition(|p| {
+            let rel = p.strip_prefix(path).unwrap_or(p);
+            !bundle::is_signature_manifest(rel, p)
+        });
         let (results, byte_limit) = scan_within_bytes(&to_scan, budget);
         return Ok(TargetScan {
             root: path.to_path_buf(),
@@ -417,7 +418,7 @@ mod tests {
     }
 
     #[test]
-    fn app_bundle_is_scanned_as_one_unit_with_resources_skipped() {
+    fn app_bundle_scores_every_member_except_a_plist_signature_manifest() {
         let dir = TempDir::new("bundle");
         let app = dir.path().join("Widget.app");
         fs::create_dir_all(app.join("Contents/MacOS")).unwrap();
@@ -433,7 +434,7 @@ mod tests {
         fs::write(app.join("Contents/Resources/helper.sh"), b"#!/bin/sh\n").unwrap();
         fs::write(
             app.join("Contents/_CodeSignature/CodeResources"),
-            b"<plist/>",
+            b"<?xml version=\"1.0\"?><plist/>",
         )
         .unwrap();
 
@@ -457,7 +458,12 @@ mod tests {
             .collect();
         assert_eq!(
             scanned,
-            vec!["Contents/MacOS/Widget", "Contents/Resources/helper.sh"]
+            vec![
+                "Contents/Info.plist",
+                "Contents/MacOS/Widget",
+                "Contents/Resources/Assets.car",
+                "Contents/Resources/helper.sh"
+            ]
         );
 
         let skipped: Vec<_> = scan
@@ -465,11 +471,48 @@ mod tests {
             .iter()
             .map(|p| p.strip_prefix(&app).unwrap().to_str().unwrap().to_string())
             .collect();
-        assert!(skipped.contains(&"Contents/Info.plist".to_string()));
-        assert!(skipped.contains(&"Contents/Resources/Assets.car".to_string()));
-        assert!(skipped.contains(&"Contents/_CodeSignature/CodeResources".to_string()));
+        assert_eq!(skipped, vec!["Contents/_CodeSignature/CodeResources"]);
 
         assert!(scan.primary_result().is_some());
+    }
+
+    #[test]
+    fn non_plist_code_resources_is_scored() {
+        let dir = TempDir::new("fake-manifest");
+        let app = dir.path().join("Widget.app");
+        fs::create_dir_all(app.join("Contents/MacOS")).unwrap();
+        fs::create_dir_all(app.join("Contents/_CodeSignature")).unwrap();
+        fs::write(app.join("Contents/MacOS/Widget"), b"#!/bin/sh\necho hi\n").unwrap();
+        fs::write(
+            app.join("Contents/_CodeSignature/CodeResources"),
+            b"#!/bin/sh\necho hi\n",
+        )
+        .unwrap();
+
+        let scan = scan_target(&app, false).unwrap();
+        assert!(scan.skipped.is_empty());
+        assert!(scan
+            .results
+            .iter()
+            .any(|r| r.path.ends_with("_CodeSignature/CodeResources")));
+    }
+
+    #[test]
+    fn bundle_under_an_lproj_ancestor_still_scores_its_members() {
+        let dir = TempDir::new("lproj-ancestor");
+        let app = dir.path().join("x.lproj/Widget.app");
+        fs::create_dir_all(app.join("Contents/MacOS")).unwrap();
+        fs::write(app.join("Contents/Info.plist"), b"<plist/>").unwrap();
+        fs::write(app.join("Contents/MacOS/Widget"), b"#!/bin/sh\necho hi\n").unwrap();
+
+        let scan = scan_target(&app, false).unwrap();
+        assert_eq!(scan.kind, TargetKind::Bundle);
+        assert_eq!(scan.results.len(), 2);
+        assert!(scan.skipped.is_empty());
+        assert!(scan
+            .results
+            .iter()
+            .any(|r| r.path.ends_with("Contents/MacOS/Widget")));
     }
 
     #[test]
