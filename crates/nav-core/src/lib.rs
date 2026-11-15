@@ -21,6 +21,7 @@ pub mod macho;
 pub mod model;
 pub mod plist;
 pub mod presentation;
+pub mod process;
 pub mod rules;
 pub mod scan;
 pub mod source;
