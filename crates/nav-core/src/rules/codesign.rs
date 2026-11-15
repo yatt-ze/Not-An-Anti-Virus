@@ -777,14 +777,20 @@ const SIGNER_ANCHOR_FLAGS: &[&str] = &["--ignore-resources", "--all-architecture
 
 /// Exit code of `codesign --verify --strict -R="anchor apple generic" <path>`;
 /// `None` if it was killed by a signal or failed to spawn.
+/// Runs `codesign --verify <flags> -R="anchor apple generic" <path>`.
 #[cfg(target_os = "macos")]
-fn spawn_strict_anchor_check(path: &std::path::Path) -> Option<i32> {
+fn run_anchor_verify(flags: &[&str], path: &std::path::Path) -> Option<Captured> {
     let arg = process::path_arg(path);
     let mut args: Vec<&OsStr> = vec!["--verify".as_ref()];
-    args.extend(STRICT_ANCHOR_FLAGS.iter().map(|f| OsStr::new(*f)));
+    args.extend(flags.iter().map(OsStr::new));
     args.push("-R=anchor apple generic".as_ref());
     args.push(arg.as_os_str());
-    anchor_exit_code(run_tool(CODESIGN, &args))
+    run_tool(CODESIGN, &args)
+}
+
+#[cfg(target_os = "macos")]
+fn spawn_strict_anchor_check(path: &std::path::Path) -> Option<i32> {
+    anchor_exit_code(run_anchor_verify(STRICT_ANCHOR_FLAGS, path))
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -797,12 +803,7 @@ fn spawn_strict_anchor_check(_path: &std::path::Path) -> Option<i32> {
 /// if it failed to spawn.
 #[cfg(target_os = "macos")]
 fn spawn_signer_check(path: &std::path::Path) -> Option<(Option<i32>, String)> {
-    let arg = process::path_arg(path);
-    let mut args: Vec<&OsStr> = vec!["--verify".as_ref()];
-    args.extend(SIGNER_ANCHOR_FLAGS.iter().map(|f| OsStr::new(*f)));
-    args.push("-R=anchor apple generic".as_ref());
-    args.push(arg.as_os_str());
-    signer_report(run_tool(CODESIGN, &args))
+    signer_report(run_anchor_verify(SIGNER_ANCHOR_FLAGS, path))
 }
 
 #[cfg(not(target_os = "macos"))]
