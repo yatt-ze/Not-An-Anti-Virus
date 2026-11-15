@@ -55,13 +55,12 @@ pub fn run_capped(
     let stderr = drain(child.stderr.take());
     let deadline = Instant::now() + timeout;
     let (status, timed_out) = wait_until(&mut child, deadline, cancel)?;
-    // Not received in time counts as cut, so the output is not trusted.
-    let (stdout, stdout_cut) = stdout
-        .recv_timeout(PIPE_GRACE)
-        .unwrap_or((Vec::new(), true));
-    let (stderr, stderr_cut) = stderr
-        .recv_timeout(PIPE_GRACE)
-        .unwrap_or((Vec::new(), true));
+    // Not received in time counts as cut, so the output is not trusted. One
+    // grace window covers both pipes.
+    let grace_end = Instant::now() + PIPE_GRACE;
+    let left = || grace_end.saturating_duration_since(Instant::now());
+    let (stdout, stdout_cut) = stdout.recv_timeout(left()).unwrap_or((Vec::new(), true));
+    let (stderr, stderr_cut) = stderr.recv_timeout(left()).unwrap_or((Vec::new(), true));
     Ok(Captured {
         status,
         stdout,
@@ -78,8 +77,14 @@ fn wait_until(
     cancel: Option<&AtomicI32>,
 ) -> io::Result<(Option<ExitStatus>, bool)> {
     loop {
-        if let Some(status) = child.try_wait()? {
-            return Ok((Some(status), false));
+        match child.try_wait() {
+            Ok(Some(status)) => return Ok((Some(status), false)),
+            Ok(None) => {}
+            Err(e) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(e);
+            }
         }
         let cancelled = cancel.is_some_and(|c| c.load(Ordering::SeqCst) != 0);
         if cancelled || Instant::now() >= deadline {
