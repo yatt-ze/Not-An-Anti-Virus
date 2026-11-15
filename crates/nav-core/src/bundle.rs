@@ -69,10 +69,19 @@ fn executable_from_info_plist(contents: &Path) -> Option<PathBuf> {
         .read_to_end(&mut buf)
         .ok()?;
 
-    let name = crate::plist::parse(&buf)?
-        .get("CFBundleExecutable")?
-        .as_str()?
-        .to_string();
+    let info = crate::plist::parse(&buf)?;
+    let key = "CFBundleExecutable";
+    // CoreFoundation keeps the first of a repeated key in a binary plist and
+    // the last in XML (#183); `get` is last-wins.
+    let exe = if buf.starts_with(b"bplist00") {
+        info.as_dict()?
+            .iter()
+            .find(|(k, _)| k == key)
+            .map(|(_, v)| v)
+    } else {
+        info.get(key)
+    };
+    let name = exe?.as_str()?.to_string();
     let leaf = Path::new(&name).file_name()?;
     let candidate = contents.join("MacOS").join(leaf);
     is_real_file(&candidate).then_some(candidate)
@@ -220,6 +229,32 @@ mod tests {
             layout.main_executable,
             Some(fixture.join("Contents/MacOS/realmain")),
         );
+    }
+
+    #[test]
+    fn repeated_cfbundleexecutable_resolves_as_corefoundation_does() {
+        // Binary: one dict, both keys referencing a single "CFBundleExecutable"
+        // string, values "a" then "b". `plutil -p` reads it as "a".
+        let mut binary = b"bplist00\xd2\x01\x01\x02\x03\x5f\x10\x12".to_vec();
+        binary.extend_from_slice(b"CFBundleExecutable\x51a\x51b\x08\x0d\x22\x24");
+        binary.extend_from_slice(&[0, 0, 0, 0, 0, 0, 1, 1]);
+        for n in [4u64, 0, 38] {
+            binary.extend_from_slice(&n.to_be_bytes());
+        }
+        let xml = b"<plist><dict><key>CFBundleExecutable</key><string>a</string>\
+            <key>CFBundleExecutable</key><string>b</string></dict></plist>";
+
+        for (info, want) in [(&binary[..], "a"), (&xml[..], "b")] {
+            let tmp = TempDir::new();
+            let root = make_bundle(&tmp.0, "Foo.app", Some("a"));
+            fs::write(root.join("Contents/MacOS/b"), b"#!/bin/sh\n").unwrap();
+            fs::write(root.join("Contents/Info.plist"), info).unwrap();
+            let layout = BundleLayout::detect(&root).unwrap();
+            assert_eq!(
+                layout.main_executable,
+                Some(root.join("Contents/MacOS").join(want))
+            );
+        }
     }
 
     #[test]

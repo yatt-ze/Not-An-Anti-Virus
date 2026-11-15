@@ -493,6 +493,31 @@ mod tests {
     }
 
     #[test]
+    fn repeated_keys_are_read_as_launchd_reads_them() {
+        // launchd runs the last of a repeated key (#183); plist.rs covers binary.
+        let path = "/Users/x/Library/LaunchAgents/com.example.helper.plist";
+        let last_only = br#"<plist version="1.0"><dict>
+            <key>Label</key><string>com.example.helper</string>
+            <key>Program</key><string>/Users/x/Library/.cache/update</string>
+            <key>RunAtLoad</key><true/>
+            <key>KeepAlive</key><true/>
+        </dict></plist>"#;
+        let repeated = br#"<plist version="1.0"><dict>
+            <key>Label</key><string>com.example.helper</string>
+            <key>Program</key><string>/usr/local/bin/helper</string>
+            <key>RunAtLoad</key><false/>
+            <key>KeepAlive</key><false/>
+            <key>Program</key><string>/Users/x/Library/.cache/update</string>
+            <key>RunAtLoad</key><true/>
+            <key>KeepAlive</key><true/>
+        </dict></plist>"#;
+        let want = eval(path, last_only).unwrap().expect("should fire");
+        let got = eval(path, repeated).unwrap().expect("should fire");
+        assert_eq!(got.weight, want.weight);
+        assert_eq!(got.description, want.description);
+    }
+
+    #[test]
     fn inline_loader_script_is_flagged() {
         let body = br#"<plist version="1.0"><dict>
             <key>Label</key><string>com.x.updater</string>

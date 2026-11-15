@@ -18,7 +18,7 @@ use super::{Rule, RuleOutcome};
 use crate::context::ScanContext;
 use crate::macho::{MachOImage, CS_ADHOC};
 use crate::model::{MatchedSignal, SignalCategory};
-use crate::plist::{self, PlistValue};
+use crate::plist;
 use std::collections::HashMap;
 
 /// Weight for at least one dylib/rpath load path in a writable/transient
@@ -341,7 +341,9 @@ fn entitlements_finding(
 
     let mut contributing: Vec<(&'static str, EntitlementBucket)> = Vec::new();
     for ent in SUSPICIOUS_ENTITLEMENTS {
-        if parsed.get(ent.key).and_then(PlistValue::as_bool) != Some(true) {
+        // Any `true`: AMFI refuses a repeated key, so which one is effective
+        // is unknown (§5.2, #183).
+        if !parsed.get_all(ent.key).any(|v| v.as_bool() == Some(true)) {
             continue;
         }
         match ent.policy {
@@ -962,6 +964,24 @@ mod tests {
             MachOStructureRule.evaluate(&ctx_for(image)),
             Ok(None)
         ));
+    }
+
+    #[test]
+    fn a_repeated_entitlement_is_flagged_if_any_occurrence_is_true() {
+        for (first, last) in [("true", "false"), ("false", "true")] {
+            let xml = format!(
+                r#"<?xml version="1.0"?><plist version="1.0"><dict>
+                <key>com.apple.security.cs.disable-library-validation</key><{first}/>
+                <key>com.apple.security.cs.disable-library-validation</key><{last}/>
+                </dict></plist>"#
+            );
+            let (image, _, _) = synth_macho_64_full(b"code", &[], &[], true, Some(xml.as_bytes()));
+            let sig = MachOStructureRule
+                .evaluate(&ctx_for(image))
+                .unwrap()
+                .expect("should fire");
+            assert!(sig.description.contains("disable-library-validation"));
+        }
     }
 
     #[test]
