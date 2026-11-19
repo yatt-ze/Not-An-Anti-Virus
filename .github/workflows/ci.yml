@@ -127,9 +127,10 @@ jobs:
           tool: cargo-fuzz@0.13.2
       # The corpus each run grows is carried to the next one, so coverage
       # accumulates. Cache entries are immutable: save under a fresh key and
-      # restore the newest earlier one by prefix.
+      # restore the newest earlier one by prefix. Restore and save are split
+      # so a failing run (the one that found something) still saves.
       - name: restore grown fuzz corpus
-        uses: actions/cache@v4
+        uses: actions/cache/restore@caa296126883cff596d87d8935842f9db880ef25 # v5.1.0
         with:
           path: crates/nav-core/fuzz/corpus
           key: fuzz-corpus-${{ github.run_id }}
@@ -139,6 +140,7 @@ jobs:
       # Seeds are named by content hash, as libFuzzer names its own, so
       # same-named vectors (bomb.in, Info.plist) don't overwrite each other.
       - name: seed fuzz corpora
+        id: seed
         working-directory: crates/nav-core
         run: |
           set -euo pipefail
@@ -187,3 +189,10 @@ jobs:
             cargo fuzz run --target x86_64-unknown-linux-gnu "${target}" -- -max_total_time=60
             echo "::endgroup::"
           done
+      # Once seeded, the corpus exists and is worth keeping whatever happened.
+      - name: save grown fuzz corpus
+        if: always() && steps.seed.outcome == 'success'
+        uses: actions/cache/save@caa296126883cff596d87d8935842f9db880ef25 # v5.1.0
+        with:
+          path: crates/nav-core/fuzz/corpus
+          key: fuzz-corpus-${{ github.run_id }}
