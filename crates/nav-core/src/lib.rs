@@ -50,7 +50,7 @@ pub use presentation::{
     INDETERMINATE, OPERATIONAL_ERROR, SCAN_JSON_SCHEMA_VERSION, SUSPICIOUS,
 };
 pub use rules::{
-    default_ruleset, disk_image_format_of_path, embedded_content_ruleset, Rule, RuleOutcome,
+    default_ruleset, disk_image_format_of_file, embedded_content_ruleset, Rule, RuleOutcome,
     UNINSPECTED_CONTAINER_ID,
 };
 pub use scan::{
