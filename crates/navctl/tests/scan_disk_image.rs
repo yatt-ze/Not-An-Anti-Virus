@@ -119,6 +119,10 @@ impl Sandbox {
 impl Drop for Sandbox {
     fn drop(&mut self) {
         self.detach_all();
+        let _ = Command::new("/usr/bin/chflags")
+            .args(["-R", "nouchg,nouappnd"])
+            .arg(&self.root)
+            .status();
         let _ = std::fs::remove_dir_all(&self.root);
     }
 }
@@ -321,9 +325,12 @@ fn a_corrupted_image_is_partial_with_a_reason() {
     assert!(stderr(&out).contains("not inspected"), "{}", stderr(&out));
     assert!(stdout(&out).contains("completeness=Partial"));
 
+    assert_no_scratch_path(&out);
+
     let rules = sb.navctl(&["rules", "test"], &image);
     assert_eq!(rules.status.code(), Some(3));
     assert!(stdout(&rules).starts_with("Disk image not mounted: "));
+    assert_no_scratch_path(&rules);
     sb.assert_clean();
 }
 
@@ -521,5 +528,100 @@ fn an_interrupted_scan_detaches_and_exits_130() {
         assert_eq!(out.status.code(), Some(130), "{}", stderr(&out));
         assert!(stderr(&out).contains("interrupted"), "{}", stderr(&out));
     }
+    sb.assert_clean();
+}
+
+/// An image another process attached with `-nomount` is scanned through
+/// navctl's own clone, and the other attachment is left alone (#175).
+#[test]
+fn an_image_attached_elsewhere_stays_attached() {
+    let sb = Sandbox::new("held");
+    std::fs::write(sb.src().join("readme.txt"), "hello\n").unwrap();
+    let image = sb.image("held.dmg", "UDZO");
+    assert!(hdiutil(&[
+        os("attach"),
+        os("-nomount"),
+        os("-readonly"),
+        os("-quiet"),
+        os(&image)
+    ]));
+    let held = sb.mounts();
+    assert_eq!(held.len(), 1, "{held:?}");
+    assert_eq!(held[0].1, "", "{held:?}");
+
+    let out = sb.navctl(&["scan"], &image);
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    assert!(
+        stdout(&out).ends_with("(disk image: 1 files)\n"),
+        "{}",
+        stdout(&out)
+    );
+    assert_no_scratch_path(&out);
+    assert_eq!(sb.mounts(), held);
+    assert_eq!(mounts_under(&sb.scratch()), Vec::new());
+    sb.detach_all();
+    sb.assert_clean();
+}
+
+/// An image on another volume than the scratch directory cannot be cloned
+/// and is never copied: it is `Partial` with the reason (#176).
+#[test]
+fn an_image_on_another_volume_is_not_copied() {
+    let sb = Sandbox::new("off-volume");
+    std::fs::write(sb.src().join("readme.txt"), "hello\n").unwrap();
+    let inner = sb.image("inner.dmg", "UDZO");
+    let outer_src = sb.root.join("outer-src");
+    std::fs::create_dir(&outer_src).unwrap();
+    std::fs::rename(&inner, outer_src.join("inner.dmg")).unwrap();
+    let outer = sb.root.join("outer.dmg");
+    assert!(hdiutil(&[
+        os("create"),
+        os("-quiet"),
+        os("-format"),
+        os("UDZO"),
+        os("-srcfolder"),
+        os(&outer_src),
+        os(&outer),
+    ]));
+    sb.wait_released();
+    let vol = sb.root.join("vol");
+    std::fs::create_dir(&vol).unwrap();
+    assert!(hdiutil(&[
+        os("attach"),
+        os("-readonly"),
+        os("-nobrowse"),
+        os("-quiet"),
+        os("-mountpoint"),
+        os(&vol),
+        os(&outer),
+    ]));
+
+    let out = sb.navctl(&["scan"], &vol.join("inner.dmg"));
+    assert_eq!(out.status.code(), Some(3), "{}", stderr(&out));
+    assert!(
+        stderr(&out).contains("different volume from the scratch directory and is not copied"),
+        "{}",
+        stderr(&out)
+    );
+    assert!(stdout(&out).contains("completeness=Partial"));
+    assert_eq!(mounts_under(&sb.scratch()), Vec::new());
+    sb.detach_all();
+    sb.assert_clean();
+}
+
+/// `uchg`/`uappnd` on the image do not keep its clone from being removed.
+#[test]
+fn an_immutable_image_leaves_no_clone_behind() {
+    let sb = Sandbox::new("uchg");
+    std::fs::write(sb.src().join("readme.txt"), "hello\n").unwrap();
+    let image = sb.image("locked.dmg", "UDZO");
+    assert!(Command::new("/usr/bin/chflags")
+        .arg("uchg,uappnd")
+        .arg(&image)
+        .status()
+        .unwrap()
+        .success());
+    let out = sb.navctl(&["scan"], &image);
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
     sb.assert_clean();
 }

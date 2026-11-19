@@ -9,7 +9,7 @@ use std::io::{self, Read};
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicI32, Ordering};
-use std::sync::{mpsc, Arc, Mutex};
+use std::sync::mpsc;
 use std::thread;
 use std::time::Duration;
 
@@ -29,6 +29,10 @@ const QUERY_TIMEOUT: Duration = Duration::from_secs(30);
 /// How long the main thread waits for the worker after a cancel signal.
 const CANCEL_GRACE: Duration = Duration::from_secs(2);
 const SCRATCH_DIR_NAME: &str = "navctl-scratch";
+/// Under a run directory: where volumes are mounted.
+const MOUNT_DIR: &str = "mnt";
+/// Under a run directory: the clone's file stem.
+const CLONE_STEM: &str = "image";
 
 /// Signal number received (SIGINT/SIGTERM/SIGHUP), or 0.
 static CANCEL: AtomicI32 = AtomicI32::new(0);
@@ -55,9 +59,9 @@ pub enum ImageScan {
 /// Mounts and scans `path` if it is a disk image. Must be called from the
 /// main thread: it installs signal handlers and waits on a worker.
 pub fn scan_image(path: &Path, budget: &ScanBudget) -> ImageScan {
-    if open_image(path).is_none() {
+    let Some(file) = open_image(path) else {
         return ImageScan::NotImage;
-    }
+    };
     if !cfg!(target_os = "macos") {
         return ImageScan::Unmounted("disk images are only mounted on macOS".into());
     }
@@ -65,7 +69,7 @@ pub fn scan_image(path: &Path, budget: &ScanBudget) -> ImageScan {
         return ImageScan::Unmounted(format!("{HDIUTIL} not found"));
     }
 
-    let outcome = mount_on_worker(path, budget);
+    let outcome = mount_on_worker(file, path, budget);
     set_signal_handlers(libc::SIG_DFL);
     match (CANCEL.load(Ordering::SeqCst), outcome) {
         (0, Ok(report)) => ImageScan::Scanned(report),
@@ -93,18 +97,16 @@ fn open_image(path: &Path) -> Option<File> {
 
 /// Runs [`mount_and_scan`] on a worker thread while this thread watches for
 /// a cancel signal, then detaches and removes the run directory either way.
-fn mount_on_worker(path: &Path, budget: &ScanBudget) -> Result<ImageReport, String> {
+fn mount_on_worker(file: File, path: &Path, budget: &ScanBudget) -> Result<ImageReport, String> {
     set_signal_handlers(on_signal as extern "C" fn(libc::c_int) as libc::sighandler_t);
     let root = scratch_root().map_err(|e| format!("scratch directory unusable: {e}"))?;
     sweep_stale(&root);
     let run = create_run_dir(&root).map_err(|e| format!("scratch directory unusable: {e}"))?;
 
     let (tx, rx) = mpsc::channel();
-    let before = Arc::new(Mutex::new(None));
-    let (image, worker_run, budget) = (path.to_path_buf(), run.clone(), *budget);
-    let worker_before = Arc::clone(&before);
+    let (label, worker_run, budget) = (path.to_path_buf(), run.clone(), *budget);
     let worker = thread::spawn(move || {
-        let _ = tx.send(mount_and_scan(&image, &worker_run, &budget, &worker_before));
+        let _ = tx.send(mount_and_scan(&file, &label, &worker_run, &budget));
     });
 
     let outcome = loop {
@@ -127,25 +129,46 @@ fn mount_on_worker(path: &Path, budget: &ScanBudget) -> Result<ImageReport, Stri
             }
         }
     };
-    let before = before.lock().map(|b| b.clone()).unwrap_or(None);
-    cleanup_run(&run, before.as_ref().map(|b: &Before| (path, b)));
+    cleanup_run(&run);
     outcome
 }
 
-/// Devices attached from the image before our attach.
-type Before = Vec<String>;
-
-/// Size checks, encryption check, attach, scan. Mounts are left for
-/// [`cleanup_run`]; `before` is set just before the attach starts.
+/// Clones `file` into `run`, checks the clone, attaches it under
+/// `run/mnt` and scans the volumes, labelling results and reasons with
+/// `label`. Every step after the clone reads only the clone. Mounts are
+/// left for [`cleanup_run`].
 fn mount_and_scan(
-    image: &Path,
+    file: &File,
+    label: &Path,
     run: &Path,
     budget: &ScanBudget,
-    before: &Mutex<Option<Before>>,
 ) -> Result<ImageReport, String> {
-    let len = std::fs::metadata(image)
+    let image = clone_into(file, label, run)?;
+    scan_clone(&image, label, run, budget).map_err(|why| {
+        why.replace(
+            image.to_string_lossy().as_ref(),
+            label.to_string_lossy().as_ref(),
+        )
+    })
+}
+
+fn scan_clone(
+    image: &Path,
+    label: &Path,
+    run: &Path,
+    budget: &ScanBudget,
+) -> Result<ImageReport, String> {
+    let clone = File::open(image).map_err(|e| format!("cannot open the clone: {e}"))?;
+    // `uchg`/`uappnd` come across with the clone and would stop its removal.
+    clear_flags(&clone).map_err(|e| format!("cannot clear the clone's file flags: {e}"))?;
+    if !matches!(nav_core::disk_image_format_of_file(&clone), Ok(Some(_))) {
+        return Err("image changed before it was cloned and is no longer a disk image".into());
+    }
+    let len = clone
+        .metadata()
         .map_err(|e| format!("cannot stat image: {e}"))?
         .len();
+    drop(clone);
     if len > MAX_IMAGE_BYTES {
         return Err(limit_reason(format!(
             "image file is larger than {} GiB",
@@ -179,12 +202,7 @@ fn mount_and_scan(
         )));
     }
 
-    // Without a real snapshot, cleanup could take an existing attachment for ours.
-    let info = query_plist(&[os("info"), os("-plist")])?;
-    let attached_before = devices_of_image(&parse_info(&info), image);
-    if let Ok(mut b) = before.lock() {
-        *b = Some(attached_before);
-    }
+    let mounts = run.join(MOUNT_DIR);
     let out = run_hdiutil(
         &[
             os("attach"),
@@ -196,7 +214,7 @@ fn mount_and_scan(
             os("-stdinpass"),
             os("-plist"),
             os("-mountrandom"),
-            run.as_os_str(),
+            mounts.as_os_str(),
             image_arg.as_os_str(),
         ],
         MOUNT_TIMEOUT,
@@ -212,25 +230,98 @@ fn mount_and_scan(
         return Err(format!("mount failed: {}", error_line(&out)));
     }
     let attached = captured_plist(&out).ok_or("mount failed: unreadable hdiutil output")?;
-    let entities = parse_attach(&attached, run);
+    let entities = parse_attach(&attached, &mounts);
     if entities.volumes.is_empty() {
         return Err("no volume on the image mounted".into());
     }
 
-    // Volumes sit one level below `run`, so their contents keep the
+    // Volumes sit one level below `mounts`, so their contents keep the
     // caller's depth limit.
     let walk_budget = ScanBudget {
         max_depth: budget.max_depth.saturating_add(1),
         ..*budget
     };
-    let mut scan = scan_target_with_budget(run, true, &walk_budget)
+    let mut scan = scan_target_with_budget(&mounts, true, &walk_budget)
         .map_err(|e| format!("cannot read the mounted volume: {e}"))?;
-    relabel(&mut scan, image, &entities.volumes);
+    relabel(&mut scan, label, &entities.volumes);
     Ok(ImageReport {
         scan,
         volumes: entities.volumes.len(),
         gaps: entities.gaps,
     })
+}
+
+/// Clones `file` into `run` as `image[.ext]`, keeping `label`'s extension
+/// for hdiutil. Never copies: an image on another volume is not mounted.
+fn clone_into(file: &File, label: &Path, run: &Path) -> Result<PathBuf, String> {
+    let name = match label.extension().and_then(OsStr::to_str) {
+        Some(ext) if ext.len() <= 32 && !ext.contains('/') => format!("{CLONE_STEM}.{ext}"),
+        _ => CLONE_STEM.to_string(),
+    };
+    match clone_file(file, run, &name) {
+        Ok(()) => Ok(run.join(name)),
+        Err(e) if e.raw_os_error() == Some(libc::EXDEV) => Err(
+            "image is on a different volume from the scratch directory and is not copied".into(),
+        ),
+        Err(e) if e.raw_os_error() == Some(libc::ENOTSUP) => {
+            Err("the image's filesystem does not support cloning; image not copied".into())
+        }
+        Err(e) => Err(format!("could not clone the image: {e}")),
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn clone_file(file: &File, dir: &Path, name: &str) -> io::Result<()> {
+    use std::os::fd::AsRawFd;
+    // <sys/clonefile.h>; not in the libc crate.
+    const CLONE_NOFOLLOW: u32 = 0x0001;
+    const CLONE_NOOWNERCOPY: u32 = 0x0002;
+    let dir = File::open(dir)?;
+    let name = std::ffi::CString::new(name).map_err(io::Error::other)?;
+    // SAFETY: both descriptors are open for the call and `name` is a valid
+    // NUL-terminated string.
+    let r = unsafe {
+        libc::fclonefileat(
+            file.as_raw_fd(),
+            dir.as_raw_fd(),
+            name.as_ptr(),
+            CLONE_NOFOLLOW | CLONE_NOOWNERCOPY,
+        )
+    };
+    if r == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
+/// Clears the user immutable and append-only flags on `file`, which we
+/// own, keeping every other flag (`UF_COMPRESSED` must stay).
+#[cfg(target_os = "macos")]
+fn clear_flags(file: &File) -> io::Result<()> {
+    use std::os::fd::AsRawFd;
+    use std::os::macos::fs::MetadataExt;
+    let blocking = libc::UF_IMMUTABLE | libc::UF_APPEND;
+    let flags = file.metadata()?.st_flags();
+    if flags & blocking == 0 {
+        return Ok(());
+    }
+    // SAFETY: fchflags on a descriptor we own.
+    if unsafe { libc::fchflags(file.as_raw_fd(), flags & !blocking) } == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn clear_flags(_: &File) -> io::Result<()> {
+    Ok(())
+}
+
+#[cfg(not(target_os = "macos"))]
+fn clone_file(_: &File, _: &Path, _: &str) -> io::Result<()> {
+    Err(io::ErrorKind::Unsupported.into())
 }
 
 fn limit_reason(what: String) -> String {
@@ -336,13 +427,21 @@ fn scratch_root() -> io::Result<PathBuf> {
     std::fs::canonicalize(&root)
 }
 
-/// A fresh 0700 `<pid>-<random>` directory under `root`.
+/// A fresh 0700 `<pid>-<random>` directory under `root`, with its 0700
+/// mount directory.
 fn create_run_dir(root: &Path) -> io::Result<PathBuf> {
     let mut rand = [0u8; 8];
-    std::fs::File::open("/dev/urandom")?.read_exact(&mut rand)?;
+    File::open("/dev/urandom")?.read_exact(&mut rand)?;
     let name = format!("{}-{:016x}", std::process::id(), u64::from_ne_bytes(rand));
     let dir = root.join(name);
     std::fs::DirBuilder::new().mode(0o700).create(&dir)?;
+    if let Err(e) = std::fs::DirBuilder::new()
+        .mode(0o700)
+        .create(dir.join(MOUNT_DIR))
+    {
+        let _ = std::fs::remove_dir(&dir);
+        return Err(e);
+    }
     Ok(dir)
 }
 
@@ -374,14 +473,11 @@ fn sweep_stale(root: &Path) {
             .is_some_and(|pid| pid != me && !pid_alive(pid))
     };
     for a in attachments() {
-        let stale = a
-            .mount_points
-            .iter()
-            .find(|m| m.starts_with(root) && dead(m));
-        if let Some(m) = stale {
+        let stale = a.paths().any(|p| p.starts_with(root) && dead(p));
+        if stale {
             eprintln!(
                 "navctl: detaching a stale scratch mount from an earlier run: {}",
-                m.display()
+                a.describe()
             );
             detach(&a);
         }
@@ -397,38 +493,35 @@ fn sweep_stale(root: &Path) {
     }
 }
 
-/// Detaches everything mounted under `run` and, given `(image, before)`,
-/// every attachment of `image` not in `before` with no mount point (a
-/// killed or failed attach); then removes `run`, warning about anything
-/// that would not go.
-fn cleanup_run(run: &Path, ours: Option<(&Path, &Before)>) {
-    let leftovers = |all: Vec<Attachment>| -> Vec<Attachment> {
-        all.into_iter()
-            .filter(|a| {
-                a.mounted_under(run)
-                    || ours.is_some_and(|(image, before)| {
-                        a.is_image(image)
-                            && a.mount_points.is_empty()
-                            && a.device.as_ref().is_some_and(|d| !before.contains(d))
-                    })
-            })
-            .collect()
+/// Detaches every attachment of ours (its image or a mount point under
+/// `run`), then removes `run`, warning about anything that would not go.
+fn cleanup_run(run: &Path) {
+    let ours = |all: Vec<Attachment>| -> Vec<Attachment> {
+        all.into_iter().filter(|a| a.refers_into(run)).collect()
     };
-    for a in leftovers(attachments()) {
+    for a in ours(attachments()) {
         detach(&a);
     }
-    for a in leftovers(attachments()) {
+    for a in ours(attachments()) {
         eprintln!("navctl: warning: could not detach {}", a.describe());
     }
     remove_run_dir(run);
 }
 
-/// Removes `dir` and its empty mount-point directories. Never recursive, so
-/// it cannot delete into a volume that is still mounted.
+/// Removes `dir`: the empty mount-point directories, the mount directory
+/// and the files directly in `dir`. Never recursive, so it cannot delete
+/// into a volume that is still mounted.
 fn remove_run_dir(dir: &Path) {
-    if let Ok(entries) = std::fs::read_dir(dir) {
+    for d in [dir.join(MOUNT_DIR), dir.to_path_buf()] {
+        let Ok(entries) = std::fs::read_dir(&d) else {
+            continue;
+        };
         for e in entries.flatten() {
-            let _ = std::fs::remove_dir(e.path());
+            let _ = if e.file_type().is_ok_and(|t| t.is_dir()) {
+                std::fs::remove_dir(e.path())
+            } else {
+                std::fs::remove_file(e.path())
+            };
         }
     }
     let _ = std::fs::remove_dir(dir);
@@ -444,14 +537,18 @@ struct Attachment {
 }
 
 impl Attachment {
-    fn mounted_under(&self, dir: &Path) -> bool {
-        self.mount_points.iter().any(|m| m.starts_with(dir))
+    /// The image path and every mount point.
+    fn paths(&self) -> impl Iterator<Item = &Path> {
+        self.image_path
+            .iter()
+            .chain(&self.mount_points)
+            .map(PathBuf::as_path)
     }
 
-    /// Same file as `image`, compared canonically as hdiutil reports it.
-    fn is_image(&self, image: &Path) -> bool {
-        let canon = std::fs::canonicalize(image).ok();
-        self.image_path.is_some() && self.image_path == canon
+    /// Whether the image or a mount point is under `dir` (canonical, as
+    /// hdiutil reports paths).
+    fn refers_into(&self, dir: &Path) -> bool {
+        self.paths().any(|p| p.starts_with(dir))
     }
 
     /// What `hdiutil detach` is given: the device, else a mount point.
@@ -477,13 +574,6 @@ fn attachments() -> Vec<Attachment> {
         Ok(info) => parse_info(&info),
         Err(_) => Vec::new(),
     }
-}
-
-fn devices_of_image(all: &[Attachment], image: &Path) -> Before {
-    all.iter()
-        .filter(|a| a.is_image(image))
-        .filter_map(|a| a.device.clone())
-        .collect()
 }
 
 fn parse_info(info: &PlistValue) -> Vec<Attachment> {
@@ -696,9 +786,27 @@ mod tests {
         assert_eq!(all.len(), 2);
         assert_eq!(all[0].device.as_deref(), Some("/dev/disk5"));
         assert_eq!(all[0].image_path, Some(PathBuf::from("/i/dev/disk5.dmg")));
-        assert!(all[0].mounted_under(Path::new("/s/1-ab")));
-        assert!(!all[1].mounted_under(Path::new("/s/1-ab")));
-        assert!(!all[0].mounted_under(Path::new("/s/1-a")));
+        assert!(all[0].refers_into(Path::new("/s/1-ab")));
+        assert!(!all[1].refers_into(Path::new("/s/1-ab")));
+        assert!(!all[0].refers_into(Path::new("/s/1-a")));
+    }
+
+    /// An attachment is ours by its image path alone (a volume unmounted
+    /// under it), or by a mount point; never by being the same image
+    /// attached from elsewhere.
+    #[test]
+    fn ownership_is_by_image_path_or_mount_point_under_the_run_dir() {
+        let run = Path::new("/s/1-ab");
+        let att = |image: &str, mounts: &[&str]| Attachment {
+            device: Some("/dev/disk9".into()),
+            image_path: Some(PathBuf::from(image)),
+            mount_points: mounts.iter().map(PathBuf::from).collect(),
+        };
+        assert!(att("/s/1-ab/image.dmg", &[]).refers_into(run));
+        assert!(att("/u/x.dmg", &["/s/1-ab/mnt/dmg.A"]).refers_into(run));
+        assert!(!att("/u/x.dmg", &[]).refers_into(run));
+        assert!(!att("/u/x.dmg", &["/Volumes/X"]).refers_into(run));
+        assert!(!att("/s/1-abc/image.dmg", &[]).refers_into(run));
     }
 
     #[test]
