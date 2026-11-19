@@ -148,7 +148,7 @@ jobs:
             for f in "$@"; do
               cp -- "$f" "fuzz/corpus/${target}/$(sha1sum < "$f" | cut -c1-40)"
             done
-            echo "${target}: $(ls "fuzz/corpus/${target}" | wc -l) inputs"
+            echo "${target}: $(find "fuzz/corpus/${target}" -type f | wc -l) inputs"
           }
           seed bzip2 testdata/bzip2/*.in
           # The inflate target tries raw deflate, zlib and gzip on each input.
