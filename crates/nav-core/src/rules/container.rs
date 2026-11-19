@@ -2,7 +2,6 @@
 //! (§6.2, §10, §11.8).
 
 use std::io;
-use std::path::Path;
 
 use super::{zip_member, Rule, RuleOutcome};
 use crate::context::{ContentSource, ScanContext};
@@ -74,12 +73,11 @@ fn probe_image_format(
     Some(None)
 }
 
-/// The disk-image format of the file at `path` (symlinks followed), as the
-/// `uninspected-container` rule detects it, or `None` if it is not one.
-/// Errors if the file cannot be opened or a probe cannot be read.
-pub fn disk_image_format_of_path(path: &Path) -> io::Result<Option<&'static str>> {
+/// The disk-image format of the open `file`, as the `uninspected-container`
+/// rule detects it, or `None` if it is not one. Errors if a probe cannot be
+/// read.
+pub fn disk_image_format_of_file(file: &std::fs::File) -> io::Result<Option<&'static str>> {
     use std::os::unix::fs::FileExt;
-    let file = std::fs::File::open(path)?;
     let len = file.metadata()?.len();
     let mut err = None;
     let found = probe_image_format(len, |offset, n| {
@@ -463,21 +461,20 @@ mod tests {
     }
 
     #[test]
-    fn disk_image_format_of_path_matches_the_rule() {
-        let dmg = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("fixtures/suspicious/dropper_in_disk_image.dmg");
-        assert_eq!(disk_image_format_of_path(&dmg).unwrap(), Some("UDIF"));
-        let encrypted = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("fixtures/suspicious/dropper_in_encrypted_disk_image.dmg");
+    fn disk_image_format_of_file_matches_the_rule() {
+        let probe = |name: &str| {
+            let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(name);
+            disk_image_format_of_file(&std::fs::File::open(path).unwrap()).unwrap()
+        };
         assert_eq!(
-            disk_image_format_of_path(&encrypted).unwrap(),
+            probe("fixtures/suspicious/dropper_in_disk_image.dmg"),
+            Some("UDIF")
+        );
+        assert_eq!(
+            probe("fixtures/suspicious/dropper_in_encrypted_disk_image.dmg"),
             Some("encrypted")
         );
-        let sh =
-            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures/suspicious/dropper.sh");
-        assert_eq!(disk_image_format_of_path(&sh).unwrap(), None);
-        let tmp = temp_dir("probe-missing");
-        assert!(disk_image_format_of_path(&tmp.0.join("nope")).is_err());
+        assert_eq!(probe("fixtures/suspicious/dropper.sh"), None);
     }
 
     #[test]

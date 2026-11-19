@@ -4,8 +4,9 @@
 //! nav-core reports `Partial` (§10, §11.8).
 
 use std::ffi::OsStr;
+use std::fs::File;
 use std::io::{self, Read};
-use std::os::unix::fs::{DirBuilderExt, MetadataExt};
+use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicI32, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
@@ -54,11 +55,7 @@ pub enum ImageScan {
 /// Mounts and scans `path` if it is a disk image. Must be called from the
 /// main thread: it installs signal handlers and waits on a worker.
 pub fn scan_image(path: &Path, budget: &ScanBudget) -> ImageScan {
-    match std::fs::metadata(path) {
-        Ok(m) if m.is_file() => {}
-        _ => return ImageScan::NotImage,
-    }
-    if !matches!(nav_core::disk_image_format_of_path(path), Ok(Some(_))) {
+    if open_image(path).is_none() {
         return ImageScan::NotImage;
     }
     if !cfg!(target_os = "macos") {
@@ -75,6 +72,23 @@ pub fn scan_image(path: &Path, budget: &ScanBudget) -> ImageScan {
         (0, Err(reason)) => ImageScan::Unmounted(reason),
         (signal, _) => ImageScan::Interrupted(signal),
     }
+}
+
+/// `path` opened, if it is a regular file holding a disk image.
+fn open_image(path: &Path) -> Option<File> {
+    // Stat first so a FIFO or device is never opened.
+    if !std::fs::metadata(path).ok()?.is_file() {
+        return None;
+    }
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK)
+        .open(path)
+        .ok()?;
+    if !file.metadata().ok()?.is_file() {
+        return None;
+    }
+    matches!(nav_core::disk_image_format_of_file(&file), Ok(Some(_))).then_some(file)
 }
 
 /// Runs [`mount_and_scan`] on a worker thread while this thread watches for

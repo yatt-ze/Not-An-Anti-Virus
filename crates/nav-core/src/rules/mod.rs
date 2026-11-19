@@ -21,7 +21,7 @@ pub use codesign::{
     UnanchoredIdentityRule, UnnotarizedSignedRule, UnsignedBinaryRule,
 };
 pub use container::{
-    disk_image_format_of_path, UninspectedContainerRule, UNINSPECTED_CONTAINER_ID,
+    disk_image_format_of_file, UninspectedContainerRule, UNINSPECTED_CONTAINER_ID,
 };
 pub use entropy::HighEntropyRule;
 pub use macho_structure::MachOStructureRule;
