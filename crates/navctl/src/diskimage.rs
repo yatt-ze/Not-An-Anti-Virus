@@ -279,11 +279,44 @@ fn scan_clone(
     let mut scan = scan_target_with_budget(&mounts, true, &walk_budget)
         .map_err(|e| format!("cannot read the mounted volume: {e}"))?;
     relabel(&mut scan, label, &entities.volumes);
+    let mut gaps = entities.gaps;
+    gaps.extend(vanished(&entities.volumes, is_mount_point));
     Ok(ImageReport {
         scan,
         volumes: entities.volumes.len(),
-        gaps: entities.gaps,
+        gaps,
     })
+}
+
+/// A gap for each of `volumes` no longer mounted where the attach put it.
+fn vanished(volumes: &[PathBuf], mounted: impl Fn(&Path) -> bool) -> Vec<String> {
+    (1..)
+        .zip(volumes)
+        .filter(|(_, v)| !mounted(v))
+        .map(|(n, _)| format!("volume {n} was unmounted during the scan"))
+        .collect()
+}
+
+/// Whether a volume is mounted at `path` exactly (`statfs`'s mount point).
+#[cfg(target_os = "macos")]
+fn is_mount_point(path: &Path) -> bool {
+    use std::os::unix::ffi::OsStrExt;
+    let Ok(c) = std::ffi::CString::new(path.as_os_str().as_bytes()) else {
+        return false;
+    };
+    // SAFETY: a zeroed statfs is a valid out-buffer and `c` is NUL-terminated.
+    let mut fs: libc::statfs = unsafe { std::mem::zeroed() };
+    if unsafe { libc::statfs(c.as_ptr(), &mut fs) } != 0 {
+        return false;
+    }
+    let name = fs.f_mntonname.map(|c| c as u8);
+    std::ffi::CStr::from_bytes_until_nul(&name)
+        .is_ok_and(|on| on.to_bytes() == path.as_os_str().as_bytes())
+}
+
+#[cfg(not(target_os = "macos"))]
+fn is_mount_point(_: &Path) -> bool {
+    true
 }
 
 /// Clones `file` into `run` as `image[.ext]`, keeping `label`'s extension
@@ -1022,6 +1055,24 @@ mod tests {
         assert_eq!(parse_info(&dict(vec![])), None);
         let empty = dict(vec![("images", PlistValue::Array(vec![]))]);
         assert_eq!(parse_info(&empty), Some(vec![]));
+    }
+
+    #[test]
+    fn each_volume_gone_from_its_mount_point_is_a_gap() {
+        let vols = [PathBuf::from("/s/a"), PathBuf::from("/s/b")];
+        assert_eq!(vanished(&vols, |_| true), Vec::<String>::new());
+        assert_eq!(
+            vanished(&vols, |v| v.ends_with("a")),
+            vec!["volume 2 was unmounted during the scan".to_string()]
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn only_a_mount_point_itself_is_one() {
+        assert!(is_mount_point(Path::new("/")));
+        assert!(!is_mount_point(Path::new("/usr/bin")));
+        assert!(!is_mount_point(Path::new("/no/such/dir")));
     }
 
     #[test]

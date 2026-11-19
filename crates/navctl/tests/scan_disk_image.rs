@@ -6,7 +6,7 @@
 #![cfg(target_os = "macos")]
 
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output, Stdio};
+use std::process::{Child, Command, Output, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
@@ -661,14 +661,14 @@ fn an_immutable_image_leaves_no_clone_behind() {
     sb.assert_clean();
 }
 
-/// Whether a volume is mounted at a mount point under a run directory.
-fn scratch_volume_mounted(scratch: &Path) -> bool {
-    let Ok(runs) = std::fs::read_dir(scratch) else {
-        return false;
-    };
-    runs.flatten().any(|run| {
+/// A volume mounted at a mount point under a run directory.
+fn scratch_volume(scratch: &Path) -> Option<PathBuf> {
+    std::fs::read_dir(scratch).ok()?.flatten().find_map(|run| {
         std::fs::read_dir(run.path().join("mnt"))
-            .is_ok_and(|mps| mps.flatten().any(|mp| is_mount_point(&mp.path())))
+            .ok()?
+            .flatten()
+            .map(|mp| mp.path())
+            .find(|mp| is_mount_point(mp))
     })
 }
 
@@ -696,12 +696,8 @@ fn is_mount_point(path: &Path) -> bool {
         .is_ok_and(|on| on.to_bytes() == path.as_os_str().as_bytes())
 }
 
-/// SIGINT while a volume is mounted under the scratch root: navctl
-/// detaches it, removes the run directory, says so and exits 130 (#173).
-#[test]
-fn a_signal_after_the_mount_detaches_and_exits_130() {
-    let sb = Sandbox::new("sigint-mounted");
-    // Enough files that the walk outlasts the time to stop navctl.
+/// An image of 5,000 small files, so its walk outlasts stopping navctl.
+fn big_image(sb: &Sandbox) -> PathBuf {
     for d in 0..50 {
         let dir = sb.src().join(format!("d{d:02}"));
         std::fs::create_dir(&dir).unwrap();
@@ -709,38 +705,54 @@ fn a_signal_after_the_mount_detaches_and_exits_130() {
             std::fs::write(dir.join(format!("f{f:03}.txt")), "plain text\n").unwrap();
         }
     }
-    let image = sb.image("big.dmg", "UDZO");
-    for attempt in 1..=3 {
-        let mut child = Command::new(env!("CARGO_BIN_EXE_navctl"))
-            .arg("scan")
-            .arg(&image)
-            .env("TMPDIR", sb.root.join("tmp"))
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .unwrap();
-        let pid = child.id() as i32;
-        let deadline = Instant::now() + Duration::from_secs(60);
-        // The volume appears before `hdiutil attach` exits; wait for both.
-        while !scratch_volume_mounted(&sb.scratch()) || has_child(pid) {
-            assert!(Instant::now() < deadline, "no volume was mounted");
-            if child.try_wait().unwrap().is_some() {
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(2));
+    sb.image("big.dmg", "UDZO")
+}
+
+/// Starts navctl `args image` and SIGSTOPs it once a volume is mounted
+/// under the scratch root. Also returns the mount point if the volume was
+/// still mounted once navctl stopped.
+fn stop_when_mounted(sb: &Sandbox, args: &[&str], image: &Path) -> (Child, Option<PathBuf>) {
+    let mut child = Command::new(env!("CARGO_BIN_EXE_navctl"))
+        .args(args)
+        .arg(image)
+        .env("TMPDIR", sb.root.join("tmp"))
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(60);
+    // The volume appears before `hdiutil attach` exits; wait for both.
+    let pid = child.id() as i32;
+    while scratch_volume(&sb.scratch()).is_none() || has_child(pid) {
+        assert!(Instant::now() < deadline, "no volume was mounted");
+        if child.try_wait().unwrap().is_some() {
+            return (child, None);
         }
-        // Stopped with the volume still mounted, navctl has not detached
-        // yet; the SIGINT is delivered on SIGCONT.
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    // SAFETY: plain kill(2) on our own child.
+    unsafe { libc::kill(pid, libc::SIGSTOP) };
+    let mounted = scratch_volume(&sb.scratch());
+    (child, mounted)
+}
+
+/// SIGINT while a volume is mounted under the scratch root: navctl
+/// detaches it, removes the run directory, says so and exits 130 (#173).
+#[test]
+fn a_signal_after_the_mount_detaches_and_exits_130() {
+    let sb = Sandbox::new("sigint-mounted");
+    let image = big_image(&sb);
+    for attempt in 1..=3 {
+        let (child, mounted) = stop_when_mounted(&sb, &["scan"], &image);
+        // The SIGINT is delivered on SIGCONT.
         // SAFETY: plain kill(2) on our own child.
-        unsafe { libc::kill(pid, libc::SIGSTOP) };
-        let mounted = scratch_volume_mounted(&sb.scratch());
         unsafe {
-            libc::kill(pid, libc::SIGINT);
-            libc::kill(pid, libc::SIGCONT);
+            libc::kill(child.id() as i32, libc::SIGINT);
+            libc::kill(child.id() as i32, libc::SIGCONT);
         }
         let out = child.wait_with_output().unwrap();
-        if !mounted || out.status.code() == Some(0) {
+        if mounted.is_none() || out.status.code() == Some(0) {
             // The walk finished first; nothing was interrupted.
             sb.assert_clean();
             assert!(attempt < 3, "never interrupted during the walk");
@@ -753,6 +765,35 @@ fn a_signal_after_the_mount_detaches_and_exits_130() {
             stderr(&out)
         );
         sb.assert_clean();
+        return;
+    }
+}
+
+/// A volume detached by someone else while navctl walks it is a mount gap,
+/// so `coverage_complete` is false (#177).
+#[test]
+fn a_volume_unmounted_during_the_scan_is_a_gap() {
+    let sb = Sandbox::new("vanished");
+    let image = big_image(&sb);
+    for attempt in 1..=3 {
+        let (child, mounted) = stop_when_mounted(&sb, &["rules", "test", "--json"], &image);
+        if let Some(mp) = &mounted {
+            assert!(hdiutil(&[os("detach"), os(mp), os("-force"), os("-quiet")]));
+        }
+        // SAFETY: plain kill(2) on our own child.
+        unsafe { libc::kill(child.id() as i32, libc::SIGCONT) };
+        let out = child.wait_with_output().unwrap();
+        sb.assert_clean();
+        let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+        let gaps = v["mount_gaps"].to_string();
+        if mounted.is_none() || !gaps.contains("unmounted during the scan") {
+            // navctl was past the check when it stopped.
+            assert!(attempt < 3, "never detached during the walk: {gaps}");
+            continue;
+        }
+        assert_eq!(out.status.code(), Some(3), "{}", stderr(&out));
+        assert_eq!(v["coverage_complete"], false);
+        assert_eq!(gaps, r#"["volume 1 was unmounted during the scan"]"#);
         return;
     }
 }
