@@ -191,23 +191,25 @@ jobs:
         working-directory: crates/nav-core
         run: |
           set -uo pipefail
-          # target     max_len  why that max_len
+          # dict: a file in fuzz/dicts/, or - for none.
+          # target     max_len  dict        why that max_len
           settings='
-          parse_plist   16384   nesting past MAX_DEPTH 32, long entity runs
-          parse_xar     65536   header + zlib TOC + several heap entries
-          parse_cpio    16384   >64 small entries, past the harness entry cap
-          inflate       65536   a full 32 KiB window plus stored blocks
-          bzip2         32768   >18002 selectors and a few small blocks
-          parse_macho   65536   load commands, a 2-slice fat file, a signature
-          parse_zip     66560   a 65535-byte comment + EOCD/ZIP64 records
+          parse_plist   16384   plist.dict  nesting past MAX_DEPTH 32, long entity runs
+          parse_xar     65536   xar.dict    header + zlib TOC + several heap entries
+          parse_cpio    16384   cpio.dict   >64 small entries, past the harness entry cap
+          inflate       65536   -           a full 32 KiB window plus stored blocks
+          bzip2         32768   bzip2.dict  >18002 selectors and a few small blocks
+          parse_macho   65536   -           load commands, a 2-slice fat file, a signature
+          parse_zip     66560   zip.dict    a 65535-byte comment + EOCD/ZIP64 records
           '
           failed=()
-          while read -r target max_len _; do
+          while read -r target max_len dict _; do
             [[ -n ${target} ]] || continue
-            echo "::group::fuzz ${target} (60s, max_len ${max_len})"
+            args=(-max_total_time=60 -timeout=10 -rss_limit_mb=2048 -max_len="${max_len}")
+            [[ ${dict} == - ]] || args+=(-dict="fuzz/dicts/${dict}")
+            echo "::group::fuzz ${target} (60s, ${args[*]:3})"
             if ! cargo fuzz run --target x86_64-unknown-linux-gnu "${target}" -- \
-                -max_total_time=60 -timeout=10 -rss_limit_mb=2048 \
-                -max_len="${max_len}" </dev/null; then
+                "${args[@]}" </dev/null; then
               failed+=("${target}")
             fi
             echo "::endgroup::"
