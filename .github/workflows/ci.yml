@@ -18,6 +18,11 @@ on:
   schedule:
     - cron: "17 5 * * *"
   workflow_dispatch:
+    inputs:
+      minimize:
+        description: "fuzz-run: shrink each fuzz corpus with cargo fuzz cmin before saving it"
+        type: boolean
+        default: false
 
 # A newer push to the same branch/PR supersedes an in-flight run.
 concurrency:
@@ -243,6 +248,22 @@ jobs:
           path: crates/nav-core/fuzz/artifacts/
           if-no-files-found: ignore
           retention-days: 30
+      # Manual opt-in only (never nightly): drop corpus inputs that add no
+      # coverage, so the carried corpus doesn't grow without bound. cmin
+      # swaps the shrunk corpus in only once its merge succeeds.
+      - name: minimize fuzz corpora
+        if: inputs.minimize
+        working-directory: crates/nav-core
+        run: |
+          set -euo pipefail
+          for target in $(cargo fuzz list); do
+            before=$(find "fuzz/corpus/${target}" -type f | wc -l)
+            echo "::group::cmin ${target}"
+            cargo fuzz cmin --target x86_64-unknown-linux-gnu "${target}" -- \
+              -timeout=10 -rss_limit_mb=2048
+            echo "::endgroup::"
+            echo "${target}: ${before} -> $(find "fuzz/corpus/${target}" -type f | wc -l) inputs"
+          done
       # Once seeded, the corpus exists and is worth keeping whatever happened.
       - name: save grown fuzz corpus
         if: always() && steps.seed.outcome == 'success'
