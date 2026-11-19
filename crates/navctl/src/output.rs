@@ -47,11 +47,13 @@ fn prepare(path: &Path, budget: &ScanBudget, no_mount: bool) -> Prepared {
             Prepared::Plain(Some(reason))
         }
         ImageScan::Scanned(report) => Prepared::Image(report),
-        ImageScan::Interrupted(signal) => {
-            eprintln!(
-                "navctl: {}: scan interrupted; scratch mounts detached",
-                path.display()
-            );
+        ImageScan::Interrupted { signal, released } => {
+            let mounts = if released {
+                "scratch mounts detached"
+            } else {
+                "warning: scratch mounts may still be attached"
+            };
+            eprintln!("navctl: {}: scan interrupted; {mounts}", path.display());
             Prepared::Done(exit::code(128u8.saturating_add(signal as u8)))
         }
     }

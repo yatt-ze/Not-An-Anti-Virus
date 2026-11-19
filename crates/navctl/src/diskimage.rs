@@ -8,8 +8,8 @@ use std::fs::File;
 use std::io::{self, Read};
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicI32, Ordering};
-use std::sync::mpsc;
+use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
+use std::sync::{mpsc, Arc};
 use std::thread;
 use std::time::Duration;
 
@@ -52,8 +52,12 @@ pub enum ImageScan {
     /// A disk image that was not mounted, and why.
     Unmounted(String),
     Scanned(ImageReport),
-    /// Cancelled by this signal; mounts have been cleaned up.
-    Interrupted(i32),
+    /// Cancelled by `signal`. `released`: cleanup verified that nothing of
+    /// this run is still attached.
+    Interrupted {
+        signal: i32,
+        released: bool,
+    },
 }
 
 /// Mounts and scans `path` if it is a disk image. Must be called from the
@@ -69,12 +73,12 @@ pub fn scan_image(path: &Path, budget: &ScanBudget) -> ImageScan {
         return ImageScan::Unmounted(format!("{HDIUTIL} not found"));
     }
 
-    let outcome = mount_on_worker(file, path, budget);
+    let (outcome, released) = mount_on_worker(file, path, budget);
     set_signal_handlers(libc::SIG_DFL);
     match (CANCEL.load(Ordering::SeqCst), outcome) {
         (0, Ok(report)) => ImageScan::Scanned(report),
         (0, Err(reason)) => ImageScan::Unmounted(reason),
-        (signal, _) => ImageScan::Interrupted(signal),
+        (signal, _) => ImageScan::Interrupted { signal, released },
     }
 }
 
@@ -96,17 +100,35 @@ fn open_image(path: &Path) -> Option<File> {
 }
 
 /// Runs [`mount_and_scan`] on a worker thread while this thread watches for
-/// a cancel signal, then detaches and removes the run directory either way.
-fn mount_on_worker(file: File, path: &Path, budget: &ScanBudget) -> Result<ImageReport, String> {
+/// a cancel signal, then cleans up either way. Also returns
+/// [`cleanup_run`]'s verdict (true when nothing was ever attached).
+fn mount_on_worker(
+    file: File,
+    path: &Path,
+    budget: &ScanBudget,
+) -> (Result<ImageReport, String>, bool) {
     set_signal_handlers(on_signal as extern "C" fn(libc::c_int) as libc::sighandler_t);
-    let root = scratch_root().map_err(|e| format!("scratch directory unusable: {e}"))?;
+    let unusable = |e: io::Error| (Err(format!("scratch directory unusable: {e}")), true);
+    let root = match scratch_root() {
+        Ok(root) => root,
+        Err(e) => return unusable(e),
+    };
     sweep_stale(&root);
-    let run = create_run_dir(&root).map_err(|e| format!("scratch directory unusable: {e}"))?;
+    if cancelled() {
+        return (Err("interrupted".into()), true);
+    }
+    let run = match create_run_dir(&root) {
+        Ok(run) => run,
+        Err(e) => return unusable(e),
+    };
 
     let (tx, rx) = mpsc::channel();
     let (label, worker_run, budget) = (path.to_path_buf(), run.clone(), *budget);
+    let attaching = Arc::new(AtomicBool::new(false));
+    let worker_attaching = Arc::clone(&attaching);
     let worker = thread::spawn(move || {
-        let _ = tx.send(mount_and_scan(&file, &label, &worker_run, &budget));
+        let r = mount_and_scan(&file, &label, &worker_run, &budget, &worker_attaching);
+        let _ = tx.send(r);
     });
 
     let outcome = loop {
@@ -129,22 +151,24 @@ fn mount_on_worker(file: File, path: &Path, budget: &ScanBudget) -> Result<Image
             }
         }
     };
-    cleanup_run(&run);
-    outcome
+    let released = cleanup_run(&run, attaching.load(Ordering::SeqCst));
+    (outcome, released)
 }
 
 /// Clones `file` into `run`, checks the clone, attaches it under
 /// `run/mnt` and scans the volumes, labelling results and reasons with
 /// `label`. Every step after the clone reads only the clone. Mounts are
-/// left for [`cleanup_run`].
+/// left for [`cleanup_run`]. `attaching` stays set if an attach was killed
+/// before it returned.
 fn mount_and_scan(
     file: &File,
     label: &Path,
     run: &Path,
     budget: &ScanBudget,
+    attaching: &AtomicBool,
 ) -> Result<ImageReport, String> {
     let image = clone_into(file, label, run)?;
-    scan_clone(&image, label, run, budget).map_err(|why| {
+    scan_clone(&image, label, run, budget, attaching).map_err(|why| {
         why.replace(
             image.to_string_lossy().as_ref(),
             label.to_string_lossy().as_ref(),
@@ -157,6 +181,7 @@ fn scan_clone(
     label: &Path,
     run: &Path,
     budget: &ScanBudget,
+    attaching: &AtomicBool,
 ) -> Result<ImageReport, String> {
     let clone = File::open(image).map_err(|e| format!("cannot open the clone: {e}"))?;
     // `uchg`/`uappnd` come across with the clone and would stop its removal.
@@ -203,6 +228,7 @@ fn scan_clone(
     }
 
     let mounts = run.join(MOUNT_DIR);
+    attaching.store(true, Ordering::SeqCst);
     let out = run_hdiutil(
         &[
             os("attach"),
@@ -218,8 +244,13 @@ fn scan_clone(
             image_arg.as_os_str(),
         ],
         MOUNT_TIMEOUT,
-    )
-    .map_err(|e| format!("hdiutil attach: {e}"))?;
+    );
+    // Only a started child that was killed may still land; run_capped
+    // errs only when nothing was spawned.
+    if !matches!(&out, Ok(o) if o.timed_out) {
+        attaching.store(false, Ordering::SeqCst);
+    }
+    let out = out.map_err(|e| format!("hdiutil attach: {e}"))?;
     if out.timed_out {
         return Err(limit_reason(format!(
             "mount did not finish within {} s",
@@ -472,46 +503,118 @@ fn sweep_stale(root: &Path) {
             .and_then(|c| owner_pid(c.as_os_str()))
             .is_some_and(|pid| pid != me && !pid_alive(pid))
     };
-    for a in attachments() {
-        let stale = a.paths().any(|p| p.starts_with(root) && dead(p));
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return;
+    };
+    for e in entries.flatten() {
+        if cancelled() {
+            return;
+        }
+        let dir = e.path();
+        if !e.file_type().is_ok_and(|t| t.is_dir()) || !dead(&dir) {
+            continue;
+        }
+        let swept = release(&dir, true).and_then(|()| remove_run_dir(&dir));
+        match swept {
+            Ok(()) => {}
+            Err(_) if cancelled() => return,
+            Err(why) => eprintln!(
+                "navctl: warning: {why}; keeping stale scratch directory {}",
+                dir.display()
+            ),
+        }
+    }
+}
+
+fn cancelled() -> bool {
+    CANCEL.load(Ordering::SeqCst) != 0
+}
+
+/// Detaches every attachment of ours (its image or a mount point under
+/// `run`), then removes `run` if nothing of ours is left attached. With
+/// `attach_cut` (an attach killed before it returned), first waits up to
+/// [`SETTLE`] for it to land; if it does not, keeps `run`.
+/// Returns whether nothing of ours is attached and `run` is gone; otherwise
+/// warns and keeps `run` for a later run's sweep.
+fn cleanup_run(run: &Path, attach_cut: bool) -> bool {
+    let landed = attach_cut && settle(run);
+    let result = release(run, false).and_then(|()| {
+        if attach_cut && !landed {
+            Err("an hdiutil attach was cut short and may still finish".into())
+        } else {
+            remove_run_dir(run)
+        }
+    });
+    match result {
+        Ok(()) => true,
+        Err(why) => {
+            eprintln!(
+                "navctl: warning: {why}; keeping scratch directory {} for a later run to clean up",
+                run.display()
+            );
+            false
+        }
+    }
+}
+
+/// How long cleanup watches for a killed attach to land.
+const SETTLE: Duration = Duration::from_secs(5);
+
+/// Waits up to [`SETTLE`] for an attachment of `run` to appear, and
+/// detaches it. Returns whether one appeared.
+fn settle(run: &Path) -> bool {
+    let end = std::time::Instant::now() + SETTLE;
+    while std::time::Instant::now() < end {
+        let ours: Vec<Attachment> = attachments(false)
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|a| a.refers_into(run))
+            .collect();
+        if !ours.is_empty() {
+            ours.iter().for_each(detach);
+            return true;
+        }
+        thread::sleep(Duration::from_millis(250));
+    }
+    false
+}
+
+/// Detaches every attachment referring into `dir` and checks that none is
+/// left. A listing that fails is an error, never "nothing attached".
+/// `stale`: a sweep, so listings stop on a cancel and each detach is noted
+/// as left by an earlier run.
+fn release(dir: &Path, stale: bool) -> Result<(), String> {
+    let ours = || -> Result<Vec<Attachment>, String> {
+        Ok(attachments(stale)?
+            .into_iter()
+            .filter(|a| a.refers_into(dir))
+            .collect())
+    };
+    let found = ours()?;
+    if found.is_empty() {
+        return Ok(());
+    }
+    for a in &found {
         if stale {
             eprintln!(
                 "navctl: detaching a stale scratch mount from an earlier run: {}",
                 a.describe()
             );
-            detach(&a);
         }
+        detach(a);
     }
-    let Ok(entries) = std::fs::read_dir(root) else {
-        return;
-    };
-    for e in entries.flatten() {
-        let path = e.path();
-        if e.file_type().is_ok_and(|t| t.is_dir()) && dead(&path) {
-            remove_run_dir(&path);
-        }
+    let left: Vec<String> = ours()?.iter().map(Attachment::describe).collect();
+    if left.is_empty() {
+        Ok(())
+    } else {
+        Err(format!("could not detach {}", left.join(", ")))
     }
-}
-
-/// Detaches every attachment of ours (its image or a mount point under
-/// `run`), then removes `run`, warning about anything that would not go.
-fn cleanup_run(run: &Path) {
-    let ours = |all: Vec<Attachment>| -> Vec<Attachment> {
-        all.into_iter().filter(|a| a.refers_into(run)).collect()
-    };
-    for a in ours(attachments()) {
-        detach(&a);
-    }
-    for a in ours(attachments()) {
-        eprintln!("navctl: warning: could not detach {}", a.describe());
-    }
-    remove_run_dir(run);
 }
 
 /// Removes `dir`: the empty mount-point directories, the mount directory
 /// and the files directly in `dir`. Never recursive, so it cannot delete
-/// into a volume that is still mounted.
-fn remove_run_dir(dir: &Path) {
+/// into a volume that is still mounted. Errors if `dir` is still there.
+fn remove_run_dir(dir: &Path) -> Result<(), String> {
     for d in [dir.join(MOUNT_DIR), dir.to_path_buf()] {
         let Ok(entries) = std::fs::read_dir(&d) else {
             continue;
@@ -524,7 +627,12 @@ fn remove_run_dir(dir: &Path) {
             };
         }
     }
-    let _ = std::fs::remove_dir(dir);
+    match std::fs::remove_dir(dir) {
+        Err(e) if e.kind() != io::ErrorKind::NotFound => {
+            Err(format!("could not remove the scratch directory: {e}"))
+        }
+        _ => Ok(()),
+    }
 }
 
 /// One image `hdiutil info` lists.
@@ -568,20 +676,25 @@ impl Attachment {
     }
 }
 
-/// Everything `hdiutil info` lists (empty if it fails).
-fn attachments() -> Vec<Attachment> {
-    match query_plist(&[os("info"), os("-plist")]) {
-        Ok(info) => parse_info(&info),
-        Err(_) => Vec::new(),
-    }
+/// Everything `hdiutil info` lists. `cancellable`: stop once a cancel
+/// signal arrives; otherwise it runs even after one.
+fn attachments(cancellable: bool) -> Result<Vec<Attachment>, String> {
+    let args = [os("info"), os("-plist")];
+    let out = if cancellable {
+        run_hdiutil(&args, QUERY_TIMEOUT)
+    } else {
+        run_hdiutil_uncancellable(&args, QUERY_TIMEOUT)
+    };
+    let info =
+        plist_result(&args, out).map_err(|e| format!("could not list attached images: {e}"))?;
+    parse_info(&info).ok_or_else(|| "could not list attached images: no image list".into())
 }
 
-fn parse_info(info: &PlistValue) -> Vec<Attachment> {
-    let images = info
-        .get("images")
-        .and_then(PlistValue::as_array)
-        .unwrap_or_default();
-    images
+/// The attachments in an `info -plist` result, or `None` if it has no
+/// `images` list.
+fn parse_info(info: &PlistValue) -> Option<Vec<Attachment>> {
+    let images = info.get("images").and_then(PlistValue::as_array)?;
+    let all = images
         .iter()
         .map(|img| {
             let entities = img
@@ -589,7 +702,7 @@ fn parse_info(info: &PlistValue) -> Vec<Attachment> {
                 .and_then(PlistValue::as_array)
                 .unwrap_or_default();
             Attachment {
-                device: whole_disk(entities).map(str::to_string),
+                device: whole_disk(entities),
                 image_path: img
                     .get("image-path")
                     .and_then(PlistValue::as_str)
@@ -601,22 +714,33 @@ fn parse_info(info: &PlistValue) -> Vec<Attachment> {
                     .collect(),
             }
         })
-        .collect()
+        .collect();
+    Some(all)
 }
 
-/// The first entity's device, when it is a whole disk (`/dev/diskN`):
-/// detaching it detaches every entity of the image.
-fn whole_disk(entities: &[PlistValue]) -> Option<&str> {
-    entities
-        .first()
-        .and_then(|e| e.get("dev-entry"))
-        .and_then(PlistValue::as_str)
-        .filter(|d| is_whole_disk(d))
+/// The image's whole disk (`/dev/diskN`): an entity that is one, else the
+/// disk of the first slice. Detaching it detaches every entity.
+fn whole_disk(entities: &[PlistValue]) -> Option<String> {
+    let devs = || {
+        entities
+            .iter()
+            .filter_map(|e| e.get("dev-entry").and_then(PlistValue::as_str))
+    };
+    devs()
+        .find(|d| disk_of(d).as_deref() == Some(*d))
+        .map(str::to_string)
+        .or_else(|| devs().find_map(disk_of))
 }
 
-fn is_whole_disk(dev: &str) -> bool {
-    dev.strip_prefix("/dev/disk")
-        .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
+/// `/dev/diskN` for `/dev/diskN` or a slice `/dev/diskNsM`.
+fn disk_of(dev: &str) -> Option<String> {
+    let rest = dev.strip_prefix("/dev/disk")?;
+    let n = rest.bytes().take_while(u8::is_ascii_digit).count();
+    let (digits, tail) = rest.split_at(n);
+    let slice = tail
+        .strip_prefix('s')
+        .is_some_and(|m| !m.is_empty() && m.bytes().all(|b| b.is_ascii_digit()));
+    (n > 0 && (tail.is_empty() || slice)).then(|| format!("/dev/disk{digits}"))
 }
 
 /// `hdiutil detach`, retried with `-force`. Runs even after a cancel.
@@ -654,8 +778,13 @@ fn error_line(out: &Captured) -> String {
 }
 
 fn query_plist(args: &[&OsStr]) -> Result<PlistValue, String> {
+    plist_result(args, run_hdiutil(args, QUERY_TIMEOUT))
+}
+
+/// The plist an `hdiutil args` run printed, or why there is none.
+fn plist_result(args: &[&OsStr], out: io::Result<Captured>) -> Result<PlistValue, String> {
     let verb = args[0].to_string_lossy().into_owned();
-    let out = run_hdiutil(args, QUERY_TIMEOUT).map_err(|e| format!("hdiutil {verb}: {e}"))?;
+    let out = out.map_err(|e| format!("hdiutil {verb}: {e}"))?;
     if out.timed_out {
         return Err(format!("hdiutil {verb} timed out"));
     }
@@ -782,7 +911,7 @@ mod tests {
                 image("/dev/disk7", "/Volumes/Mine"),
             ]),
         )]);
-        let all = parse_info(&info);
+        let all = parse_info(&info).unwrap();
         assert_eq!(all.len(), 2);
         assert_eq!(all[0].device.as_deref(), Some("/dev/disk5"));
         assert_eq!(all[0].image_path, Some(PathBuf::from("/i/dev/disk5.dmg")));
@@ -810,13 +939,37 @@ mod tests {
     }
 
     #[test]
+    fn an_info_result_without_an_image_list_is_not_empty() {
+        assert_eq!(parse_info(&dict(vec![])), None);
+        let empty = dict(vec![("images", PlistValue::Array(vec![]))]);
+        assert_eq!(parse_info(&empty), Some(vec![]));
+    }
+
+    #[test]
     fn run_dir_names_give_their_pid() {
         assert_eq!(owner_pid(OsStr::new("123-00ff")), Some(123));
         for bad in ["123", "123-", "abc-1", "-5-x", "0-x"] {
             assert_eq!(owner_pid(OsStr::new(bad)), None, "{bad}");
         }
-        assert!(is_whole_disk("/dev/disk12"));
-        assert!(!is_whole_disk("/dev/disk12s1"));
-        assert!(!is_whole_disk("/dev/disk"));
+        assert_eq!(disk_of("/dev/disk12").as_deref(), Some("/dev/disk12"));
+        assert_eq!(disk_of("/dev/disk12s1").as_deref(), Some("/dev/disk12"));
+        for bad in [
+            "/dev/disk",
+            "/dev/disks1",
+            "/dev/disk1x",
+            "/dev/disk1s",
+            "/dev/rdisk1",
+        ] {
+            assert_eq!(disk_of(bad), None, "{bad}");
+        }
+        let entities = [entity("/dev/disk5s1", Some("/s/1-ab/mnt/dmg.A"), true)];
+        assert_eq!(whole_disk(&entities).as_deref(), Some("/dev/disk5"));
+        // An APFS image: the synthesized container's slice before the disk.
+        let entities = [
+            entity("/dev/disk6s1", Some("/s/1-ab/mnt/dmg.A"), true),
+            entity("/dev/disk5s1", None, false),
+            entity("/dev/disk5", None, false),
+        ];
+        assert_eq!(whole_disk(&entities).as_deref(), Some("/dev/disk5"));
     }
 }

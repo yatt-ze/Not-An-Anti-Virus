@@ -26,7 +26,7 @@ pub struct Captured {
     pub stderr: Vec<u8>,
     /// As `stdout_cut`, for stderr.
     pub stderr_cut: bool,
-    /// Killed at the timeout or on cancel.
+    /// Killed at the timeout, on cancel, or because waiting on it failed.
     pub timed_out: bool,
 }
 
@@ -49,7 +49,8 @@ pub fn path_arg(path: &Path) -> PathBuf {
 
 /// Runs `program` with empty stdin, keeping up to [`MAX_CAPTURE`] of each
 /// output stream (drained concurrently so the child never blocks), killed
-/// at `timeout` or once `cancel` becomes non-zero.
+/// at `timeout` or once `cancel` becomes non-zero. Errors only if it could
+/// not be spawned; a child that was started never yields an error.
 pub fn run_capped(
     program: impl AsRef<OsStr>,
     args: &[&OsStr],
@@ -65,7 +66,7 @@ pub fn run_capped(
     let stdout = drain(child.stdout.take());
     let stderr = drain(child.stderr.take());
     let deadline = Instant::now() + timeout;
-    let (status, timed_out) = wait_until(&mut child, deadline, cancel)?;
+    let (status, timed_out) = wait_until(&mut child, deadline, cancel);
     // Not received in time counts as cut, so the output is not trusted. One
     // grace window covers both pipes.
     let grace_end = Instant::now() + PIPE_GRACE;
@@ -86,22 +87,22 @@ fn wait_until(
     child: &mut Child,
     deadline: Instant,
     cancel: Option<&AtomicI32>,
-) -> io::Result<(Option<ExitStatus>, bool)> {
+) -> (Option<ExitStatus>, bool) {
     loop {
         match child.try_wait() {
-            Ok(Some(status)) => return Ok((Some(status), false)),
+            Ok(Some(status)) => return (Some(status), false),
             Ok(None) => {}
-            Err(e) => {
+            Err(_) => {
                 let _ = child.kill();
                 let _ = child.wait();
-                return Err(e);
+                return (None, true);
             }
         }
         let cancelled = cancel.is_some_and(|c| c.load(Ordering::SeqCst) != 0);
         if cancelled || Instant::now() >= deadline {
             let _ = child.kill();
             let _ = child.wait();
-            return Ok((None, true));
+            return (None, true);
         }
         thread::sleep(Duration::from_millis(20));
     }

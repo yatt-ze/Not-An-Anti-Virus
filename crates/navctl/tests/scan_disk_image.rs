@@ -498,7 +498,8 @@ fn stale_mounts_from_a_dead_run_are_swept() {
     assert!(!dead_dir.exists());
 }
 
-/// SIGINT while the image is attaching: navctl detaches and exits 130.
+/// SIGINT while the image is attaching: navctl exits 130. If the attach
+/// was killed, the run directory is kept and the next run sweeps it.
 #[test]
 fn an_interrupted_scan_detaches_and_exits_130() {
     let sb = Sandbox::new("sigint");
@@ -527,6 +528,10 @@ fn an_interrupted_scan_detaches_and_exits_130() {
     if out.status.code() != Some(0) {
         assert_eq!(out.status.code(), Some(130), "{}", stderr(&out));
         assert!(stderr(&out).contains("interrupted"), "{}", stderr(&out));
+    }
+    if stderr(&out).contains("may still be attached") {
+        let next = sb.navctl(&["scan"], &image);
+        assert_eq!(next.status.code(), Some(0), "{}", stderr(&next));
     }
     sb.assert_clean();
 }
@@ -624,4 +629,100 @@ fn an_immutable_image_leaves_no_clone_behind() {
     let out = sb.navctl(&["scan"], &image);
     assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
     sb.assert_clean();
+}
+
+/// Whether a volume is mounted at a mount point under a run directory.
+fn scratch_volume_mounted(scratch: &Path) -> bool {
+    let Ok(runs) = std::fs::read_dir(scratch) else {
+        return false;
+    };
+    runs.flatten().any(|run| {
+        std::fs::read_dir(run.path().join("mnt"))
+            .is_ok_and(|mps| mps.flatten().any(|mp| is_mount_point(&mp.path())))
+    })
+}
+
+/// Whether process `pid` has a child (navctl's `hdiutil`).
+fn has_child(pid: i32) -> bool {
+    Command::new("/usr/bin/pgrep")
+        .args(["-P", &pid.to_string()])
+        .stdout(Stdio::null())
+        .status()
+        .is_ok_and(|s| s.success())
+}
+
+fn is_mount_point(path: &Path) -> bool {
+    use std::os::unix::ffi::OsStrExt;
+    let Ok(c) = std::ffi::CString::new(path.as_os_str().as_bytes()) else {
+        return false;
+    };
+    // SAFETY: a zeroed statfs is a valid out-buffer and `c` is NUL-terminated.
+    let mut fs: libc::statfs = unsafe { std::mem::zeroed() };
+    if unsafe { libc::statfs(c.as_ptr(), &mut fs) } != 0 {
+        return false;
+    }
+    let name = fs.f_mntonname.map(|c| c as u8);
+    std::ffi::CStr::from_bytes_until_nul(&name)
+        .is_ok_and(|on| on.to_bytes() == path.as_os_str().as_bytes())
+}
+
+/// SIGINT while a volume is mounted under the scratch root: navctl
+/// detaches it, removes the run directory, says so and exits 130 (#173).
+#[test]
+fn a_signal_after_the_mount_detaches_and_exits_130() {
+    let sb = Sandbox::new("sigint-mounted");
+    // Enough files that the walk outlasts the time to stop navctl.
+    for d in 0..50 {
+        let dir = sb.src().join(format!("d{d:02}"));
+        std::fs::create_dir(&dir).unwrap();
+        for f in 0..100 {
+            std::fs::write(dir.join(format!("f{f:03}.txt")), "plain text\n").unwrap();
+        }
+    }
+    let image = sb.image("big.dmg", "UDZO");
+    for attempt in 1..=3 {
+        let mut child = Command::new(env!("CARGO_BIN_EXE_navctl"))
+            .arg("scan")
+            .arg(&image)
+            .env("TMPDIR", sb.root.join("tmp"))
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let pid = child.id() as i32;
+        let deadline = Instant::now() + Duration::from_secs(60);
+        // The volume appears before `hdiutil attach` exits; wait for both.
+        while !scratch_volume_mounted(&sb.scratch()) || has_child(pid) {
+            assert!(Instant::now() < deadline, "no volume was mounted");
+            if child.try_wait().unwrap().is_some() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        // Stopped with the volume still mounted, navctl has not detached
+        // yet; the SIGINT is delivered on SIGCONT.
+        // SAFETY: plain kill(2) on our own child.
+        unsafe { libc::kill(pid, libc::SIGSTOP) };
+        let mounted = scratch_volume_mounted(&sb.scratch());
+        unsafe {
+            libc::kill(pid, libc::SIGINT);
+            libc::kill(pid, libc::SIGCONT);
+        }
+        let out = child.wait_with_output().unwrap();
+        if !mounted || out.status.code() == Some(0) {
+            // The walk finished first; nothing was interrupted.
+            sb.assert_clean();
+            assert!(attempt < 3, "never interrupted during the walk");
+            continue;
+        }
+        assert_eq!(out.status.code(), Some(130), "{}", stderr(&out));
+        assert!(
+            stderr(&out).contains("scan interrupted; scratch mounts detached"),
+            "{}",
+            stderr(&out)
+        );
+        sb.assert_clean();
+        return;
+    }
 }
