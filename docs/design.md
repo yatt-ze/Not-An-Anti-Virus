@@ -19,6 +19,7 @@ messages.
 | [`docs/design/platform.md`](design/platform.md) | §4, §9 | Event sources, daemon communication & notification delivery |
 | [`docs/design/gaps-and-requirements.md`](design/gaps-and-requirements.md) | §10–§11 | Out-of-scope / known gaps, cross-cutting requirements |
 | [`docs/design/roadmap.md`](design/roadmap.md) | §12–§14 | Phased roadmap, locked decisions, open decisions |
+| [`docs/design/config-candidates.md`](design/config-candidates.md) | — | Inventory of values that could become config options (Phase 3), by risk class |
 | [`docs/design-changelog.md`](design-changelog.md) | — | Revision history |
 
 ---
