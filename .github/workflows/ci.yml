@@ -18,6 +18,11 @@ on:
   schedule:
     - cron: "17 5 * * *"
   workflow_dispatch:
+    inputs:
+      minimize:
+        description: "fuzz-run: shrink each fuzz corpus with cargo fuzz cmin before saving it"
+        type: boolean
+        default: false
 
 # A newer push to the same branch/PR supersedes an in-flight run.
 concurrency:
@@ -26,6 +31,8 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
+  # Dated, so the fuzz jobs' rust-cache entries survive between runs.
+  FUZZ_TOOLCHAIN: nightly-2026-11-17
 
 jobs:
   fmt:
@@ -76,17 +83,22 @@ jobs:
     name: fuzz targets build (compile-only)
     if: github.event_name == 'push' || github.event_name == 'pull_request'
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     steps:
-      - uses: actions/checkout@v5
-      - uses: dtolnay/rust-toolchain@nightly
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1 (2026-10-15)
+        with:
+          toolchain: ${{ env.FUZZ_TOOLCHAIN }}
           targets: x86_64-unknown-linux-gnu
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           workspaces: crates/nav-core/fuzz
-      - uses: taiki-e/install-action@v2
+      - uses: taiki-e/install-action@c509219cf42fba86913069efd0ade2458c59337b # v2.90.1
         with:
-          tool: cargo-fuzz
+          tool: cargo-fuzz@0.13.2
       # Compile-only: catches bitrot in the harnesses on every PR without
       # spending PR time actually fuzzing. Bounded fuzzing runs nightly
       # instead, in fuzz-run below (NAV-014). `--target` is pinned to the gnu
@@ -102,22 +114,28 @@ jobs:
     # inflate, bzip2, then macho; zip was added after.
     if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     steps:
-      - uses: actions/checkout@v5
-      - uses: dtolnay/rust-toolchain@nightly
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1 (2026-10-15)
+        with:
+          toolchain: ${{ env.FUZZ_TOOLCHAIN }}
           targets: x86_64-unknown-linux-gnu
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           workspaces: crates/nav-core/fuzz
-      - uses: taiki-e/install-action@v2
+      - uses: taiki-e/install-action@c509219cf42fba86913069efd0ade2458c59337b # v2.90.1
         with:
-          tool: cargo-fuzz
+          tool: cargo-fuzz@0.13.2
       # The corpus each run grows is carried to the next one, so coverage
       # accumulates. Cache entries are immutable: save under a fresh key and
-      # restore the newest earlier one by prefix.
+      # restore the newest earlier one by prefix. Restore and save are split
+      # so a failing run (the one that found something) still saves.
       - name: restore grown fuzz corpus
-        uses: actions/cache@v4
+        uses: actions/cache/restore@caa296126883cff596d87d8935842f9db880ef25 # v5.1.0
         with:
           path: crates/nav-core/fuzz/corpus
           key: fuzz-corpus-${{ github.run_id }}
@@ -127,6 +145,7 @@ jobs:
       # Seeds are named by content hash, as libFuzzer names its own, so
       # same-named vectors (bomb.in, Info.plist) don't overwrite each other.
       - name: seed fuzz corpora
+        id: seed
         working-directory: crates/nav-core
         run: |
           set -euo pipefail
@@ -136,7 +155,7 @@ jobs:
             for f in "$@"; do
               cp -- "$f" "fuzz/corpus/${target}/$(sha1sum < "$f" | cut -c1-40)"
             done
-            echo "${target}: $(ls "fuzz/corpus/${target}" | wc -l) inputs"
+            echo "${target}: $(find "fuzz/corpus/${target}" -type f | wc -l) inputs"
           }
           seed bzip2 testdata/bzip2/*.in
           # The inflate target tries raw deflate, zlib and gzip on each input.
@@ -148,22 +167,107 @@ jobs:
           while IFS= read -r -d '' f; do plists+=("$f"); done \
             < <(find fixtures -name '*.plist' -print0)
           seed parse_plist "${plists[@]}"
-          # Mach-O by magic (thin 32/64-bit either endian, fat), not by name.
+          # Mach-O by magic (thin 32/64-bit either endian, fat 32/64), not by
+          # name. Java .class shares cafebabe; its bytes 4-7 are a version
+          # (>= 45) where a fat header has a small arch count.
           machos=()
           while IFS= read -r -d '' f; do
-            case "$(od -An -tx1 -N4 "$f" | tr -d ' \n')" in
-              feedface|cefaedfe|feedfacf|cffaedfe|cafebabe) machos+=("$f") ;;
+            head8=$(od -An -tx1 -N8 "$f" | tr -d ' \n')
+            case "${head8:0:8}" in
+              feedface|cefaedfe|feedfacf|cffaedfe) machos+=("$f") ;;
+              cafebabe|cafebabf)
+                if [[ ${#head8} -eq 16 ]] && (( 16#${head8:8:8} < 45 )); then
+                  machos+=("$f")
+                fi
+                ;;
             esac
           done < <(find fixtures -type f -print0)
           seed parse_macho "${machos[@]}"
-      # 60s/target bounds wall-clock (~5min total) rather than depth. With the
-      # seeds and the carried corpus, the time goes to the deep decode paths.
+      # Built once up front so fuzzing time isn't spent compiling.
+      - name: build fuzz targets
+        working-directory: crates/nav-core
+        run: cargo fuzz build --target x86_64-unknown-linux-gnu
+      # About 7.5 minutes of fuzzing, as four parallel lanes on the 4-core
+      # runner: the slow decoders get a lane (and core) each, the targets
+      # whose coverage plateaus early share the fourth. Every target runs
+      # even if another crashes; the step fails at the end if any did.
+      # -timeout turns a hang into a failure (libFuzzer's default is 1200s).
+      # -max_len is set per target rather than inferred from the largest
+      # seed; longer seeds are truncated.
       - name: bounded fuzz run
         working-directory: crates/nav-core
         run: |
-          set -euo pipefail
-          for target in parse_plist parse_xar parse_cpio inflate bzip2 parse_macho parse_zip; do
-            echo "::group::fuzz ${target} (60s)"
-            cargo fuzz run --target x86_64-unknown-linux-gnu "${target}" -- -max_total_time=60
+          set -uo pipefail
+          # Same-lane targets run in turn; lanes run in parallel.
+          # dict: a file in fuzz/dicts/, or - for none.
+          # target    lane secs max_len dict        why that max_len
+          settings='
+          inflate      1   450  65536   -           a full 32 KiB window plus stored blocks
+          bzip2        2   450  32768   bzip2.dict  >18002 selectors and a few small blocks
+          parse_xar    3   450  65536   xar.dict    header + zlib TOC + several heap entries
+          parse_plist  4   110  16384   plist.dict  nesting past MAX_DEPTH 32, long entity runs
+          parse_cpio   4   110  16384   cpio.dict   >64 small entries, past the harness entry cap
+          parse_macho  4   110  65536   -           load commands, a 2-slice fat file, a signature
+          parse_zip    4   110  66560   zip.dict    a 65535-byte comment + EOCD/ZIP64 records
+          '
+          logs=$(mktemp -d)
+          echo "fuzzing on $(nproc) cores"
+
+          run_lane() {
+            local want=$1 target lane secs max_len dict args
+            while read -r target lane secs max_len dict _; do
+              [[ -n ${target} && ${lane} == "${want}" ]] || continue
+              args=(-max_total_time="${secs}" -timeout=10 -rss_limit_mb=2048 -max_len="${max_len}")
+              [[ ${dict} == - ]] || args+=(-dict="fuzz/dicts/${dict}")
+              echo "${args[*]}" >"${logs}/${target}.args"
+              if ! cargo fuzz run --target x86_64-unknown-linux-gnu "${target}" -- \
+                  "${args[@]}" >"${logs}/${target}.log" 2>&1 </dev/null; then
+                echo "${target}" >>"${logs}/failed"
+              fi
+            done <<< "${settings}"
+          }
+          for lane in 1 2 3 4; do run_lane "${lane}" & done
+          wait
+
+          while read -r target _; do
+            [[ -n ${target} ]] || continue
+            echo "::group::fuzz ${target} ($(cat "${logs}/${target}.args"))"
+            cat "${logs}/${target}.log"
             echo "::endgroup::"
+          done <<< "${settings}"
+          if [[ -s ${logs}/failed ]]; then
+            echo "::error::fuzz targets failed: $(tr '\n' ' ' <"${logs}/failed")"
+            exit 1
+          fi
+      # Crash, timeout and OOM inputs, as libFuzzer writes them.
+      - name: upload fuzz artifacts
+        if: failure()
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: fuzz-artifacts-${{ github.run_id }}-${{ github.run_attempt }}
+          path: crates/nav-core/fuzz/artifacts/
+          if-no-files-found: ignore
+          retention-days: 30
+      # Manual opt-in only (never nightly): drop corpus inputs that add no
+      # coverage, so the carried corpus doesn't grow without bound. cmin
+      # swaps the shrunk corpus in only once its merge succeeds.
+      - name: minimize fuzz corpora
+        if: inputs.minimize
+        working-directory: crates/nav-core
+        run: |
+          set -euo pipefail
+          for target in $(cargo fuzz list); do
+            before=$(find "fuzz/corpus/${target}" -type f | wc -l)
+            echo "::group::cmin ${target}"
+            cargo fuzz cmin --target x86_64-unknown-linux-gnu "${target}" -- \
+              -timeout=10 -rss_limit_mb=2048
+            echo "::endgroup::"
+            echo "${target}: ${before} -> $(find "fuzz/corpus/${target}" -type f | wc -l) inputs"
           done
+      # Once seeded, the corpus exists and is worth keeping whatever happened.
+      - name: save grown fuzz corpus
+        if: always() && steps.seed.outcome == 'success'
+        uses: actions/cache/save@caa296126883cff596d87d8935842f9db880ef25 # v5.1.0
+        with:
+          path: crates/nav-core/fuzz/corpus
+          key: fuzz-corpus-${{ github.run_id }}

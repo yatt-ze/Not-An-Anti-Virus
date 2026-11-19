@@ -1,0 +1,4 @@
+# libFuzzer dictionary for bzip2: stream header and block/end markers.
+stream_header="BZh9"
+block_magic="1AY&SY"
+end_of_stream="\x17rE8P\x90"

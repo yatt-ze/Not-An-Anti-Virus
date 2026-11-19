@@ -1,0 +1,7 @@
+# libFuzzer dictionary for parse_zip: record signatures.
+local_file_header="PK\x03\x04"
+central_directory="PK\x01\x02"
+end_of_central_directory="PK\x05\x06"
+zip64_eocd_record="PK\x06\x06"
+zip64_eocd_locator="PK\x06\x07"
+data_descriptor="PK\x07\x08"

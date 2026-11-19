@@ -1,0 +1,5 @@
+# libFuzzer dictionary for parse_cpio: header magics and the end marker.
+odc="070707"
+newc="070701"
+newc_crc="070702"
+trailer="TRAILER!!!"

@@ -1,0 +1,6 @@
+# libFuzzer dictionary for parse_xar: header magic and heap-entry stream magics.
+xar_magic="xar!"
+zlib_default="\x78\x9c"
+zlib_best="\x78\xda"
+gzip="\x1f\x8b\x08"
+bzip2="BZh9"
