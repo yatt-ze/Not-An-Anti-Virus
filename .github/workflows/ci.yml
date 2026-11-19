@@ -178,17 +178,40 @@ jobs:
             esac
           done < <(find fixtures -type f -print0)
           seed parse_macho "${machos[@]}"
-      # 60s/target bounds wall-clock (~5min total) rather than depth. With the
-      # seeds and the carried corpus, the time goes to the deep decode paths.
+      # Built once up front so fuzzing time isn't spent compiling.
+      - name: build fuzz targets
+        working-directory: crates/nav-core
+        run: cargo fuzz build --target x86_64-unknown-linux-gnu
+      # 60s/target bounds wall-clock rather than depth. Every target runs even
+      # if an earlier one crashes; the step fails at the end if any did.
+      # -timeout turns a hang into a reported failure (libFuzzer's default is
+      # 1200s, longer than the run).
       - name: bounded fuzz run
         working-directory: crates/nav-core
         run: |
-          set -euo pipefail
+          set -uo pipefail
+          failed=()
           for target in parse_plist parse_xar parse_cpio inflate bzip2 parse_macho parse_zip; do
             echo "::group::fuzz ${target} (60s)"
-            cargo fuzz run --target x86_64-unknown-linux-gnu "${target}" -- -max_total_time=60
+            if ! cargo fuzz run --target x86_64-unknown-linux-gnu "${target}" -- \
+                -max_total_time=60 -timeout=10 -rss_limit_mb=2048; then
+              failed+=("${target}")
+            fi
             echo "::endgroup::"
           done
+          if (( ${#failed[@]} )); then
+            echo "::error::fuzz targets failed: ${failed[*]}"
+            exit 1
+          fi
+      # Crash, timeout and OOM inputs, as libFuzzer writes them.
+      - name: upload fuzz artifacts
+        if: failure()
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: fuzz-artifacts-${{ github.run_id }}-${{ github.run_attempt }}
+          path: crates/nav-core/fuzz/artifacts/
+          if-no-files-found: ignore
+          retention-days: 30
       # Once seeded, the corpus exists and is worth keeping whatever happened.
       - name: save grown fuzz corpus
         if: always() && steps.seed.outcome == 'success'
