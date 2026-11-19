@@ -182,40 +182,56 @@ jobs:
       - name: build fuzz targets
         working-directory: crates/nav-core
         run: cargo fuzz build --target x86_64-unknown-linux-gnu
-      # 60s/target bounds wall-clock rather than depth. Every target runs even
-      # if an earlier one crashes; the step fails at the end if any did.
-      # -timeout turns a hang into a reported failure (libFuzzer's default is
-      # 1200s, longer than the run). -max_len is set per target below rather
-      # than inferred from the largest seed; longer seeds are truncated.
+      # About 7.5 minutes of fuzzing, as four parallel lanes on the 4-core
+      # runner: the slow decoders get a lane (and core) each, the targets
+      # whose coverage plateaus early share the fourth. Every target runs
+      # even if another crashes; the step fails at the end if any did.
+      # -timeout turns a hang into a failure (libFuzzer's default is 1200s).
+      # -max_len is set per target rather than inferred from the largest
+      # seed; longer seeds are truncated.
       - name: bounded fuzz run
         working-directory: crates/nav-core
         run: |
           set -uo pipefail
+          # Same-lane targets run in turn; lanes run in parallel.
           # dict: a file in fuzz/dicts/, or - for none.
-          # target     max_len  dict        why that max_len
+          # target    lane secs max_len dict        why that max_len
           settings='
-          parse_plist   16384   plist.dict  nesting past MAX_DEPTH 32, long entity runs
-          parse_xar     65536   xar.dict    header + zlib TOC + several heap entries
-          parse_cpio    16384   cpio.dict   >64 small entries, past the harness entry cap
-          inflate       65536   -           a full 32 KiB window plus stored blocks
-          bzip2         32768   bzip2.dict  >18002 selectors and a few small blocks
-          parse_macho   65536   -           load commands, a 2-slice fat file, a signature
-          parse_zip     66560   zip.dict    a 65535-byte comment + EOCD/ZIP64 records
+          inflate      1   450  65536   -           a full 32 KiB window plus stored blocks
+          bzip2        2   450  32768   bzip2.dict  >18002 selectors and a few small blocks
+          parse_xar    3   450  65536   xar.dict    header + zlib TOC + several heap entries
+          parse_plist  4   110  16384   plist.dict  nesting past MAX_DEPTH 32, long entity runs
+          parse_cpio   4   110  16384   cpio.dict   >64 small entries, past the harness entry cap
+          parse_macho  4   110  65536   -           load commands, a 2-slice fat file, a signature
+          parse_zip    4   110  66560   zip.dict    a 65535-byte comment + EOCD/ZIP64 records
           '
-          failed=()
-          while read -r target max_len dict _; do
+          logs=$(mktemp -d)
+          echo "fuzzing on $(nproc) cores"
+
+          run_lane() {
+            local want=$1 target lane secs max_len dict args
+            while read -r target lane secs max_len dict _; do
+              [[ -n ${target} && ${lane} == "${want}" ]] || continue
+              args=(-max_total_time="${secs}" -timeout=10 -rss_limit_mb=2048 -max_len="${max_len}")
+              [[ ${dict} == - ]] || args+=(-dict="fuzz/dicts/${dict}")
+              echo "${args[*]}" >"${logs}/${target}.args"
+              if ! cargo fuzz run --target x86_64-unknown-linux-gnu "${target}" -- \
+                  "${args[@]}" >"${logs}/${target}.log" 2>&1 </dev/null; then
+                echo "${target}" >>"${logs}/failed"
+              fi
+            done <<< "${settings}"
+          }
+          for lane in 1 2 3 4; do run_lane "${lane}" & done
+          wait
+
+          while read -r target _; do
             [[ -n ${target} ]] || continue
-            args=(-max_total_time=60 -timeout=10 -rss_limit_mb=2048 -max_len="${max_len}")
-            [[ ${dict} == - ]] || args+=(-dict="fuzz/dicts/${dict}")
-            echo "::group::fuzz ${target} (60s, ${args[*]:3})"
-            if ! cargo fuzz run --target x86_64-unknown-linux-gnu "${target}" -- \
-                "${args[@]}" </dev/null; then
-              failed+=("${target}")
-            fi
+            echo "::group::fuzz ${target} ($(cat "${logs}/${target}.args"))"
+            cat "${logs}/${target}.log"
             echo "::endgroup::"
           done <<< "${settings}"
-          if (( ${#failed[@]} )); then
-            echo "::error::fuzz targets failed: ${failed[*]}"
+          if [[ -s ${logs}/failed ]]; then
+            echo "::error::fuzz targets failed: $(tr '\n' ' ' <"${logs}/failed")"
             exit 1
           fi
       # Crash, timeout and OOM inputs, as libFuzzer writes them.
