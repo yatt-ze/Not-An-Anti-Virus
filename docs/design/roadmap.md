@@ -50,7 +50,7 @@ Builds on 0a's proven scanner core: category-based, interaction-term scoring (§
 Polling (process/socket snapshots), NSWorkspace lifecycle, Packet Capture (BPF/libpcap + bounded ClientHello reconstruction + SNI parsing + event-triggered attribution, with the fuzzing/minimization discipline from §11.9), Correlator/identity-based dedup layer, verdict cache, `navctl events tail`. Only claim detections actually supported by what Phase 0c's feasibility spikes measured — not aspirational coverage.
 
 **Phase 3 — Quarantine, config, hardening**
-Quarantine manager, allow/denylist, config file support (including an opt-in to copy a disk image on another volume from the scratch directory so `navctl` can mount it, at the cost of a longer scan; §6.2, #176), ruleset hot-reload + rollback, daemon self-termination detection, event log privacy hardening (redaction, retention), socket protocol hardening (§9.1), safe root-daemon installation path (§11.10), `navnotify` install/uninstall, clean uninstall path.
+Quarantine manager, allow/denylist, config file support ([candidate options](config-candidates.md), including an opt-in to copy a disk image on another volume from the scratch directory so `navctl` can mount it, at the cost of a longer scan; §6.2, #176), ruleset hot-reload + rollback, daemon self-termination detection, event log privacy hardening (redaction, retention), socket protocol hardening (§9.1), safe root-daemon installation path (§11.10), `navnotify` install/uninstall, clean uninstall path.
 
 **Phase 4 — Polish / stretch**
 `navtop` TUI, ruleset update distribution channel, optional on-device ML scoring layer, optional ESF-backed edition if the entitlement/packaging tradeoff is ever revisited.
