@@ -31,6 +31,10 @@ const CANCEL_GRACE: Duration = Duration::from_secs(2);
 const SCRATCH_DIR_NAME: &str = "navctl-scratch";
 /// Under a run directory: where volumes are mounted.
 const MOUNT_DIR: &str = "mnt";
+/// Under a run directory: the lock its run holds while it lives.
+const LOCK_FILE: &str = "lock";
+/// Under a run directory: the lock file before it is locked and renamed.
+const LOCK_PENDING: &str = "lock.new";
 /// Under a run directory: the clone's file stem.
 const CLONE_STEM: &str = "image";
 
@@ -117,7 +121,7 @@ fn mount_on_worker(
     if cancelled() {
         return (Err("interrupted".into()), true);
     }
-    let run = match create_run_dir(&root) {
+    let (run, _lock) = match create_run_dir(&root) {
         Ok(run) => run,
         Err(e) => return unusable(e),
     };
@@ -459,21 +463,95 @@ fn scratch_root() -> io::Result<PathBuf> {
 }
 
 /// A fresh 0700 `<pid>-<random>` directory under `root`, with its 0700
-/// mount directory.
-fn create_run_dir(root: &Path) -> io::Result<PathBuf> {
+/// mount directory, and the lock that marks it live. The run owns the
+/// directory while it holds the returned lock file.
+fn create_run_dir(root: &Path) -> io::Result<(PathBuf, File)> {
     let mut rand = [0u8; 8];
     File::open("/dev/urandom")?.read_exact(&mut rand)?;
     let name = format!("{}-{:016x}", std::process::id(), u64::from_ne_bytes(rand));
     let dir = root.join(name);
     std::fs::DirBuilder::new().mode(0o700).create(&dir)?;
-    if let Err(e) = std::fs::DirBuilder::new()
-        .mode(0o700)
-        .create(dir.join(MOUNT_DIR))
-    {
-        let _ = std::fs::remove_dir(&dir);
-        return Err(e);
+    match lock_run_dir(&dir) {
+        Ok(lock) => Ok((dir, lock)),
+        Err(e) => {
+            let _ = remove_run_dir(&dir);
+            Err(e)
+        }
     }
-    Ok(dir)
+}
+
+/// Creates `dir`'s lock file, locked, and its mount directory. The lock is
+/// taken under a temporary name and renamed into place, so a sweep never
+/// finds `lock` unlocked.
+fn lock_run_dir(dir: &Path) -> io::Result<File> {
+    let pending = dir.join(LOCK_PENDING);
+    let lock = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(&pending)?;
+    if try_lock(&lock) != Lock::Free {
+        return Err(io::Error::other("cannot lock the run directory"));
+    }
+    std::fs::rename(&pending, dir.join(LOCK_FILE))?;
+    std::fs::DirBuilder::new()
+        .mode(0o700)
+        .create(dir.join(MOUNT_DIR))?;
+    Ok(lock)
+}
+
+/// A run directory's lock file, as a sweep finds it.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Lock {
+    /// Taken by us now: its run has exited.
+    Free,
+    /// Held by a live run.
+    Held,
+    /// No lock file: a run still creating it, or one from navctl 0.7.
+    Missing,
+    /// Could not be checked.
+    Unknown,
+}
+
+/// `flock(LOCK_EX | LOCK_NB)` on `file`.
+fn try_lock(file: &File) -> Lock {
+    use std::os::fd::AsRawFd;
+    // SAFETY: flock on a descriptor we own.
+    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+        return Lock::Free;
+    }
+    match io::Error::last_os_error().raw_os_error() {
+        Some(libc::EWOULDBLOCK) => Lock::Held,
+        _ => Lock::Unknown,
+    }
+}
+
+/// The state of `dir`'s lock file; when `Free`, also the file holding it.
+fn probe_lock(dir: &Path) -> (Lock, Option<File>) {
+    let opened = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(dir.join(LOCK_FILE));
+    match opened {
+        Ok(f) => match try_lock(&f) {
+            Lock::Free => (Lock::Free, Some(f)),
+            other => (other, None),
+        },
+        Err(e) if e.kind() == io::ErrorKind::NotFound => (Lock::Missing, None),
+        Err(_) => (Lock::Unknown, None),
+    }
+}
+
+/// Whether a run directory is dead, given its lock and whether the pid in
+/// its name is alive (consulted only when there is no lock file; §6.2).
+fn run_is_dead(lock: Lock, pid_alive: impl FnOnce() -> bool) -> bool {
+    match lock {
+        Lock::Free => true,
+        Lock::Held | Lock::Unknown => false,
+        Lock::Missing => !pid_alive(),
+    }
 }
 
 /// The pid a run directory name under the scratch root starts with.
@@ -492,17 +570,10 @@ fn pid_alive(pid: i32) -> bool {
     r == 0 || io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
 }
 
-/// Detaches mounts and removes run directories left under `root` by a
-/// navctl that is no longer running. Nothing outside `root` is touched.
+/// Detaches the attachments of, and removes, run directories under `root`
+/// whose navctl has exited (see [`run_is_dead`]). A directory is removed
+/// only once nothing refers into it. Nothing outside `root` is touched.
 fn sweep_stale(root: &Path) {
-    let me = std::process::id() as i32;
-    let dead = |dir: &Path| -> bool {
-        dir.strip_prefix(root)
-            .ok()
-            .and_then(|rel| rel.components().next())
-            .and_then(|c| owner_pid(c.as_os_str()))
-            .is_some_and(|pid| pid != me && !pid_alive(pid))
-    };
     let Ok(entries) = std::fs::read_dir(root) else {
         return;
     };
@@ -511,7 +582,15 @@ fn sweep_stale(root: &Path) {
             return;
         }
         let dir = e.path();
-        if !e.file_type().is_ok_and(|t| t.is_dir()) || !dead(&dir) {
+        let Some(pid) = owner_pid(&e.file_name()) else {
+            continue;
+        };
+        if !e.file_type().is_ok_and(|t| t.is_dir()) {
+            continue;
+        }
+        // Held until the directory is gone, so no other sweep takes it.
+        let (lock, _held) = probe_lock(&dir);
+        if !run_is_dead(lock, || pid_alive(pid)) {
             continue;
         }
         let swept = release(&dir, true).and_then(|()| remove_run_dir(&dir));
@@ -943,6 +1022,33 @@ mod tests {
         assert_eq!(parse_info(&dict(vec![])), None);
         let empty = dict(vec![("images", PlistValue::Array(vec![]))]);
         assert_eq!(parse_info(&empty), Some(vec![]));
+    }
+
+    #[test]
+    fn a_run_is_dead_when_its_lock_can_be_taken() {
+        let unreachable = || -> bool { panic!("pid consulted") };
+        assert!(run_is_dead(Lock::Free, unreachable));
+        assert!(!run_is_dead(Lock::Held, unreachable));
+        assert!(!run_is_dead(Lock::Unknown, unreachable));
+        assert!(run_is_dead(Lock::Missing, || false));
+        assert!(!run_is_dead(Lock::Missing, || true));
+    }
+
+    #[test]
+    fn a_held_run_lock_is_seen_as_held_and_a_released_one_as_free() {
+        let root = std::env::temp_dir().join(format!("navctl-lock-test-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let (dir, lock) = create_run_dir(&root).unwrap();
+        assert_eq!(probe_lock(&dir).0, Lock::Held);
+        drop(lock);
+        let (state, held) = probe_lock(&dir);
+        assert_eq!(state, Lock::Free);
+        assert!(held.is_some());
+        drop(held);
+        remove_run_dir(&dir).unwrap();
+        assert!(!dir.exists());
+        assert_eq!(probe_lock(&dir).0, Lock::Missing);
+        let _ = std::fs::remove_dir(&root);
     }
 
     #[test]

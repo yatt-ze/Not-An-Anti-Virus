@@ -444,42 +444,67 @@ fn an_image_over_the_size_caps_is_not_mounted() {
     sb.assert_clean();
 }
 
-/// A mount left by a killed navctl (its pid gone) is detached by the next
-/// run; one owned by a live pid is left alone.
+/// Opens a run directory's lock file, creating it.
+fn lock_file(dir: &Path) -> std::fs::File {
+    std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(dir.join("lock"))
+        .unwrap()
+}
+
+/// The sweep detaches and removes run directories whose lock is free, and
+/// keeps locked ones; lockless ones go by pid (§6.2, #174).
 #[test]
 fn stale_mounts_from_a_dead_run_are_swept() {
     let sb = Sandbox::new("stale");
     std::fs::write(sb.src().join("readme.txt"), "hello\n").unwrap();
     let image = sb.image("stale.dmg", "UDZO");
-    // One image can only be attached once at a time.
-    let dead_image = sb.root.join("dead.dmg");
-    let live_image = sb.root.join("live.dmg");
-    std::fs::copy(&image, &dead_image).unwrap();
-    std::fs::copy(&image, &live_image).unwrap();
     std::fs::create_dir(sb.scratch()).unwrap();
     use std::os::unix::fs::PermissionsExt;
     std::fs::set_permissions(sb.scratch(), std::fs::Permissions::from_mode(0o700)).unwrap();
 
     let mut gone = Command::new("/usr/bin/true").spawn().unwrap();
-    let dead = gone.id();
+    let dead_pid = gone.id();
     gone.wait().unwrap();
-    let dead_dir = sb.scratch().join(format!("{dead}-feedface"));
-    let live_dir = sb
-        .scratch()
-        .join(format!("{}-feedface", std::process::id()));
-    for (dir, img) in [(&dead_dir, &dead_image), (&live_dir, &live_image)] {
-        std::fs::create_dir(dir).unwrap();
-        let attached = hdiutil(&[
-            os("attach"),
-            os("-readonly"),
-            os("-nobrowse"),
-            os("-quiet"),
-            os("-mountrandom"),
-            os(dir),
-            os(img),
-        ]);
-        assert!(attached);
+    let live_pid = std::process::id();
+    let run = |pid: u32, tag: &str| {
+        let dir = sb.scratch().join(format!("{pid}-{tag}"));
+        std::fs::create_dir(&dir).unwrap();
+        dir
+    };
+    // Its pid is alive (ours), but nothing holds its lock.
+    let mounted = run(live_pid, "0001");
+    drop(lock_file(&mounted));
+    let unmounted = run(live_pid, "0002");
+    drop(lock_file(&unmounted));
+    // Its pid is gone, but the lock is held.
+    let locked = run(dead_pid, "0003");
+    let held = lock_file(&locked);
+    // SAFETY: flock on a descriptor we own.
+    assert_eq!(
+        unsafe { libc::flock(std::os::fd::AsRawFd::as_raw_fd(&held), libc::LOCK_EX) },
+        0
+    );
+    let legacy_dead = run(dead_pid, "0004");
+    let legacy_live = run(live_pid, "0005");
+
+    // One image can only be attached once at a time.
+    for (dir, mount) in [(&mounted, true), (&unmounted, false), (&locked, false)] {
+        let copy = dir.join("image.dmg");
+        std::fs::copy(&image, &copy).unwrap();
+        let mut args = vec![os("attach"), os("-readonly"), os("-nobrowse"), os("-quiet")];
+        if mount {
+            args.extend([os("-mountrandom"), os(dir)]);
+        } else {
+            args.push(os("-nomount"));
+        }
+        args.push(os(&copy));
+        assert!(hdiutil(&args), "attach in {}", dir.display());
     }
+    assert_eq!(sb.mounts().len(), 3, "{:?}", sb.mounts());
 
     let out = sb.navctl(&["scan"], &image);
     assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
@@ -488,14 +513,19 @@ fn stale_mounts_from_a_dead_run_are_swept() {
         "{}",
         stderr(&out)
     );
-    let left: Vec<_> = sb
-        .mounts()
-        .into_iter()
-        .filter(|m| !m.1.is_empty())
-        .collect();
+    let left = sb.mounts();
     assert_eq!(left.len(), 1, "{left:?}");
-    assert!(Path::new(&left[0].1).starts_with(&live_dir), "{left:?}");
-    assert!(!dead_dir.exists());
+    assert_eq!(mounts_under(&locked), left);
+    for (dir, kept) in [
+        (&mounted, false),
+        (&unmounted, false),
+        (&locked, true),
+        (&legacy_dead, false),
+        (&legacy_live, true),
+    ] {
+        assert_eq!(dir.exists(), kept, "{}", dir.display());
+    }
+    drop(held);
 }
 
 /// SIGINT while the image is attaching: navctl exits 130. If the attach
