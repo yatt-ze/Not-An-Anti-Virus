@@ -361,9 +361,12 @@ mod tests {
 
     impl TempDir {
         fn new(tag: &str) -> Self {
+            // Timestamps alone collide across threads (macOS clocks are µs).
+            static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
             let base = std::env::temp_dir().join(format!(
-                "nav-target-{tag}-{}-{:?}",
+                "nav-target-{tag}-{}-{}-{:?}",
                 std::process::id(),
+                SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
                 std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
                     .unwrap()
