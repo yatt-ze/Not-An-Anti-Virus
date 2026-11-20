@@ -109,6 +109,9 @@ pub fn scan_context(ctx: &ScanContext, rules: &[Box<dyn Rule>]) -> ScanResult {
         if truncation_uncovered || (ctx.truncated && evaluated_count == 0) {
             gaps.push(CoverageGap::Truncated);
         }
+        if ctx.allowance_hit() {
+            gaps.push(CoverageGap::ByteBudget);
+        }
         gaps
     };
     let completeness = if !ctx.readable() {

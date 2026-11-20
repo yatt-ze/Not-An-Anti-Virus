@@ -122,6 +122,11 @@ fn inspect_with_rules(
     let mut unsigned = Listing::default();
     let mut unsigned_weight = 0;
     let mut member_gaps = Listing::default();
+    let (max_read_back_bytes, lowered) = ctx.decode_cap(limits.max_read_back_bytes);
+    let limits = &ZipLimits {
+        max_read_back_bytes,
+        ..*limits
+    };
     let read = zip::read(content, limits, &mut |m: Member| {
         let label = |name: &str| format!("{}!{name}", ctx.path.display());
         // A name changes the content rules' result only by its extension, so
@@ -189,6 +194,10 @@ fn inspect_with_rules(
     gaps.more += read.more_gaps;
     gaps.push_all(member_gaps);
     ctx.add_decoded(read.decoded);
+    let budget_gap = |g: &zip::Gap| g.kind == zip::GapKind::Limit(zip::Limit::Budget);
+    if lowered && (read.more_gaps > 0 || read.gaps.iter().any(budget_gap)) {
+        ctx.note_allowance_hit();
+    }
     Some(ZipInspection {
         findings,
         strongest,
