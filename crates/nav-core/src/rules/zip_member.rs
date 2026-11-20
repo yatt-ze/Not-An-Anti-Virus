@@ -188,6 +188,7 @@ fn inspect_with_rules(
     }
     gaps.more += read.more_gaps;
     gaps.push_all(member_gaps);
+    ctx.add_decoded(read.decoded);
     Some(ZipInspection {
         findings,
         strongest,

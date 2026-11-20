@@ -163,6 +163,9 @@ pub struct XarArchive {
     /// Absolute offset where the heap begins.
     pub heap_start: u64,
     pub halted: Option<XarHalt>,
+    /// Bytes the TOC decompressed to, its output ceiling if the inflate
+    /// failed; 0 if no inflate was attempted.
+    pub toc_bytes: usize,
 }
 
 impl XarArchive {
@@ -249,6 +252,7 @@ pub fn parse(data: &[u8], limits: &XarLimits) -> Option<XarArchive> {
         checksum_style: None,
         heap_start: 0,
         halted: None,
+        toc_bytes: 0,
     };
 
     let header_size = header.header_size as usize;
@@ -291,16 +295,18 @@ pub fn parse(data: &[u8], limits: &XarLimits) -> Option<XarArchive> {
         .min(limits.max_toc_bytes);
     let toc = match inflate::zlib_decompress(toc_compressed, toc_budget) {
         Ok(t) => t,
-        Err(DecodeError::BudgetExceeded) => {
-            archive.halted = Some(XarHalt::TocTooLarge);
-            return Some(archive);
-        }
-        Err(_) => {
-            archive.halted = Some(XarHalt::TocUndecodable);
+        Err(e) => {
+            // A failed inflate may have done up to its budget's work.
+            archive.toc_bytes = toc_budget;
+            archive.halted = Some(match e {
+                DecodeError::BudgetExceeded => XarHalt::TocTooLarge,
+                _ => XarHalt::TocUndecodable,
+            });
             return Some(archive);
         }
     };
 
+    archive.toc_bytes = toc.len();
     walk_toc(&toc, limits, &mut archive);
     Some(archive)
 }
@@ -625,6 +631,8 @@ struct Decoded {
     capped: bool,
     /// Read as a gzip or zlib stream (not stored bytes or bzip2).
     stream: bool,
+    /// Copied as stored bytes, not decompressed.
+    stored: bool,
     /// Input a stream read before it ended or stopped; 0 for other encodings.
     consumed: usize,
 }
@@ -654,6 +662,7 @@ fn decode_entry_to(raw: &[u8], caps: Caps, out: &mut inflate::Sink) -> Decoded {
         blocks: 0,
         capped: false,
         stream: false,
+        stored: false,
         consumed: 0,
     };
     let gap = |result: Result<(), DecodeError>| Ok(result.err().map(XarEntryError::Undecodable));
@@ -693,13 +702,19 @@ fn decode_entry_to(raw: &[u8], caps: Caps, out: &mut inflate::Sink) -> Decoded {
             // A header failure writes nothing.
             Err(DecodeError::BadHeader) => {
                 let (result, written) = stored(raw, caps.stored, out);
-                plain(result, written, caps.stored)
+                Decoded {
+                    stored: true,
+                    ..plain(result, written, caps.stored)
+                }
             }
             result => stream(result, paid, raw.len(), used),
         }
     } else {
         let (result, written) = stored(raw, caps.stored, out);
-        plain(result, written, caps.stored)
+        Decoded {
+            stored: true,
+            ..plain(result, written, caps.stored)
+        }
     }
 }
 
@@ -778,6 +793,8 @@ pub struct ReadBudget {
     cut_by_share: bool,
     cut_at_limit: bool,
     input_over_share: bool,
+    /// Bytes decompressed, nested layers included.
+    decoded: usize,
     /// Probes read from disk, by entry start.
     probes: HashMap<u64, CachedProbe>,
 }
@@ -793,6 +810,7 @@ impl ReadBudget {
             cut_by_share: false,
             cut_at_limit: false,
             input_over_share: false,
+            decoded: 0,
             probes: HashMap::new(),
         }
     }
@@ -893,6 +911,11 @@ impl ReadBudget {
     /// Bytes still available across the archive.
     pub fn remaining(&self) -> usize {
         self.shares.remaining()
+    }
+
+    /// Bytes decompressed so far (§11.12); stored entries are not counted.
+    pub fn decoded(&self) -> usize {
+        self.decoded
     }
 
     /// Gives the next entry an equal share of what remains. `entries_left`
@@ -1029,6 +1052,7 @@ impl ReadBudget {
         }
         let (used, spent, result) = inflate::gzip_decompress_metered_to(data, cap, cap, out);
         self.charge(spent.work);
+        self.decoded = self.decoded.saturating_add(spent.output);
         (spent.output, used, result, result == over)
     }
 
@@ -1193,6 +1217,9 @@ impl ReadBudget {
         self.input_over_share = cut && !capped && decoded.consumed > lone_share / 2;
         self.charge(decoded.written);
         self.charge(decoded.blocks);
+        if !decoded.stored {
+            self.decoded = self.decoded.saturating_add(decoded.written);
+        }
         let read = |gap| Read {
             gap,
             input,
@@ -1919,6 +1946,23 @@ mod tests {
         let larger = parse(&xar_from_zlib_toc(&z, real + 100), &limits).expect("xar");
         assert_eq!(larger.halted, None);
         assert!(larger.is_complete());
+    }
+
+    #[test]
+    fn toc_bytes_is_the_decoded_size_or_the_ceiling_on_failure() {
+        let toc = b"<?xml version=\"1.0\"?><xar><toc></toc></xar>";
+        let z = stored_zlib(toc);
+        let real = toc.len() as u64;
+        let limits = XarLimits::default();
+        let larger = parse(&xar_from_zlib_toc(&z, real + 100), &limits).expect("xar");
+        assert_eq!(larger.toc_bytes, toc.len());
+        let short = parse(&xar_from_zlib_toc(&z, real - 1), &limits).expect("xar");
+        assert_eq!(short.toc_bytes, toc.len() - 1);
+        let mut bad = z.clone();
+        bad[2] = 0x07; // reserved block type
+        let failed = parse(&xar_from_zlib_toc(&bad, 5000), &limits).expect("xar");
+        assert_eq!(failed.halted, Some(XarHalt::TocUndecodable));
+        assert_eq!(failed.toc_bytes, 5000);
     }
 
     #[test]

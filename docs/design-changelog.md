@@ -5,6 +5,10 @@ for the current document map. Newest first.
 
 ---
 
+**Changelog from v0.98 (2026-11-20):** The target byte budget counts decoded container bytes (§11.12, §6.2, #166). `max_total_bytes` counted only disk reads, so a file small on disk that decodes a lot charged the target almost nothing: a 1.7 MB zip of 256 distinct compressible 1 MB members spends its whole 256 MiB read-back budget (about 2 s, `Complete`), and a directory of 1,000 of them was about 30 minutes of CPU. Each scan now records what its container readers decompress on the `ScanContext` (`decoded_bytes`): zip members including nested zips, a package's TOC, its `Scripts`/`Distribution` entries and the gzip layers inside them, and zips among `Scripts` members (rolled up from the member's context to the package file's). Stored members and entries are not counted, as their bytes were already read. The target charges reads plus decoded bytes against the one 4 GiB default, with the existing `TotalBytes` behaviour: later files are not started and the target is `Partial`. Measured: a directory of 40 such zips stops after 17 files in 30 s, where it ran all 40 in 73 s before. One file can still overshoot by its own container budgets. A wall-clock limit was considered and not built: the byte charge bounds the work deterministically.
+
+---
+
 **Changelog from v0.97 (2026-11-20):** A zip member's aliases are scanned at most twice (§6.2, §11.8, #166). A zip whose directory gives one local header many names (a few dozen bytes per name) was scanned once per name, each name charged the fixed member cost plus the member's bytes, until the 256 MiB read-back budget ran out: about 256 full content scans of a 1 MB member, roughly 1.6 s for a 1 MB file. Since a name changes the content rules' result only through its extension, the decoded bytes are now scanned once for the names with a script extension and once for the rest, and every finding and gap is still listed under each name (the bounded lists cap the text). An extra name now costs only the fixed per-member cost, so names stay bounded by the share and by the 10,000-header limit. Nested zips are still read once, under one name.
 
 ---

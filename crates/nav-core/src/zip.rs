@@ -196,6 +196,8 @@ pub struct ZipRead {
     pub members: usize,
     /// Budget charged, at most `max_read_back_bytes`.
     pub spent: usize,
+    /// Bytes decompressed, nested zips included; stored members not counted.
+    pub decoded: usize,
 }
 
 /// True for ZIP-format bytes: a local header at offset 0, or an end record
@@ -234,6 +236,7 @@ pub fn read(data: &[u8], limits: &ZipLimits, visit: &mut dyn FnMut(Member)) -> Z
         more_gaps: 0,
         seen_gaps: HashSet::new(),
         members: 0,
+        decoded: 0,
         visit,
     };
     let mut shares = ShareBudget::new(limits.max_read_back_bytes);
@@ -243,6 +246,7 @@ pub fn read(data: &[u8], limits: &ZipLimits, visit: &mut dyn FnMut(Member)) -> Z
         more_gaps: reader.more_gaps,
         members: reader.members,
         spent: limits.max_read_back_bytes - shares.remaining(),
+        decoded: reader.decoded,
     }
 }
 
@@ -513,6 +517,7 @@ struct Reader<'v> {
     /// (member, kind) already reported.
     seen_gaps: HashSet<(String, GapKind)>,
     members: usize,
+    decoded: usize,
     visit: &'v mut dyn FnMut(Member),
 }
 
@@ -892,6 +897,9 @@ impl Reader<'_> {
         }
         shares.charge(bytes.len());
         shares.charge(work);
+        if item.method != STORED {
+            self.decoded = self.decoded.saturating_add(bytes.len());
+        }
 
         let mut cut = true;
         match result {
@@ -1351,6 +1359,11 @@ pub(crate) mod tests_support {
 
         pub(crate) fn deflated(name: &str, data: &[u8]) -> Self {
             Spec::new(name, 8, deflate_stored(data), data)
+        }
+
+        /// Deflated: `n` copies of `byte`, compressed (under 300:1).
+        pub(crate) fn run(name: &str, byte: u8, n: usize) -> Self {
+            Spec::new(name, 8, deflate_run(byte, n), &vec![byte; n])
         }
 
         /// Streamed: bit 3 in both views, zero CRC and sizes in the local
