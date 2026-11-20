@@ -48,6 +48,7 @@ const HELPER_BIN_REL: &str = "Library/PrivilegedHelperTools/navd";
 const PLIST_REL: &str = "Library/LaunchDaemons/com.nav.navd.plist";
 const CONFIG_DIR_REL: &str = "etc/navd";
 const STATE_DIR_REL: &str = "private/var/db/navd";
+const HELPER_DIR_MARKER_REL: &str = "private/var/db/navd/helper-dir-created";
 const STDOUT_LOG_REL: &str = "private/var/db/navd/navd.out.log";
 const STDERR_LOG_REL: &str = "private/var/db/navd/navd.err.log";
 
@@ -85,9 +86,16 @@ impl Layout {
     }
 
     /// The shared Apple helper dir. Created only if absent, and reclaimed on
-    /// uninstall only if we created it *and* it is empty (§11.10).
+    /// uninstall only if we created it (see [`helper_dir_marker`](Self::helper_dir_marker))
+    /// *and* it is empty (§11.10).
     pub fn helper_dir(&self) -> PathBuf {
         self.prefix.join(HELPER_DIR_REL)
+    }
+
+    /// Present iff install created (or was creating) [`helper_dir`](Self::helper_dir).
+    /// Lives in the state dir, so uninstall reclaims the helper dir first.
+    pub fn helper_dir_marker(&self) -> PathBuf {
+        self.prefix.join(HELPER_DIR_MARKER_REL)
     }
 
     /// The root-owned copy of `navd` the plist points at (never the Cellar path).
@@ -108,16 +116,18 @@ impl Layout {
     }
 
     /// Full inventory of what install creates and uninstall must remove.
-    /// Ordered for teardown: leaf files before the shared dir that holds them.
+    /// Ordered for teardown: leaf files before the shared dir that holds them,
+    /// and the shared dir before the state dir that holds its marker.
     pub fn manifest(&self) -> Manifest {
         Manifest {
             fs: vec![
                 FsArtifact::new(self.plist_path(), FsKind::File),
                 FsArtifact::new(self.helper_binary(), FsKind::File),
                 FsArtifact::new(self.config_dir(), FsKind::Dir),
-                FsArtifact::new(self.state_dir(), FsKind::Dir),
-                // Reclaimed last, and only if we created it and it's now empty.
+                // Reclaimed only if we created it and it's now empty. Must
+                // precede the state dir, which holds the creation marker.
                 FsArtifact::new(self.helper_dir(), FsKind::SharedDir),
+                FsArtifact::new(self.state_dir(), FsKind::Dir),
             ],
             system: vec![
                 SystemArtifact::LaunchdJob {

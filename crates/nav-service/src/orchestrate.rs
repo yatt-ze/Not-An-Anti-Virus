@@ -39,12 +39,24 @@ pub fn install(layout: &Layout, ops: &dyn SystemOps, navd_src: &Path) -> Result<
         ops.bootout(LABEL)?;
     }
 
+    // Root-owned config and state dirs; state holds the helper-dir marker.
+    for dir in [layout.config_dir(), layout.state_dir()] {
+        fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
+        fs::set_permissions(&dir, fs::Permissions::from_mode(DIR_MODE))?;
+        ops.chown_root(&dir)?;
+    }
+
     // Root-owned copy of the daemon (never the Cellar path, §11.10). The helper
     // dir is Apple-shared: create it only if absent and set explicit root:wheel
     // 0755 perms only when we created it — never re-permission a dir another
     // installer already owns, and don't leave the perms to root's umask.
+    // Marker first, so a failure after creating the dir can't leave it unmarked.
     let helper_dir = layout.helper_dir();
     if !helper_dir.exists() {
+        let marker = layout.helper_dir_marker();
+        fs::write(&marker, b"").with_context(|| format!("writing marker {}", marker.display()))?;
+        fs::set_permissions(&marker, fs::Permissions::from_mode(PLIST_MODE))?;
+        ops.chown_root(&marker)?;
         fs::create_dir_all(&helper_dir)
             .with_context(|| format!("creating {}", helper_dir.display()))?;
         fs::set_permissions(&helper_dir, fs::Permissions::from_mode(DIR_MODE))?;
@@ -59,13 +71,6 @@ pub fn install(layout: &Layout, ops: &dyn SystemOps, navd_src: &Path) -> Result<
     fs::set_permissions(&bin, fs::Permissions::from_mode(BIN_MODE))?;
     ops.chown_root(&bin)?;
     ops.codesign_adhoc(&bin, CODESIGN_ID)?;
-
-    // Root-owned config and state dirs.
-    for dir in [layout.config_dir(), layout.state_dir()] {
-        fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
-        fs::set_permissions(&dir, fs::Permissions::from_mode(DIR_MODE))?;
-        ops.chown_root(&dir)?;
-    }
 
     // LaunchDaemon plist, pointing at the copied binary.
     let plist = layout.plist_path();
@@ -130,14 +135,27 @@ pub fn uninstall(layout: &Layout, ops: &dyn SystemOps) -> UninstallReport {
         report.errors.push(format!("bootout {LABEL}: {e:#}"));
     }
 
+    let helper_dir_ours = layout.helper_dir_marker().is_file();
+    let mut helper_dir_failed = false;
     for artifact in layout.manifest().fs {
         let path = artifact.path;
         let result = match artifact.kind {
             FsKind::File => remove_file_if_present(&path),
+            // Keep the marker so a re-run can still reclaim the helper dir.
+            FsKind::Dir if helper_dir_failed && path == layout.state_dir() => {
+                report.errors.push(format!(
+                    "{}: kept, holds the helper-dir marker",
+                    path.display()
+                ));
+                continue;
+            }
             FsKind::Dir => remove_dir_all_if_present(&path),
-            // Reclaim the shared Apple dir only if empty — a non-empty one holds
-            // another installer's helper and must be left alone (§11.10).
-            FsKind::SharedDir => remove_shared_dir_if_empty(&path),
+            // A non-empty shared dir holds another installer's helper (§11.10).
+            FsKind::SharedDir => {
+                let r = remove_shared_dir_if_empty(&path, helper_dir_ours);
+                helper_dir_failed = r.is_err();
+                r
+            }
         };
         match result {
             Ok(true) => report.removed.push(path),
@@ -160,7 +178,8 @@ pub fn uninstall(layout: &Layout, ops: &dyn SystemOps) -> UninstallReport {
 /// be queried here, so it's reported by [`uninstall`]'s action, not asserted.
 #[derive(Debug, Default)]
 pub struct ResidueReport {
-    /// Manifest paths still present (a `SharedDir` only if present *and* empty).
+    /// Manifest paths still present (a `SharedDir` only if we created it, and it
+    /// is present and empty).
     pub fs_residue: Vec<PathBuf>,
     pub launchd_loaded: bool,
     pub launchd_disabled: bool,
@@ -188,6 +207,7 @@ impl ResidueReport {
 pub fn residue(layout: &Layout, ops: &dyn SystemOps) -> Result<ResidueReport> {
     let mut report = ResidueReport::default();
     let manifest = layout.manifest();
+    let helper_dir_ours = layout.helper_dir_marker().is_file();
 
     for artifact in &manifest.fs {
         let leftover = match artifact.kind {
@@ -195,7 +215,9 @@ pub fn residue(layout: &Layout, ops: &dyn SystemOps) -> Result<ResidueReport> {
             // dangling one — `exists()` would miss it, but `remove_file_if_present`
             // (uninstall) removes it, so residue must see it too.
             FsKind::File | FsKind::Dir => fs::symlink_metadata(&artifact.path).is_ok(),
-            FsKind::SharedDir => artifact.path.is_dir() && is_empty_dir(&artifact.path)?,
+            FsKind::SharedDir => {
+                helper_dir_ours && artifact.path.is_dir() && is_empty_dir(&artifact.path)?
+            }
         };
         if leftover {
             report.fs_residue.push(artifact.path.clone());
@@ -266,8 +288,8 @@ fn remove_dir_all_if_present(path: &Path) -> Result<bool> {
     }
 }
 
-fn remove_shared_dir_if_empty(path: &Path) -> Result<bool> {
-    if path.is_dir() && is_empty_dir(path)? {
+fn remove_shared_dir_if_empty(path: &Path, ours: bool) -> Result<bool> {
+    if ours && path.is_dir() && is_empty_dir(path)? {
         fs::remove_dir(path)?;
         Ok(true)
     } else {
@@ -433,6 +455,62 @@ mod tests {
     }
 
     #[test]
+    fn preexisting_empty_helper_dir_survives_install_and_uninstall() {
+        let tp = TempPrefix::new();
+        let layout = tp.layout();
+        fs::create_dir_all(layout.helper_dir()).unwrap();
+        let ops = FakeSystemOps::new();
+        assert!(
+            residue(&layout, &ops).unwrap().is_clean(),
+            "a pre-existing empty dir is not residue before any install"
+        );
+        install(&layout, &ops, &fake_navd(&tp)).unwrap();
+        assert!(!layout.helper_dir_marker().exists());
+
+        let report = uninstall(&layout, &ops);
+        assert!(report.is_ok(), "uninstall errors: {:?}", report.errors);
+        assert!(
+            layout.helper_dir().is_dir(),
+            "must not reclaim a dir we didn't create"
+        );
+        assert!(residue(&layout, &ops).unwrap().is_clean());
+    }
+
+    #[test]
+    fn install_marks_a_helper_dir_it_creates_and_uninstall_clears_the_marker() {
+        let tp = TempPrefix::new();
+        let layout = tp.layout();
+        let ops = FakeSystemOps::new();
+        install(&layout, &ops, &fake_navd(&tp)).unwrap();
+        assert!(layout.helper_dir_marker().is_file());
+        // A re-install over our own dir keeps the marker.
+        install(&layout, &ops, &fake_navd(&tp)).unwrap();
+        assert!(layout.helper_dir_marker().is_file());
+
+        uninstall(&layout, &ops);
+        assert!(!layout.helper_dir().exists());
+        assert!(!layout.helper_dir_marker().exists());
+    }
+
+    #[test]
+    fn uninstall_crash_after_reclaiming_helper_dir_leaves_the_marker_as_residue() {
+        let tp = TempPrefix::new();
+        let layout = tp.layout();
+        let ops = FakeSystemOps::new();
+        install(&layout, &ops, &fake_navd(&tp)).unwrap();
+        // Helper dir gone, marker (in the state dir) not yet removed.
+        fs::remove_file(layout.helper_binary()).unwrap();
+        fs::remove_dir(layout.helper_dir()).unwrap();
+
+        let report = residue(&layout, &ops).unwrap();
+        assert!(report.fs_residue.contains(&layout.state_dir()));
+        // Re-running uninstall finishes the job.
+        let report = uninstall(&layout, &ops);
+        assert!(report.is_ok(), "errors: {:?}", report.errors);
+        assert!(residue(&layout, &ops).unwrap().is_clean());
+    }
+
+    #[test]
     fn uninstall_tolerates_partial_install() {
         let tp = TempPrefix::new();
         let layout = tp.layout();
@@ -443,6 +521,32 @@ mod tests {
 
         let report = uninstall(&layout, &ops);
         assert!(report.is_ok(), "errors: {:?}", report.errors);
+        assert!(residue(&layout, &ops).unwrap().is_clean());
+    }
+
+    #[test]
+    fn uninstall_keeps_the_marker_when_reclaiming_the_helper_dir_fails() {
+        let tp = TempPrefix::new();
+        let layout = tp.layout();
+        let ops = FakeSystemOps::new();
+        install(&layout, &ops, &fake_navd(&tp)).unwrap();
+        fs::remove_file(layout.helper_binary()).unwrap();
+        let dir = layout.helper_dir();
+        // An unreadable dir makes the emptiness check fail.
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o000)).unwrap();
+        if fs::read_dir(&dir).is_ok() {
+            fs::set_permissions(&dir, fs::Permissions::from_mode(0o755)).unwrap();
+            return; // running as root: permissions don't bite
+        }
+
+        let report = uninstall(&layout, &ops);
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(!report.is_ok());
+        assert!(layout.helper_dir_marker().is_file(), "marker must survive");
+
+        let report = uninstall(&layout, &ops);
+        assert!(report.is_ok(), "errors: {:?}", report.errors);
+        assert!(!dir.exists());
         assert!(residue(&layout, &ops).unwrap().is_clean());
     }
 
