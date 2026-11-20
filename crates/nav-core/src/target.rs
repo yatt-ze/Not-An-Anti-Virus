@@ -36,8 +36,10 @@ pub struct ScanBudget {
     /// Maximum number of files scored in one target scan.
     pub max_files: usize,
     /// Maximum bytes the scan reads from disk across the target, re-reads
-    /// included; `codesign`/`spctl` reads are not counted (§11.12). One file
-    /// can overshoot it.
+    /// included, plus the bytes container readers decompress
+    /// ([`ScanContext::decoded_bytes`]); `codesign`/`spctl` reads are not
+    /// counted (§11.12). One file can overshoot it, up to its own
+    /// container budgets.
     pub max_total_bytes: u64,
     /// Maximum directory-recursion depth below the named target.
     pub max_depth: usize,
@@ -55,7 +57,7 @@ impl Default for ScanBudget {
     fn default() -> Self {
         Self {
             max_files: 50_000,
-            max_total_bytes: 4 * 1024 * 1024 * 1024, // 4 GiB read
+            max_total_bytes: 4 * 1024 * 1024 * 1024, // 4 GiB read or decoded
             max_depth: 64,
             max_entries: 1_000_000,
         }
@@ -240,10 +242,11 @@ fn outcome(collect_limit: Option<BudgetLimit>, byte_limit: Option<BudgetLimit>) 
 }
 
 /// Scan `files` in order, charging each the bytes its scan read from disk
-/// ([`ScanContext::bytes_read`]). After the first file, a file is started only if its
+/// ([`ScanContext::bytes_read`]) and decompressed
+/// ([`ScanContext::decoded_bytes`]). After the first file, a file is started only if its
 /// length, clipped to `MAX_STREAM_BYTES`, still fits under `max_total_bytes`;
-/// a file can read more than that, so the ceiling can be overshot by one
-/// file's reads (§11.12). Returns the results scored and `Some(TotalBytes)`
+/// a file can read and decode more than that, so the ceiling can be
+/// overshot by one file's work (§11.12). Returns the results scored and `Some(TotalBytes)`
 /// if the cap stopped it short.
 fn scan_within_bytes(
     files: &[PathBuf],
@@ -262,7 +265,9 @@ fn scan_within_bytes(
             return (results, Some(BudgetLimit::TotalBytes));
         };
         results.push(scan_context(&ctx, &rules));
-        used = used.saturating_add(ctx.bytes_read());
+        used = used
+            .saturating_add(ctx.bytes_read())
+            .saturating_add(ctx.decoded_bytes());
     }
     (results, None)
 }
@@ -605,6 +610,48 @@ mod tests {
             scan.budget,
             BudgetOutcome::Exhausted(BudgetLimit::TotalBytes)
         );
+    }
+
+    /// Zips small on disk whose members inflate far past their size stop the
+    /// target at `TotalBytes` once the decoded bytes add up (#166).
+    #[test]
+    fn total_bytes_charges_decoded_container_bytes() {
+        use crate::zip::tests_support::{plain, Spec};
+        const MIB: usize = 1024 * 1024;
+        let zip = plain(&[Spec::run("a.txt", b'a', MIB)]);
+        assert!(zip.len() < 64 * 1024, "{}", zip.len());
+        let dir = TempDir::new("budget-decoded");
+        for name in ["a.zip", "b.zip", "c.zip", "d.zip"] {
+            fs::write(dir.path().join(name), &zip).unwrap();
+        }
+        let ctx = ScanContext::load(&dir.path().join("a.zip"));
+        scan_context(&ctx, &default_ruleset());
+        assert_eq!(ctx.decoded_bytes(), MIB as u64);
+        assert_eq!(ctx.bytes_read(), zip.len() as u64);
+
+        let budget = ScanBudget {
+            max_total_bytes: 5 * MIB as u64 / 2,
+            ..ScanBudget::default()
+        };
+        let scan = scan_target_with_budget(dir.path(), true, &budget).unwrap();
+        assert_eq!(scan.results.len(), 3);
+        assert_eq!(
+            scan.budget,
+            BudgetOutcome::Exhausted(BudgetLimit::TotalBytes)
+        );
+    }
+
+    /// A plain file decodes nothing: it is charged its reads alone.
+    #[test]
+    fn a_plain_file_is_charged_only_its_reads() {
+        let dir = TempDir::new("budget-plain");
+        let path = dir.path().join("a.sh");
+        let script = b"#!/bin/sh\necho hi\n";
+        fs::write(&path, script).unwrap();
+        let ctx = ScanContext::load(&path);
+        scan_context(&ctx, &default_ruleset());
+        assert_eq!(ctx.decoded_bytes(), 0);
+        assert_eq!(ctx.bytes_read(), script.len() as u64);
     }
 
     /// A non-Mach-O file over `MAX_STREAM_BYTES` is read only in its prefix:

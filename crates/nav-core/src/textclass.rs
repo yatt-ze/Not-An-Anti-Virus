@@ -63,15 +63,18 @@ const SCRIPT_EXTS: &[&str] = &[
     "ps1",
 ];
 
+/// True if `path` ends in one of [`SCRIPT_EXTS`], in any case. The only way a
+/// name changes how [`classify_text`] reads content.
+pub(crate) fn has_script_extension(path: &Path) -> bool {
+    path.extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|ext| SCRIPT_EXTS.iter().any(|e| e.eq_ignore_ascii_case(ext)))
+}
+
 /// Classify `content`/`path` as script/text (which could carry an obfuscated
 /// payload) or an opaque binary blob (§5.2).
 pub(crate) fn classify_text(content: &[u8], path: &Path) -> TextClass {
-    let strong = content.starts_with(b"#!")
-        || path
-            .extension()
-            .and_then(|e| e.to_str())
-            .is_some_and(|ext| SCRIPT_EXTS.iter().any(|e| e.eq_ignore_ascii_case(ext)));
-    if strong {
+    if content.starts_with(b"#!") || has_script_extension(path) {
         return TextClass::Text {
             container_evidence: false,
         };

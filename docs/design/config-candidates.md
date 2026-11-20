@@ -19,7 +19,7 @@ Each item has one class, by what changing it puts at risk.
 | Option | Value | Location | Controls | Class |
 |---|---|---|---|---|
 | ScanBudget.max_files | 50,000 | nav-core/src/target.rs:57 | Files scored per target (`--max-files` overrides) | Resource |
-| ScanBudget.max_total_bytes | 4 GiB | nav-core/src/target.rs:58 | Bytes read across one target (`--max-total-bytes` overrides) | Resource |
+| ScanBudget.max_total_bytes | 4 GiB | nav-core/src/target.rs:58 | Bytes read plus bytes decompressed from containers across one target (`--max-total-bytes` overrides) | Resource |
 | ScanBudget.max_depth | 64 | nav-core/src/target.rs:59 | Directory recursion depth | Resource |
 | ScanBudget.max_entries | 1,000,000 | nav-core/src/target.rs:60 | Directory entries examined | Resource |
 | MAX_CONTENT_BYTES | 8 MiB | nav-core/src/context.rs:16 | Per-file prefix read | Resource |

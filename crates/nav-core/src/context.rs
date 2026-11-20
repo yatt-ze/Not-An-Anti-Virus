@@ -138,6 +138,8 @@ pub struct ScanContext {
     pub(crate) incomplete_rules: std::sync::Mutex<Vec<&'static str>>,
     /// Bytes this scan read from disk; see [`Self::bytes_read`].
     pub(crate) bytes_read: AtomicU64,
+    /// Bytes container readers decompressed; see [`Self::decoded_bytes`].
+    pub(crate) decoded_bytes: AtomicU64,
 }
 
 impl ScanContext {
@@ -222,6 +224,7 @@ impl ScanContext {
             zip_format_cache: OnceLock::new(),
             incomplete_rules: std::sync::Mutex::new(Vec::new()),
             bytes_read: AtomicU64::new(0),
+            decoded_bytes: AtomicU64::new(0),
         }
     }
 
@@ -451,6 +454,18 @@ impl ScanContext {
     /// external tools (`codesign`, `spctl`) are not counted.
     pub fn bytes_read(&self) -> u64 {
         self.bytes_read.load(Ordering::Relaxed)
+    }
+
+    /// Bytes this scan's container readers decompressed (zip, xar entries
+    /// and TOC, nested layers), for the target byte budget (§11.12). Stored
+    /// members are not counted: their bytes were already read.
+    pub fn decoded_bytes(&self) -> u64 {
+        self.decoded_bytes.load(Ordering::Relaxed)
+    }
+
+    /// Adds `n` to [`Self::decoded_bytes`].
+    pub(crate) fn add_decoded(&self, n: usize) {
+        self.decoded_bytes.fetch_add(n as u64, Ordering::Relaxed);
     }
 
     /// Distinct rules marked incomplete this scan, in marking order.
