@@ -34,6 +34,9 @@ pub fn run(path: &Path, recursive: bool, json: bool) -> ExitCode {
         if let Some(note) = unreadable_note(&scan) {
             nav_core::safe_eprintln!("{note}");
         }
+        for note in nav_core::not_walked_notes(&scan) {
+            nav_core::safe_eprintln!("navd scan-once: {note}");
+        }
         nav_core::safe_eprintln!("navd scan-once: no files found under {}", path.display());
         return nav_core::exit_code(nav_core::INDETERMINATE);
     }
@@ -60,6 +63,9 @@ pub fn run(path: &Path, recursive: bool, json: bool) -> ExitCode {
     }
     if let Some(note) = unreadable_note(&scan) {
         nav_core::safe_eprintln!("{note}");
+    }
+    for note in nav_core::not_walked_notes(&scan) {
+        nav_core::safe_eprintln!("navd scan-once: {note}");
     }
 
     nav_core::exit_code(nav_core::for_target(&scan))

@@ -167,3 +167,23 @@ fn a_budget_that_admits_no_file_is_indeterminate() {
     let json = navctl(&["rules", "test", "--json", "--max-files", "0"], dir.path());
     assert!(String::from_utf8_lossy(&json.stdout).contains("\"coverage_complete\": false"));
 }
+
+/// #159: a subdirectory skipped without `--recursive` is named on stderr,
+/// and the note alone does not change the exit code.
+#[test]
+fn subdir_note_keeps_exit_code() {
+    let dir = TempDir::new("not-recursive");
+    std::fs::write(dir.path().join("readme.txt"), b"hello\n").unwrap();
+    let baseline = run_scan(dir.path()).status.code();
+    std::fs::create_dir(dir.path().join("sub")).unwrap();
+    std::fs::copy(DROPPER_SH, dir.path().join("sub/dropper.sh")).unwrap();
+
+    let out = run_scan(dir.path());
+
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("1 subdirectory of ") && stderr.contains("(use --recursive)"),
+        "stderr: {stderr}"
+    );
+    assert_eq!(out.status.code(), baseline, "stderr: {stderr}");
+}

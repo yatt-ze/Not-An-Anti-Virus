@@ -858,7 +858,7 @@ mod tests {
     /// Without `recursive`, subdirectories are counted, not silently
     /// dropped, and the target is still complete (#159).
     #[test]
-    fn subdirectories_not_entered_are_counted() {
+    fn counts_skipped_subdirs() {
         let dir = TempDir::new("nonrecursive");
         fs::write(dir.path().join("readme.txt"), b"x").unwrap();
         fs::create_dir(dir.path().join("sub")).unwrap();

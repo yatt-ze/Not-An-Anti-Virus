@@ -16,9 +16,9 @@ use nav_core::model::lossy_path;
 use std::process::ExitCode;
 
 use nav_core::{
-    scan_target_with_budget, with_schema_version, BudgetLimit, BudgetOutcome, EvidenceConfidence,
-    Recommendation, ScanBudget, ScanCompleteness, ScanResult, TargetKind, TargetScan,
-    SCAN_JSON_SCHEMA_VERSION, UNINSPECTED_CONTAINER_ID,
+    not_walked_notes, scan_target_with_budget, with_schema_version, BudgetLimit, BudgetOutcome,
+    EvidenceConfidence, Recommendation, ScanBudget, ScanCompleteness, ScanResult, TargetKind,
+    TargetScan, SCAN_JSON_SCHEMA_VERSION, UNINSPECTED_CONTAINER_ID,
 };
 
 use crate::diskimage::{self, ImageReport, ImageScan};
@@ -87,6 +87,7 @@ pub fn run_scan(
         if let Some(note) = budget_warning(&scan, path) {
             nav_core::safe_eprintln!("{note}");
         }
+        print_not_walked(&scan);
         nav_core::safe_eprintln!("navctl: no files found under {}", path.display());
         return exit::code(empty_scan_exit_code(&scan));
     }
@@ -119,6 +120,7 @@ pub fn run_scan(
     if let Some(note) = unreadable_note(&scan) {
         nav_core::safe_eprintln!("{note}");
     }
+    print_not_walked(&scan);
     exit::code(exit::for_target(&scan))
 }
 
@@ -174,6 +176,7 @@ pub fn run_rules_test(
         for note in &notes {
             nav_core::safe_eprintln!("{note}");
         }
+        print_not_walked(&scan);
         // Unreadable directories and a budget stop are structured data
         // (§11.12), so `--json` gets the multi-target envelope (empty
         // `results`, `coverage_complete: false`). `print_rules_test_multi`
@@ -256,6 +259,14 @@ fn print_image_warnings(report: &ImageReport, nested: bool) {
     }
     if let Some(note) = unreadable_note(scan) {
         nav_core::safe_eprintln!("{note}");
+    }
+    print_not_walked(scan);
+}
+
+/// [`not_walked_notes`] on stderr, one `navctl:` line each.
+fn print_not_walked(scan: &TargetScan) {
+    for note in not_walked_notes(scan) {
+        nav_core::safe_eprintln!("navctl: {note}");
     }
 }
 
@@ -468,6 +479,9 @@ fn print_rules_test_multi(scan: &TargetScan, image: Option<&ImageReport>) {
     if let Some(note) = unreadable_coverage_note(scan) {
         nav_core::safe_println!("{note}");
     }
+    for note in not_walked_notes(scan) {
+        nav_core::safe_println!("  [{note}]");
+    }
     nav_core::safe_println!();
     nav_core::safe_println!("Worst finding — {}", member(&worst.path));
     nav_core::safe_println!("  Threat score:        {}", worst.score);
@@ -563,6 +577,8 @@ fn multi_json(
         "coverage_complete": scan.coverage_complete() && gaps_ok,
         "budget_limit": budget_limit_str(scan),
         "unreadable": paths(&scan.unreadable),
+        "subdirs_not_entered": scan.not_walked.subdirs,
+        "links_and_special_not_followed": scan.not_walked.links_and_special,
         "recommendation": serde_json::to_value(scan.recommendation())?,
         "results": serde_json::to_value(&scan.results)?,
     });

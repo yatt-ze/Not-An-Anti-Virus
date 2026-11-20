@@ -33,6 +33,29 @@ pub fn scan_result_json(result: &ScanResult) -> Result<String, serde_json::Error
     Ok(with_schema_version(result)?.to_string())
 }
 
+/// Human notes for the entries `scan`'s walk passed over by design (#159),
+/// without a program prefix; empty when there were none. Informational
+/// only: they do not change the exit code (§8).
+pub fn not_walked_notes(scan: &TargetScan) -> Vec<String> {
+    let nw = scan.not_walked;
+    let root = scan.root.display();
+    let mut notes = Vec::new();
+    if nw.subdirs > 0 {
+        notes.push(format!(
+            "{} subdirector{} of {root} not scanned (use --recursive)",
+            nw.subdirs,
+            if nw.subdirs == 1 { "y" } else { "ies" }
+        ));
+    }
+    if nw.links_and_special > 0 {
+        notes.push(format!(
+            "{} symlink(s) or special file(s) under {root} not followed",
+            nw.links_and_special
+        ));
+    }
+    notes
+}
+
 /// `s` with control characters (C0, DEL, C1) and bidi embedding/override/
 /// isolate characters replaced by U+FFFD, so untrusted text cannot rewrite
 /// terminal output (§8). Borrows when nothing needs replacing.
