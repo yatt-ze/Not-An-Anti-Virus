@@ -46,8 +46,9 @@ pub use model::{
 };
 pub use plist::PlistValue;
 pub use presentation::{
-    exit_code, for_result, for_target, scan_result_json, terminal_safe, with_schema_version, CLEAN,
-    HIGH_RISK, INDETERMINATE, OPERATIONAL_ERROR, SCAN_JSON_SCHEMA_VERSION, SUSPICIOUS,
+    exit_code, for_result, for_target, not_walked_notes, scan_result_json, terminal_safe,
+    with_schema_version, CLEAN, HIGH_RISK, INDETERMINATE, OPERATIONAL_ERROR,
+    SCAN_JSON_SCHEMA_VERSION, SUSPICIOUS,
 };
 pub use rules::{
     default_ruleset, disk_image_format_of_file, embedded_content_ruleset, Rule, RuleOutcome,
@@ -57,7 +58,7 @@ pub use scan::{
     scan_context, scan_embedded_bytes, scan_file, scan_file_with_rules, ENGINE_VERSION,
 };
 pub use target::{
-    scan_target, scan_target_with_budget, BudgetLimit, BudgetOutcome, ScanBudget, TargetKind,
-    TargetScan,
+    scan_target, scan_target_with_budget, BudgetLimit, BudgetOutcome, NotWalked, ScanBudget,
+    TargetKind, TargetScan,
 };
 pub use xar::{XarArchive, XarFile, XarHalt, XarLimits};

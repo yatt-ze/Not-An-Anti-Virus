@@ -33,6 +33,38 @@ pub fn scan_result_json(result: &ScanResult) -> Result<String, serde_json::Error
     Ok(with_schema_version(result)?.to_string())
 }
 
+/// Human notes for the entries `scan`'s walk passed over by design (#159),
+/// without a program prefix; empty when there were none. Informational
+/// only: they do not change the exit code (§8). `all_links` adds the count
+/// of links and special files that stay inside the target; links that
+/// resolve outside it are always noted.
+pub fn not_walked_notes(scan: &TargetScan, all_links: bool) -> Vec<String> {
+    let nw = scan.not_walked;
+    let root = scan.root.display();
+    let mut notes = Vec::new();
+    if nw.subdirs > 0 {
+        notes.push(format!(
+            "{} subdirector{} of {root} not scanned (use --recursive)",
+            nw.subdirs,
+            if nw.subdirs == 1 { "y" } else { "ies" }
+        ));
+    }
+    if nw.links_outside > 0 {
+        notes.push(format!(
+            "{} symlink(s) under {root} point outside it (not followed)",
+            nw.links_outside
+        ));
+    }
+    let inside = nw.links_and_special - nw.links_outside;
+    if all_links && inside > 0 {
+        let other = if nw.links_outside > 0 { "other " } else { "" };
+        notes.push(format!(
+            "{inside} {other}symlink(s) or special file(s) under {root} not followed"
+        ));
+    }
+    notes
+}
+
 /// `s` with control characters (C0, DEL, C1) and bidi embedding/override/
 /// isolate characters replaced by U+FFFD, so untrusted text cannot rewrite
 /// terminal output (§8). Borrows when nothing needs replacing.
@@ -260,6 +292,7 @@ mod tests {
             primary: None,
             skipped: Vec::new(),
             unreadable: Vec::new(),
+            not_walked: Default::default(),
             results: vec![sample_result()], // complete + NoAction
             budget,
         };
@@ -286,6 +319,7 @@ mod tests {
             primary: None,
             skipped: Vec::new(),
             unreadable: vec![PathBuf::from("/tmp/locked")],
+            not_walked: Default::default(),
             results: vec![sample_result()], // complete + NoAction
             budget: BudgetOutcome::Within,
         };
@@ -311,6 +345,7 @@ mod tests {
             primary: None,
             skipped: Vec::new(),
             unreadable: Vec::new(),
+            not_walked: Default::default(),
             results: vec![high_risk, partial_no_action],
             budget: BudgetOutcome::Within,
         };
@@ -335,6 +370,7 @@ mod tests {
             primary: None,
             skipped: Vec::new(),
             unreadable: Vec::new(),
+            not_walked: Default::default(),
             results: vec![notify, partial_no_action],
             budget: BudgetOutcome::Within,
         };
@@ -355,6 +391,7 @@ mod tests {
             primary: None,
             skipped: Vec::new(),
             unreadable: Vec::new(),
+            not_walked: Default::default(),
             results: vec![sample_result(), partial_no_action],
             budget: BudgetOutcome::Within,
         };
@@ -375,6 +412,7 @@ mod tests {
             primary: None,
             skipped: Vec::new(),
             unreadable: Vec::new(),
+            not_walked: Default::default(),
             results: vec![high_risk],
             budget: BudgetOutcome::Exhausted(BudgetLimit::Files),
         };
@@ -395,6 +433,7 @@ mod tests {
             primary: None,
             skipped: Vec::new(),
             unreadable: vec![PathBuf::from("/tmp/locked")],
+            not_walked: Default::default(),
             results: vec![notify],
             budget: BudgetOutcome::Within,
         };

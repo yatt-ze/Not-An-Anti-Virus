@@ -66,6 +66,32 @@ fn bundle_scan_prints_one_line_and_verbose_adds_file_lines() {
     }
 }
 
+/// #159: a bundle's links that leave it are always noted; the ones that
+/// stay inside only with `--verbose`.
+#[cfg(unix)]
+#[test]
+fn bundle_link_notes() {
+    use std::os::unix::fs::symlink;
+    let base = std::env::temp_dir().join(format!("navctl-links-{}", std::process::id()));
+    let app = base.join("Evil.app");
+    let res = app.join("Contents/Resources");
+    std::fs::create_dir_all(&res).unwrap();
+    std::fs::write(base.join("evil.sh"), b"x").unwrap();
+    std::fs::write(res.join("a.txt"), b"x").unwrap();
+    symlink("a.txt", res.join("inside")).unwrap();
+    symlink("../../../evil.sh", res.join("y.sh")).unwrap();
+    let target = app.to_str().unwrap();
+
+    let plain = String::from_utf8_lossy(&navctl(&[], target).stderr).into_owned();
+    let verbose = String::from_utf8_lossy(&navctl(&["--verbose"], target).stderr).into_owned();
+    let _ = std::fs::remove_dir_all(&base);
+
+    assert!(plain.contains("1 symlink(s) under "), "{plain}");
+    assert!(plain.contains("point outside it"), "{plain}");
+    assert!(!plain.contains("other symlink"), "{plain}");
+    assert!(verbose.contains("1 other symlink(s)"), "{verbose}");
+}
+
 #[test]
 fn directory_scan_ignores_verbose() {
     let plain = navctl(&[], BENIGN_DIR);

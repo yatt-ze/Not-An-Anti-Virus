@@ -103,8 +103,22 @@ pub struct TargetScan {
     /// each one rather than aborting (§11.8); non-empty means the target's
     /// coverage is partial (§11.12). Always empty for a single-file target.
     pub unreadable: Vec<PathBuf>,
+    /// Entries the walk passed over by design. Reported as a note only: they
+    /// do not affect [`Self::coverage_complete`] (§8, §11.8).
+    pub not_walked: NotWalked,
     /// Whether the scan fit inside its budget, or was cut short (and how).
     pub budget: BudgetOutcome,
+}
+
+/// Counts of directory entries a target walk did not enter or follow (#159).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct NotWalked {
+    /// Subdirectories not entered because the walk was not recursive.
+    pub subdirs: usize,
+    /// Symlinks, sockets, FIFOs and devices, which are never followed.
+    pub links_and_special: usize,
+    /// Of those, symlinks that resolve outside the target.
+    pub links_outside: usize,
 }
 
 impl TargetScan {
@@ -191,17 +205,19 @@ pub fn scan_target_with_budget(
             primary: None,
             skipped: Vec::new(),
             unreadable: Vec::new(),
+            not_walked: NotWalked::default(),
             budget: BudgetOutcome::Within,
         });
     }
 
     if let Some(layout) = BundleLayout::detect(path) {
         // A bundle is always traversed in full; `recursive` doesn't apply.
-        let (all, collect_limit, unreadable) = collect_files(path, true, budget)?;
-        let (to_scan, skipped): (Vec<PathBuf>, Vec<PathBuf>) = all.into_iter().partition(|p| {
-            let rel = p.strip_prefix(path).unwrap_or(p);
-            !bundle::is_signature_manifest(rel, p)
-        });
+        let walk = collect_files(path, true, budget)?;
+        let (to_scan, skipped): (Vec<PathBuf>, Vec<PathBuf>) =
+            walk.files.into_iter().partition(|p| {
+                let rel = p.strip_prefix(path).unwrap_or(p);
+                !bundle::is_signature_manifest(rel, p)
+            });
         let (results, byte_limit, _) = scan_within_bytes(&to_scan, budget);
         return Ok(TargetScan {
             root: path.to_path_buf(),
@@ -209,21 +225,23 @@ pub fn scan_target_with_budget(
             results,
             primary: layout.main_executable,
             skipped,
-            unreadable,
-            budget: outcome(collect_limit, byte_limit),
+            unreadable: walk.unreadable,
+            not_walked: walk.not_walked,
+            budget: outcome(walk.limit, byte_limit),
         });
     }
 
-    let (files, collect_limit, unreadable) = collect_files(path, recursive, budget)?;
-    let (results, byte_limit, _) = scan_within_bytes(&files, budget);
+    let walk = collect_files(path, recursive, budget)?;
+    let (results, byte_limit, _) = scan_within_bytes(&walk.files, budget);
     Ok(TargetScan {
         root: path.to_path_buf(),
         kind: TargetKind::Directory,
         results,
         primary: None,
         skipped: Vec::new(),
-        unreadable,
-        budget: outcome(collect_limit, byte_limit),
+        unreadable: walk.unreadable,
+        not_walked: walk.not_walked,
+        budget: outcome(walk.limit, byte_limit),
     })
 }
 
@@ -273,6 +291,17 @@ fn scan_within_bytes(
     (results, hit, used)
 }
 
+/// What [`collect_files`] found.
+struct Walk {
+    /// Regular files, sorted.
+    files: Vec<PathBuf>,
+    /// The budget ceiling that stopped the walk, if any.
+    limit: Option<BudgetLimit>,
+    /// Directories that could not be listed, sorted.
+    unreadable: Vec<PathBuf>,
+    not_walked: NotWalked,
+}
+
 /// Depth-first file collection under `root`, sorted for determinism (§11.1).
 /// Directory symlinks are not followed (traversal cycles, scan escape).
 /// Stops early if the budget's file-count or depth ceiling is reached,
@@ -284,14 +313,12 @@ fn scan_within_bytes(
 /// `file_type()` that errors while listing one) is recorded in the returned
 /// set instead, and the walk continues; a failing entry is just skipped
 /// (§11.8).
-fn collect_files(
-    root: &Path,
-    recursive: bool,
-    budget: &ScanBudget,
-) -> io::Result<(Vec<PathBuf>, Option<BudgetLimit>, Vec<PathBuf>)> {
+fn collect_files(root: &Path, recursive: bool, budget: &ScanBudget) -> io::Result<Walk> {
     let mut out = Vec::new();
     let mut limit_hit = None;
     let mut unreadable: BTreeSet<PathBuf> = BTreeSet::new();
+    let mut not_walked = NotWalked::default();
+    let real_root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
     // Every directory entry examined, across the whole walk — bounds breadth
     // (and, since each queued directory was itself one such entry, the stack)
     // so an all-empty-directory tree can't run unbounded past `max_files`.
@@ -341,6 +368,8 @@ fn collect_files(
                     } else {
                         limit_hit.get_or_insert(BudgetLimit::Depth);
                     }
+                } else {
+                    not_walked.subdirs += 1;
                 }
             } else if file_type.is_file() {
                 if out.len() >= budget.max_files {
@@ -348,13 +377,48 @@ fn collect_files(
                     break 'walk;
                 }
                 out.push(path);
+            } else {
+                not_walked.links_and_special += 1;
+                if file_type.is_symlink() && points_outside(&path, &real_root) {
+                    not_walked.links_outside += 1;
+                }
             }
-            // Symlinks, sockets, fifos, devices: skip.
         }
     }
 
     out.sort();
-    Ok((out, limit_hit, unreadable.into_iter().collect()))
+    Ok(Walk {
+        files: out,
+        limit: limit_hit,
+        unreadable: unreadable.into_iter().collect(),
+        not_walked,
+    })
+}
+
+/// Whether symlink `link` points outside `real_root` (a canonical path).
+/// A link that won't resolve (dangling, looping, unreadable on the way) is
+/// judged by its own text, read lexically from its real parent directory.
+fn points_outside(link: &Path, real_root: &Path) -> bool {
+    if let Ok(target) = link.canonicalize() {
+        return !target.starts_with(real_root);
+    }
+    let (Ok(text), Some(Ok(parent))) = (
+        std::fs::read_link(link),
+        link.parent().map(Path::canonicalize),
+    ) else {
+        return true; // can't tell where it goes: don't call it inside
+    };
+    let mut resolved = PathBuf::new();
+    for part in parent.join(text).components() {
+        match part {
+            std::path::Component::ParentDir => {
+                resolved.pop();
+            }
+            std::path::Component::CurDir => {}
+            other => resolved.push(other),
+        }
+    }
+    !resolved.starts_with(real_root)
 }
 
 #[cfg(test)]
@@ -622,8 +686,8 @@ mod tests {
             max_total_bytes,
             ..ScanBudget::default()
         };
-        let (files, _, _) = collect_files(dir, true, &budget).unwrap();
-        scan_within_bytes(&files, &budget)
+        let walk = collect_files(dir, true, &budget).unwrap();
+        scan_within_bytes(&walk.files, &budget)
     }
 
     /// A file whose re-reads would pass the budget is cut at it: the reads
@@ -818,7 +882,51 @@ mod tests {
             let scan = scan_target(dir.path(), true).unwrap();
             // "real/x.txt" once, not also via "link/x.txt".
             assert_eq!(scan.results.len(), 1);
+            assert_eq!(scan.not_walked.links_and_special, 1);
+            assert_eq!(scan.not_walked.links_outside, 0);
+            assert!(scan.coverage_complete());
         }
+    }
+
+    /// A link that points outside the target is counted apart (#159),
+    /// dangling or not; a dangling link that stays inside is not.
+    #[cfg(unix)]
+    #[test]
+    fn counts_links_outside() {
+        use std::os::unix::fs::symlink;
+        let outside = TempDir::new("outside");
+        fs::write(outside.path().join("evil.sh"), b"x").unwrap();
+        let dir = TempDir::new("links");
+        fs::write(dir.path().join("a.txt"), b"x").unwrap();
+        symlink("a.txt", dir.path().join("inside")).unwrap();
+        symlink(outside.path().join("evil.sh"), dir.path().join("out")).unwrap();
+        symlink("missing", dir.path().join("dangling")).unwrap();
+        symlink(outside.path().join("gone"), dir.path().join("dangling-out")).unwrap();
+        symlink("../../nowhere", dir.path().join("dangling-up")).unwrap();
+
+        let scan = scan_target(dir.path(), false).unwrap();
+        assert_eq!(scan.not_walked.links_and_special, 5);
+        assert_eq!(scan.not_walked.links_outside, 3);
+    }
+
+    /// Without `recursive`, subdirectories are counted, not silently
+    /// dropped, and the target is still complete (#159).
+    #[test]
+    fn counts_skipped_subdirs() {
+        let dir = TempDir::new("nonrecursive");
+        fs::write(dir.path().join("readme.txt"), b"x").unwrap();
+        fs::create_dir(dir.path().join("sub")).unwrap();
+        fs::write(dir.path().join("sub/evil.sh"), b"x").unwrap();
+        fs::create_dir(dir.path().join("sub2")).unwrap();
+
+        let scan = scan_target(dir.path(), false).unwrap();
+        assert_eq!(scan.results.len(), 1);
+        assert_eq!(scan.not_walked.subdirs, 2);
+        assert!(scan.coverage_complete());
+
+        let scan = scan_target(dir.path(), true).unwrap();
+        assert_eq!(scan.results.len(), 2);
+        assert_eq!(scan.not_walked, NotWalked::default());
     }
 
     /// A `chmod 000` subdirectory is recorded, not fatal: the rest of the
