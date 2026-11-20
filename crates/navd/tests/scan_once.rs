@@ -235,3 +235,41 @@ fn only_unreadable_subdirs_is_indeterminate_and_names_the_directory() {
         "stderr should name the unreadable directory: {stderr}"
     );
 }
+
+#[test]
+fn human_output_replaces_control_and_bidi_characters() {
+    let dir = std::env::temp_dir().join(format!("navd-terminal-safe-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("a\x1b[2K\rCLEAN\x1b[0m\n.sh"), "#!/bin/sh\ntrue\n").unwrap();
+    let sub = dir.join("d\x1b\r\n\u{202E}dir");
+    std::fs::create_dir(&sub).unwrap();
+    std::fs::write(sub.join("inner.sh"), "#!/bin/sh\ntrue\n").unwrap();
+
+    let out = run_scan_once(&dir, &["--recursive"]);
+    let json = run_scan_once(&dir, &["--recursive", "--json"]);
+    let _ = std::fs::remove_dir_all(&dir);
+
+    for bytes in [&out.stdout, &out.stderr] {
+        let text = String::from_utf8_lossy(bytes);
+        assert!(!text.contains('\x1b') && !text.contains('\r'), "{text:?}");
+        assert!(!text.contains('\u{202E}'), "{text:?}");
+    }
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(text.contains('\u{FFFD}'), "{text:?}");
+    assert_eq!(text.lines().count(), 2, "one line per file: {text:?}");
+
+    let raw = String::from_utf8_lossy(&json.stdout);
+    let paths: Vec<String> = raw
+        .lines()
+        .map(|l| {
+            let v: serde_json::Value = serde_json::from_str(l).unwrap();
+            v["path"].as_str().unwrap().to_string()
+        })
+        .collect();
+    assert!(
+        paths
+            .iter()
+            .any(|p| p.ends_with("a\x1b[2K\rCLEAN\x1b[0m\n.sh")),
+        "{paths:?}"
+    );
+}

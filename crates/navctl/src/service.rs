@@ -19,23 +19,25 @@ fn is_root() -> bool {
 
 pub fn run_install() -> ExitCode {
     if !is_root() {
-        eprintln!("navctl: `service install` must run as root (try: sudo navctl service install)");
+        nav_core::safe_eprintln!(
+            "navctl: `service install` must run as root (try: sudo navctl service install)"
+        );
         return exit::code(exit::OPERATIONAL_ERROR);
     }
     let navd_src = match navd_beside_current_exe() {
         Ok(p) => p,
         Err(e) => {
-            eprintln!("navctl: {e:#}");
+            nav_core::safe_eprintln!("navctl: {e:#}");
             return exit::code(exit::OPERATIONAL_ERROR);
         }
     };
     match install(&Layout::system(), &RealSystemOps, &navd_src) {
         Ok(()) => {
-            println!("navd installed and bootstrapped ({LABEL}).");
+            nav_core::safe_println!("navd installed and bootstrapped ({LABEL}).");
             exit::code(exit::CLEAN)
         }
         Err(e) => {
-            eprintln!("navctl: install failed: {e:#}");
+            nav_core::safe_eprintln!("navctl: install failed: {e:#}");
             exit::code(exit::OPERATIONAL_ERROR)
         }
     }
@@ -43,14 +45,14 @@ pub fn run_install() -> ExitCode {
 
 pub fn run_uninstall() -> ExitCode {
     if !is_root() {
-        eprintln!(
+        nav_core::safe_eprintln!(
             "navctl: `service uninstall` must run as root (try: sudo navctl service uninstall)"
         );
         return exit::code(exit::OPERATIONAL_ERROR);
     }
     let report = uninstall(&Layout::system(), &RealSystemOps);
     for path in &report.removed {
-        println!("removed {}", path.display());
+        nav_core::safe_println!("removed {}", path.display());
     }
     // The FDA/TCC grant reset is best-effort and can't be asserted clean — say
     // so rather than implying a guarantee (§11.8). But if the reset itself
@@ -60,19 +62,21 @@ pub fn run_uninstall() -> ExitCode {
         .iter()
         .any(|e| e.starts_with("tccutil reset "))
     {
-        println!("Full Disk Access grant reset could not be run; check System Settings.");
+        nav_core::safe_println!(
+            "Full Disk Access grant reset could not be run; check System Settings."
+        );
     } else {
-        println!(
+        nav_core::safe_println!(
             "Full Disk Access grant reset (best-effort); verify in System Settings if needed."
         );
     }
 
     if report.is_ok() {
-        println!("navd uninstalled.");
+        nav_core::safe_println!("navd uninstalled.");
         exit::code(exit::CLEAN)
     } else {
         for err in &report.errors {
-            eprintln!("navctl: uninstall: {err}");
+            nav_core::safe_eprintln!("navctl: uninstall: {err}");
         }
         exit::code(exit::OPERATIONAL_ERROR)
     }
@@ -87,7 +91,7 @@ pub fn run_status() -> ExitCode {
         ("state dir", layout.state_dir()),
     ] {
         let state = if path.exists() { "present" } else { "absent" };
-        println!("{label:<12} {state}");
+        nav_core::safe_println!("{label:<12} {state}");
     }
 
     // launchctl's system domain is only reliably readable as root; without it,
@@ -95,15 +99,15 @@ pub fn run_status() -> ExitCode {
     if is_root() {
         let ops = RealSystemOps;
         match ops.is_loaded(LABEL) {
-            Ok(true) => println!("{:<12} loaded", "launchd job"),
-            Ok(false) => println!("{:<12} not loaded", "launchd job"),
-            Err(e) => println!("{:<12} unknown ({e:#})", "launchd job"),
+            Ok(true) => nav_core::safe_println!("{:<12} loaded", "launchd job"),
+            Ok(false) => nav_core::safe_println!("{:<12} not loaded", "launchd job"),
+            Err(e) => nav_core::safe_println!("{:<12} unknown ({e:#})", "launchd job"),
         }
         if matches!(ops.is_disabled(LABEL), Ok(true)) {
-            println!("{:<12} disable override present", "launchd");
+            nav_core::safe_println!("{:<12} disable override present", "launchd");
         }
     } else {
-        println!(
+        nav_core::safe_println!(
             "{:<12} unknown (run as root to query launchd)",
             "launchd job"
         );

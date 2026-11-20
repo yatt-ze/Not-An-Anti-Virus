@@ -630,7 +630,7 @@ fn sweep_stale(root: &Path) {
         match swept {
             Ok(()) => {}
             Err(_) if cancelled() => return,
-            Err(why) => eprintln!(
+            Err(why) => nav_core::safe_eprintln!(
                 "navctl: warning: {why}; keeping stale scratch directory {}",
                 dir.display()
             ),
@@ -660,7 +660,7 @@ fn cleanup_run(run: &Path, attach_cut: bool) -> bool {
     match result {
         Ok(()) => true,
         Err(why) => {
-            eprintln!(
+            nav_core::safe_eprintln!(
                 "navctl: warning: {why}; keeping scratch directory {} for a later run to clean up",
                 run.display()
             );
@@ -708,7 +708,7 @@ fn release(dir: &Path, stale: bool) -> Result<(), String> {
     }
     for a in &found {
         if stale {
-            eprintln!(
+            nav_core::safe_eprintln!(
                 "navctl: detaching a stale scratch mount from an earlier run: {}",
                 a.describe()
             );

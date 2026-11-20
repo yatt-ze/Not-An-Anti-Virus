@@ -46,8 +46,8 @@ pub use model::{
 };
 pub use plist::PlistValue;
 pub use presentation::{
-    exit_code, for_result, for_target, scan_result_json, with_schema_version, CLEAN, HIGH_RISK,
-    INDETERMINATE, OPERATIONAL_ERROR, SCAN_JSON_SCHEMA_VERSION, SUSPICIOUS,
+    exit_code, for_result, for_target, scan_result_json, terminal_safe, with_schema_version, CLEAN,
+    HIGH_RISK, INDETERMINATE, OPERATIONAL_ERROR, SCAN_JSON_SCHEMA_VERSION, SUSPICIOUS,
 };
 pub use rules::{
     default_ruleset, disk_image_format_of_file, embedded_content_ruleset, Rule, RuleOutcome,

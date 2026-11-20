@@ -185,7 +185,7 @@ enum ConfigCommand {
 }
 
 fn not_yet_implemented(feature: &str, phase: &str) -> ExitCode {
-    eprintln!(
+    nav_core::safe_eprintln!(
         "navctl: `{feature}` requires navd, which isn't built yet ({phase}). \
          See design doc §12 for the phased roadmap."
     );

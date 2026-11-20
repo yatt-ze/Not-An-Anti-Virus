@@ -33,6 +33,51 @@ pub fn scan_result_json(result: &ScanResult) -> Result<String, serde_json::Error
     Ok(with_schema_version(result)?.to_string())
 }
 
+/// `s` with control characters (C0, DEL, C1) and bidi embedding/override/
+/// isolate characters replaced by U+FFFD, so untrusted text cannot rewrite
+/// terminal output (§8). Borrows when nothing needs replacing.
+pub fn terminal_safe(s: &str) -> std::borrow::Cow<'_, str> {
+    fn unsafe_char(c: char) -> bool {
+        c.is_control() || matches!(c, '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}')
+    }
+    if !s.chars().any(unsafe_char) {
+        return std::borrow::Cow::Borrowed(s);
+    }
+    std::borrow::Cow::Owned(
+        s.chars()
+            .map(|c| if unsafe_char(c) { '\u{FFFD}' } else { c })
+            .collect(),
+    )
+}
+
+/// `println!` through [`terminal_safe`]; for human output only.
+#[macro_export]
+macro_rules! safe_println {
+    () => { ::std::println!() };
+    ($($arg:tt)*) => {{
+        let line = ::std::format!($($arg)*);
+        ::std::println!("{}", $crate::presentation::terminal_safe(&line));
+    }};
+}
+
+/// `print!` through [`terminal_safe`]; for human output only.
+#[macro_export]
+macro_rules! safe_print {
+    ($($arg:tt)*) => {{
+        let text = ::std::format!($($arg)*);
+        ::std::print!("{}", $crate::presentation::terminal_safe(&text));
+    }};
+}
+
+/// `eprintln!` through [`terminal_safe`]; for human output only.
+#[macro_export]
+macro_rules! safe_eprintln {
+    ($($arg:tt)*) => {{
+        let line = ::std::format!($($arg)*);
+        ::std::eprintln!("{}", $crate::presentation::terminal_safe(&line));
+    }};
+}
+
 pub const CLEAN: u8 = 0;
 pub const SUSPICIOUS: u8 = 1;
 pub const HIGH_RISK: u8 = 2;
@@ -84,6 +129,31 @@ mod tests {
     use crate::target::{BudgetLimit, BudgetOutcome, TargetKind};
     use std::path::PathBuf;
     use std::time::SystemTime;
+
+    #[test]
+    fn terminal_safe_replaces_controls_and_bidi() {
+        let bad = [
+            '\x1b', '\r', '\n', '\t', '\x7f', '\u{9b}', '\u{202A}', '\u{202B}', '\u{202C}',
+            '\u{202D}', '\u{202E}', '\u{2066}', '\u{2067}', '\u{2068}', '\u{2069}',
+        ];
+        for c in bad {
+            let s = format!("a{c}b");
+            assert_eq!(terminal_safe(&s), "a\u{FFFD}b", "U+{:04X}", c as u32);
+        }
+    }
+
+    #[test]
+    fn terminal_safe_keeps_ordinary_text_borrowed() {
+        for s in [
+            "café",
+            "日本語のテキスト",
+            "plain ascii /tmp/x",
+            "a\u{200E}b",
+        ] {
+            assert!(matches!(terminal_safe(s), std::borrow::Cow::Borrowed(_)));
+            assert_eq!(terminal_safe(s), s);
+        }
+    }
 
     fn sample_result() -> ScanResult {
         ScanResult {

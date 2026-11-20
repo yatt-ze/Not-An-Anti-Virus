@@ -40,7 +40,7 @@ fn prepare(path: &Path, budget: &ScanBudget, no_mount: bool) -> Prepared {
     match diskimage::scan_image(path, budget) {
         ImageScan::NotImage => Prepared::Plain(None),
         ImageScan::Unmounted(reason) => {
-            eprintln!(
+            nav_core::safe_eprintln!(
                 "navctl: {}: disk image not mounted: {reason}",
                 path.display()
             );
@@ -53,7 +53,7 @@ fn prepare(path: &Path, budget: &ScanBudget, no_mount: bool) -> Prepared {
             } else {
                 "warning: scratch mounts may still be attached"
             };
-            eprintln!("navctl: {}: scan interrupted; {mounts}", path.display());
+            nav_core::safe_eprintln!("navctl: {}: scan interrupted; {mounts}", path.display());
             Prepared::Done(exit::code(128u8.saturating_add(signal as u8)))
         }
     }
@@ -75,19 +75,19 @@ pub fn run_scan(
     let scan = match scan_target_with_budget(path, recursive, budget) {
         Ok(s) => s,
         Err(e) => {
-            eprintln!("navctl: {}: {e}", path.display());
+            nav_core::safe_eprintln!("navctl: {}: {e}", path.display());
             return exit::code(exit::OPERATIONAL_ERROR);
         }
     };
 
     if scan.results.is_empty() {
         if let Some(note) = unreadable_note(&scan) {
-            eprintln!("{note}");
+            nav_core::safe_eprintln!("{note}");
         }
         if let Some(note) = budget_warning(&scan, path) {
-            eprintln!("{note}");
+            nav_core::safe_eprintln!("{note}");
         }
-        eprintln!("navctl: no files found under {}", path.display());
+        nav_core::safe_eprintln!("navctl: no files found under {}", path.display());
         return exit::code(empty_scan_exit_code(&scan));
     }
 
@@ -103,21 +103,21 @@ pub fn run_scan(
         }
     }
     if bundle_line {
-        println!("{}", bundle_summary_line(&scan));
+        nav_core::safe_println!("{}", bundle_summary_line(&scan));
     }
     // Budget-exhausted coverage goes to stderr (keeping the --json stream on
     // stdout parseable as one object per file) and is folded into the exit
     // code below — a target cut short is not a clean target (§8, §11.8/§11.12).
     if let Some(note) = budget_warning(&scan, path) {
-        eprintln!("{note}");
+        nav_core::safe_eprintln!("{note}");
     }
     if !json {
         for note in uninspected_notes(&scan.results) {
-            eprintln!("{note}");
+            nav_core::safe_eprintln!("{note}");
         }
     }
     if let Some(note) = unreadable_note(&scan) {
-        eprintln!("{note}");
+        nav_core::safe_eprintln!("{note}");
     }
     exit::code(exit::for_target(&scan))
 }
@@ -130,7 +130,7 @@ pub fn run_rules_test(
     no_mount: bool,
 ) -> ExitCode {
     if !path.exists() {
-        eprintln!("navctl: {} does not exist", path.display());
+        nav_core::safe_eprintln!("navctl: {} does not exist", path.display());
         return exit::code(exit::OPERATIONAL_ERROR);
     }
     let unmounted = match prepare(path, budget, no_mount) {
@@ -142,7 +142,7 @@ pub fn run_rules_test(
     let scan = match scan_target_with_budget(path, recursive, budget) {
         Ok(s) => s,
         Err(e) => {
-            eprintln!("navctl: {}: {e}", path.display());
+            nav_core::safe_eprintln!("navctl: {}: {e}", path.display());
             return exit::code(exit::OPERATIONAL_ERROR);
         }
     };
@@ -157,8 +157,8 @@ pub fn run_rules_test(
             }
         } else {
             if let Some(reason) = &unmounted {
-                println!("Disk image not mounted: {reason}");
-                println!();
+                nav_core::safe_println!("Disk image not mounted: {reason}");
+                nav_core::safe_println!();
             }
             print_rules_test(result);
         }
@@ -172,7 +172,7 @@ pub fn run_rules_test(
             .chain(budget_warning(&scan, path))
             .collect();
         for note in &notes {
-            eprintln!("{note}");
+            nav_core::safe_eprintln!("{note}");
         }
         // Unreadable directories and a budget stop are structured data
         // (§11.12), so `--json` gets the multi-target envelope (empty
@@ -184,7 +184,7 @@ pub fn run_rules_test(
                 Err(e) => json_error(&e),
             };
         }
-        eprintln!("navctl: no files to scan under {}", path.display());
+        nav_core::safe_eprintln!("navctl: no files to scan under {}", path.display());
         return exit::code(exit::INDETERMINATE);
     }
 
@@ -214,9 +214,9 @@ fn render_image_scan(report: &ImageReport, json: bool, verbose: bool) -> ExitCod
         }
     }
     if scan.results.is_empty() {
-        eprintln!("navctl: no files found in {}", scan.root.display());
+        nav_core::safe_eprintln!("navctl: no files found in {}", scan.root.display());
     } else if !json {
-        println!("{}", image_summary_line(report));
+        nav_core::safe_println!("{}", image_summary_line(report));
     }
     print_image_warnings(report, !json);
     exit::code(image_exit_code(report))
@@ -231,7 +231,7 @@ fn render_image_rules_test(report: &ImageReport, json: bool) -> ExitCode {
             return json_error(&e);
         }
     } else if scan.results.is_empty() {
-        eprintln!("navctl: no files found in {}", scan.root.display());
+        nav_core::safe_eprintln!("navctl: no files found in {}", scan.root.display());
     } else {
         print_rules_test_multi(scan, Some(report));
     }
@@ -244,18 +244,18 @@ fn render_image_rules_test(report: &ImageReport, json: bool) -> ExitCode {
 fn print_image_warnings(report: &ImageReport, nested: bool) {
     let scan = &report.scan;
     for gap in &report.gaps {
-        eprintln!("navctl: partial coverage — {}: {gap}", scan.root.display());
+        nav_core::safe_eprintln!("navctl: partial coverage — {}: {gap}", scan.root.display());
     }
     if let Some(note) = budget_warning(scan, &scan.root) {
-        eprintln!("{note}");
+        nav_core::safe_eprintln!("{note}");
     }
     if nested {
         for note in uninspected_notes(&scan.results) {
-            eprintln!("{note}");
+            nav_core::safe_eprintln!("{note}");
         }
     }
     if let Some(note) = unreadable_note(scan) {
-        eprintln!("{note}");
+        nav_core::safe_eprintln!("{note}");
     }
 }
 
@@ -297,13 +297,13 @@ fn image_member(image: &Path, label: &Path) -> String {
 
 pub fn run_rules_list() -> ExitCode {
     for rule in nav_core::default_ruleset() {
-        println!("{:<28} {:?}", rule.id(), rule.category());
+        nav_core::safe_println!("{:<28} {:?}", rule.id(), rule.category());
     }
     exit::code(exit::CLEAN)
 }
 
 fn print_scan_summary(result: &ScanResult) {
-    println!(
+    nav_core::safe_println!(
         "{}",
         summary_line(
             &result.path.display().to_string(),
@@ -397,27 +397,27 @@ fn gap_lines<'a>(result: &'a ScanResult, indent: &'a str) -> impl Iterator<Item 
 }
 
 fn print_rules_test(result: &ScanResult) {
-    println!("Threat score:        {}", result.score);
-    println!("Evidence confidence: {}", confidence_str(result.confidence));
-    println!(
+    nav_core::safe_println!("Threat score:        {}", result.score);
+    nav_core::safe_println!("Evidence confidence: {}", confidence_str(result.confidence));
+    nav_core::safe_println!(
         "Scan completeness:   {}",
         completeness_str(result.completeness)
     );
     for line in gap_lines(result, "  ") {
-        println!("{line}");
+        nav_core::safe_println!("{line}");
     }
-    println!();
+    nav_core::safe_println!();
 
     if result.signals.is_empty() {
-        println!("Signals matched: (none)");
+        nav_core::safe_println!("Signals matched: (none)");
     } else {
-        println!("Signals matched:");
+        nav_core::safe_println!("Signals matched:");
         for s in &result.signals {
-            println!("  [{:+4}] {:<28} {}", s.weight, s.id, s.description);
+            nav_core::safe_println!("  [{:+4}] {:<28} {}", s.weight, s.id, s.description);
         }
     }
-    println!();
-    println!(
+    nav_core::safe_println!();
+    nav_core::safe_println!(
         "Recommendation: {}",
         recommendation_str(result.recommendation, result.completeness)
     );
@@ -434,68 +434,72 @@ fn print_rules_test_multi(scan: &TargetScan, image: Option<&ImageReport>) {
     };
 
     if let Some(report) = image {
-        println!("Disk image: {}", scan.root.display());
-        println!("Volumes scanned: {}", report.volumes);
-        println!("Files scanned: {}", scan.results.len());
+        nav_core::safe_println!("Disk image: {}", scan.root.display());
+        nav_core::safe_println!("Volumes scanned: {}", report.volumes);
+        nav_core::safe_println!("Files scanned: {}", scan.results.len());
         for gap in &report.gaps {
-            println!("  [PARTIAL COVERAGE: {gap}]");
+            nav_core::safe_println!("  [PARTIAL COVERAGE: {gap}]");
         }
     } else if scan.kind == TargetKind::Bundle {
-        println!("Bundle: {}", scan.root.display());
+        nav_core::safe_println!("Bundle: {}", scan.root.display());
         match &scan.primary {
-            Some(p) => println!("Main executable: {}", display_relative(&scan.root, p)),
-            None => println!("Main executable: (could not resolve — scanned all members)"),
+            Some(p) => {
+                nav_core::safe_println!("Main executable: {}", display_relative(&scan.root, p))
+            }
+            None => nav_core::safe_println!(
+                "Main executable: (could not resolve — scanned all members)"
+            ),
         }
-        print!("Files scanned: {}", scan.results.len());
+        nav_core::safe_print!("Files scanned: {}", scan.results.len());
         if !scan.skipped.is_empty() {
-            print!(" ({} signature manifest(s) not scored)", scan.skipped.len());
+            nav_core::safe_print!(" ({} signature manifest(s) not scored)", scan.skipped.len());
         }
-        println!();
+        nav_core::safe_println!();
     } else {
-        println!(
+        nav_core::safe_println!(
             "Target: {} ({} files scanned)",
             scan.root.display(),
             scan.results.len()
         );
     }
     if let Some(note) = budget_note(scan) {
-        println!("{note}");
+        nav_core::safe_println!("{note}");
     }
     if let Some(note) = unreadable_coverage_note(scan) {
-        println!("{note}");
+        nav_core::safe_println!("{note}");
     }
-    println!();
-    println!("Worst finding — {}", member(&worst.path));
-    println!("  Threat score:        {}", worst.score);
-    println!(
+    nav_core::safe_println!();
+    nav_core::safe_println!("Worst finding — {}", member(&worst.path));
+    nav_core::safe_println!("  Threat score:        {}", worst.score);
+    nav_core::safe_println!(
         "  Evidence confidence: {}",
         confidence_str(worst.confidence)
     );
-    println!(
+    nav_core::safe_println!(
         "  Scan completeness:   {}",
         completeness_str(worst.completeness)
     );
     for line in gap_lines(worst, "    ") {
-        println!("{line}");
+        nav_core::safe_println!("{line}");
     }
     if worst.signals.is_empty() {
-        println!("  Signals matched: (none)");
+        nav_core::safe_println!("  Signals matched: (none)");
     } else {
-        println!("  Signals matched:");
+        nav_core::safe_println!("  Signals matched:");
         for s in &worst.signals {
-            println!("    [{:+4}] {:<28} {}", s.weight, s.id, s.description);
+            nav_core::safe_println!("    [{:+4}] {:<28} {}", s.weight, s.id, s.description);
         }
     }
-    println!();
+    nav_core::safe_println!();
 
-    println!("All files:");
+    nav_core::safe_println!("All files:");
     for result in &scan.results {
         let marker = if scan.primary.as_deref() == Some(result.path.as_path()) {
             "  *"
         } else {
             "   "
         };
-        println!(
+        nav_core::safe_println!(
             "{marker} {:<48} score={:<4} completeness={:<13} -> {}",
             member(&result.path),
             result.score,
@@ -503,15 +507,15 @@ fn print_rules_test_multi(scan: &TargetScan, image: Option<&ImageReport>) {
             recommendation_str(result.recommendation, result.completeness),
         );
         for line in gap_lines(result, "        ") {
-            println!("{line}");
+            nav_core::safe_println!("{line}");
         }
     }
     if scan.primary.is_some() {
-        println!("  (* = bundle main executable)");
+        nav_core::safe_println!("  (* = bundle main executable)");
     }
-    println!();
+    nav_core::safe_println!();
     let covered = image.map_or(true, |r| r.gaps.is_empty());
-    println!(
+    nav_core::safe_println!(
         "Recommendation: {}",
         recommendation_str(
             worst.recommendation,
@@ -522,7 +526,7 @@ fn print_rules_test_multi(scan: &TargetScan, image: Option<&ImageReport>) {
 
 /// Report a JSON serialization failure as an operational error (§8).
 fn json_error(e: &serde_json::Error) -> ExitCode {
-    eprintln!("navctl: cannot serialize JSON output: {e}");
+    nav_core::safe_eprintln!("navctl: cannot serialize JSON output: {e}");
     exit::code(exit::OPERATIONAL_ERROR)
 }
 
