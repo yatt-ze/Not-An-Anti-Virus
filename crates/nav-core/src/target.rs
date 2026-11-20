@@ -117,6 +117,8 @@ pub struct NotWalked {
     pub subdirs: usize,
     /// Symlinks, sockets, FIFOs and devices, which are never followed.
     pub links_and_special: usize,
+    /// Of those, symlinks that resolve outside the target.
+    pub links_outside: usize,
 }
 
 impl TargetScan {
@@ -316,6 +318,7 @@ fn collect_files(root: &Path, recursive: bool, budget: &ScanBudget) -> io::Resul
     let mut limit_hit = None;
     let mut unreadable: BTreeSet<PathBuf> = BTreeSet::new();
     let mut not_walked = NotWalked::default();
+    let real_root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
     // Every directory entry examined, across the whole walk — bounds breadth
     // (and, since each queued directory was itself one such entry, the stack)
     // so an all-empty-directory tree can't run unbounded past `max_files`.
@@ -376,6 +379,9 @@ fn collect_files(root: &Path, recursive: bool, budget: &ScanBudget) -> io::Resul
                 out.push(path);
             } else {
                 not_walked.links_and_special += 1;
+                if file_type.is_symlink() && points_outside(&path, &real_root) {
+                    not_walked.links_outside += 1;
+                }
             }
         }
     }
@@ -387,6 +393,13 @@ fn collect_files(root: &Path, recursive: bool, budget: &ScanBudget) -> io::Resul
         unreadable: unreadable.into_iter().collect(),
         not_walked,
     })
+}
+
+/// Whether symlink `link` resolves to somewhere outside `real_root` (a
+/// canonical path). A dangling or looping link resolves nowhere: `false`.
+fn points_outside(link: &Path, real_root: &Path) -> bool {
+    link.canonicalize()
+        .is_ok_and(|target| !target.starts_with(real_root))
 }
 
 #[cfg(test)]
@@ -851,8 +864,28 @@ mod tests {
             // "real/x.txt" once, not also via "link/x.txt".
             assert_eq!(scan.results.len(), 1);
             assert_eq!(scan.not_walked.links_and_special, 1);
+            assert_eq!(scan.not_walked.links_outside, 0);
             assert!(scan.coverage_complete());
         }
+    }
+
+    /// A link that resolves outside the target is counted apart (#159);
+    /// a dangling one is not.
+    #[cfg(unix)]
+    #[test]
+    fn counts_links_outside() {
+        use std::os::unix::fs::symlink;
+        let outside = TempDir::new("outside");
+        fs::write(outside.path().join("evil.sh"), b"x").unwrap();
+        let dir = TempDir::new("links");
+        fs::write(dir.path().join("a.txt"), b"x").unwrap();
+        symlink("a.txt", dir.path().join("inside")).unwrap();
+        symlink(outside.path().join("evil.sh"), dir.path().join("out")).unwrap();
+        symlink("missing", dir.path().join("dangling")).unwrap();
+
+        let scan = scan_target(dir.path(), false).unwrap();
+        assert_eq!(scan.not_walked.links_and_special, 3);
+        assert_eq!(scan.not_walked.links_outside, 1);
     }
 
     /// Without `recursive`, subdirectories are counted, not silently

@@ -87,7 +87,7 @@ pub fn run_scan(
         if let Some(note) = budget_warning(&scan, path) {
             nav_core::safe_eprintln!("{note}");
         }
-        print_not_walked(&scan);
+        print_not_walked(&scan, verbose || scan.kind != TargetKind::Bundle);
         nav_core::safe_eprintln!("navctl: no files found under {}", path.display());
         return exit::code(empty_scan_exit_code(&scan));
     }
@@ -120,7 +120,7 @@ pub fn run_scan(
     if let Some(note) = unreadable_note(&scan) {
         nav_core::safe_eprintln!("{note}");
     }
-    print_not_walked(&scan);
+    print_not_walked(&scan, verbose || scan.kind != TargetKind::Bundle);
     exit::code(exit::for_target(&scan))
 }
 
@@ -176,7 +176,7 @@ pub fn run_rules_test(
         for note in &notes {
             nav_core::safe_eprintln!("{note}");
         }
-        print_not_walked(&scan);
+        print_not_walked(&scan, true);
         // Unreadable directories and a budget stop are structured data
         // (§11.12), so `--json` gets the multi-target envelope (empty
         // `results`, `coverage_complete: false`). `print_rules_test_multi`
@@ -221,7 +221,7 @@ fn render_image_scan(report: &ImageReport, json: bool, verbose: bool) -> ExitCod
     } else if !json {
         nav_core::safe_println!("{}", image_summary_line(report));
     }
-    print_image_warnings(report, !json);
+    print_image_warnings(report, !json, verbose);
     exit::code(image_exit_code(report))
 }
 
@@ -238,13 +238,14 @@ fn render_image_rules_test(report: &ImageReport, json: bool) -> ExitCode {
     } else {
         print_rules_test_multi(scan, Some(report));
     }
-    print_image_warnings(report, false);
+    print_image_warnings(report, false, true);
     exit::code(image_exit_code(report))
 }
 
 /// Stderr notes for a mounted image: mount gaps, budget, unreadable
-/// directories and (with `nested`) uninspected members.
-fn print_image_warnings(report: &ImageReport, nested: bool) {
+/// directories, (with `nested`) uninspected members, and skipped entries
+/// (internal links only with `all_links`).
+fn print_image_warnings(report: &ImageReport, nested: bool, all_links: bool) {
     let scan = &report.scan;
     for gap in &report.gaps {
         nav_core::safe_eprintln!("navctl: partial coverage — {}: {gap}", scan.root.display());
@@ -260,12 +261,12 @@ fn print_image_warnings(report: &ImageReport, nested: bool) {
     if let Some(note) = unreadable_note(scan) {
         nav_core::safe_eprintln!("{note}");
     }
-    print_not_walked(scan);
+    print_not_walked(scan, all_links);
 }
 
 /// [`not_walked_notes`] on stderr, one `navctl:` line each.
-fn print_not_walked(scan: &TargetScan) {
-    for note in not_walked_notes(scan) {
+fn print_not_walked(scan: &TargetScan, all_links: bool) {
+    for note in not_walked_notes(scan, all_links) {
         nav_core::safe_eprintln!("navctl: {note}");
     }
 }
@@ -479,7 +480,7 @@ fn print_rules_test_multi(scan: &TargetScan, image: Option<&ImageReport>) {
     if let Some(note) = unreadable_coverage_note(scan) {
         nav_core::safe_println!("{note}");
     }
-    for note in not_walked_notes(scan) {
+    for note in not_walked_notes(scan, true) {
         nav_core::safe_println!("  [{note}]");
     }
     nav_core::safe_println!();
@@ -579,6 +580,7 @@ fn multi_json(
         "unreadable": paths(&scan.unreadable),
         "subdirs_not_entered": scan.not_walked.subdirs,
         "links_and_special_not_followed": scan.not_walked.links_and_special,
+        "links_outside_target": scan.not_walked.links_outside,
         "recommendation": serde_json::to_value(scan.recommendation())?,
         "results": serde_json::to_value(&scan.results)?,
     });

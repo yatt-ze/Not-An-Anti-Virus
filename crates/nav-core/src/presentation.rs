@@ -35,8 +35,10 @@ pub fn scan_result_json(result: &ScanResult) -> Result<String, serde_json::Error
 
 /// Human notes for the entries `scan`'s walk passed over by design (#159),
 /// without a program prefix; empty when there were none. Informational
-/// only: they do not change the exit code (§8).
-pub fn not_walked_notes(scan: &TargetScan) -> Vec<String> {
+/// only: they do not change the exit code (§8). `all_links` adds the count
+/// of links and special files that stay inside the target; links that
+/// resolve outside it are always noted.
+pub fn not_walked_notes(scan: &TargetScan, all_links: bool) -> Vec<String> {
     let nw = scan.not_walked;
     let root = scan.root.display();
     let mut notes = Vec::new();
@@ -47,10 +49,17 @@ pub fn not_walked_notes(scan: &TargetScan) -> Vec<String> {
             if nw.subdirs == 1 { "y" } else { "ies" }
         ));
     }
-    if nw.links_and_special > 0 {
+    if nw.links_outside > 0 {
         notes.push(format!(
-            "{} symlink(s) or special file(s) under {root} not followed",
-            nw.links_and_special
+            "{} symlink(s) under {root} point outside it (not followed)",
+            nw.links_outside
+        ));
+    }
+    let inside = nw.links_and_special - nw.links_outside;
+    if all_links && inside > 0 {
+        let other = if nw.links_outside > 0 { "other " } else { "" };
+        notes.push(format!(
+            "{inside} {other}symlink(s) or special file(s) under {root} not followed"
         ));
     }
     notes
