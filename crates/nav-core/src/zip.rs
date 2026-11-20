@@ -171,11 +171,15 @@ pub struct Gap {
     pub kind: GapKind,
 }
 
-/// One decoded member, handed to [`read`]'s visitor.
+/// One decoded member, handed to [`read`]'s visitor once however many names
+/// it has.
 #[derive(Debug)]
 pub struct Member<'a> {
     /// Its name, with any nested zips' names before it joined by `!`.
     pub path: &'a str,
+    /// Other names the views give the same bytes, prefixed as `path` is;
+    /// each is reported as `path` is (§11.8).
+    pub aliases: &'a [String],
     pub bytes: Vec<u8>,
     /// `bytes` stops short of the whole member.
     pub cut: bool,
@@ -188,6 +192,7 @@ pub struct ZipRead {
     pub gaps: Vec<Gap>,
     /// Distinct gaps past those.
     pub more_gaps: usize,
+    /// Names visited, aliases included.
     pub members: usize,
     /// Budget charged, at most `max_read_back_bytes`.
     pub spent: usize,
@@ -953,9 +958,9 @@ impl Reader<'_> {
         resume
     }
 
-    /// Visits a decoded member under `label` and each alias, or reads it as a
-    /// nested zip once, under `label`. Each alias visit is charged
-    /// [`ENTRY_COST`] plus its bytes against the entry's share.
+    /// Visits a decoded member once, under `label` and the aliases that fit
+    /// the entry's share at [`ENTRY_COST`] each, or reads it as a nested zip
+    /// once, under `label`.
     fn deliver(
         &mut self,
         label: &str,
@@ -974,34 +979,28 @@ impl Reader<'_> {
         let at_start = bytes.starts_with(LOCAL_SIG) || bytes.starts_with(END_SIG);
         let read_nested = nested && !past_depth;
         if !read_nested || !at_start {
-            let cost = ENTRY_COST.saturating_add(bytes.len());
-            let mut names = std::iter::once(label)
-                .chain(aliases.iter().map(String::as_str))
-                .peekable();
-            let mut first = true;
-            while let Some(name) = names.next() {
-                if !std::mem::take(&mut first) {
-                    if shares.entry_remaining() < cost {
-                        self.gap(name, GapKind::Limit(Limit::Budget));
-                        continue;
-                    }
-                    shares.charge(cost);
+            let mut names = Vec::with_capacity(aliases.len());
+            for name in aliases {
+                if shares.entry_remaining() < ENTRY_COST {
+                    self.gap(name, GapKind::Limit(Limit::Budget));
+                    continue;
                 }
-                // No later visit fits once one alias does not: costs are equal.
-                let last = names.peek().is_none() || shares.entry_remaining() < cost;
-                // Only a prefixed nested zip is both visited and read.
-                let bytes = if last && !read_nested {
-                    std::mem::take(&mut bytes)
-                } else {
-                    bytes.clone()
-                };
-                self.members += 1;
-                (self.visit)(Member {
-                    path: name,
-                    bytes,
-                    cut,
-                });
+                shares.charge(ENTRY_COST);
+                names.push(name.clone());
             }
+            // Only a prefixed nested zip is both visited and read.
+            let visited = if read_nested {
+                bytes.clone()
+            } else {
+                std::mem::take(&mut bytes)
+            };
+            self.members += 1 + names.len();
+            (self.visit)(Member {
+                path: label,
+                aliases: &names,
+                bytes: visited,
+                cut,
+            });
         }
         if read_nested {
             let mut inner = ShareBudget::new(shares.entry_remaining());
@@ -1181,6 +1180,35 @@ pub(crate) mod tests_support {
     //! Hand-built zips for tests: each field of both views is settable.
 
     use super::{CENTRAL_SIG, DESCRIPTOR_SIG, END64_SIG, END_SIG, LOCAL_SIG, LOCATOR_SIG};
+
+    /// `zip` (one with no comment) with its first directory entry replaced
+    /// by one copy per name in `names`, extra field and comment dropped.
+    pub(crate) fn with_names(zip: &[u8], names: &[String]) -> Vec<u8> {
+        let cd = zip.windows(4).position(|w| w == CENTRAL_SIG).unwrap();
+        let end = zip.len() - super::END_LEN;
+        let field = |at: usize| usize::from(u16::from_le_bytes([zip[cd + at], zip[cd + at + 1]]));
+        let len = super::CENTRAL_LEN + field(28) + field(30) + field(32);
+        let mut out = zip[..cd].to_vec();
+        for name in names {
+            let mut e = zip[cd..cd + super::CENTRAL_LEN].to_vec();
+            e[28..30].copy_from_slice(&(name.len() as u16).to_le_bytes());
+            e[30..34].fill(0);
+            e.extend(name.as_bytes());
+            out.extend(e);
+        }
+        let added = out.len() - cd;
+        out.extend(&zip[cd + len..end]);
+        let mut eocd = zip[end..].to_vec();
+        for at in [8, 10] {
+            let count = u16::from_le_bytes([eocd[at], eocd[at + 1]]) + names.len() as u16 - 1;
+            eocd[at..at + 2].copy_from_slice(&count.to_le_bytes());
+        }
+        let size = u32::from_le_bytes(eocd[12..16].try_into().unwrap());
+        let size = size - len as u32 + added as u32;
+        eocd[12..16].copy_from_slice(&size.to_le_bytes());
+        out.extend(eocd);
+        out
+    }
 
     pub(crate) fn crc(data: &[u8]) -> u32 {
         crate::inflate::crc32_extend(0, data)
@@ -1479,7 +1507,9 @@ mod tests {
     fn read_with(data: &[u8], limits: &ZipLimits) -> (Seen, ZipRead) {
         let mut seen = Vec::new();
         let result = read(data, limits, &mut |m: Member| {
-            seen.push((m.path.to_string(), m.bytes, m.cut))
+            for name in std::iter::once(m.path).chain(m.aliases.iter().map(String::as_str)) {
+                seen.push((name.to_string(), m.bytes.clone(), m.cut));
+            }
         });
         assert_eq!(result.members, seen.len());
         (seen, result)
@@ -2000,42 +2030,36 @@ mod tests {
         assert!(seen.len() < 50, "{}", seen.len());
     }
 
-    /// `zip` (whose first member has a one-byte name) with that member's
-    /// directory entry repeated under `n` names, `A` onwards.
+    /// `zip` with its first directory entry repeated under `n` names, `A`
+    /// onwards.
     fn with_aliases(zip: &[u8], n: u8) -> Vec<u8> {
-        let cd = zip.windows(4).position(|w| w == CENTRAL_SIG).unwrap();
-        let end = zip.len() - END_LEN;
-        let len = CENTRAL_LEN + 1;
-        let mut out = zip[..cd].to_vec();
-        for i in 0..n {
-            let mut e = zip[cd..cd + len].to_vec();
-            e[CENTRAL_LEN] = b'A' + i;
-            out.extend(e);
-        }
-        out.extend(&zip[cd + len..end]);
-        let mut eocd = zip[end..].to_vec();
-        let extra = u16::from(n) - 1;
-        for at in [8, 10] {
-            let count = u16::from_le_bytes([eocd[at], eocd[at + 1]]) + extra;
-            eocd[at..at + 2].copy_from_slice(&count.to_le_bytes());
-        }
-        let size = u32::from_le_bytes(eocd[12..16].try_into().unwrap());
-        let size = size + u32::from(extra) * len as u32;
-        eocd[12..16].copy_from_slice(&size.to_le_bytes());
-        out.extend(eocd);
-        out
+        let names: Vec<String> = (0..n).map(|i| char::from(b'A' + i).to_string()).collect();
+        tests_support::with_names(zip, &names)
     }
 
     #[test]
     fn each_name_is_charged_the_fixed_member_cost() {
-        let many = with_aliases(&plain(&[Spec::stored("a", b"q")]), 50);
+        let many = with_aliases(&plain(&[Spec::stored("a", &[b'q'; 1000])]), 50);
         let limits = ZipLimits {
-            max_read_back_bytes: 20_000,
+            max_read_back_bytes: 40_000,
             ..ZipLimits::default()
         };
         let (seen, r) = read_with(&many, &limits);
         assert!(kinds(&r).contains(&GapKind::Limit(Limit::Budget)), "{r:?}");
-        assert!(seen.len() <= 20_000 / ENTRY_COST, "{}", seen.len());
+        assert!(seen.len() <= 40_000 / ENTRY_COST, "{}", seen.len());
+        // An alias is not charged its bytes again.
+        assert!(seen.len() > 40_000 / (ENTRY_COST + 1000), "{}", seen.len());
+    }
+
+    #[test]
+    fn a_members_names_share_one_visit() {
+        let many = with_aliases(&plain(&[Spec::deflated("a", &[b'q'; 5000])]), 50);
+        let mut visits = Vec::new();
+        let r = read(&many, &ZipLimits::default(), &mut |m: Member| {
+            visits.push((m.aliases.len(), m.bytes.len()))
+        });
+        assert_eq!(visits, [(49, 5000)], "{r:?}");
+        assert_eq!(r.members, 50);
     }
 
     #[test]

@@ -5,6 +5,10 @@ for the current document map. Newest first.
 
 ---
 
+**Changelog from v0.97 (2026-11-20):** A zip member's aliases are scanned at most twice (§6.2, §11.8, #166). A zip whose directory gives one local header many names (a few dozen bytes per name) was scanned once per name, each name charged the fixed member cost plus the member's bytes, until the 256 MiB read-back budget ran out: about 256 full content scans of a 1 MB member, roughly 1.6 s for a 1 MB file. Since a name changes the content rules' result only through its extension, the decoded bytes are now scanned once for the names with a script extension and once for the rest, and every finding and gap is still listed under each name (the bounded lists cap the text). An extra name now costs only the fixed per-member cost, so names stay bounded by the share and by the 10,000-header limit. Nested zips are still read once, under one name.
+
+---
+
 **Changelog from v0.96 (2026-11-20):** Human output is terminal-safe (§8, #156). `navctl` and `navd scan-once` printed file paths and signal descriptions raw, so a name such as `a\x1b[2K\rCLEAN\x1b[0m.sh`, or one containing a newline, could rewrite or forge verdict lines on the terminal; a disk image's volume name reached the mount-point warnings the same way. Every human-output print now goes through `nav_core::safe_println!`/`safe_print!`/`safe_eprintln!`, which replace control characters (C0, DEL, C1) and bidi embedding/override/isolate characters (U+202A-202E, U+2066-2069) with U+FFFD; U+200E/U+200F/U+061C are kept. Descriptions are cleaned at print time, so rules that embed a path in a label are covered. `--json` is unchanged (serde escapes).
 
 ---
