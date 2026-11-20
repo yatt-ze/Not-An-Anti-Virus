@@ -395,11 +395,30 @@ fn collect_files(root: &Path, recursive: bool, budget: &ScanBudget) -> io::Resul
     })
 }
 
-/// Whether symlink `link` resolves to somewhere outside `real_root` (a
-/// canonical path). A dangling or looping link resolves nowhere: `false`.
+/// Whether symlink `link` points outside `real_root` (a canonical path).
+/// A link that won't resolve (dangling, looping, unreadable on the way) is
+/// judged by its own text, read lexically from its real parent directory.
 fn points_outside(link: &Path, real_root: &Path) -> bool {
-    link.canonicalize()
-        .is_ok_and(|target| !target.starts_with(real_root))
+    if let Ok(target) = link.canonicalize() {
+        return !target.starts_with(real_root);
+    }
+    let (Ok(text), Some(Ok(parent))) = (
+        std::fs::read_link(link),
+        link.parent().map(Path::canonicalize),
+    ) else {
+        return true; // can't tell where it goes: don't call it inside
+    };
+    let mut resolved = PathBuf::new();
+    for part in parent.join(text).components() {
+        match part {
+            std::path::Component::ParentDir => {
+                resolved.pop();
+            }
+            std::path::Component::CurDir => {}
+            other => resolved.push(other),
+        }
+    }
+    !resolved.starts_with(real_root)
 }
 
 #[cfg(test)]
@@ -869,8 +888,8 @@ mod tests {
         }
     }
 
-    /// A link that resolves outside the target is counted apart (#159);
-    /// a dangling one is not.
+    /// A link that points outside the target is counted apart (#159),
+    /// dangling or not; a dangling link that stays inside is not.
     #[cfg(unix)]
     #[test]
     fn counts_links_outside() {
@@ -882,10 +901,12 @@ mod tests {
         symlink("a.txt", dir.path().join("inside")).unwrap();
         symlink(outside.path().join("evil.sh"), dir.path().join("out")).unwrap();
         symlink("missing", dir.path().join("dangling")).unwrap();
+        symlink(outside.path().join("gone"), dir.path().join("dangling-out")).unwrap();
+        symlink("../../nowhere", dir.path().join("dangling-up")).unwrap();
 
         let scan = scan_target(dir.path(), false).unwrap();
-        assert_eq!(scan.not_walked.links_and_special, 3);
-        assert_eq!(scan.not_walked.links_outside, 1);
+        assert_eq!(scan.not_walked.links_and_special, 5);
+        assert_eq!(scan.not_walked.links_outside, 3);
     }
 
     /// Without `recursive`, subdirectories are counted, not silently
