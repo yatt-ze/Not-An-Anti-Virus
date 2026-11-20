@@ -556,9 +556,22 @@ fn print_multi_json(
     Ok(())
 }
 
-/// The multi-target `rules test --json` envelope; an image adds `volumes`
-/// and `mount_gaps`, which also clear `coverage_complete`.
+/// The multi-target `rules test --json` envelope: [`target_json`] plus
+/// `results`.
 fn multi_json(
+    scan: &TargetScan,
+    image: Option<&ImageReport>,
+) -> Result<serde_json::Value, serde_json::Error> {
+    let mut v = target_json(scan, image)?;
+    if let serde_json::Value::Object(map) = &mut v {
+        map.insert("results".into(), serde_json::to_value(&scan.results)?);
+    }
+    Ok(v)
+}
+
+/// Target-level coverage fields, without per-file results. An image adds
+/// `volumes` and `mount_gaps`, which also clear `coverage_complete`.
+fn target_json(
     scan: &TargetScan,
     image: Option<&ImageReport>,
 ) -> Result<serde_json::Value, serde_json::Error> {
@@ -582,7 +595,6 @@ fn multi_json(
         "links_and_special_not_followed": scan.not_walked.links_and_special,
         "links_outside_target": scan.not_walked.links_outside,
         "recommendation": serde_json::to_value(scan.recommendation())?,
-        "results": serde_json::to_value(&scan.results)?,
     });
     if let (Some(report), serde_json::Value::Object(map)) = (image, &mut v) {
         map.insert("volumes".into(), report.volumes.into());
