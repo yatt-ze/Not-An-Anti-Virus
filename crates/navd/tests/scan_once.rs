@@ -26,9 +26,12 @@ struct TempFile(PathBuf);
 
 impl TempFile {
     fn new(tag: &str, contents: &[u8]) -> Self {
+        // Timestamps alone collide across threads (macOS clocks are µs).
+        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let path = std::env::temp_dir().join(format!(
-            "navd-scan-once-{tag}-{}-{:?}",
+            "navd-scan-once-{tag}-{}-{}-{:?}",
             std::process::id(),
+            SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
