@@ -197,11 +197,12 @@ pub fn scan_target_with_budget(
 
     if let Some(layout) = BundleLayout::detect(path) {
         // A bundle is always traversed in full; `recursive` doesn't apply.
-        let (all, collect_limit, unreadable) = collect_files(path, true, budget)?;
-        let (to_scan, skipped): (Vec<PathBuf>, Vec<PathBuf>) = all.into_iter().partition(|p| {
-            let rel = p.strip_prefix(path).unwrap_or(p);
-            !bundle::is_signature_manifest(rel, p)
-        });
+        let walk = collect_files(path, true, budget)?;
+        let (to_scan, skipped): (Vec<PathBuf>, Vec<PathBuf>) =
+            walk.files.into_iter().partition(|p| {
+                let rel = p.strip_prefix(path).unwrap_or(p);
+                !bundle::is_signature_manifest(rel, p)
+            });
         let (results, byte_limit, _) = scan_within_bytes(&to_scan, budget);
         return Ok(TargetScan {
             root: path.to_path_buf(),
@@ -209,21 +210,21 @@ pub fn scan_target_with_budget(
             results,
             primary: layout.main_executable,
             skipped,
-            unreadable,
-            budget: outcome(collect_limit, byte_limit),
+            unreadable: walk.unreadable,
+            budget: outcome(walk.limit, byte_limit),
         });
     }
 
-    let (files, collect_limit, unreadable) = collect_files(path, recursive, budget)?;
-    let (results, byte_limit, _) = scan_within_bytes(&files, budget);
+    let walk = collect_files(path, recursive, budget)?;
+    let (results, byte_limit, _) = scan_within_bytes(&walk.files, budget);
     Ok(TargetScan {
         root: path.to_path_buf(),
         kind: TargetKind::Directory,
         results,
         primary: None,
         skipped: Vec::new(),
-        unreadable,
-        budget: outcome(collect_limit, byte_limit),
+        unreadable: walk.unreadable,
+        budget: outcome(walk.limit, byte_limit),
     })
 }
 
@@ -273,6 +274,16 @@ fn scan_within_bytes(
     (results, hit, used)
 }
 
+/// What [`collect_files`] found.
+struct Walk {
+    /// Regular files, sorted.
+    files: Vec<PathBuf>,
+    /// The budget ceiling that stopped the walk, if any.
+    limit: Option<BudgetLimit>,
+    /// Directories that could not be listed, sorted.
+    unreadable: Vec<PathBuf>,
+}
+
 /// Depth-first file collection under `root`, sorted for determinism (§11.1).
 /// Directory symlinks are not followed (traversal cycles, scan escape).
 /// Stops early if the budget's file-count or depth ceiling is reached,
@@ -284,11 +295,7 @@ fn scan_within_bytes(
 /// `file_type()` that errors while listing one) is recorded in the returned
 /// set instead, and the walk continues; a failing entry is just skipped
 /// (§11.8).
-fn collect_files(
-    root: &Path,
-    recursive: bool,
-    budget: &ScanBudget,
-) -> io::Result<(Vec<PathBuf>, Option<BudgetLimit>, Vec<PathBuf>)> {
+fn collect_files(root: &Path, recursive: bool, budget: &ScanBudget) -> io::Result<Walk> {
     let mut out = Vec::new();
     let mut limit_hit = None;
     let mut unreadable: BTreeSet<PathBuf> = BTreeSet::new();
@@ -354,7 +361,11 @@ fn collect_files(
     }
 
     out.sort();
-    Ok((out, limit_hit, unreadable.into_iter().collect()))
+    Ok(Walk {
+        files: out,
+        limit: limit_hit,
+        unreadable: unreadable.into_iter().collect(),
+    })
 }
 
 #[cfg(test)]
@@ -622,8 +633,8 @@ mod tests {
             max_total_bytes,
             ..ScanBudget::default()
         };
-        let (files, _, _) = collect_files(dir, true, &budget).unwrap();
-        scan_within_bytes(&files, &budget)
+        let walk = collect_files(dir, true, &budget).unwrap();
+        scan_within_bytes(&walk.files, &budget)
     }
 
     /// A file whose re-reads would pass the budget is cut at it: the reads
