@@ -73,6 +73,9 @@ jobs:
     name: cargo audit
     if: github.event_name == 'push' || github.event_name == 'pull_request'
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      checks: write
     steps:
       - uses: actions/checkout@v5
       - uses: rustsec/audit-check@v2
