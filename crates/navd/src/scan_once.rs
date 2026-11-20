@@ -23,7 +23,7 @@ pub fn run(path: &Path, recursive: bool, json: bool) -> ExitCode {
     let scan = match scan_target(path, recursive) {
         Ok(s) => s,
         Err(e) => {
-            eprintln!("navd scan-once: {}: {e}", path.display());
+            nav_core::safe_eprintln!("navd scan-once: {}: {e}", path.display());
             return nav_core::exit_code(nav_core::OPERATIONAL_ERROR);
         }
     };
@@ -32,9 +32,9 @@ pub fn run(path: &Path, recursive: bool, json: bool) -> ExitCode {
         // Nothing readable, not a tool failure — matches `navctl rules
         // test`'s empty-target code, the baseline B3 compares against.
         if let Some(note) = unreadable_note(&scan) {
-            eprintln!("{note}");
+            nav_core::safe_eprintln!("{note}");
         }
-        eprintln!("navd scan-once: no files found under {}", path.display());
+        nav_core::safe_eprintln!("navd scan-once: no files found under {}", path.display());
         return nav_core::exit_code(nav_core::INDETERMINATE);
     }
 
@@ -43,7 +43,7 @@ pub fn run(path: &Path, recursive: bool, json: bool) -> ExitCode {
             match scan_result_json(result) {
                 Ok(line) => println!("{line}"),
                 Err(e) => {
-                    eprintln!("navd scan-once: cannot serialize result: {e}");
+                    nav_core::safe_eprintln!("navd scan-once: cannot serialize result: {e}");
                     return nav_core::exit_code(nav_core::OPERATIONAL_ERROR);
                 }
             }
@@ -53,13 +53,13 @@ pub fn run(path: &Path, recursive: bool, json: bool) -> ExitCode {
     }
 
     if let BudgetOutcome::Exhausted(_) = scan.budget {
-        eprintln!(
+        nav_core::safe_eprintln!(
             "navd scan-once: partial coverage — scan budget reached; more of {} was not scanned",
             path.display()
         );
     }
     if let Some(note) = unreadable_note(&scan) {
-        eprintln!("{note}");
+        nav_core::safe_eprintln!("{note}");
     }
 
     nav_core::exit_code(nav_core::for_target(&scan))
@@ -88,7 +88,7 @@ fn unreadable_note(scan: &TargetScan) -> Option<String> {
 
 /// Terse one-line-per-file human summary (§5.5).
 fn print_summary(result: &ScanResult) {
-    println!(
+    nav_core::safe_println!(
         "{}  score={} confidence={} completeness={} -> {}",
         result.path.display(),
         result.score,

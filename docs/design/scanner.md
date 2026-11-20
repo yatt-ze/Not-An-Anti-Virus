@@ -215,6 +215,8 @@ Design principles: `--json` everywhere for scriptability, versioned via a top-le
 
 **`ScanResult`'s presentation is canonical in `nav-core`, not duplicated per binary.** The `schema_version` envelope and the exit-code mapping below live in `nav_core::presentation` (Phase 0b A2) so every binary that renders a verdict — `navctl` today, `navd` for its Phase 0b A2 `scan-once` spike instrument (§12) — emits the identical contract. This is a deliberate, small widening of `nav-core`'s charter beyond scoring alone, recorded here rather than left as silent drift.
 
+**Human output is terminal-safe.** Paths, signal descriptions and messages come from attacker-chosen names, so human output (`navctl`, `navd scan-once`) replaces control characters (C0, DEL, C1) and bidi embedding/override/isolate characters with U+FFFD (`nav_core::terminal_safe`); `--json` carries strings unchanged, JSON-escaped (#156).
+
 **Exit codes distinguish completeness from verdict**, not just clean/malicious — a partial scan (e.g. a decompression-bomb limit hit, §6.2) must never return the same code as a complete clean scan, since those mean very different things to a script consuming the exit status:
 
 | Code | Meaning |
