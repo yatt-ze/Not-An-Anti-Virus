@@ -7,7 +7,7 @@
 use std::borrow::Cow;
 use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::OnceLock;
 
 /// Cap on how much of a file is read into memory for content rules. Static
@@ -140,18 +140,31 @@ pub struct ScanContext {
     pub(crate) bytes_read: AtomicU64,
     /// Bytes container readers decompressed; see [`Self::decoded_bytes`].
     pub(crate) decoded_bytes: AtomicU64,
+    /// Bytes this scan may still read or decode (§11.12); see
+    /// [`Self::allowance_left`].
+    pub(crate) allowance: AtomicU64,
+    /// Set when work was refused for want of allowance.
+    pub(crate) allowance_hit: AtomicBool,
 }
 
 impl ScanContext {
     pub fn load(path: &Path) -> Self {
-        Self::load_if(path, |_| true).expect("admit always accepts")
+        Self::load_if(path, u64::MAX, |_| true).expect("admit always accepts")
     }
 
     /// Like [`Self::load`], but calls `admit` with the opened file's length
     /// before reading anything, and returns `None` without reading if it
-    /// refuses. A file that can't be opened or stat'd is never refused.
-    pub(crate) fn load_if(path: &Path, admit: impl FnOnce(u64) -> bool) -> Option<Self> {
-        let unreadable = || Self::empty(path.to_path_buf(), ContentSource::File);
+    /// refuses. A file that can't be opened or stat'd is never refused. The
+    /// scan may read and decode at most `allowance` bytes, prefix included.
+    pub(crate) fn load_if(
+        path: &Path,
+        allowance: u64,
+        admit: impl FnOnce(u64) -> bool,
+    ) -> Option<Self> {
+        let unreadable = || ScanContext {
+            allowance: AtomicU64::new(allowance),
+            ..Self::empty(path.to_path_buf(), ContentSource::File)
+        };
         // Identity and length come from the *opened* handle, and the bytes are
         // read through it, so a pre-open `stat` can't be raced (§11.7).
         let Ok(mut f) = std::fs::File::open(path) else {
@@ -163,27 +176,31 @@ impl ScanContext {
         if !admit(md.len()) {
             return None;
         }
-        let mut buf = Vec::new();
-        let read = (&mut f)
-            .take(MAX_CONTENT_BYTES as u64)
-            .read_to_end(&mut buf);
-        // On error `buf` still holds what was read before it; charge that.
-        let loaded = AtomicU64::new(buf.len() as u64);
-        if read.is_err() {
-            return Some(ScanContext {
-                bytes_read: loaded,
-                ..unreadable()
-            });
-        }
         let file_len = md.len();
+        let cap = allowance.min(MAX_CONTENT_BYTES as u64);
+        let mut buf = Vec::new();
+        let read = (&mut f).take(cap).read_to_end(&mut buf);
+        // On error `buf` still holds what was read before it; charge that.
+        let loaded = buf.len() as u64;
+        let ctx = ScanContext {
+            bytes_read: AtomicU64::new(loaded),
+            allowance: AtomicU64::new(allowance - loaded),
+            // A file exactly `cap` long was read in full; one that stats 0 can't tell.
+            allowance_hit: AtomicBool::new(
+                cap < MAX_CONTENT_BYTES as u64 && loaded == cap && loaded != file_len,
+            ),
+            ..unreadable()
+        };
+        if read.is_err() {
+            return Some(ctx);
+        }
         Some(ScanContext {
-            truncated: (buf.len() as u64) < file_len,
+            truncated: loaded < file_len,
             content: Some(buf),
             file_len: Some(file_len),
             identity: Some(ObjectIdentity::from_metadata(&md)),
             file: Some(f),
-            bytes_read: loaded,
-            ..unreadable()
+            ..ctx
         })
     }
 
@@ -225,6 +242,8 @@ impl ScanContext {
             incomplete_rules: std::sync::Mutex::new(Vec::new()),
             bytes_read: AtomicU64::new(0),
             decoded_bytes: AtomicU64::new(0),
+            allowance: AtomicU64::new(u64::MAX),
+            allowance_hit: AtomicBool::new(false),
         }
     }
 
@@ -289,14 +308,25 @@ impl ScanContext {
     }
 
     fn read_at_file(&self, offset: u64, len: usize) -> Option<Vec<u8>> {
-        self.file.as_ref()?;
+        if !self.supports_ranged_reads() || !self.spend(len as u64) {
+            return None;
+        }
         let mut buf = vec![0u8; len];
-        self.read_file_into(offset, &mut buf)?;
+        self.read_spent_into(offset, &mut buf)?;
         Some(buf)
     }
 
-    #[cfg(unix)]
     fn read_file_into(&self, offset: u64, buf: &mut [u8]) -> Option<()> {
+        if !self.supports_ranged_reads() || !self.spend(buf.len() as u64) {
+            return None;
+        }
+        self.read_spent_into(offset, buf)
+    }
+
+    /// The disk read behind [`Self::read_file_into`], its allowance already
+    /// spent.
+    #[cfg(unix)]
+    fn read_spent_into(&self, offset: u64, buf: &mut [u8]) -> Option<()> {
         use std::os::unix::fs::FileExt;
         let file = self.file.as_ref()?;
         // Charged on attempt: a read that fails partway may still have read.
@@ -306,7 +336,7 @@ impl ScanContext {
     }
 
     #[cfg(not(unix))]
-    fn read_file_into(&self, _offset: u64, _buf: &mut [u8]) -> Option<()> {
+    fn read_spent_into(&self, _offset: u64, _buf: &mut [u8]) -> Option<()> {
         None
     }
 
@@ -420,6 +450,9 @@ impl ScanContext {
     /// is inconclusive, not clean (§10/§11.7/§11.8). Embedded content and files
     /// whose identity couldn't be captured pass through unchanged.
     fn spawn_if_object_stable<T>(&self, spawn: impl FnOnce() -> Option<T>) -> Option<T> {
+        if !self.tool_allowed() {
+            return None;
+        }
         let out = spawn()?;
         match self.identity {
             Some(at_load) if ObjectIdentity::of_path(&self.path) != Some(at_load) => None,
@@ -463,9 +496,73 @@ impl ScanContext {
         self.decoded_bytes.load(Ordering::Relaxed)
     }
 
-    /// Adds `n` to [`Self::decoded_bytes`].
+    /// Adds `n` to [`Self::decoded_bytes`] and takes it from the allowance,
+    /// which saturates at zero (recorded as a hit) if `n` does not fit.
     pub(crate) fn add_decoded(&self, n: usize) {
         self.decoded_bytes.fetch_add(n as u64, Ordering::Relaxed);
+        if !self.spend(n as u64) {
+            self.allowance.store(0, Ordering::Relaxed);
+        }
+    }
+
+    /// Whether a path-based tool (`codesign`, `spctl`) may run: false, and a
+    /// hit recorded, when a real file's allowance left is below its length.
+    /// The tool's own reads are not charged (#106).
+    pub(crate) fn tool_allowed(&self) -> bool {
+        let allowed = !self.is_file_backed() || self.allowance_left() >= self.file_len.unwrap_or(0);
+        if !allowed {
+            self.note_allowance_hit();
+        }
+        allowed
+    }
+
+    /// `cap` lowered to the allowance left: the most a container decode may
+    /// spend, input re-reads included. Returns the cap and whether it was
+    /// lowered.
+    pub(crate) fn decode_cap(&self, cap: usize) -> (usize, bool) {
+        let left = usize::try_from(self.allowance_left()).unwrap_or(usize::MAX);
+        (cap.min(left), left < cap)
+    }
+
+    /// Bytes this scan may still read from disk or decode (§11.12):
+    /// `u64::MAX` for an unbounded scan.
+    pub fn allowance_left(&self) -> u64 {
+        self.allowance.load(Ordering::Relaxed)
+    }
+
+    /// Whether a read, decode or tool run was refused, or a container read
+    /// cut short, for want of allowance: the scan did not get the work it
+    /// needed (§11.12).
+    pub fn allowance_hit(&self) -> bool {
+        self.allowance_hit.load(Ordering::Relaxed)
+    }
+
+    /// Records that a decode under a lowered [`Self::decode_cap`] stopped
+    /// short.
+    pub(crate) fn note_allowance_hit(&self) {
+        self.allowance_hit.store(true, Ordering::Relaxed);
+    }
+
+    /// Takes `n` from the allowance, or refuses (and records it) without
+    /// taking anything if fewer than `n` are left.
+    fn spend(&self, n: u64) -> bool {
+        // A CAS loop rather than `fetch_update`, deprecated on newer stable.
+        let mut left = self.allowance.load(Ordering::Relaxed);
+        loop {
+            let Some(rest) = left.checked_sub(n) else {
+                self.note_allowance_hit();
+                return false;
+            };
+            match self.allowance.compare_exchange_weak(
+                left,
+                rest,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return true,
+                Err(now) => left = now,
+            }
+        }
     }
 
     /// Distinct rules marked incomplete this scan, in marking order.
@@ -812,12 +909,143 @@ mod tests {
     fn load_if_offers_the_opened_length_and_a_refusal_returns_none() {
         let path = write_temp_file("load-if", &[7u8; 1000]);
         let mut offered = None;
-        let refused = ScanContext::load_if(&path, |len| {
+        let refused = ScanContext::load_if(&path, u64::MAX, |len| {
             offered = Some(len);
             false
         });
         assert!(refused.is_none());
         assert_eq!(offered, Some(1000));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    fn load_with(path: &Path, allowance: u64) -> ScanContext {
+        ScanContext::load_if(path, allowance, |_| true).unwrap()
+    }
+
+    /// Past the prefix, a read the allowance can't cover is refused before
+    /// it reads: nothing is charged and the hit is recorded (§11.12).
+    #[test]
+    fn a_read_past_the_allowance_is_refused_without_reading() {
+        let len = (MAX_CONTENT_BYTES + 4096) as u64;
+        let path = sparse_temp_file("allowance-read", len);
+        let ctx = load_with(&path, MAX_CONTENT_BYTES as u64 + 150);
+        assert!(!ctx.allowance_hit());
+        assert!(ctx.read_at(len - 100, 100).is_some());
+        assert_eq!(ctx.allowance_left(), 50);
+        assert_eq!(ctx.read_at(len - 100, 100), None);
+        assert_eq!(ctx.bytes_read(), MAX_CONTENT_BYTES as u64 + 100);
+        assert_eq!(ctx.allowance_left(), 50);
+        assert!(ctx.allowance_hit());
+        // Reads served from `content` cost nothing and still succeed.
+        assert!(ctx.read_at(0, 100).is_some());
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A stream stops at the chunk the allowance can't cover.
+    #[test]
+    fn a_stream_stops_where_the_allowance_runs_out() {
+        let len = (MAX_CONTENT_BYTES + 3 * STREAM_CHUNK) as u64;
+        let path = sparse_temp_file("allowance-stream", len);
+        let ctx = load_with(&path, (MAX_CONTENT_BYTES + STREAM_CHUNK) as u64);
+        let mut delivered = 0;
+        let ok = ctx.for_each_window(MAX_CONTENT_BYTES as u64..len, 0, |w, _| {
+            delivered += w.len();
+        });
+        assert!(!ok);
+        assert_eq!(delivered, STREAM_CHUNK);
+        assert_eq!(ctx.bytes_read(), (MAX_CONTENT_BYTES + STREAM_CHUNK) as u64);
+        assert!(ctx.allowance_hit());
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// An allowance below the prefix cuts the prefix there.
+    #[test]
+    fn the_prefix_load_is_cut_at_the_allowance() {
+        let path = write_temp_file("allowance-prefix", &[7u8; 1000]);
+        let ctx = load_with(&path, 100);
+        assert_eq!(ctx.content.as_ref().map(Vec::len), Some(100));
+        assert!(ctx.truncated);
+        assert_eq!(ctx.bytes_read(), 100);
+        assert_eq!(ctx.allowance_left(), 0);
+        assert!(ctx.allowance_hit());
+        assert_eq!(ctx.read_at(500, 10), None);
+        let _ = std::fs::remove_file(&path);
+
+        let path = write_temp_file("allowance-prefix-fits", &[7u8; 1000]);
+        // Exactly the allowance long: read whole, so not a hit.
+        let ctx = load_with(&path, 1000);
+        assert!(!ctx.truncated);
+        assert!(!ctx.allowance_hit());
+        let ctx = load_with(&path, 1001);
+        assert!(!ctx.truncated);
+        assert!(!ctx.allowance_hit());
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// The prefix is read to EOF whatever the stat'd length says: a FIFO
+    /// reports 0 but has content.
+    #[cfg(unix)]
+    #[test]
+    fn the_prefix_is_read_past_a_zero_stat_length() {
+        let dir = std::env::temp_dir().join(format!(
+            "nav-fifo-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_file(&dir);
+        let made = std::process::Command::new("mkfifo").arg(&dir).status();
+        if !made.is_ok_and(|s| s.success()) {
+            return; // no mkfifo here: nothing to test
+        }
+        let fifo = dir.clone();
+        let writer = std::thread::spawn(move || std::fs::write(fifo, b"piped content"));
+        let ctx = load_with(&dir, 1 << 20);
+        writer.join().unwrap().unwrap();
+        let _ = std::fs::remove_file(&dir);
+        assert_eq!(ctx.content.as_deref(), Some(&b"piped content"[..]));
+        assert_eq!(ctx.bytes_read(), 13);
+        assert!(!ctx.allowance_hit());
+    }
+
+    /// Decoded bytes come out of the allowance, and a decode cap is lowered
+    /// to what is left: none once it is spent.
+    #[test]
+    fn decoded_bytes_are_charged_and_capped_at_the_allowance() {
+        let path = write_temp_file("allowance-decode", &[7u8; 100]);
+        let ctx = load_with(&path, 1100);
+        assert_eq!(ctx.decode_cap(4096), (1000, true));
+        assert_eq!(ctx.decode_cap(500), (500, false));
+        ctx.add_decoded(1000);
+        assert_eq!(ctx.decoded_bytes(), 1000);
+        assert_eq!(ctx.decode_cap(4096), (0, true));
+        assert!(!ctx.allowance_hit());
+        // More than is left saturates at zero and is recorded, never panics.
+        ctx.add_decoded(1);
+        assert_eq!(ctx.allowance_left(), 0);
+        assert!(ctx.allowance_hit());
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// An external tool reads the whole file, so it is not run on less
+    /// allowance than the file's length (§11.12, #106).
+    #[test]
+    fn a_tool_is_not_run_without_allowance_for_the_file() {
+        let path = write_temp_file("allowance-tool", &[7u8; 1000]);
+        let ctx = load_with(&path, 1999);
+        let mut ran = false;
+        assert_eq!(
+            ctx.run_object_bound(|| {
+                ran = true;
+                Some(())
+            }),
+            None
+        );
+        assert!(!ran);
+        assert!(ctx.allowance_hit());
+
+        let ctx = load_with(&path, 2000);
+        assert_eq!(ctx.run_object_bound(|| Some(())), Some(()));
+        assert!(!ctx.allowance_hit());
         let _ = std::fs::remove_file(&path);
     }
 }

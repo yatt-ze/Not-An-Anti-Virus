@@ -88,15 +88,25 @@ impl InstallerScriptRule {
     ) -> Result<Option<MatchedSignal>, RuleOutcome> {
         let content = ctx.content.as_ref().ok_or(RuleOutcome::NotApplicable)?;
 
-        let Some(archive) = xar::parse(content, limits) else {
+        let Some(archive) = parse_within(ctx, content, limits) else {
             return Ok(None); // not a package
         };
-        ctx.add_decoded(archive.toc_bytes);
         // Couldn't read in full => "couldn't check", never "clean" (§10, §11.8).
         if !archive.is_complete() {
             return Err(RuleOutcome::NotApplicable);
         }
 
+        // Read-back first, member zips from what the allowance has left past it.
+        let left = usize::try_from(ctx.allowance_left()).unwrap_or(usize::MAX);
+        let read_back = limits.max_read_back_bytes.min(left);
+        let zip_left = zips.left.min(left - read_back);
+        let read_back_lowered = read_back < limits.max_read_back_bytes;
+        let lowered = read_back_lowered || zip_left < zips.left;
+        zips.left = zip_left;
+        let limits = &xar::XarLimits {
+            max_read_back_bytes: read_back,
+            ..*limits
+        };
         let mut unreadable = false;
         let mut budget = xar::ReadBudget::new(limits);
 
@@ -222,8 +232,9 @@ impl InstallerScriptRule {
                         zips,
                         &mut found,
                     );
-                    // Reported once per package (§5.2, #112, #123).
-                    if runs && overrun && !starved {
+                    // Reported once per package (§5.2, #112, #123); a cut
+                    // under the file's allowance is a gap, not a finding.
+                    if runs && overrun && !starved && !read_back_lowered {
                         starved = true;
                         let s = if scripts == 1 { "" } else { "s" };
                         found.add(
@@ -251,6 +262,9 @@ impl InstallerScriptRule {
         }
 
         ctx.add_decoded(budget.decoded().saturating_add(zips.take_decoded()));
+        if lowered && unreadable {
+            ctx.note_allowance_hit();
+        }
 
         // Merged in TOC order, so the report does not depend on read order.
         found_by_entry.sort_by_key(|(toc_index, _)| *toc_index);
@@ -279,6 +293,26 @@ impl InstallerScriptRule {
             category: self.category(),
         }))
     }
+}
+
+/// [`xar::parse`] with the TOC capped at `ctx`'s allowance, its decoded
+/// bytes charged to `ctx`.
+fn parse_within(
+    ctx: &ScanContext,
+    content: &[u8],
+    limits: &xar::XarLimits,
+) -> Option<xar::XarArchive> {
+    let (max_toc_bytes, lowered) = ctx.decode_cap(limits.max_toc_bytes);
+    let limits = xar::XarLimits {
+        max_toc_bytes,
+        ..*limits
+    };
+    let archive = xar::parse(content, &limits)?;
+    ctx.add_decoded(archive.toc_bytes);
+    if lowered && !archive.is_complete() {
+        ctx.note_allowance_hit();
+    }
+    Some(archive)
 }
 
 /// A `Scripts` or `Distribution` TOC entry; `nested` if it is read with
@@ -1463,10 +1497,9 @@ impl Rule for UnsignedPackageRule {
     fn evaluate(&self, ctx: &ScanContext) -> Result<Option<MatchedSignal>, RuleOutcome> {
         let content = ctx.content.as_ref().ok_or(RuleOutcome::NotApplicable)?;
 
-        let Some(archive) = xar::parse(content, &xar::XarLimits::default()) else {
+        let Some(archive) = parse_within(ctx, content, &xar::XarLimits::default()) else {
             return Ok(None); // not a package
         };
-        ctx.add_decoded(archive.toc_bytes);
         if !archive.is_complete() {
             return Err(RuleOutcome::NotApplicable);
         }
@@ -2675,6 +2708,30 @@ mod tests {
             .unwrap()
             .toc_bytes;
         c.decoded_bytes() - toc as u64
+    }
+
+    /// A file allowance too small for the `Scripts` decode cuts it short:
+    /// never clean, never past the allowance, and recorded (§11.12, #104).
+    #[test]
+    fn the_scripts_read_back_is_capped_at_the_file_allowance() {
+        let gz = include_bytes!("../../testdata/gzip/scripts_dropper.in");
+        let pkg = pkg_with_scripts(&zlib_stored(gz));
+        let toc = xar::parse(&pkg, &xar::XarLimits::default())
+            .unwrap()
+            .toc_bytes as u64;
+        let path = crate::test_support::write_temp_file("pkg-allowance", &pkg);
+        let allowance = pkg.len() as u64 + toc + 64;
+        let c = ScanContext::load_if(&path, allowance, |_| true).unwrap();
+        let full = ScanContext::load(&path);
+        let _ = std::fs::remove_file(&path);
+        assert!(InstallerScriptRule.evaluate(&full).unwrap().is_some());
+        assert!(!full.marked_incomplete("installer-script-suspicious"));
+        assert!(!full.allowance_hit());
+        let out = InstallerScriptRule.evaluate(&c);
+        // A cut under the allowance is a gap, never the starved finding.
+        assert!(matches!(out, Err(RuleOutcome::NotApplicable)), "{out:?}");
+        assert!(c.allowance_hit());
+        assert!(c.bytes_read() + c.decoded_bytes() <= allowance);
     }
 
     #[test]
@@ -4863,6 +4920,39 @@ mod tests {
         let signal = r.expect("runs").expect("finding");
         assert_eq!(signal.description, format!("{STARVED} (2 components)"));
         assert!(c.marked_incomplete("installer-script-suspicious"));
+    }
+
+    /// The same starvation under a read-back lowered by the file's allowance
+    /// is a gap, not the finding: the target budget cut it (§11.12, #104).
+    #[test]
+    fn components_cut_by_the_file_allowance_are_not_reported_starved() {
+        let limits = xar::XarLimits {
+            max_entry_bytes: 4096,
+            max_read_back_bytes: 1 << 20,
+            ..xar::XarLimits::default()
+        };
+        let blobs = [benign_scripts(1000), benign_scripts(8000)];
+        let pkg = components_archive(&blobs, true);
+        let toc = xar::parse(&pkg, &limits).unwrap().toc_bytes as u64;
+        let path = crate::test_support::write_temp_file("pkg-starved-allowance", &pkg);
+        let allowance = pkg.len() as u64 + toc + 4000;
+        let c = ScanContext::load_if(&path, allowance, |_| true).unwrap();
+        let _ = std::fs::remove_file(&path);
+        let r = InstallerScriptRule.evaluate_with(&c, &limits);
+        assert!(matches!(r, Err(RuleOutcome::NotApplicable)), "{r:?}");
+        assert!(c.allowance_hit());
+
+        // Control: the same read-back budget set directly is reported.
+        let direct = xar::XarLimits {
+            max_read_back_bytes: 4000,
+            ..limits
+        };
+        let (r, _) = evaluate_small(&pkg, &direct);
+        assert!(r
+            .expect("runs")
+            .expect("finding")
+            .description
+            .starts_with(STARVED));
     }
 
     /// Each of the fixture's `Scripts` reads clean on its own budget, through

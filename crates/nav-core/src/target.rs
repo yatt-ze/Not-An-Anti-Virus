@@ -38,8 +38,8 @@ pub struct ScanBudget {
     /// Maximum bytes the scan reads from disk across the target, re-reads
     /// included, plus the bytes container readers decompress
     /// ([`ScanContext::decoded_bytes`]); `codesign`/`spctl` reads are not
-    /// counted (§11.12). One file can overshoot it, up to its own
-    /// container budgets.
+    /// counted (§11.12, #106). The in-process reads and decodes never exceed
+    /// it: each file may spend only what is left.
     pub max_total_bytes: u64,
     /// Maximum directory-recursion depth below the named target.
     pub max_depth: usize,
@@ -202,7 +202,7 @@ pub fn scan_target_with_budget(
             let rel = p.strip_prefix(path).unwrap_or(p);
             !bundle::is_signature_manifest(rel, p)
         });
-        let (results, byte_limit) = scan_within_bytes(&to_scan, budget);
+        let (results, byte_limit, _) = scan_within_bytes(&to_scan, budget);
         return Ok(TargetScan {
             root: path.to_path_buf(),
             kind: TargetKind::Bundle,
@@ -215,7 +215,7 @@ pub fn scan_target_with_budget(
     }
 
     let (files, collect_limit, unreadable) = collect_files(path, recursive, budget)?;
-    let (results, byte_limit) = scan_within_bytes(&files, budget);
+    let (results, byte_limit, _) = scan_within_bytes(&files, budget);
     Ok(TargetScan {
         root: path.to_path_buf(),
         kind: TargetKind::Directory,
@@ -241,35 +241,36 @@ fn outcome(collect_limit: Option<BudgetLimit>, byte_limit: Option<BudgetLimit>) 
     }
 }
 
-/// Scan `files` in order, charging each the bytes its scan read from disk
-/// ([`ScanContext::bytes_read`]) and decompressed
-/// ([`ScanContext::decoded_bytes`]). After the first file, a file is started only if its
-/// length, clipped to `MAX_STREAM_BYTES`, still fits under `max_total_bytes`;
-/// a file can read and decode more than that, so the ceiling can be
-/// overshot by one file's work (§11.12). Returns the results scored and `Some(TotalBytes)`
-/// if the cap stopped it short.
+/// Scan `files` in order, each with a hard allowance of what is left of
+/// `max_total_bytes` (§11.12): its disk reads and decoded bytes are charged
+/// as they happen, and work past the allowance is refused. After the first
+/// file, a file is started only if its length, clipped to `MAX_STREAM_BYTES`,
+/// fits in what is left. Returns the results scored, `Some(TotalBytes)` if a
+/// file was refused or one's allowance cut its scan short, and the bytes
+/// spent.
 fn scan_within_bytes(
     files: &[PathBuf],
     budget: &ScanBudget,
-) -> (Vec<ScanResult>, Option<BudgetLimit>) {
+) -> (Vec<ScanResult>, Option<BudgetLimit>, u64) {
     let rules = default_ruleset();
     let mut results = Vec::new();
     let mut used: u64 = 0;
+    let mut hit = None;
     for f in files {
+        let left = budget.max_total_bytes.saturating_sub(used);
         // Always allow the first file through, so one large file still scans.
         let first = results.is_empty();
-        let admit = |len: u64| {
-            first || used.saturating_add(len.min(MAX_STREAM_BYTES)) <= budget.max_total_bytes
-        };
-        let Some(ctx) = ScanContext::load_if(f, admit) else {
-            return (results, Some(BudgetLimit::TotalBytes));
+        let admit = |len: u64| first || len.min(MAX_STREAM_BYTES) <= left;
+        let Some(ctx) = ScanContext::load_if(f, left, admit) else {
+            return (results, Some(BudgetLimit::TotalBytes), used);
         };
         results.push(scan_context(&ctx, &rules));
-        used = used
-            .saturating_add(ctx.bytes_read())
-            .saturating_add(ctx.decoded_bytes());
+        used += left - ctx.allowance_left();
+        if ctx.allowance_hit() {
+            hit = Some(BudgetLimit::TotalBytes);
+        }
     }
-    (results, None)
+    (results, hit, used)
 }
 
 /// Depth-first file collection under `root`, sorted for determinism (§11.1).
@@ -612,6 +613,79 @@ mod tests {
         );
     }
 
+    /// The files under `dir` scanned within `budget`: results, limit, spent.
+    fn scan_dir_within(
+        dir: &Path,
+        max_total_bytes: u64,
+    ) -> (Vec<ScanResult>, Option<BudgetLimit>, u64) {
+        let budget = ScanBudget {
+            max_total_bytes,
+            ..ScanBudget::default()
+        };
+        let (files, _, _) = collect_files(dir, true, &budget).unwrap();
+        scan_within_bytes(&files, &budget)
+    }
+
+    /// A file whose re-reads would pass the budget is cut at it: the reads
+    /// it can't afford are refused, so the total never exceeds the budget
+    /// and the file is not reported complete (§11.12, #104).
+    #[test]
+    fn a_file_is_cut_at_its_allowance_and_the_total_never_exceeds_the_budget() {
+        const MIB: usize = 1024 * 1024;
+        let payload: Vec<u8> = (0..12 * MIB).map(|i| (i % 251) as u8).collect();
+        let (image, _) = crate::macho::tests_support::synth_macho_64(&payload);
+        let dir = TempDir::new("budget-allowance");
+        fs::write(dir.path().join("a"), &image).unwrap();
+        fs::write(dir.path().join("b"), b"#!/bin/sh\necho hi\n").unwrap();
+        let len = image.len() as u64;
+        assert!(bytes_read_scanning(&dir.path().join("a")) > len + 3 * MIB as u64);
+
+        for max in [100, MIB as u64, len, len + MIB as u64, len + 2 * MIB as u64] {
+            let (results, limit, spent) = scan_dir_within(dir.path(), max);
+            assert!(spent <= max, "{spent} > {max}");
+            assert_eq!(limit, Some(BudgetLimit::TotalBytes), "{max}");
+            assert_ne!(results[0].completeness, ScanCompleteness::Complete);
+            assert!(results[0]
+                .coverage_gaps
+                .contains(&crate::model::CoverageGap::ByteBudget));
+        }
+    }
+
+    /// With room for the tool's whole-file read gone, `codesign` is not run:
+    /// its rules report not-applicable and the target the byte budget.
+    #[test]
+    fn a_tool_is_not_run_once_the_allowance_cannot_cover_the_file() {
+        let (image, _) = crate::macho::tests_support::synth_macho_64(b"code");
+        let dir = TempDir::new("budget-tool");
+        fs::write(dir.path().join("a"), &image).unwrap();
+        let len = image.len() as u64;
+        let skipped = |r: &ScanResult| {
+            r.coverage_gaps
+                .contains(&crate::model::CoverageGap::RuleNotApplicable {
+                    rule: "unsigned-binary".to_string(),
+                })
+        };
+
+        let (results, limit, spent) = scan_dir_within(dir.path(), len + len / 2);
+        assert!(spent <= len + len / 2);
+        assert_eq!(limit, Some(BudgetLimit::TotalBytes));
+        assert!(skipped(&results[0]));
+        assert_ne!(results[0].completeness, ScanCompleteness::Complete);
+        assert!(results[0]
+            .coverage_gaps
+            .contains(&crate::model::CoverageGap::ByteBudget));
+
+        let (results, limit, _) = scan_dir_within(dir.path(), 4 * len);
+        assert_eq!(limit, None);
+        assert!(!results[0]
+            .coverage_gaps
+            .contains(&crate::model::CoverageGap::ByteBudget));
+        // Off macOS the tool never runs, so the rule is not applicable anyway.
+        #[cfg(target_os = "macos")]
+        assert!(!skipped(&results[0]));
+        let _ = results;
+    }
+
     /// Zips small on disk whose members inflate far past their size stop the
     /// target at `TotalBytes` once the decoded bytes add up (#166).
     #[test]
@@ -629,16 +703,13 @@ mod tests {
         assert_eq!(ctx.decoded_bytes(), MIB as u64);
         assert_eq!(ctx.bytes_read(), zip.len() as u64);
 
-        let budget = ScanBudget {
-            max_total_bytes: 5 * MIB as u64 / 2,
-            ..ScanBudget::default()
-        };
-        let scan = scan_target_with_budget(dir.path(), true, &budget).unwrap();
-        assert_eq!(scan.results.len(), 3);
-        assert_eq!(
-            scan.budget,
-            BudgetOutcome::Exhausted(BudgetLimit::TotalBytes)
-        );
+        let max = 5 * MIB as u64 / 2;
+        let (results, limit, spent) = scan_dir_within(dir.path(), max);
+        assert!(spent <= max, "{spent} > {max}");
+        assert_eq!(limit, Some(BudgetLimit::TotalBytes));
+        assert!(results.len() >= 3, "{}", results.len());
+        // The third zip's decode is cut at its allowance, not finished.
+        assert_ne!(results[2].completeness, ScanCompleteness::Complete);
     }
 
     /// A plain file decodes nothing: it is charged its reads alone.

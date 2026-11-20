@@ -123,7 +123,9 @@ impl Rule for MachOStructureRule {
     }
 
     fn evaluate(&self, ctx: &ScanContext) -> Result<Option<MatchedSignal>, RuleOutcome> {
-        self.evaluate_with(ctx, || super::codesign::verifies_apple_anchor(ctx))
+        self.evaluate_with(ctx, || {
+            super::codesign::verifies_apple_anchor(ctx, self.id())
+        })
     }
 
     /// Covered when the content is determined not to be Mach-O at all (a

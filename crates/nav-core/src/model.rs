@@ -44,6 +44,8 @@ pub enum CoverageGap {
     RuleNotApplicable { rule: String },
     /// The rule ran but marked its own result incomplete.
     RuleIncomplete { rule: String },
+    /// The target byte budget (§11.12) refused this file work it needed.
+    ByteBudget,
 }
 
 impl std::fmt::Display for CoverageGap {
@@ -53,6 +55,10 @@ impl std::fmt::Display for CoverageGap {
             CoverageGap::Truncated => f.write_str("content was only partly read"),
             CoverageGap::RuleNotApplicable { rule } => write!(f, "{rule} could not run"),
             CoverageGap::RuleIncomplete { rule } => write!(f, "{rule} did not finish"),
+            CoverageGap::ByteBudget => f.write_str(
+                "the target byte budget ran out before this file was fully scanned \
+                 (raise --max-total-bytes)",
+            ),
         }
     }
 }

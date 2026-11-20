@@ -756,14 +756,44 @@ fn spawn_codesign_verify(_path: &std::path::Path) -> Result<String, RuleOutcome>
     Err(RuleOutcome::NotApplicable)
 }
 
-/// True only if `codesign --verify --strict -R="anchor apple generic"` accepts
-/// the scanned file: the signature is intact and chains to an Apple anchor
-/// (Developer ID, Apple's own, App Store). False for embedded content, off
-/// macOS, a swapped object, a spawn failure, or any verification failure —
-/// callers treat that as "not verified," never as an error (§5.2).
-pub(super) fn verifies_apple_anchor(ctx: &ScanContext) -> bool {
-    ctx.source == crate::context::ContentSource::File
-        && ctx.run_object_bound(|| spawn_strict_anchor_check(&ctx.path)) == Some(0)
+/// Outcome of the strict Apple-anchor check.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum AnchorCheck {
+    Verified,
+    NotVerified,
+    /// Not run: the file's byte allowance could not cover it (§11.12).
+    Skipped,
+}
+
+/// Whether `codesign --verify --strict -R="anchor apple generic"` accepts the
+/// scanned file: the signature is intact and chains to an Apple anchor
+/// (Developer ID, Apple's own, App Store). `NotVerified` for embedded
+/// content, off macOS, a swapped object, a spawn failure, or any
+/// verification failure (§5.2).
+pub(super) fn apple_anchor_check(ctx: &ScanContext) -> AnchorCheck {
+    if ctx.source != crate::context::ContentSource::File {
+        return AnchorCheck::NotVerified;
+    }
+    if !ctx.tool_allowed() {
+        return AnchorCheck::Skipped;
+    }
+    match ctx.run_object_bound(|| spawn_strict_anchor_check(&ctx.path)) {
+        Some(0) => AnchorCheck::Verified,
+        _ => AnchorCheck::NotVerified,
+    }
+}
+
+/// [`apple_anchor_check`] as a demotion test for `rule_id`: only `Verified`
+/// demotes, and `Skipped` also marks `rule_id` incomplete.
+pub(super) fn verifies_apple_anchor(ctx: &ScanContext, rule_id: &'static str) -> bool {
+    match apple_anchor_check(ctx) {
+        AnchorCheck::Verified => true,
+        AnchorCheck::NotVerified => false,
+        AnchorCheck::Skipped => {
+            ctx.mark_incomplete(rule_id);
+            false
+        }
+    }
 }
 
 /// Whole signature, including the bundle seal, must verify. Used only to lower weights.
@@ -1015,6 +1045,23 @@ mod tests {
     use super::*;
     use crate::context::ScanContext;
     use std::path::PathBuf;
+
+    /// A skipped anchor check is unknown, not "not verified": the rule keeps
+    /// its undemoted weight but is marked incomplete (§11.12, #104).
+    #[test]
+    fn a_skipped_anchor_check_marks_the_rule_incomplete() {
+        let path = crate::test_support::write_temp_file("anchor-skip", &[7u8; 1000]);
+        let ctx = ScanContext::load_if(&path, 1500, |_| true).unwrap();
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(apple_anchor_check(&ctx), AnchorCheck::Skipped);
+        assert!(!verifies_apple_anchor(&ctx, "some-rule"));
+        assert!(ctx.marked_incomplete("some-rule"));
+        assert!(ctx.allowance_hit());
+
+        let embedded = ScanContext::from_embedded_bytes("x!y", vec![1], false);
+        assert!(!verifies_apple_anchor(&embedded, "some-rule"));
+        assert!(!embedded.marked_incomplete("some-rule"));
+    }
 
     fn ctx(name: &str, body: &[u8]) -> ScanContext {
         ScanContext {

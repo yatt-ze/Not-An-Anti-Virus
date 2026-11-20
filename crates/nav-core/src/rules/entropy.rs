@@ -134,7 +134,9 @@ impl Rule for HighEntropyRule {
     }
 
     fn evaluate(&self, ctx: &ScanContext) -> Result<Option<MatchedSignal>, RuleOutcome> {
-        self.evaluate_with(ctx, || super::codesign::verifies_apple_anchor(ctx))
+        self.evaluate_with(ctx, || {
+            super::codesign::verifies_apple_anchor(ctx, self.id())
+        })
     }
 
     /// Covered when every slice's `__TEXT` and payload regions were scored:
