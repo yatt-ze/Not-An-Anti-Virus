@@ -260,6 +260,7 @@ mod tests {
             primary: None,
             skipped: Vec::new(),
             unreadable: Vec::new(),
+            not_walked: Default::default(),
             results: vec![sample_result()], // complete + NoAction
             budget,
         };
@@ -286,6 +287,7 @@ mod tests {
             primary: None,
             skipped: Vec::new(),
             unreadable: vec![PathBuf::from("/tmp/locked")],
+            not_walked: Default::default(),
             results: vec![sample_result()], // complete + NoAction
             budget: BudgetOutcome::Within,
         };
@@ -311,6 +313,7 @@ mod tests {
             primary: None,
             skipped: Vec::new(),
             unreadable: Vec::new(),
+            not_walked: Default::default(),
             results: vec![high_risk, partial_no_action],
             budget: BudgetOutcome::Within,
         };
@@ -335,6 +338,7 @@ mod tests {
             primary: None,
             skipped: Vec::new(),
             unreadable: Vec::new(),
+            not_walked: Default::default(),
             results: vec![notify, partial_no_action],
             budget: BudgetOutcome::Within,
         };
@@ -355,6 +359,7 @@ mod tests {
             primary: None,
             skipped: Vec::new(),
             unreadable: Vec::new(),
+            not_walked: Default::default(),
             results: vec![sample_result(), partial_no_action],
             budget: BudgetOutcome::Within,
         };
@@ -375,6 +380,7 @@ mod tests {
             primary: None,
             skipped: Vec::new(),
             unreadable: Vec::new(),
+            not_walked: Default::default(),
             results: vec![high_risk],
             budget: BudgetOutcome::Exhausted(BudgetLimit::Files),
         };
@@ -395,6 +401,7 @@ mod tests {
             primary: None,
             skipped: Vec::new(),
             unreadable: vec![PathBuf::from("/tmp/locked")],
+            not_walked: Default::default(),
             results: vec![notify],
             budget: BudgetOutcome::Within,
         };

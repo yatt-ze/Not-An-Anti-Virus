@@ -103,8 +103,20 @@ pub struct TargetScan {
     /// each one rather than aborting (§11.8); non-empty means the target's
     /// coverage is partial (§11.12). Always empty for a single-file target.
     pub unreadable: Vec<PathBuf>,
+    /// Entries the walk passed over by design. Reported as a note only: they
+    /// do not affect [`Self::coverage_complete`] (§8, §11.8).
+    pub not_walked: NotWalked,
     /// Whether the scan fit inside its budget, or was cut short (and how).
     pub budget: BudgetOutcome,
+}
+
+/// Counts of directory entries a target walk did not enter or follow (#159).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct NotWalked {
+    /// Subdirectories not entered because the walk was not recursive.
+    pub subdirs: usize,
+    /// Symlinks, sockets, FIFOs and devices, which are never followed.
+    pub links_and_special: usize,
 }
 
 impl TargetScan {
@@ -191,6 +203,7 @@ pub fn scan_target_with_budget(
             primary: None,
             skipped: Vec::new(),
             unreadable: Vec::new(),
+            not_walked: NotWalked::default(),
             budget: BudgetOutcome::Within,
         });
     }
@@ -211,6 +224,7 @@ pub fn scan_target_with_budget(
             primary: layout.main_executable,
             skipped,
             unreadable: walk.unreadable,
+            not_walked: walk.not_walked,
             budget: outcome(walk.limit, byte_limit),
         });
     }
@@ -224,6 +238,7 @@ pub fn scan_target_with_budget(
         primary: None,
         skipped: Vec::new(),
         unreadable: walk.unreadable,
+        not_walked: walk.not_walked,
         budget: outcome(walk.limit, byte_limit),
     })
 }
@@ -282,6 +297,7 @@ struct Walk {
     limit: Option<BudgetLimit>,
     /// Directories that could not be listed, sorted.
     unreadable: Vec<PathBuf>,
+    not_walked: NotWalked,
 }
 
 /// Depth-first file collection under `root`, sorted for determinism (§11.1).
@@ -299,6 +315,7 @@ fn collect_files(root: &Path, recursive: bool, budget: &ScanBudget) -> io::Resul
     let mut out = Vec::new();
     let mut limit_hit = None;
     let mut unreadable: BTreeSet<PathBuf> = BTreeSet::new();
+    let mut not_walked = NotWalked::default();
     // Every directory entry examined, across the whole walk — bounds breadth
     // (and, since each queued directory was itself one such entry, the stack)
     // so an all-empty-directory tree can't run unbounded past `max_files`.
@@ -348,6 +365,8 @@ fn collect_files(root: &Path, recursive: bool, budget: &ScanBudget) -> io::Resul
                     } else {
                         limit_hit.get_or_insert(BudgetLimit::Depth);
                     }
+                } else {
+                    not_walked.subdirs += 1;
                 }
             } else if file_type.is_file() {
                 if out.len() >= budget.max_files {
@@ -355,8 +374,9 @@ fn collect_files(root: &Path, recursive: bool, budget: &ScanBudget) -> io::Resul
                     break 'walk;
                 }
                 out.push(path);
+            } else {
+                not_walked.links_and_special += 1;
             }
-            // Symlinks, sockets, fifos, devices: skip.
         }
     }
 
@@ -365,6 +385,7 @@ fn collect_files(root: &Path, recursive: bool, budget: &ScanBudget) -> io::Resul
         files: out,
         limit: limit_hit,
         unreadable: unreadable.into_iter().collect(),
+        not_walked,
     })
 }
 
@@ -829,7 +850,29 @@ mod tests {
             let scan = scan_target(dir.path(), true).unwrap();
             // "real/x.txt" once, not also via "link/x.txt".
             assert_eq!(scan.results.len(), 1);
+            assert_eq!(scan.not_walked.links_and_special, 1);
+            assert!(scan.coverage_complete());
         }
+    }
+
+    /// Without `recursive`, subdirectories are counted, not silently
+    /// dropped, and the target is still complete (#159).
+    #[test]
+    fn subdirectories_not_entered_are_counted() {
+        let dir = TempDir::new("nonrecursive");
+        fs::write(dir.path().join("readme.txt"), b"x").unwrap();
+        fs::create_dir(dir.path().join("sub")).unwrap();
+        fs::write(dir.path().join("sub/evil.sh"), b"x").unwrap();
+        fs::create_dir(dir.path().join("sub2")).unwrap();
+
+        let scan = scan_target(dir.path(), false).unwrap();
+        assert_eq!(scan.results.len(), 1);
+        assert_eq!(scan.not_walked.subdirs, 2);
+        assert!(scan.coverage_complete());
+
+        let scan = scan_target(dir.path(), true).unwrap();
+        assert_eq!(scan.results.len(), 2);
+        assert_eq!(scan.not_walked, NotWalked::default());
     }
 
     /// A `chmod 000` subdirectory is recorded, not fatal: the rest of the

@@ -772,6 +772,7 @@ mod tests {
             primary: None,
             skipped: Vec::new(),
             unreadable: Vec::new(),
+            not_walked: Default::default(),
             results: vec![sample_result()],
             budget: nav_core::BudgetOutcome::Within,
         };
@@ -790,6 +791,7 @@ mod tests {
             primary: None,
             skipped: Vec::new(),
             unreadable: Vec::new(),
+            not_walked: Default::default(),
             results: vec![sample_result()], // complete + NoAction
             budget,
         };
@@ -812,6 +814,7 @@ mod tests {
             primary: None,
             skipped: Vec::new(),
             unreadable,
+            not_walked: Default::default(),
             results: Vec::new(),
             budget: nav_core::BudgetOutcome::Within,
         }
@@ -869,6 +872,7 @@ mod tests {
             primary: Some(bad(b"/tmp/root\xff/p\xfe")),
             skipped: vec![bad(b"/tmp/s\xfe")],
             unreadable: vec![bad(b"/tmp/u\xff\xfe")],
+            not_walked: Default::default(),
             results: vec![result],
             budget: nav_core::BudgetOutcome::Within,
         };
@@ -906,6 +910,7 @@ mod tests {
             primary: Some(PathBuf::from("/Apps/X.app/Contents/MacOS/X")),
             skipped: Vec::new(),
             unreadable: Vec::new(),
+            not_walked: Default::default(),
             results,
             budget,
         }
