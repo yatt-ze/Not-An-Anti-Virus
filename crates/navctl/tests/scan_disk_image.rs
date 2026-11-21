@@ -266,12 +266,18 @@ fn a_dropper_inside_an_image_is_found() {
     assert_no_scratch_path(&out);
 
     let json = sb.navctl(&["scan", "--json"], &image);
-    let paths: Vec<String> = stdout(&json)
+    let objects: Vec<serde_json::Value> = stdout(&json)
         .lines()
-        .map(|l| {
-            let v: serde_json::Value = serde_json::from_str(l).unwrap();
-            v["path"].as_str().unwrap().to_owned()
-        })
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect();
+    // Members first, then the target summary (#51).
+    let (summary, members) = objects.split_last().unwrap();
+    assert_eq!(summary["kind"], "disk-image");
+    assert_eq!(summary["files"], 2);
+    assert!(summary["volumes"].is_number() && summary["mount_gaps"].is_array());
+    let paths: Vec<String> = members
+        .iter()
+        .map(|v| v["path"].as_str().unwrap().to_owned())
         .collect();
     let label = |n: &str| format!("{}!{n}", image.display());
     assert_eq!(paths, vec![label("install.sh"), label("readme.txt")]);
@@ -381,8 +387,9 @@ fn symlinks_do_not_leave_the_volume() {
     let out = sb.navctl(&["scan", "--json"], &image);
     assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
     let lines: Vec<_> = stdout(&out).lines().map(str::to_owned).collect();
-    assert_eq!(lines.len(), 1, "{lines:?}");
+    assert_eq!(lines.len(), 2, "{lines:?}");
     assert!(lines[0].contains("links.dmg!readme.txt"), "{lines:?}");
+    assert!(lines[1].contains("\"kind\":\"disk-image\""), "{lines:?}");
     sb.assert_clean();
 }
 

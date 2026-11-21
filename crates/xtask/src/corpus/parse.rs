@@ -7,9 +7,15 @@ use anyhow::{bail, Context, Result};
 use nav_core::model::ScanResult;
 use nav_core::SCAN_JSON_SCHEMA_VERSION;
 
-/// Parses JSONL from `reader`, skipping lines that don't start with `{`.
-/// Errors on malformed JSON or any `schema_version` other than
-/// [`SCAN_JSON_SCHEMA_VERSION`].
+/// Whether a stdout line is the `scan --json` target summary (§8), the only
+/// object with a top-level `kind` key, rather than a per-file result.
+pub fn is_summary(line: &[u8]) -> bool {
+    serde_json::from_slice::<serde_json::Value>(line).is_ok_and(|v| v.get("kind").is_some())
+}
+
+/// Parses JSONL from `reader`, skipping lines that don't start with `{` and
+/// the target summary. Errors on malformed JSON or any `schema_version`
+/// other than [`SCAN_JSON_SCHEMA_VERSION`].
 pub fn parse_jsonl(reader: impl BufRead) -> Result<Vec<ScanResult>> {
     let mut out = Vec::new();
     for (i, line) in reader.lines().enumerate() {
@@ -27,6 +33,9 @@ pub fn parse_jsonl(reader: impl BufRead) -> Result<Vec<ScanResult>> {
                 "line {n}: schema_version {version:?}, expected {SCAN_JSON_SCHEMA_VERSION}; \
                  rebuild both navctl binaries from compatible revisions"
             );
+        }
+        if value.get("kind").is_some() {
+            continue;
         }
         out.push(
             serde_json::from_value(value).with_context(|| format!("line {n}: not a ScanResult"))?,
@@ -53,6 +62,15 @@ mod tests {
         let rs = parse_jsonl(input.as_bytes()).unwrap();
         assert_eq!(rs.len(), 2);
         assert_eq!(rs[0].score, 3);
+    }
+
+    #[test]
+    fn skips_target_summary() {
+        let summary = r#"{"schema_version":1,"target":"/d","kind":"directory","files":1}"#;
+        let rs = parse_jsonl(format!("{LINE}\n{summary}\n").as_bytes()).unwrap();
+        assert_eq!(rs.len(), 1);
+        assert!(is_summary(summary.as_bytes()));
+        assert!(!is_summary(LINE.as_bytes()));
     }
 
     #[test]

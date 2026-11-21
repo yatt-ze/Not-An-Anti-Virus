@@ -88,6 +88,11 @@ pub fn run_scan(
             nav_core::safe_eprintln!("{note}");
         }
         print_not_walked(&scan, verbose || scan.kind != TargetKind::Bundle);
+        if json {
+            if let Err(e) = print_scan_summary_json(&scan, None) {
+                return json_error(&e);
+            }
+        }
         nav_core::safe_eprintln!("navctl: no files found under {}", path.display());
         return exit::code(empty_scan_exit_code(&scan));
     }
@@ -106,9 +111,14 @@ pub fn run_scan(
     if bundle_line {
         nav_core::safe_println!("{}", bundle_summary_line(&scan));
     }
-    // Budget-exhausted coverage goes to stderr (keeping the --json stream on
-    // stdout parseable as one object per file) and is folded into the exit
-    // code below — a target cut short is not a clean target (§8, §11.8/§11.12).
+    if json && scan.kind != TargetKind::File {
+        if let Err(e) = print_scan_summary_json(&scan, None) {
+            return json_error(&e);
+        }
+    }
+    // Budget-exhausted coverage goes to stderr too, and is folded into the
+    // exit code below — a target cut short is not a clean target
+    // (§8, §11.8/§11.12).
     if let Some(note) = budget_warning(&scan, path) {
         nav_core::safe_eprintln!("{note}");
     }
@@ -203,7 +213,7 @@ pub fn run_rules_test(
 }
 
 /// `navctl scan` for a mounted image: one line, member lines with
-/// `--verbose`, one JSON object per member with `--json`.
+/// `--verbose`; with `--json`, one object per member then the summary.
 fn render_image_scan(report: &ImageReport, json: bool, verbose: bool) -> ExitCode {
     let scan = &report.scan;
     for result in &scan.results {
@@ -220,6 +230,11 @@ fn render_image_scan(report: &ImageReport, json: bool, verbose: bool) -> ExitCod
         nav_core::safe_eprintln!("navctl: no files found in {}", scan.root.display());
     } else if !json {
         nav_core::safe_println!("{}", image_summary_line(report));
+    }
+    if json {
+        if let Err(e) = print_scan_summary_json(scan, Some(report)) {
+            return json_error(&e);
+        }
     }
     print_image_warnings(report, !json, verbose);
     exit::code(image_exit_code(report))
@@ -556,6 +571,28 @@ fn print_multi_json(
     Ok(())
 }
 
+/// Print the final `scan --json` line: [`scan_summary_json`] on one line.
+fn print_scan_summary_json(
+    scan: &TargetScan,
+    image: Option<&ImageReport>,
+) -> Result<(), serde_json::Error> {
+    println!("{}", scan_summary_json(scan, image)?);
+    Ok(())
+}
+
+/// The `scan --json` target summary: [`target_json`] plus `files`, the
+/// number of per-file lines before it. Only this line has a top-level `kind` key.
+fn scan_summary_json(
+    scan: &TargetScan,
+    image: Option<&ImageReport>,
+) -> Result<serde_json::Value, serde_json::Error> {
+    let mut v = target_json(scan, image)?;
+    if let serde_json::Value::Object(map) = &mut v {
+        map.insert("files".into(), scan.results.len().into());
+    }
+    Ok(v)
+}
+
 /// The multi-target `rules test --json` envelope: [`target_json`] plus
 /// `results`.
 fn multi_json(
@@ -808,6 +845,18 @@ mod tests {
         };
         let value = multi_json(&scan, None).unwrap();
         assert_eq!(value["schema_version"], SCAN_JSON_SCHEMA_VERSION);
+    }
+
+    /// The scan summary has `files` and `kind` but no `results`.
+    #[test]
+    fn scan_summary_counts_files() {
+        let mut scan = empty_scan(Vec::new());
+        scan.results = vec![sample_result(), sample_result()];
+        let value = scan_summary_json(&scan, None).unwrap();
+        assert_eq!(value["files"], 2);
+        assert_eq!(value["kind"], "directory");
+        assert_eq!(value["schema_version"], SCAN_JSON_SCHEMA_VERSION);
+        assert!(value.get("results").is_none());
     }
 
     /// A budget-exhausted target is never a clean exit, even when every file it

@@ -150,12 +150,15 @@ script can tell "checked, clean" apart from "couldn't check":
 
 A finding outranks an incomplete scan: a flagged file returns `1` or `2` even
 if part of the scan came up short. Check each file's `completeness` in
-`--json` output, and stderr for skipped coverage.
+`--json` output, and the target summary for skipped coverage.
 
 ### JSON output
 
 `--json` output has the same structure as the text breakdown, plus a
-top-level `"schema_version"` (currently `1`). Check the version before
+top-level `"schema_version"` (currently `1`). For a directory, bundle or
+disk image, `scan --json` prints one object per file and then a summary
+line, the only object with a top-level `"kind"` key, carrying `files` and
+the target's coverage (`coverage_complete`, `budget_limit`, `unreadable`). Check the version before
 parsing further. Rule IDs such as `suspicious-strings` and
 `macho-loader-anomaly` identify the signals in a result; consumers should
 tolerate IDs they don't recognise as the ruleset evolves.
