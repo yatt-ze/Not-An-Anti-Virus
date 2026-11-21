@@ -194,7 +194,7 @@ navctl setup fda                      # explicitly user-invoked; opens System Se
 navctl service install                # install navd as a root LaunchDaemon and bootstrap it (needs root); see §11.10
 navctl service uninstall              # remove navd and its artifacts (needs root), best-effort/zero-residue; see §11.10
 navctl service status                 # report install state: which artifacts are present + the launchd job status
-navctl scan <path> [--recursive] [--json] [--verbose] [--quick|--full] [--no-mount] [--max-files N] [--max-total-bytes BYTES]
+navctl scan <path> [--recursive] [--json] [--verbose] [--quick|--full] [--no-mount] [--max-files N] [--max-total-bytes BYTES]   # --quick/--full: not built yet, exit 4
 navctl rules test <path> [--recursive] [--json] [--no-mount] [--max-files N] [--max-total-bytes BYTES]   # full signal breakdown (file / dir / .app bundle §5.8 / disk image §6.2), dry-run, no action taken
 navctl rules list
 navctl rules reload
