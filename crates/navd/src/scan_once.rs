@@ -44,7 +44,7 @@ pub fn run(path: &Path, recursive: bool, json: bool) -> ExitCode {
     for result in &scan.results {
         if json {
             match scan_result_json(result) {
-                Ok(line) => println!("{line}"),
+                Ok(line) => nav_core::raw_println!("{line}"),
                 Err(e) => {
                     nav_core::safe_eprintln!("navd scan-once: cannot serialize result: {e}");
                     return nav_core::exit_code(nav_core::OPERATIONAL_ERROR);

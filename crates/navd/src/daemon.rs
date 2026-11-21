@@ -41,7 +41,7 @@ pub fn run() {
 
     // stdout/stderr are the plist's log paths (§11.10) — this is how the
     // `--real` verify run confirms the daemon actually came up under launchd.
-    println!(
+    nav_core::safe_println!(
         "navd starting (pid {}, engine {}): stay-alive skeleton, no event sources yet (§12).",
         std::process::id(),
         nav_core::ENGINE_VERSION
@@ -51,5 +51,5 @@ pub fn run() {
         thread::sleep(POLL_INTERVAL);
     }
 
-    println!("navd shutting down on signal.");
+    nav_core::safe_println!("navd shutting down on signal.");
 }

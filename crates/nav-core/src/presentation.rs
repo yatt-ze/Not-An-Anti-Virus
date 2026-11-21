@@ -5,6 +5,7 @@
 
 use serde::Serialize;
 use std::process::ExitCode;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::model::{Recommendation, ScanCompleteness, ScanResult};
 use crate::target::TargetScan;
@@ -82,32 +83,69 @@ pub fn terminal_safe(s: &str) -> std::borrow::Cow<'_, str> {
     )
 }
 
-/// `println!` through [`terminal_safe`]; for human output only.
+static STDOUT_CLOSED: AtomicBool = AtomicBool::new(false);
+static STDERR_CLOSED: AtomicBool = AtomicBool::new(false);
+
+/// Writes `text` to stdout (`err` = false) or stderr without panicking. A
+/// broken pipe latches that stream closed and later writes are no-ops, so the
+/// program runs to completion with its normal exit code (§8); any other write
+/// error drops only that write.
+#[doc(hidden)]
+pub fn emit(err: bool, text: &str) {
+    use std::io::Write;
+    let flag = if err { &STDERR_CLOSED } else { &STDOUT_CLOSED };
+    if flag.load(Ordering::Relaxed) {
+        return;
+    }
+    let res = if err {
+        std::io::stderr().lock().write_all(text.as_bytes())
+    } else {
+        std::io::stdout().lock().write_all(text.as_bytes())
+    };
+    if res.is_err_and(|e| e.kind() == std::io::ErrorKind::BrokenPipe) {
+        flag.store(true, Ordering::Relaxed);
+    }
+}
+
+/// `println!` through [`terminal_safe`], tolerant of a closed stdout; for
+/// human output only.
 #[macro_export]
 macro_rules! safe_println {
-    () => { ::std::println!() };
+    () => { $crate::presentation::emit(false, "\n") };
     ($($arg:tt)*) => {{
         let line = ::std::format!($($arg)*);
-        ::std::println!("{}", $crate::presentation::terminal_safe(&line));
+        $crate::presentation::emit(false, &::std::format!("{}\n", $crate::presentation::terminal_safe(&line)));
     }};
 }
 
-/// `print!` through [`terminal_safe`]; for human output only.
+/// `print!` through [`terminal_safe`], tolerant of a closed stdout; for human
+/// output only.
 #[macro_export]
 macro_rules! safe_print {
     ($($arg:tt)*) => {{
         let text = ::std::format!($($arg)*);
-        ::std::print!("{}", $crate::presentation::terminal_safe(&text));
+        $crate::presentation::emit(false, &$crate::presentation::terminal_safe(&text));
     }};
 }
 
-/// `eprintln!` through [`terminal_safe`]; for human output only.
+/// `eprintln!` through [`terminal_safe`], tolerant of a closed stderr; for
+/// human output only.
 #[macro_export]
 macro_rules! safe_eprintln {
     ($($arg:tt)*) => {{
         let line = ::std::format!($($arg)*);
-        ::std::eprintln!("{}", $crate::presentation::terminal_safe(&line));
+        $crate::presentation::emit(true, &::std::format!("{}\n", $crate::presentation::terminal_safe(&line)));
     }};
+}
+
+/// Unsanitised `println!` that tolerates a closed stdout; for machine-readable
+/// (JSON) output only.
+#[macro_export]
+macro_rules! raw_println {
+    () => { $crate::presentation::emit(false, "\n") };
+    ($($arg:tt)*) => {
+        $crate::presentation::emit(false, &::std::format!("{}\n", ::std::format!($($arg)*)))
+    };
 }
 
 pub const CLEAN: u8 = 0;

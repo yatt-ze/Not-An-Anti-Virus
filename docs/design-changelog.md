@@ -5,6 +5,10 @@ for the current document map. Newest first.
 
 ---
 
+**Changelog from v1.03 (2026-11-21):** A closed stdout no longer panics `navctl` or `navd scan-once` (§8, #160). `navctl scan dir | head -1` exited 101 with a panic, because `println!` panics on EPIPE, and an early exit mid disk-image scan would skip the detach. All output now goes through non-panicking writes in `nav-core`: the `safe_*` macros for human output, and a new `raw_println!` for the `--json` lines. The first write error on a stream latches it closed and later writes are dropped, so the scan finishes and returns its normal exit code. Decided: not resetting SIGPIPE to the default, which would kill the process mid disk-image scan and leave the mount behind; stdout and stderr latch independently.
+
+---
+
 **Changelog from v1.02 (2026-11-21):** `navctl scan --json` ends a directory, bundle or disk-image target with a summary line (§8, §11.12, #51). Target-level coverage (a budget stop, unreadable subdirectories, the not-walked counts) reached stdout only through `rules test --json`, and since #34 a flagged file outranks incompleteness in the exit code, so a script reading `scan --json` and the exit status could not tell that most of a tree was never scanned. The final line is the `rules test` envelope without `results`, plus `files`; per-file objects have no top-level `kind` key, so it identifies the summary. A single-file target is unchanged (one object), and a target with no scored file prints the summary with `files: 0`. Decided: an additive line, no schema bump (`schema_version` stays `1`), stderr notes and exit codes unchanged. `navd scan-once` is scheduled for deletion after spike B3 and still reports target coverage on stderr only.
 
 ---
