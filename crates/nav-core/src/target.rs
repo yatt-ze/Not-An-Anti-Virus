@@ -883,15 +883,13 @@ mod tests {
         fs::create_dir(dir.path().join("real")).unwrap();
         fs::write(dir.path().join("real/x.txt"), b"x").unwrap();
 
-        {
-            std::os::unix::fs::symlink(dir.path().join("real"), dir.path().join("link")).unwrap();
-            let scan = scan_target(dir.path(), true).unwrap();
-            // "real/x.txt" once, not also via "link/x.txt".
-            assert_eq!(scan.results.len(), 1);
-            assert_eq!(scan.not_walked.links_and_special, 1);
-            assert_eq!(scan.not_walked.links_outside, 0);
-            assert!(scan.coverage_complete());
-        }
+        std::os::unix::fs::symlink(dir.path().join("real"), dir.path().join("link")).unwrap();
+        let scan = scan_target(dir.path(), true).unwrap();
+        // "real/x.txt" once, not also via "link/x.txt".
+        assert_eq!(scan.results.len(), 1);
+        assert_eq!(scan.not_walked.links_and_special, 1);
+        assert_eq!(scan.not_walked.links_outside, 0);
+        assert!(scan.coverage_complete());
     }
 
     /// A link that points outside the target is counted apart (#159),

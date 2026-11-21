@@ -74,9 +74,9 @@ pub enum ContentSource {
 }
 
 /// Open `path` read-only and return the handle only if it is a regular file.
-/// The open is `O_NONBLOCK`, so a FIFO swapped in after the walker's
-/// check can't block it; a FIFO, device or other non-regular file yields `None`,
-/// the same as an unreadable one (§11.7, §11.8).
+/// The open is `O_NONBLOCK`, so a FIFO swapped in after the walker's check
+/// can't block it; a FIFO, device or other non-regular file yields `None`, the
+/// same as an unreadable one (§11.7, §11.8).
 pub(crate) fn open_regular(path: &Path) -> Option<std::fs::File> {
     use std::os::unix::fs::OpenOptionsExt;
     let mut opts = std::fs::OpenOptions::new();
@@ -249,8 +249,9 @@ impl ScanContext {
     }
 
     /// True when [`Self::read_at`]/[`Self::for_each_window`] can actually
-    /// reach bytes past `content`: a real, opened file. A rule deciding whether it can stream/range-read
-    /// past the prefix should check this, not [`Self::is_file_backed`] alone.
+    /// reach bytes past `content`: a real, opened file. A rule deciding whether
+    /// it can stream/range-read past the prefix should check this, not
+    /// [`Self::is_file_backed`] alone.
     pub fn supports_ranged_reads(&self) -> bool {
         self.file.is_some()
     }
@@ -912,9 +913,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("nav-fifo-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let fifo = dir.join("pipe");
-        let made = std::process::Command::new("/usr/bin/mkfifo")
-            .arg(&fifo)
-            .status();
+        let made = std::process::Command::new("mkfifo").arg(&fifo).status();
         assert!(made.unwrap().success());
         let (tx, rx) = std::sync::mpsc::channel();
         let p = fifo.clone();
