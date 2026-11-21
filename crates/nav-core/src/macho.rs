@@ -2712,6 +2712,29 @@ mod tests {
         }
     }
 
+    /// `read_known` with the held boundary inside the unknown rest charges
+    /// only the bytes past it, and a fat slice whose load commands straddle
+    /// that boundary scans as it does fully held.
+    #[test]
+    fn read_known_straddling_held_prefix() {
+        let (a, _, _) = synth_macho_64_full(b"a", &["/usr/lib/libA.dylib"], &[], true, None);
+        let (b, _, _) = synth_macho_64_full(b"b", &["/usr/lib/libB.dylib"], &[], true, None);
+        let fat = synth_fat(&[&a, &b]);
+        let off = fat_arch_offset(&fat, false, 1).unwrap();
+        let held = off + 40; // inside slice b's load commands, past its probe
+        let src = LimitedHeldSource { data: &fat, held };
+
+        let len = 200;
+        let mut budget = RangeBudget { remaining: 1000 };
+        let known = &fat[off as usize..off as usize + 32];
+        let got = read_known(&src, &mut budget, off, len, known).unwrap();
+        assert_eq!(&got[..], &fat[off as usize..off as usize + len]);
+        assert_eq!(budget.remaining, 1000 - (off + len as u64 - held));
+
+        assert_eq!(scan_ranged(&src), scan_ranged(&fat[..]));
+        assert_eq!(scan_ranged(&src).images.len(), 2);
+    }
+
     /// A hostile fat table of `MAX_FAT_ARCHES` distinct offsets, each
     /// pointing at its own big-ish (but otherwise ordinary) valid slice, must
     /// stop reading once `MAX_RANGED_BYTES` is exhausted rather than walk
