@@ -3,11 +3,28 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+/// A temp directory removed on drop, panic included.
+struct TempDir(PathBuf);
+
+impl TempDir {
+    fn new(tag: &str) -> Self {
+        let dir =
+            std::env::temp_dir().join(format!("navctl-unmounted-{tag}-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        TempDir(dir)
+    }
+}
+
+impl Drop for TempDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
 /// A file with sparse-image magic: detected as a disk image, never mountable.
-fn fake_image(tag: &str) -> (PathBuf, PathBuf) {
-    let dir = std::env::temp_dir().join(format!("navctl-unmounted-{tag}-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
-    let image = dir.join("fake.dmg");
+fn fake_image(tag: &str) -> (TempDir, PathBuf) {
+    let dir = TempDir::new(tag);
+    let image = dir.0.join("fake.dmg");
     let mut bytes = b"sprs".to_vec();
     bytes.resize(4096, 0);
     std::fs::write(&image, bytes).unwrap();
@@ -36,31 +53,35 @@ fn not_mounted_reason(v: &serde_json::Value) -> String {
 
 #[test]
 fn no_mount_names_its_reason() {
-    let (dir, image) = fake_image("no-mount");
+    let (_dir, image) = fake_image("no-mount");
     let v = first_object(&["scan", "--json", "--no-mount"], &image);
     assert_eq!(not_mounted_reason(&v), "--no-mount");
-    std::fs::remove_dir_all(&dir).unwrap();
 }
 
 #[test]
 fn a_failed_mount_names_its_reason() {
-    let (dir, image) = fake_image("failed");
+    let (_dir, image) = fake_image("failed");
     let v = first_object(&["scan", "--json"], &image);
     let reason = not_mounted_reason(&v);
     assert!(!reason.is_empty() && reason != "--no-mount", "{reason}");
     if !cfg!(target_os = "macos") {
         assert_eq!(reason, "disk images are only mounted on macOS");
     }
-    std::fs::remove_dir_all(&dir).unwrap();
 }
 
 #[test]
 fn a_plain_file_has_no_such_gap() {
-    let dir = std::env::temp_dir().join(format!("navctl-unmounted-plain-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
-    let file = dir.join("a.txt");
+    let dir = TempDir::new("plain");
+    let file = dir.0.join("a.txt");
     std::fs::write(&file, "hello\n").unwrap();
     let v = first_object(&["scan", "--json", "--no-mount"], &file);
     assert!(v["coverage_gaps"].as_array().unwrap().is_empty(), "{v}");
-    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn a_directory_holding_an_image_has_no_such_gap() {
+    let (dir, _image) = fake_image("dir");
+    let v = first_object(&["scan", "--json", "--no-mount"], &dir.0);
+    let gaps = v["coverage_gaps"].as_array().unwrap();
+    assert!(gaps.iter().all(|g| g["kind"] != "not-mounted"), "{v}");
 }

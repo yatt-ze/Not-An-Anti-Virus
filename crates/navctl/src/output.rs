@@ -214,17 +214,17 @@ pub fn run_rules_test(
     exit::code(exit::for_target(&scan))
 }
 
-/// Records `reason` as a coverage gap on a single-file target that carries
-/// the disk-image `uninspected-container` signal, so `--json` says why it was
-/// not mounted (§6.2, §8).
+/// Records `reason` as a coverage gap when the target itself is a regular
+/// file holding a disk image, so `--json` says why it was not mounted
+/// (§6.2, §8). A directory or bundle that merely contains an image gets none.
 fn note_unmounted(scan: &mut TargetScan, reason: Option<&str>) {
-    let (Some(reason), [result]) = (reason, scan.results.as_mut_slice()) else {
+    let (Some(reason), TargetKind::File, [result]) =
+        (reason, scan.kind, scan.results.as_mut_slice())
+    else {
         return;
     };
-    let is_image = result
-        .signals
-        .iter()
-        .any(|s| s.id == UNINSPECTED_CONTAINER_ID && s.description.starts_with("disk image ("));
+    let is_image = std::fs::File::open(&scan.root)
+        .is_ok_and(|f| matches!(nav_core::disk_image_format_of_file(&f), Ok(Some(_))));
     if is_image {
         result.coverage_gaps.push(CoverageGap::NotMounted {
             reason: reason.to_string(),
