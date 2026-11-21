@@ -234,7 +234,7 @@ checksum = "cf8baf1c55e62ffcace7a9f06f4bd9cd3f0c4beb022d3b367256b91b87513d98"
 
 [[package]]
 name = "nav-core"
-version = "0.12.3"
+version = "0.12.4"
 dependencies = [
  "libc",
  "serde",
@@ -245,14 +245,14 @@ dependencies = [
 
 [[package]]
 name = "nav-service"
-version = "0.12.3"
+version = "0.12.4"
 dependencies = [
  "anyhow",
 ]
 
 [[package]]
 name = "navctl"
-version = "0.12.3"
+version = "0.12.4"
 dependencies = [
  "anyhow",
  "clap",
@@ -265,7 +265,7 @@ dependencies = [
 
 [[package]]
 name = "navd"
-version = "0.12.3"
+version = "0.12.4"
 dependencies = [
  "clap",
  "libc",
@@ -275,7 +275,7 @@ dependencies = [
 
 [[package]]
 name = "navnotify"
-version = "0.12.3"
+version = "0.12.4"
 
 [[package]]
 name = "once_cell_polyfill"
@@ -515,7 +515,7 @@ dependencies = [
 
 [[package]]
 name = "xtask"
-version = "0.12.3"
+version = "0.12.4"
 dependencies = [
  "anyhow",
  "clap",
