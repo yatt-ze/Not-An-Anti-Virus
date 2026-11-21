@@ -98,8 +98,9 @@ pub fn run_scan(
                 return json_error(&e);
             }
         }
-        nav_core::safe_eprintln!("navctl: no files found under {}", path.display());
-        return exit::code(empty_scan_exit_code(&scan));
+        nav_core::safe_eprintln!("navctl: no files to scan under {}", path.display());
+        // Nothing to inspect is "couldn't check", as in `rules test` (§8, §11.8).
+        return exit::code(exit::INDETERMINATE);
     }
 
     let bundle_line = !json && scan.kind == TargetKind::Bundle;
@@ -673,17 +674,6 @@ fn budget_note(scan: &TargetScan) -> Option<String> {
     }
 }
 
-/// Exit code for a `scan` target that scored no files: `INDETERMINATE` when
-/// unreadable directories or a budget stop explain the emptiness ("couldn't
-/// check", §10/§11.8), `OPERATIONAL_ERROR` otherwise (issue #29).
-fn empty_scan_exit_code(scan: &TargetScan) -> u8 {
-    if scan.coverage_complete() {
-        exit::OPERATIONAL_ERROR
-    } else {
-        exit::INDETERMINATE
-    }
-}
-
 /// The stderr partial-coverage warning for a budget stop, or `None` if the
 /// scan fit its budget (§11.12).
 fn budget_warning(scan: &TargetScan, path: &Path) -> Option<String> {
@@ -917,30 +907,6 @@ mod tests {
             results: Vec::new(),
             budget: nav_core::BudgetOutcome::Within,
         }
-    }
-
-    /// #32 follow-up: a target whose only content is unreadable subdirectories
-    /// (the Phase 0b B3 TCC case) is "couldn't check," not a tool failure —
-    /// distinct from a target that is genuinely empty (issue #29, unchanged).
-    #[test]
-    fn empty_scan_exit_code_is_indeterminate_only_when_unreadable_explains_it() {
-        assert_eq!(
-            empty_scan_exit_code(&empty_scan(Vec::new())),
-            exit::OPERATIONAL_ERROR,
-            "a genuinely empty, fully-readable target is still issue #29's exit 4"
-        );
-        assert_eq!(
-            empty_scan_exit_code(&empty_scan(vec![PathBuf::from("/tmp/locked")])),
-            exit::INDETERMINATE,
-            "unreadable subdirectories explain the emptiness — couldn't check, not a failure"
-        );
-        let mut stopped = empty_scan(Vec::new());
-        stopped.budget = nav_core::BudgetOutcome::Exhausted(BudgetLimit::Files);
-        assert_eq!(
-            empty_scan_exit_code(&stopped),
-            exit::INDETERMINATE,
-            "a budget stop before any file is partial coverage, not a failure (§11.12)"
-        );
     }
 
     /// `multi_json` must stay safe on an empty-results scan — it backs the
