@@ -141,7 +141,7 @@ dependencies = [
 
 [[package]]
 name = "nav-core"
-version = "0.12.7"
+version = "0.13.0"
 dependencies = [
  "libc",
  "serde",
