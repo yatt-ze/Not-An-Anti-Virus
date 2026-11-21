@@ -101,7 +101,8 @@ pub(crate) fn open_regular(path: &Path) -> Option<std::fs::File> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
-        opts.custom_flags(libc::O_NONBLOCK);
+        // O_NOCTTY: a tty swapped in must not become our controlling terminal.
+        opts.custom_flags(libc::O_NONBLOCK | libc::O_NOCTTY);
     }
     let f = opts.open(path).ok()?;
     f.metadata().ok()?.is_file().then_some(f)
