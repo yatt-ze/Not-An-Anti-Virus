@@ -305,7 +305,7 @@ fn no_mount_keeps_the_image_unread() {
         assert_eq!(out.status.code(), Some(3), "{cmd:?}");
         let text = stdout(&out) + &stderr(&out);
         assert!(text.contains("not inspected"), "{cmd:?}: {text}");
-        assert!(!text.contains("not mounted"), "{cmd:?}: {text}");
+        assert!(!text.contains("disk image not mounted"), "{cmd:?}: {text}");
     }
     assert!(!sb.scratch().exists(), "--no-mount must not create scratch");
 }
@@ -335,7 +335,11 @@ fn a_corrupted_image_is_partial_with_a_reason() {
 
     let rules = sb.navctl(&["rules", "test"], &image);
     assert_eq!(rules.status.code(), Some(3));
-    assert!(stdout(&rules).starts_with("Disk image not mounted: "));
+    assert!(
+        stdout(&rules).contains("  - not mounted: "),
+        "{}",
+        stdout(&rules)
+    );
     assert_no_scratch_path(&rules);
     sb.assert_clean();
 }

@@ -46,6 +46,8 @@ pub enum CoverageGap {
     RuleIncomplete { rule: String },
     /// The target byte budget (§11.12) refused this file work it needed.
     ByteBudget,
+    /// A disk image that was not mounted (§6.2); `reason` says why.
+    NotMounted { reason: String },
 }
 
 impl std::fmt::Display for CoverageGap {
@@ -55,6 +57,7 @@ impl std::fmt::Display for CoverageGap {
             CoverageGap::Truncated => f.write_str("content was only partly read"),
             CoverageGap::RuleNotApplicable { rule } => write!(f, "{rule} could not run"),
             CoverageGap::RuleIncomplete { rule } => write!(f, "{rule} did not finish"),
+            CoverageGap::NotMounted { reason } => write!(f, "not mounted: {reason}"),
             CoverageGap::ByteBudget => f.write_str(
                 "the target byte budget ran out before this file was fully scanned \
                  (raise --max-total-bytes)",

@@ -17,8 +17,8 @@ use std::process::ExitCode;
 
 use nav_core::{
     not_walked_notes, scan_target_with_budget, with_schema_version, BudgetLimit, BudgetOutcome,
-    EvidenceConfidence, Recommendation, ScanBudget, ScanCompleteness, ScanResult, TargetKind,
-    TargetScan, SCAN_JSON_SCHEMA_VERSION, UNINSPECTED_CONTAINER_ID,
+    CoverageGap, EvidenceConfidence, Recommendation, ScanBudget, ScanCompleteness, ScanResult,
+    TargetKind, TargetScan, SCAN_JSON_SCHEMA_VERSION, UNINSPECTED_CONTAINER_ID,
 };
 
 use crate::diskimage::{self, ImageReport, ImageScan};
@@ -33,17 +33,21 @@ enum Prepared {
     Done(ExitCode),
 }
 
-fn prepare(path: &Path, budget: &ScanBudget, no_mount: bool) -> Prepared {
+/// `announce`: also print the not-mounted reason to stderr (human output;
+/// `--json` carries it as a coverage gap instead).
+fn prepare(path: &Path, budget: &ScanBudget, no_mount: bool, announce: bool) -> Prepared {
     if no_mount {
-        return Prepared::Plain(None);
+        return Prepared::Plain(Some("--no-mount".into()));
     }
     match diskimage::scan_image(path, budget) {
         ImageScan::NotImage => Prepared::Plain(None),
         ImageScan::Unmounted(reason) => {
-            nav_core::safe_eprintln!(
-                "navctl: {}: disk image not mounted: {reason}",
-                path.display()
-            );
+            if announce {
+                nav_core::safe_eprintln!(
+                    "navctl: {}: disk image not mounted: {reason}",
+                    path.display()
+                );
+            }
             Prepared::Plain(Some(reason))
         }
         ImageScan::Scanned(report) => Prepared::Image(report),
@@ -67,18 +71,19 @@ pub fn run_scan(
     budget: &ScanBudget,
     no_mount: bool,
 ) -> ExitCode {
-    match prepare(path, budget, no_mount) {
-        Prepared::Plain(_) => {}
+    let unmounted = match prepare(path, budget, no_mount, !json) {
+        Prepared::Plain(reason) => reason,
         Prepared::Image(report) => return render_image_scan(&report, json, verbose),
         Prepared::Done(code) => return code,
-    }
-    let scan = match scan_target_with_budget(path, recursive, budget) {
+    };
+    let mut scan = match scan_target_with_budget(path, recursive, budget) {
         Ok(s) => s,
         Err(e) => {
             nav_core::safe_eprintln!("navctl: {}: {e}", path.display());
             return exit::code(exit::OPERATIONAL_ERROR);
         }
     };
+    note_unmounted(&mut scan, unmounted.as_deref());
 
     if scan.results.is_empty() {
         if let Some(note) = unreadable_note(&scan) {
@@ -145,19 +150,20 @@ pub fn run_rules_test(
         nav_core::safe_eprintln!("navctl: {} does not exist", path.display());
         return exit::code(exit::OPERATIONAL_ERROR);
     }
-    let unmounted = match prepare(path, budget, no_mount) {
+    let unmounted = match prepare(path, budget, no_mount, !json) {
         Prepared::Plain(reason) => reason,
         Prepared::Image(report) => return render_image_rules_test(&report, json),
         Prepared::Done(code) => return code,
     };
 
-    let scan = match scan_target_with_budget(path, recursive, budget) {
+    let mut scan = match scan_target_with_budget(path, recursive, budget) {
         Ok(s) => s,
         Err(e) => {
             nav_core::safe_eprintln!("navctl: {}: {e}", path.display());
             return exit::code(exit::OPERATIONAL_ERROR);
         }
     };
+    note_unmounted(&mut scan, unmounted.as_deref());
 
     // Single-file target: one full breakdown.
     if scan.kind == TargetKind::File {
@@ -168,10 +174,6 @@ pub fn run_rules_test(
                 Err(e) => return json_error(&e),
             }
         } else {
-            if let Some(reason) = &unmounted {
-                nav_core::safe_println!("Disk image not mounted: {reason}");
-                nav_core::safe_println!();
-            }
             print_rules_test(result);
         }
         return exit::code(exit::for_result(result));
@@ -210,6 +212,24 @@ pub fn run_rules_test(
     }
 
     exit::code(exit::for_target(&scan))
+}
+
+/// Records `reason` as a coverage gap on a single-file target that carries
+/// the disk-image `uninspected-container` signal, so `--json` says why it was
+/// not mounted (§6.2, §8).
+fn note_unmounted(scan: &mut TargetScan, reason: Option<&str>) {
+    let (Some(reason), [result]) = (reason, scan.results.as_mut_slice()) else {
+        return;
+    };
+    let is_image = result
+        .signals
+        .iter()
+        .any(|s| s.id == UNINSPECTED_CONTAINER_ID && s.description.starts_with("disk image ("));
+    if is_image {
+        result.coverage_gaps.push(CoverageGap::NotMounted {
+            reason: reason.to_string(),
+        });
+    }
 }
 
 /// `navctl scan` for a mounted image: one line, member lines with

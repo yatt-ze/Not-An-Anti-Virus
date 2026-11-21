@@ -5,6 +5,10 @@ for the current document map. Newest first.
 
 ---
 
+**Changelog from v1.05 (2026-11-21):** An unmounted disk-image target now says why in its JSON (§8, §6.2, #208). `navctl scan --json x.dmg` printed one `Partial` object and gave the reason it was not mounted (no `hdiutil`, encrypted, size cap, mount failure, timeout) on stderr only. The reason is now a new `not-mounted` coverage gap with a `reason` field on that object, and `--no-mount` gives the reason `--no-mount`. Decided: a per-file gap rather than a target summary line, so a single-file target still gets no summary (#51); the field is additive, so `schema_version` stays `1`. Human `scan` keeps its stderr line, `--json` no longer prints it, and `rules test` shows the gap under `Scan completeness` instead of a separate line above the report.
+
+---
+
 **Changelog from v1.04 (2026-11-21):** Clippy now enforces terminal-safe output in `navctl` and `navd` (§8, #201). A per-crate `clippy.toml` disallows `println!`, `print!`, `eprintln!` and `eprint!`, so a raw std print can no longer bypass the `safe_*` / `raw_println!` macros and reach the terminal unsanitised. Decided: scoped to those two crates so `nav-core` and `xtask` need no allow-attributes; integration tests may still print directly (`navd/tests/scan_once.rs` opts out). No behaviour change.
 
 ---
