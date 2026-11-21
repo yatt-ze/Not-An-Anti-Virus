@@ -369,20 +369,43 @@ impl ScanContext {
             return false;
         }
 
-        let mut carry: Vec<u8> = Vec::new();
+        // A window is `[pos - carry, pos + want)`: borrowed from `content`
+        // while its chunk is held there, else assembled in `buf`, carry first.
+        let mut buf: Vec<u8> = Vec::new();
+        let mut prev_held: Option<&[u8]> = None;
+        let mut prev_len = 0usize;
+        let mut carry = 0usize;
         let mut pos = range.start;
         while pos < range.end {
             let want = STREAM_CHUNK.min((range.end - pos) as usize);
-            let Some(chunk) = self.read_at(pos, want) else {
-                return false;
+            let len = carry + want;
+            let window: &[u8] = match self.locate(pos, want) {
+                None => return false,
+                Some(Some(_)) => {
+                    // `content` is a prefix, so the carry before a held chunk is held too.
+                    let start = (pos - carry as u64) as usize;
+                    let held = &self.content.as_deref().unwrap_or_default()[start..start + len];
+                    prev_held = Some(held);
+                    held
+                }
+                Some(None) => {
+                    if buf.is_empty() {
+                        buf = vec![0u8; overlap + STREAM_CHUNK];
+                    }
+                    match prev_held.take() {
+                        Some(prev) => buf[..carry].copy_from_slice(&prev[prev.len() - carry..]),
+                        None => buf.copy_within(prev_len - carry..prev_len, 0),
+                    }
+                    if self.read_file_into(pos, &mut buf[carry..len]).is_none() {
+                        return false;
+                    }
+                    &buf[..len]
+                }
             };
-            let mut window = carry;
-            window.extend_from_slice(&chunk);
             pos += want as u64;
-            let is_last = pos == range.end;
-            f(&window, is_last);
-            let keep = overlap.min(window.len());
-            carry = window[window.len() - keep..].to_vec();
+            f(window, pos == range.end);
+            prev_len = len;
+            carry = overlap.min(len);
         }
         true
     }
@@ -855,6 +878,36 @@ mod tests {
         );
         assert_eq!(total_new_bytes, range.end - range.start);
 
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Windows crossing from the held prefix into file reads carry the right
+    /// bytes, and only chunks not wholly held are read from disk.
+    #[test]
+    fn windows_match_file_bytes() {
+        let len = MAX_CONTENT_BYTES + 3 * STREAM_CHUNK + 123;
+        let data: Vec<u8> = (0..len).map(|i| (i % 251) as u8).collect();
+        let path = write_temp_file("for-each-window-bytes", &data);
+        let ctx = ScanContext::load(&path);
+        let (start, overlap) = (5u64, 100usize);
+
+        let mut pos = start;
+        let mut carry = 0usize;
+        let mut from_disk = 0u64;
+        let ok = ctx.for_each_window(start..len as u64, overlap, |window, is_last| {
+            let want = window.len() - carry;
+            let from = pos as usize - carry;
+            assert_eq!(window, &data[from..pos as usize + want]);
+            if pos as usize + want > MAX_CONTENT_BYTES {
+                from_disk += want as u64;
+            }
+            pos += want as u64;
+            assert_eq!(is_last, pos == len as u64);
+            carry = overlap.min(window.len());
+        });
+        assert!(ok);
+        assert_eq!(pos, len as u64);
+        assert_eq!(ctx.bytes_read(), MAX_CONTENT_BYTES as u64 + from_disk);
         let _ = std::fs::remove_file(&path);
     }
 
