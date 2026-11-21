@@ -5,6 +5,7 @@
 //! `create` can leave its own temporary attach behind.
 #![cfg(target_os = "macos")]
 
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -413,6 +414,53 @@ fn the_scan_budget_applies_to_the_image() {
         stdout(&out)
     );
     assert!(stderr(&out).contains("max-files"), "{}", stderr(&out));
+    assert_no_scratch_path(&out);
+    sb.assert_clean();
+}
+
+/// A directory on the volume that can't be read (as with a denied
+/// removable-volume prompt, #187) makes the image `Partial`, never clean,
+/// and names the directory (§11.8).
+#[test]
+fn an_unreadable_directory_is_a_gap() {
+    let sb = Sandbox::new("unreadable");
+    let (rw, mnt, image) = (
+        sb.root.join("rw.dmg"),
+        sb.root.join("m"),
+        sb.root.join("locked.dmg"),
+    );
+    let run = |a: &str| assert!(hdiutil(&a.split(' ').map(os).collect::<Vec<_>>()), "{a}");
+    let (rw_s, mnt_s) = (rw.to_str().unwrap(), mnt.to_str().unwrap());
+    std::fs::create_dir(&mnt).unwrap();
+    run(&format!(
+        "create -quiet -size 2m -fs HFS+ -volname NavTest {rw_s}"
+    ));
+    run(&format!(
+        "attach -quiet -nobrowse -owners on -mountpoint {mnt_s} {rw_s}"
+    ));
+    std::fs::write(mnt.join("ok.txt"), "ok\n").unwrap();
+    std::fs::create_dir(mnt.join("locked")).unwrap();
+    std::fs::copy(DROPPER_SH, mnt.join("locked/dropper.sh")).unwrap();
+    std::fs::set_permissions(mnt.join("locked"), PermissionsExt::from_mode(0o000)).unwrap();
+    run(&format!("detach -quiet {mnt_s}"));
+    sb.wait_released();
+    run(&format!(
+        "convert -quiet -format UDZO -o {} {rw_s}",
+        image.display()
+    ));
+
+    let out = sb.navctl(&["scan"], &image);
+    assert_eq!(out.status.code(), Some(3), "{}", stderr(&out));
+    assert!(
+        stdout(&out).contains("not fully checked"),
+        "{}",
+        stdout(&out)
+    );
+    let err = stderr(&out);
+    assert!(
+        err.contains("could not be read") && err.contains("locked.dmg!locked"),
+        "{err}"
+    );
     assert_no_scratch_path(&out);
     sb.assert_clean();
 }
