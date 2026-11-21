@@ -75,7 +75,9 @@ fn a_plain_file_has_no_such_gap() {
     let file = dir.0.join("a.txt");
     std::fs::write(&file, "hello\n").unwrap();
     let v = first_object(&["scan", "--json", "--no-mount"], &file);
-    assert!(v["coverage_gaps"].as_array().unwrap().is_empty(), "{v}");
+    // Not `is_empty()`: off macOS, macOS-only rules add rule-not-applicable gaps.
+    let gaps = v["coverage_gaps"].as_array().unwrap();
+    assert!(gaps.iter().all(|g| g["kind"] != "not-mounted"), "{v}");
 }
 
 #[test]
