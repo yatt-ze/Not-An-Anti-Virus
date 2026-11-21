@@ -8,6 +8,14 @@
 //! it turns a file path into a `ScanResult` and owns that result's canonical
 //! presentation: the versioned `--json` envelope and the §8 exit-code
 //! mapping, so `navctl` and `navd` render one contract instead of two.
+//!
+//! Unix-only (macOS product, Linux CI): it uses `std::os::unix` and `libc`
+//! directly and does not build elsewhere.
+
+#![forbid(unsafe_code)]
+
+#[cfg(not(unix))]
+compile_error!("nav-core is unix-only");
 
 pub(crate) mod base64;
 pub(crate) mod budget;

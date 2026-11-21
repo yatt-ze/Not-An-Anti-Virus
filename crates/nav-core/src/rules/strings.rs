@@ -1375,7 +1375,6 @@ mod tests {
     /// Past `MAX_STREAM_BYTES`, `covers_truncation` declines and `evaluate`
     /// falls back to the 8 MiB prefix — a marker further in is missed, not
     /// discovered at the cost of streaming a huge file.
-    #[cfg(unix)]
     #[test]
     fn file_beyond_the_stream_cap_falls_back_to_prefix_only_scan() {
         let total_len = MAX_STREAM_BYTES + 1;
@@ -1515,8 +1514,7 @@ mod tests {
     }
 
     /// A context that looks file-backed but has no actual file handle (the
-    /// shape a non-unix platform's `read_at_file` always leaves, since it
-    /// never serves a real read either way) must not claim coverage — every
+    /// shape of a failed open) must not claim coverage — every
     /// streamed byte past `content` would in fact be unreachable (§5.2,
     /// #45).
     #[test]

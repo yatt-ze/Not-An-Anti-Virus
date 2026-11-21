@@ -48,7 +48,6 @@ impl ObjectIdentity {
         Some(Self::from_metadata(&std::fs::metadata(path).ok()?))
     }
 
-    #[cfg(unix)]
     fn from_metadata(md: &std::fs::Metadata) -> Self {
         use std::os::unix::fs::MetadataExt;
         Self {
@@ -57,23 +56,6 @@ impl ObjectIdentity {
             size: md.size(),
             mtime_secs: md.mtime(),
             mtime_nanos: md.mtime_nsec(),
-        }
-    }
-
-    #[cfg(not(unix))]
-    fn from_metadata(md: &std::fs::Metadata) -> Self {
-        let (secs, nanos) = md
-            .modified()
-            .ok()
-            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-            .map(|d| (d.as_secs() as i64, d.subsec_nanos() as i64))
-            .unwrap_or((0, 0));
-        Self {
-            dev: 0,
-            inode: 0,
-            size: md.len(),
-            mtime_secs: secs,
-            mtime_nanos: nanos,
         }
     }
 }
@@ -92,18 +74,15 @@ pub enum ContentSource {
 }
 
 /// Open `path` read-only and return the handle only if it is a regular file.
-/// On unix the open is `O_NONBLOCK`, so a FIFO swapped in after the walker's
-/// check can't block it; a FIFO, device or other non-regular file yields `None`,
-/// the same as an unreadable one (§11.7, §11.8).
+/// The open is `O_NONBLOCK`, so a FIFO swapped in after the walker's check
+/// can't block it; a FIFO, device or other non-regular file yields `None`, the
+/// same as an unreadable one (§11.7, §11.8).
 pub(crate) fn open_regular(path: &Path) -> Option<std::fs::File> {
+    use std::os::unix::fs::OpenOptionsExt;
     let mut opts = std::fs::OpenOptions::new();
     opts.read(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        // O_NOCTTY: a tty swapped in must not become our controlling terminal.
-        opts.custom_flags(libc::O_NONBLOCK | libc::O_NOCTTY);
-    }
+    // O_NOCTTY: a tty swapped in must not become our controlling terminal.
+    opts.custom_flags(libc::O_NONBLOCK | libc::O_NOCTTY);
     let f = opts.open(path).ok()?;
     f.metadata().ok()?.is_file().then_some(f)
 }
@@ -270,13 +249,11 @@ impl ScanContext {
     }
 
     /// True when [`Self::read_at`]/[`Self::for_each_window`] can actually
-    /// reach bytes past `content`: a real, opened file, on a platform with
-    /// an fd-based `read_at` ([`Self::read_at_file`] is unix-only). A rule
-    /// deciding whether it can stream/range-read past the prefix should
-    /// check this, not [`Self::is_file_backed`] alone — on a non-unix
-    /// platform the latter is true but every such read still fails.
+    /// reach bytes past `content`: a real, opened file. A rule deciding whether
+    /// it can stream/range-read past the prefix should check this, not
+    /// [`Self::is_file_backed`] alone.
     pub fn supports_ranged_reads(&self) -> bool {
-        cfg!(unix) && self.file.is_some()
+        self.file.is_some()
     }
 
     pub fn readable(&self) -> bool {
@@ -342,7 +319,6 @@ impl ScanContext {
 
     /// The disk read behind [`Self::read_file_into`], its allowance already
     /// spent.
-    #[cfg(unix)]
     fn read_spent_into(&self, offset: u64, buf: &mut [u8]) -> Option<()> {
         use std::os::unix::fs::FileExt;
         let file = self.file.as_ref()?;
@@ -350,11 +326,6 @@ impl ScanContext {
         self.bytes_read
             .fetch_add(buf.len() as u64, Ordering::Relaxed);
         file.read_exact_at(buf, offset).ok()
-    }
-
-    #[cfg(not(unix))]
-    fn read_spent_into(&self, _offset: u64, _buf: &mut [u8]) -> Option<()> {
-        None
     }
 
     /// Streams `range` to `f` as successive overlapping windows: each window
@@ -711,13 +682,13 @@ mod tests {
     }
 
     /// A real, opened file supports ranged reads; embedded content (no file
-    /// at all) never does, on any platform (§5.2, #45).
+    /// at all) never does (§5.2, #45).
     #[test]
     fn supports_ranged_reads_requires_an_actual_file_handle() {
         let path = write_temp_file("supports-ranged-reads", b"hello world");
         let ctx = ScanContext::load(&path);
         assert!(ctx.file.is_some());
-        assert_eq!(ctx.supports_ranged_reads(), cfg!(unix));
+        assert!(ctx.supports_ranged_reads());
         let _ = std::fs::remove_file(&path);
 
         let embedded = ScanContext::from_embedded_bytes("x.pkg!member", vec![1, 2, 3], false);
@@ -937,14 +908,13 @@ mod tests {
 
     /// A FIFO (e.g. swapped in after the walker's check) loads as unreadable
     /// instead of blocking the scan (§11.7, §11.8).
-    #[cfg(unix)]
     #[test]
     fn fifo_loads_unreadable() {
         let dir = std::env::temp_dir().join(format!("nav-fifo-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let fifo = dir.join("pipe");
-        let c = std::ffi::CString::new(fifo.to_str().unwrap()).unwrap();
-        assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
+        let made = std::process::Command::new("mkfifo").arg(&fifo).status();
+        assert!(made.unwrap().success());
         let (tx, rx) = std::sync::mpsc::channel();
         let p = fifo.clone();
         std::thread::spawn(move || {

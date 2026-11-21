@@ -481,7 +481,6 @@ mod tests {
 
     /// A non-UTF-8 path serializes lossily instead of failing; a UTF-8 path
     /// is emitted unchanged.
-    #[cfg(unix)]
     #[test]
     fn non_utf8_path_serializes_lossily() {
         use std::ffi::OsStr;

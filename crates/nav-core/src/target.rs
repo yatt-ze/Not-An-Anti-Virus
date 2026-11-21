@@ -883,21 +883,17 @@ mod tests {
         fs::create_dir(dir.path().join("real")).unwrap();
         fs::write(dir.path().join("real/x.txt"), b"x").unwrap();
 
-        #[cfg(unix)]
-        {
-            std::os::unix::fs::symlink(dir.path().join("real"), dir.path().join("link")).unwrap();
-            let scan = scan_target(dir.path(), true).unwrap();
-            // "real/x.txt" once, not also via "link/x.txt".
-            assert_eq!(scan.results.len(), 1);
-            assert_eq!(scan.not_walked.links_and_special, 1);
-            assert_eq!(scan.not_walked.links_outside, 0);
-            assert!(scan.coverage_complete());
-        }
+        std::os::unix::fs::symlink(dir.path().join("real"), dir.path().join("link")).unwrap();
+        let scan = scan_target(dir.path(), true).unwrap();
+        // "real/x.txt" once, not also via "link/x.txt".
+        assert_eq!(scan.results.len(), 1);
+        assert_eq!(scan.not_walked.links_and_special, 1);
+        assert_eq!(scan.not_walked.links_outside, 0);
+        assert!(scan.coverage_complete());
     }
 
     /// A link that points outside the target is counted apart (#159),
     /// dangling or not; a dangling link that stays inside is not.
-    #[cfg(unix)]
     #[test]
     fn counts_links_outside() {
         use std::os::unix::fs::symlink;
@@ -938,7 +934,6 @@ mod tests {
 
     /// A `chmod 000` subdirectory is recorded, not fatal: the rest of the
     /// target still scans and the target is reported partial (§11.8/§11.12).
-    #[cfg(unix)]
     #[test]
     fn unreadable_subdirectory_is_recorded_and_traversal_continues() {
         use std::os::unix::fs::PermissionsExt;
