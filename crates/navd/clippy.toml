@@ -1,0 +1,6 @@
+disallowed-macros = [
+    { path = "std::println", reason = "use nav_core::safe_println! (human output) or nav_core::raw_println! (JSON); see §8" },
+    { path = "std::print", reason = "use nav_core::safe_print!; see §8" },
+    { path = "std::eprintln", reason = "use nav_core::safe_eprintln!; see §8" },
+    { path = "std::eprint", reason = "use nav_core::safe_eprintln!; see §8" },
+]
