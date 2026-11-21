@@ -457,14 +457,18 @@ fn parse_attach(plist: &PlistValue, run: &Path) -> Attached {
                 if Path::new(mp).starts_with(run) {
                     out.volumes.push((out.candidates, PathBuf::from(mp)));
                 } else {
-                    out.gaps.push(
-                        "a volume mounted outside the scratch directory was not scanned".into(),
-                    );
+                    out.gaps.push(format!(
+                        "volume {} was mounted outside the scratch directory and not scanned",
+                        out.candidates
+                    ));
                 }
             }
             None if mountable == Some(true) => {
                 out.candidates += 1;
-                out.gaps.push("a volume on the image did not mount".into())
+                out.gaps.push(format!(
+                    "volume {} on the image did not mount",
+                    out.candidates
+                ))
             }
             None => {}
         }
