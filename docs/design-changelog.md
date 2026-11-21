@@ -5,6 +5,10 @@ for the current document map. Newest first.
 
 ---
 
+**Changelog from v1.04 (2026-11-21):** Clippy now enforces terminal-safe output in `navctl` and `navd` (§8, #201). A per-crate `clippy.toml` disallows `println!`, `print!`, `eprintln!` and `eprint!`, so a raw std print can no longer bypass the `safe_*` / `raw_println!` macros and reach the terminal unsanitised. Decided: scoped to those two crates so `nav-core` and `xtask` need no allow-attributes; integration tests may still print directly (`navd/tests/scan_once.rs` opts out). No behaviour change.
+
+---
+
 **Changelog from v1.03 (2026-11-21):** A closed stdout no longer panics `navctl` or `navd scan-once` (§8, #160). `navctl scan dir | head -1` exited 101 with a panic, because `println!` panics on EPIPE, and an early exit mid disk-image scan would skip the detach. All output now goes through non-panicking writes in `nav-core`: the `safe_*` macros for human output, and a new `raw_println!` for the `--json` lines. The first write error on a stream latches it closed and later writes are dropped, so the scan finishes and returns its normal exit code. Decided: not resetting SIGPIPE to the default, which would kill the process mid disk-image scan and leave the mount behind; stdout and stderr latch independently.
 
 ---

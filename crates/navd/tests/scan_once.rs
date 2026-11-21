@@ -3,6 +3,7 @@
 //! `navd` binary as a subprocess, the same way the B3 spike invokes it. The
 //! no-arg-routes-to-daemon invariant is covered separately, as a unit test
 //! on the arg dispatcher in `src/main.rs`.
+#![allow(clippy::disallowed_macros)] // tests may print skip notes directly
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
