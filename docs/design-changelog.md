@@ -5,6 +5,10 @@ for the current document map. Newest first.
 
 ---
 
+**Changelog from v1.10 (2026-11-21):** A revoked signing certificate keeps a binary `Partial` (§5.2, §11.8, §11.1a, #150). Measured in the benchmark VM: with one byte of a revoked binary's code flipped, `codesign` still reports only the revocation, so it never checks the code hashes, and `invalid-code-signature` cannot say the signature is intact. Decided by the user: no rule change, both signer-check rules stay `NotApplicable` on a revocation. The revocation answer itself depends on `codesign`'s cache (a cold first verify exited 0), so `malware compare` now runs a throwaway warm-up pass before the base and new scans, and mughthesec-01's expected result is now `no-action/partial`.
+
+---
+
 **Changelog from v1.09 (2026-11-21):** Cross-platform `nav-core` is recorded as an open decision (§3, §14, #218). §3 now states the platform position: NAV is a macOS product, and `nav-core` is Unix-only (macOS, plus Linux for CI). §14 records the user's wish to keep a cross-platform `nav-core` possible: Linux first-class, perhaps Windows later. It also sets the prerequisite, a platform-aware rule set that drops rules meaningless on the running OS but still reports a gap for a check that matters to the file and cannot run there (§11.8).
 
 ---
