@@ -231,6 +231,13 @@ pub fn scan_target_with_budget(
         });
     }
 
+    if !meta.is_dir() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "not a regular file or directory",
+        ));
+    }
+
     let walk = collect_files(path, recursive, budget)?;
     let (results, byte_limit, _) = scan_within_bytes(&walk.files, budget);
     Ok(TargetScan {
