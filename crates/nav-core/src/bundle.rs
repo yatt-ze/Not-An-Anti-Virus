@@ -63,8 +63,7 @@ fn executable_from_info_plist(contents: &Path) -> Option<PathBuf> {
         return None;
     }
     let mut buf = Vec::new();
-    std::fs::File::open(&info)
-        .ok()?
+    crate::context::open_regular(&info)?
         .take(MAX_INFO_PLIST_BYTES)
         .read_to_end(&mut buf)
         .ok()?;
@@ -144,7 +143,7 @@ fn starts_as_plist(path: &Path) -> bool {
     if !is_real_file(path) {
         return false;
     }
-    let Ok(file) = std::fs::File::open(path) else {
+    let Some(file) = crate::context::open_regular(path) else {
         return false;
     };
     let mut head = Vec::with_capacity(8);
