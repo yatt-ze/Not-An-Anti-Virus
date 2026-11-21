@@ -91,6 +91,22 @@ pub enum ContentSource {
     Embedded,
 }
 
+/// Open `path` read-only and return the handle only if it is a regular file.
+/// On unix the open is `O_NONBLOCK`, so a FIFO swapped in after the walker's
+/// check can't block it; a FIFO, device or other non-regular file yields `None`,
+/// the same as an unreadable one (§11.7, §11.8).
+pub(crate) fn open_regular(path: &Path) -> Option<std::fs::File> {
+    let mut opts = std::fs::OpenOptions::new();
+    opts.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.custom_flags(libc::O_NONBLOCK);
+    }
+    let f = opts.open(path).ok()?;
+    f.metadata().ok()?.is_file().then_some(f)
+}
+
 pub struct ScanContext {
     /// The file this content came from, or — when `source` is
     /// [`ContentSource::Embedded`] — a display label that names nothing on
@@ -167,7 +183,7 @@ impl ScanContext {
         };
         // Identity and length come from the *opened* handle, and the bytes are
         // read through it, so a pre-open `stat` can't be raced (§11.7).
-        let Ok(mut f) = std::fs::File::open(path) else {
+        let Some(mut f) = open_regular(path) else {
             return Some(unreadable());
         };
         let Ok(md) = f.metadata() else {
@@ -918,6 +934,27 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
+    /// A FIFO (e.g. swapped in after the walker's check) loads as unreadable
+    /// instead of blocking the scan (§11.7, §11.8).
+    #[cfg(unix)]
+    #[test]
+    fn fifo_loads_unreadable() {
+        let dir = std::env::temp_dir().join(format!("nav-fifo-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let fifo = dir.join("pipe");
+        let c = std::ffi::CString::new(fifo.to_str().unwrap()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let p = fifo.clone();
+        std::thread::spawn(move || {
+            let ctx = ScanContext::load(&p);
+            let _ = tx.send((ctx.content.is_none(), ctx.file_len.is_none()));
+        });
+        let got = rx.recv_timeout(std::time::Duration::from_secs(10));
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(got, Ok((true, true)));
+    }
+
     fn load_with(path: &Path, allowance: u64) -> ScanContext {
         ScanContext::load_if(path, allowance, |_| true).unwrap()
     }
@@ -982,28 +1019,16 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
-    /// The prefix is read to EOF whatever the stat'd length says: a FIFO
-    /// reports 0 but has content.
-    #[cfg(unix)]
+    /// The prefix is read to EOF whatever the stat'd length says: a procfs
+    /// file is regular, reports 0, and has content.
+    #[cfg(target_os = "linux")]
     #[test]
     fn the_prefix_is_read_past_a_zero_stat_length() {
-        let dir = std::env::temp_dir().join(format!(
-            "nav-fifo-{}-{:?}",
-            std::process::id(),
-            std::thread::current().id()
-        ));
-        let _ = std::fs::remove_file(&dir);
-        let made = std::process::Command::new("mkfifo").arg(&dir).status();
-        if !made.is_ok_and(|s| s.success()) {
-            return; // no mkfifo here: nothing to test
-        }
-        let fifo = dir.clone();
-        let writer = std::thread::spawn(move || std::fs::write(fifo, b"piped content"));
-        let ctx = load_with(&dir, 1 << 20);
-        writer.join().unwrap().unwrap();
-        let _ = std::fs::remove_file(&dir);
-        assert_eq!(ctx.content.as_deref(), Some(&b"piped content"[..]));
-        assert_eq!(ctx.bytes_read(), 13);
+        let ctx = load_with(Path::new("/proc/self/status"), 1 << 20);
+        assert_eq!(ctx.file_len, Some(0));
+        let content = ctx.content.as_deref().unwrap();
+        assert!(content.starts_with(b"Name:"));
+        assert_eq!(ctx.bytes_read(), content.len() as u64);
         assert!(!ctx.allowance_hit());
     }
 
