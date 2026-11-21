@@ -119,6 +119,8 @@ pub struct ScanContext {
     /// Memoized signer check (`codesign --verify --all-architectures
     /// -R=...`, §5.2): exit code and stderr. `None` as for the caches above.
     pub(crate) signer_check_cache: OnceLock<Option<(Option<i32>, String)>>,
+    /// Memoized strict Apple-anchor check exit code (§5.2, #106).
+    pub(crate) strict_anchor_cache: OnceLock<Option<i32>>,
     /// Memoized offset-based Mach-O scan (§5.2, #45) — several rules ask
     /// about the same file. `pub(crate)` for the same reason as the caches
     /// above; use [`ScanContext::macho`] to read it.
@@ -232,6 +234,7 @@ impl ScanContext {
             codesign_dv_cache: OnceLock::new(),
             spctl_cache: OnceLock::new(),
             signer_check_cache: OnceLock::new(),
+            strict_anchor_cache: OnceLock::new(),
             macho_cache: OnceLock::new(),
             zip_cache: OnceLock::new(),
             zip_format_cache: OnceLock::new(),
@@ -442,6 +445,15 @@ impl ScanContext {
         self.signer_check_cache
             .get_or_init(|| self.spawn_if_object_stable(spawn))
             .clone()
+    }
+
+    /// Runs `spawn` at most once per scan and returns the cached strict
+    /// Apple-anchor check exit code. `None` on the same terms as
+    /// [`Self::codesign_dv`].
+    pub fn strict_anchor_check(&self, spawn: impl FnOnce() -> Option<i32>) -> Option<i32> {
+        *self
+            .strict_anchor_cache
+            .get_or_init(|| self.spawn_if_object_stable(spawn))
     }
 
     /// Run a path-based external check bound to the scanned object's identity,
@@ -672,6 +684,22 @@ mod tests {
             None
         );
 
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Two rules ask for the strict anchor check; `codesign` runs once (#106).
+    #[test]
+    fn anchor_check_spawns_once() {
+        let path = write_temp_file("anchor-once", b"bytes");
+        let ctx = ScanContext::load(&path);
+        let spawns = std::cell::Cell::new(0);
+        let spawn = || {
+            spawns.set(spawns.get() + 1);
+            Some(0)
+        };
+        assert_eq!(ctx.strict_anchor_check(spawn), Some(0));
+        assert_eq!(ctx.strict_anchor_check(spawn), Some(0));
+        assert_eq!(spawns.get(), 1);
         let _ = std::fs::remove_file(&path);
     }
 
