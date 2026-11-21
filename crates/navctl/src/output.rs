@@ -101,7 +101,7 @@ pub fn run_scan(
     for result in &scan.results {
         if json {
             match with_schema_version(result) {
-                Ok(v) => println!("{v}"),
+                Ok(v) => nav_core::raw_println!("{v}"),
                 Err(e) => return json_error(&e),
             }
         } else if !bundle_line || verbose {
@@ -164,7 +164,7 @@ pub fn run_rules_test(
         let result = &scan.results[0];
         if json {
             match with_schema_version(result).and_then(|v| serde_json::to_string_pretty(&v)) {
-                Ok(s) => println!("{s}"),
+                Ok(s) => nav_core::raw_println!("{s}"),
                 Err(e) => return json_error(&e),
             }
         } else {
@@ -219,7 +219,7 @@ fn render_image_scan(report: &ImageReport, json: bool, verbose: bool) -> ExitCod
     for result in &scan.results {
         if json {
             match with_schema_version(result) {
-                Ok(v) => println!("{v}"),
+                Ok(v) => nav_core::raw_println!("{v}"),
                 Err(e) => return json_error(&e),
             }
         } else if verbose {
@@ -564,7 +564,7 @@ fn print_multi_json(
     scan: &TargetScan,
     image: Option<&ImageReport>,
 ) -> Result<(), serde_json::Error> {
-    println!(
+    nav_core::raw_println!(
         "{}",
         serde_json::to_string_pretty(&multi_json(scan, image)?)?
     );
@@ -576,7 +576,7 @@ fn print_scan_summary_json(
     scan: &TargetScan,
     image: Option<&ImageReport>,
 ) -> Result<(), serde_json::Error> {
-    println!("{}", scan_summary_json(scan, image)?);
+    nav_core::raw_println!("{}", scan_summary_json(scan, image)?);
     Ok(())
 }
 
