@@ -5,6 +5,10 @@ for the current document map. Newest first.
 
 ---
 
+**Changelog from v1.07 (2026-11-21):** Disk-image volume labels are now stable between runs (§6.2, §11.1, #178). `x.dmg!N/...` numbered volumes in the order `hdiutil attach -plist` listed `system-entities`, which varies. Decided: `N` is the position among the image's volume entities (mounted, mounted elsewhere, or potentially-mountable but unmounted) sorted by `dev-entry` (disk, then slice, numerically), so a volume that failed to mount keeps its number and the others do not shift; an entity with a missing or odd `dev-entry` sorts after the rest in listing order. A single mounted volume among several candidates is therefore still labelled `!N/`. No JSON schema change.
+
+---
+
 **Changelog from v1.06 (2026-11-21):** `navctl scan` on an empty directory exits 3, not 4 (§8, §11.8, #29). `scan` returned `OPERATIONAL_ERROR` for a readable directory with no files while `rules test` and `navd scan-once` returned `INDETERMINATE`; "nothing to inspect" is a failure to check, not a tool failure, so `scan` now matches. Decided: no shared helper, since the decision is one line at each call site; stderr now reads `no files to scan under` in both commands. No JSON change.
 
 ---
