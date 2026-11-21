@@ -1756,7 +1756,6 @@ mod tests {
         assert_eq!(parse_spctl_source(out), Some("Unnotarized Developer ID"));
     }
 
-    #[cfg(unix)]
     mod tool_captures {
         use super::*;
         use std::os::unix::process::ExitStatusExt;
