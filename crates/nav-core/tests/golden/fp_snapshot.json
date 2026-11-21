@@ -806,6 +806,16 @@
     ],
     "completeness": "complete"
   },
+  "suspicious/macho_rpath_install_command": {
+    "score": 23,
+    "recommendation": "notify",
+    "rule_ids": [
+      "macho-loader-anomaly",
+      "suspicious-strings",
+      "unsigned-binary"
+    ],
+    "completeness": "complete"
+  },
   "suspicious/macho_self_signed_corrupt_cms": {
     "score": 5,
     "recommendation": "no-action",
@@ -912,15 +922,6 @@
     "recommendation": "notify",
     "rule_ids": [
       "suspicious-strings"
-    ],
-    "completeness": "complete"
-  },
-  "suspicious/unsigned_macho_install_command": {
-    "score": 18,
-    "recommendation": "notify",
-    "rule_ids": [
-      "suspicious-strings",
-      "unsigned-binary"
     ],
     "completeness": "complete"
   }
