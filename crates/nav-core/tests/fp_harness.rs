@@ -557,7 +557,9 @@ fn golden_path() -> PathBuf {
 /// snapshot differently than on the real target platform (roadmap.md §12
 /// treats a golden-file format as Phase 0a scaffolding, on the assumption
 /// it's evaluated where NAV actually runs). The three tests above stay
-/// cross-platform since they don't depend on exact scores.
+/// cross-platform since they don't depend on exact scores. No Linux golden
+/// is kept on purpose: it would double the snapshot to maintain, and the
+/// macOS CI runner catches score movement (revisit with #218).
 ///
 /// To regenerate after an intentional rule change, review the resulting
 /// `git diff` before committing:
