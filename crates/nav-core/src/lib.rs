@@ -12,6 +12,8 @@
 //! Unix-only (macOS product, Linux CI): it uses `std::os::unix` and `libc`
 //! directly and does not build elsewhere.
 
+#![forbid(unsafe_code)]
+
 #[cfg(not(unix))]
 compile_error!("nav-core is unix-only");
 

@@ -12,6 +12,8 @@
 //! always name the canonical system paths — a real launchd never sees the
 //! prefix, and pinning them keeps the golden file stable.
 
+#![forbid(unsafe_code)]
+
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};

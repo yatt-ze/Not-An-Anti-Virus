@@ -949,12 +949,18 @@ fn set_signal_handlers(handler: libc::sighandler_t) {
     for sig in [libc::SIGINT, libc::SIGTERM, libc::SIGHUP] {
         // SAFETY: a zeroed sigaction is valid; `on_signal` only does an
         // atomic store, which is async-signal-safe.
-        unsafe {
+        let rc = unsafe {
             let mut sa: libc::sigaction = std::mem::zeroed();
             sa.sa_sigaction = handler;
             sa.sa_flags = libc::SA_RESTART;
             libc::sigemptyset(&mut sa.sa_mask);
-            libc::sigaction(sig, &sa, std::ptr::null_mut());
+            libc::sigaction(sig, &sa, std::ptr::null_mut())
+        };
+        if rc != 0 {
+            nav_core::safe_eprintln!(
+                "navctl: could not set a handler for signal {sig}: {}",
+                std::io::Error::last_os_error()
+            );
         }
     }
 }

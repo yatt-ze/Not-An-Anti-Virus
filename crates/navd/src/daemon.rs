@@ -26,12 +26,22 @@ extern "C" fn on_terminate(_signum: libc::c_int) {
 }
 
 fn install_signal_handlers() {
-    let handler = on_terminate as extern "C" fn(libc::c_int) as libc::sighandler_t;
-    // SAFETY: the handler only performs an atomic store, which is
-    // async-signal-safe; installing it has no other precondition.
-    unsafe {
-        libc::signal(libc::SIGTERM, handler);
-        libc::signal(libc::SIGINT, handler);
+    for sig in [libc::SIGTERM, libc::SIGINT] {
+        // SAFETY: a zeroed sigaction is valid; the handler only performs an
+        // atomic store, which is async-signal-safe.
+        let rc = unsafe {
+            let mut sa: libc::sigaction = std::mem::zeroed();
+            sa.sa_sigaction = on_terminate as extern "C" fn(libc::c_int) as libc::sighandler_t;
+            sa.sa_flags = libc::SA_RESTART;
+            libc::sigemptyset(&mut sa.sa_mask);
+            libc::sigaction(sig, &sa, std::ptr::null_mut())
+        };
+        if rc != 0 {
+            nav_core::safe_eprintln!(
+                "navd: could not install a handler for signal {sig}: {}",
+                std::io::Error::last_os_error()
+            );
+        }
     }
 }
 
