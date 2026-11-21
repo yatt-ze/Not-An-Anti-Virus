@@ -12,7 +12,7 @@ use crate::target::TargetScan;
 
 /// Version of the scan `--json` output shape (§8). Bump on any breaking
 /// change to the emitted fields — scripts key off this to detect drift.
-pub const SCAN_JSON_SCHEMA_VERSION: u32 = 1;
+pub const SCAN_JSON_SCHEMA_VERSION: u32 = 2;
 
 /// Serializes `value` to a JSON object with `schema_version` merged in.
 /// `value` must serialize to a JSON object (every current caller does).
@@ -340,7 +340,7 @@ mod tests {
             "a fully covered clean target exits clean"
         );
         assert_eq!(
-            for_target(&mk(BudgetOutcome::Exhausted(BudgetLimit::Files))),
+            for_target(&mk(BudgetOutcome::Exhausted(BudgetLimit::Files.into()))),
             INDETERMINATE,
             "a target cut short by the budget is indeterminate, not clean"
         );
@@ -452,7 +452,7 @@ mod tests {
             unreadable: Vec::new(),
             not_walked: Default::default(),
             results: vec![high_risk],
-            budget: BudgetOutcome::Exhausted(BudgetLimit::Files),
+            budget: BudgetOutcome::Exhausted(BudgetLimit::Files.into()),
         };
         assert_eq!(for_target(&scan), HIGH_RISK);
     }

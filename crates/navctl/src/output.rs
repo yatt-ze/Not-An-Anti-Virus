@@ -16,9 +16,9 @@ use nav_core::model::lossy_path;
 use std::process::ExitCode;
 
 use nav_core::{
-    not_walked_notes, scan_target_with_budget, with_schema_version, BudgetLimit, BudgetOutcome,
-    CoverageGap, EvidenceConfidence, Recommendation, ScanBudget, ScanCompleteness, ScanResult,
-    TargetKind, TargetScan, SCAN_JSON_SCHEMA_VERSION, UNINSPECTED_CONTAINER_ID,
+    not_walked_notes, scan_target_with_budget, with_schema_version, BudgetLimit, BudgetLimits,
+    BudgetOutcome, CoverageGap, EvidenceConfidence, Recommendation, ScanBudget, ScanCompleteness,
+    ScanResult, TargetKind, TargetScan, SCAN_JSON_SCHEMA_VERSION, UNINSPECTED_CONTAINER_ID,
 };
 
 use crate::diskimage::{self, ImageReport, ImageScan};
@@ -647,7 +647,7 @@ fn target_json(
         "primary": scan.primary.as_ref().map(lossy_path::to_value),
         "skipped_resources": paths(&scan.skipped),
         "coverage_complete": scan.coverage_complete() && gaps_ok,
-        "budget_limit": budget_limit_str(scan),
+        "budget_limits": budget_labels(scan),
         "unreadable": paths(&scan.unreadable),
         "subdirs_not_entered": scan.not_walked.subdirs,
         "links_and_special_not_followed": scan.not_walked.links_and_special,
@@ -667,9 +667,9 @@ fn target_json(
 fn budget_note(scan: &TargetScan) -> Option<String> {
     match scan.budget {
         BudgetOutcome::Within => None,
-        BudgetOutcome::Exhausted(limit) => Some(format!(
+        BudgetOutcome::Exhausted(limits) => Some(format!(
             "  [PARTIAL COVERAGE: scan budget reached ({}) — more of this target was not scanned]",
-            budget_limit_label(limit)
+            limit_labels(limits).join(", ")
         )),
     }
 }
@@ -678,9 +678,9 @@ fn budget_note(scan: &TargetScan) -> Option<String> {
 /// scan fit its budget (§11.12).
 fn budget_warning(scan: &TargetScan, path: &Path) -> Option<String> {
     match scan.budget {
-        BudgetOutcome::Exhausted(limit) => Some(format!(
+        BudgetOutcome::Exhausted(limits) => Some(format!(
             "navctl: partial coverage — scan budget reached ({}); more of {} was not scanned",
-            budget_limit_label(limit),
+            limit_labels(limits).join(", "),
             path.display()
         )),
         BudgetOutcome::Within => None,
@@ -743,12 +743,17 @@ fn unreadable_coverage_note(scan: &TargetScan) -> Option<String> {
     ))
 }
 
-/// Machine-readable budget-limit tag for `--json`, or `None` if within budget.
-fn budget_limit_str(scan: &TargetScan) -> Option<&'static str> {
+/// Labels of every budget limit `scan` hit, in declaration order; empty
+/// when within budget.
+fn budget_labels(scan: &TargetScan) -> Vec<&'static str> {
     match scan.budget {
-        BudgetOutcome::Within => None,
-        BudgetOutcome::Exhausted(limit) => Some(budget_limit_label(limit)),
+        BudgetOutcome::Within => Vec::new(),
+        BudgetOutcome::Exhausted(limits) => limit_labels(limits),
     }
+}
+
+fn limit_labels(limits: BudgetLimits) -> Vec<&'static str> {
+    limits.iter().map(budget_limit_label).collect()
 }
 
 fn budget_limit_label(limit: BudgetLimit) -> &'static str {
@@ -890,7 +895,7 @@ mod tests {
             "a fully covered clean target exits clean"
         );
         assert_eq!(
-            exit::for_target(&mk(BudgetOutcome::Exhausted(BudgetLimit::Files))),
+            exit::for_target(&mk(BudgetOutcome::Exhausted(BudgetLimit::Files.into()))),
             exit::INDETERMINATE,
             "a target cut short by the budget is indeterminate, not clean"
         );
@@ -1016,7 +1021,7 @@ mod tests {
     fn bundle_line_with_incomplete_coverage_is_not_clean() {
         let scan = bundle(
             vec![member(MAIN, 0, ScanCompleteness::Complete)],
-            BudgetOutcome::Exhausted(BudgetLimit::Files),
+            BudgetOutcome::Exhausted(BudgetLimit::Files.into()),
         );
         let line = bundle_summary_line(&scan);
         assert!(line.contains("not fully checked"), "{line}");
@@ -1107,12 +1112,27 @@ mod tests {
                 member(MAIN, 0, ScanCompleteness::Complete),
                 member(EVIL, 0, ScanCompleteness::Complete),
             ],
-            BudgetOutcome::Exhausted(BudgetLimit::Files),
+            BudgetOutcome::Exhausted(BudgetLimit::Files.into()),
         );
         let line = bundle_summary_line(&scan);
         assert!(line.contains("completeness=Partial"), "{line}");
         assert!(!line.contains("completeness=Complete"), "{line}");
         assert!(!line.contains("worst:"), "{line}");
+    }
+
+    #[test]
+    fn budget_note_lists_every_limit() {
+        let scan = bundle(
+            vec![member(MAIN, 0, ScanCompleteness::Complete)],
+            BudgetOutcome::Exhausted([BudgetLimit::TotalBytes, BudgetLimit::Files].into()),
+        );
+        let note = budget_note(&scan).unwrap();
+        assert!(note.contains("(max-files, max-total-bytes)"), "{note}");
+        let warning = budget_warning(&scan, &scan.root).unwrap();
+        assert!(
+            warning.contains("(max-files, max-total-bytes)"),
+            "{warning}"
+        );
     }
 
     #[test]
