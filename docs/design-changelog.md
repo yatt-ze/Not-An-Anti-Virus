@@ -5,6 +5,10 @@ for the current document map. Newest first.
 
 ---
 
+**Changelog from v1.13 (2026-11-21):** A launchd job that repeats a key with differing values scores 8 in `launchd-persistence-plist` (§5.2, #192). launchd runs the last occurrence while CoreFoundation, and so `plutil`, shows the first in a binary plist, so such a job can show an analyst one program and run another (#183). Any dict in the job counts, so a repeated `EnvironmentVariables` entry does too. Identical repeats score nothing: a survey of 903 launchd plists and 2,706 `Info.plist`s found 17 repeats, all identical, and none differing. The weight is corroboration-only (§5.1): alone it stays below Notify, and with `RunAtLoad` + `KeepAlive` (8) it reaches 16. Decided by the user: implement once the survey showed no benign differing repeats. `Info.plist` is not scored for it.
+
+---
+
 **Changelog from v1.12 (2026-11-21):** A target scan reports every scan-budget limit it hit, not one (§8, §11.12, #105). The walk kept only the last collection limit (a later `max-files` stop overwrote `max-depth`), and a precedence rule then picked one of that and `max-total-bytes`, so a scan cut short by several limits named only one and raising that flag alone could still leave coverage partial. `BudgetOutcome::Exhausted` now carries the set. In the `scan --json` target summary, `budget_limit` (a label or `null`) is replaced by `budget_limits`, an array of labels in declaration order (`max-files`, `max-total-bytes`, `max-depth`, `max-entries`), `[]` within budget, and `schema_version` becomes `2`. Per-file objects are unchanged, so `xtask corpus`/`malware compare` accept versions 1 and 2. The human notes list every limit, comma-separated. Decided by the user: replace the field with an array and bump schema_version to 2.
 
 ---

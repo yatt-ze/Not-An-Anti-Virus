@@ -10,6 +10,7 @@
 //! independent evidence families under §5.1 (NAV-002). `BehavioralConcern` is
 //! reserved for `navd`'s runtime event pipeline (§5.3, Phase 2).
 
+use std::collections::hash_map::{Entry, HashMap};
 use std::path::Path;
 
 use super::{Rule, RuleOutcome};
@@ -23,6 +24,11 @@ const MAX_WEIGHT: i32 = 30;
 /// A `StartInterval` shorter than this (seconds) reads as beaconing rather
 /// than a normal periodic maintenance job.
 const SHORT_INTERVAL_SECS: i64 = 300;
+/// A key repeated with differing values: corroboration-only, since alone it
+/// stays below Notify (§5.2, #192).
+const DIFFERING_REPEAT_WEIGHT: i32 = 8;
+/// Longest repeated key name quoted in the description.
+const MAX_KEY_CHARS: usize = 64;
 
 pub struct LaunchdPersistenceRule;
 
@@ -104,6 +110,13 @@ impl Rule for LaunchdPersistenceRule {
             findings.push((
                 6,
                 format!("StartInterval {secs}s (< 5 min) — possible beaconing"),
+            ));
+        }
+        if let Some(key) = differing_repeat(&parsed) {
+            let key: String = key.chars().take(MAX_KEY_CHARS).collect();
+            findings.push((
+                DIFFERING_REPEAT_WEIGHT,
+                format!("key '{key}' repeated with differing values (tools may disagree on which applies)"),
             ));
         }
         // Location heuristics need a real path — container-extracted content's
@@ -223,6 +236,49 @@ impl<'a> LaunchdJob<'a> {
     fn short_start_interval(&self) -> Option<i64> {
         self.start_interval
             .filter(|&n| n > 0 && n < SHORT_INTERVAL_SECS)
+    }
+}
+
+/// The first key, in any dict of `v`, that a dict repeats with differing
+/// values. Identical repeats return `None`: they carry no differential.
+fn differing_repeat(v: &PlistValue) -> Option<&str> {
+    match v {
+        PlistValue::Dict(entries) => {
+            let mut seen: HashMap<&str, &PlistValue> = HashMap::with_capacity(entries.len());
+            for (k, val) in entries {
+                match seen.entry(k.as_str()) {
+                    Entry::Occupied(first) if !same_value(first.get(), val) => {
+                        return Some(k.as_str());
+                    }
+                    Entry::Occupied(_) => {}
+                    Entry::Vacant(slot) => {
+                        slot.insert(val);
+                    }
+                }
+            }
+            entries.iter().find_map(|(_, val)| differing_repeat(val))
+        }
+        PlistValue::Array(items) => items.iter().find_map(differing_repeat),
+        _ => None,
+    }
+}
+
+/// Structural equality with floats compared by bits, so a repeated NaN counts
+/// as identical.
+fn same_value(a: &PlistValue, b: &PlistValue) -> bool {
+    use PlistValue::*;
+    match (a, b) {
+        (Real(x), Real(y)) | (Date(x), Date(y)) => x.to_bits() == y.to_bits(),
+        (Array(x), Array(y)) => {
+            x.len() == y.len() && x.iter().zip(y).all(|(a, b)| same_value(a, b))
+        }
+        (Dict(x), Dict(y)) => {
+            x.len() == y.len()
+                && x.iter()
+                    .zip(y)
+                    .all(|((ka, va), (kb, vb))| ka == kb && same_value(va, vb))
+        }
+        _ => a == b,
     }
 }
 
@@ -513,8 +569,51 @@ mod tests {
         </dict></plist>"#;
         let want = eval(path, last_only).unwrap().expect("should fire");
         let got = eval(path, repeated).unwrap().expect("should fire");
-        assert_eq!(got.weight, want.weight);
-        assert_eq!(got.description, want.description);
+        assert_eq!(got.weight, want.weight + DIFFERING_REPEAT_WEIGHT);
+        assert!(got.description.starts_with(&want.description));
+    }
+
+    #[test]
+    fn differing_repeats_corroborate() {
+        let path = "/Users/x/Library/LaunchAgents/com.example.helper.plist";
+        let differing = br#"<plist version="1.0"><dict>
+            <key>Label</key><string>com.example.helper</string>
+            <key>Program</key><string>/usr/local/bin/helper</string>
+            <key>Program</key><string>/usr/local/bin/other</string>
+        </dict></plist>"#;
+        let sig = eval(path, differing).unwrap().expect("should fire");
+        assert_eq!(sig.weight, DIFFERING_REPEAT_WEIGHT);
+        assert!(sig.description.contains("key 'Program' repeated"));
+
+        let nested = br#"<plist version="1.0"><dict>
+            <key>Label</key><string>com.example.helper</string>
+            <key>Program</key><string>/usr/local/bin/helper</string>
+            <key>EnvironmentVariables</key><dict>
+                <key>DYLD_INSERT_LIBRARIES</key><string></string>
+                <key>DYLD_INSERT_LIBRARIES</key><string>/tmp/x.dylib</string>
+            </dict>
+        </dict></plist>"#;
+        let sig = eval(path, nested).unwrap().expect("should fire");
+        assert!(sig.description.contains("DYLD_INSERT_LIBRARIES"));
+    }
+
+    #[test]
+    fn a_repeated_nan_is_identical() {
+        let nan = PlistValue::Real(f64::NAN);
+        let dict = PlistValue::Dict(vec![("X".into(), nan.clone()), ("X".into(), nan)]);
+        assert_eq!(differing_repeat(&dict), None);
+    }
+
+    #[test]
+    fn identical_repeats_score_nothing() {
+        let path = "/Users/x/Library/LaunchAgents/com.example.helper.plist";
+        let same = br#"<plist version="1.0"><dict>
+            <key>Label</key><string>com.example.helper</string>
+            <key>Program</key><string>/usr/local/bin/helper</string>
+            <key>EnablePressuredExit</key><true/>
+            <key>EnablePressuredExit</key><true/>
+        </dict></plist>"#;
+        assert!(eval(path, same).unwrap().is_none());
     }
 
     #[test]
