@@ -253,3 +253,25 @@ fn file_scan_has_no_summary() {
     assert_eq!(lines.len(), 1);
     assert!(lines[0].get("kind").is_none());
 }
+
+/// #29: a readable empty directory is indeterminate (exit 3) for both commands.
+#[test]
+fn empty_dir_indeterminate() {
+    let dir = TempDir::new("empty-dir");
+    for args in [
+        &["scan"][..],
+        &["scan", "--json"],
+        &["rules", "test"],
+        &["rules", "test", "--json"],
+    ] {
+        let out = navctl(args, dir.path());
+        assert_eq!(out.status.code(), Some(3), "{args:?}");
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(err.contains("no files to scan under"), "{args:?}: {err}");
+    }
+    // `scan --json` still prints its target summary, with zero files.
+    let out = navctl(&["scan", "--json"], dir.path());
+    let lines = json_lines(&out);
+    assert_eq!(lines.len(), 1);
+    assert_eq!(lines[0]["files"], 0);
+}
