@@ -72,7 +72,8 @@ fn benign_file_scans_clean_and_json_carries_the_shared_contract() {
     // macOS-only and report `NotApplicable` elsewhere, capping completeness
     // at `Partial` off-macOS (§10) — asserted per-platform below.
     let value = json_line(&out.stdout);
-    assert_eq!(value["schema_version"], 1);
+    // A literal, so an accidental schema bump fails here (§8).
+    assert_eq!(value["schema_version"], 2);
     assert_eq!(value["recommendation"], "no-action");
 
     #[cfg(target_os = "macos")]

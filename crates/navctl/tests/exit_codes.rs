@@ -210,8 +210,12 @@ fn dir_scan_ends_with_summary() {
     assert!(files.iter().all(|f| f.get("kind").is_none()));
     assert_eq!(summary["kind"], "directory");
     assert_eq!(summary["files"], 2);
-    assert_eq!(summary["schema_version"], 1);
+    assert_eq!(
+        summary["schema_version"],
+        nav_core::SCAN_JSON_SCHEMA_VERSION
+    );
     assert!(summary["coverage_complete"].is_boolean());
+    assert_eq!(summary["budget_limits"], serde_json::json!([]));
     assert!(summary.get("results").is_none());
 }
 
@@ -226,7 +230,7 @@ fn budget_stop_in_summary() {
     let summary = lines.last().unwrap();
     assert_eq!(summary["files"], 1);
     assert_eq!(summary["coverage_complete"], false);
-    assert_eq!(summary["budget_limit"], "max-files");
+    assert_eq!(summary["budget_limits"], serde_json::json!(["max-files"]));
 }
 
 /// #51: a budget that admits no file still prints the summary, `files: 0`.

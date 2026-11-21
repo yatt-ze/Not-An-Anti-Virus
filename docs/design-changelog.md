@@ -5,6 +5,10 @@ for the current document map. Newest first.
 
 ---
 
+**Changelog from v1.12 (2026-11-21):** A target scan reports every scan-budget limit it hit, not one (§8, §11.12, #105). The walk kept only the last collection limit (a later `max-files` stop overwrote `max-depth`), and a precedence rule then picked one of that and `max-total-bytes`, so a scan cut short by several limits named only one and raising that flag alone could still leave coverage partial. `BudgetOutcome::Exhausted` now carries the set. In the `scan --json` target summary, `budget_limit` (a label or `null`) is replaced by `budget_limits`, an array of labels in declaration order (`max-files`, `max-total-bytes`, `max-depth`, `max-entries`), `[]` within budget, and `schema_version` becomes `2`. Per-file objects are unchanged, so `xtask corpus`/`malware compare` accept versions 1 and 2. The human notes list every limit, comma-separated. Decided by the user: replace the field with an array and bump schema_version to 2.
+
+---
+
 **Changelog from v1.11 (2026-11-21):** The §6.2 container-limits table now states the limits the code enforces (§6.2, §11.12, #196). It listed 2 GB extracted, 500 MB per file, 50,000 files and 60 s per scan, with configurable ranges, none of which the code had: the real defaults are per format (a 256 MiB read-back per `.pkg` or ZIP, 4 MiB per xar entry, 8 MiB per ZIP member, 10,000 entries, 300:1 for ZIP members, 16 GiB / 64 GiB and `hdiutil` timeouts for a mounted image), under the whole-target budget, with no per-scan clock. Decided by the user: the doc follows the code, no limit changes, and the configurable-range column is dropped until Phase 3 picks ranges (`config-candidates.md`).
 
 ---
