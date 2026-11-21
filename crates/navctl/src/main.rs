@@ -210,8 +210,12 @@ fn main() -> ExitCode {
             budget,
         } => {
             if quick || full {
-                let flag = if quick { "scan --quick" } else { "scan --full" };
-                return not_yet_implemented(flag, "Phase 1");
+                let flag = if quick { "--quick" } else { "--full" };
+                // Not `not_yet_implemented`: these flags don't need navd.
+                nav_core::safe_eprintln!(
+                    "navctl: `scan {flag}` isn't built yet; run `navctl scan` without it."
+                );
+                return exit::code(exit::OPERATIONAL_ERROR);
             }
             output::run_scan(&path, recursive, json, verbose, &budget.budget(), no_mount)
         }
