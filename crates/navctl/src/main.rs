@@ -73,12 +73,6 @@ enum Command {
         /// List every file of a `.app` bundle before its verdict line.
         #[arg(long)]
         verbose: bool,
-        /// Not built yet; exits 4.
-        #[arg(long, conflicts_with = "full")]
-        quick: bool,
-        /// Not built yet; exits 4.
-        #[arg(long, conflicts_with = "quick")]
-        full: bool,
         /// Scan a disk image as a file instead of mounting it (§6.2).
         #[arg(long)]
         no_mount: bool,
@@ -204,21 +198,9 @@ fn main() -> ExitCode {
             json,
             recursive,
             verbose,
-            quick,
-            full,
             no_mount,
             budget,
-        } => {
-            if quick || full {
-                let flag = if quick { "--quick" } else { "--full" };
-                // Not `not_yet_implemented`: these flags don't need navd.
-                nav_core::safe_eprintln!(
-                    "navctl: `scan {flag}` isn't built yet; run `navctl scan` without it."
-                );
-                return exit::code(exit::OPERATIONAL_ERROR);
-            }
-            output::run_scan(&path, recursive, json, verbose, &budget.budget(), no_mount)
-        }
+        } => output::run_scan(&path, recursive, json, verbose, &budget.budget(), no_mount),
 
         Command::Rules { command } => match command {
             RulesCommand::Test {

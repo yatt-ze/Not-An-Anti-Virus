@@ -149,7 +149,6 @@ All Boundary: a user-chosen tool path runs that binary, and the service paths ar
 | `--max-files` / `--max-total-bytes` | 50,000 / 4 GiB | navctl/src/main.rs | Resource |
 | `--recursive` / `--json` / `--verbose` | off | navctl/src/main.rs | Operational |
 | `--no-mount` | off | navctl/src/main.rs | Operational (an unmounted image is reported `Partial`, not clean) |
-| `--quick` / `--full` | — | navctl/src/main.rs | Operational |
 | Stubs: `status --resource-usage`, `events tail --min-score/--signal`, `logs --since/--grep`, `quarantine purge --force`, `config get/set` | — | navctl/src/main.rs | Operational |
 
 ## Daemon and service

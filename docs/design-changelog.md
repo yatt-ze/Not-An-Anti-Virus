@@ -5,6 +5,10 @@ for the current document map. Newest first.
 
 ---
 
+**Changelog from v1.08 (2026-11-21):** `navctl scan --quick` and `--full` are removed from the CLI (§8, §6.2). They were declared but unbuilt, exiting 4 since #167. `--quick` was never defined beyond its listing in the §8 CLI surface. `--full` keeps its design meaning: an explicit full walk of a volume that the Phase 2 mount inventory would otherwise only sample. It returns with that work, and today `navctl scan --recursive` already walks everything it is pointed at. Decided by the user: remove both rather than keep placeholders.
+
+---
+
 **Changelog from v1.07 (2026-11-21):** Disk-image volume labels are now stable between runs (§6.2, §11.1, #178). `x.dmg!N/...` numbered volumes in the order `hdiutil attach -plist` listed `system-entities`, which varies. Decided: `N` is the position among the image's volume entities (mounted, mounted elsewhere, or potentially-mountable but unmounted) sorted by `dev-entry` (disk, then slice, numerically), so a volume that failed to mount keeps its number and the others do not shift; an entity with a missing or odd `dev-entry` sorts after the rest in listing order. A single mounted volume among several candidates is therefore still labelled `!N/`. No JSON schema change.
 
 ---
