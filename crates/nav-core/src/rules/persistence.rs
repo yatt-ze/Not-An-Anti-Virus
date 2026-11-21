@@ -23,6 +23,11 @@ const MAX_WEIGHT: i32 = 30;
 /// A `StartInterval` shorter than this (seconds) reads as beaconing rather
 /// than a normal periodic maintenance job.
 const SHORT_INTERVAL_SECS: i64 = 300;
+/// A key repeated with differing values: corroboration-only, since alone it
+/// stays below Notify (§5.2, #192).
+const DIFFERING_REPEAT_WEIGHT: i32 = 8;
+/// Longest repeated key name quoted in the description.
+const MAX_KEY_CHARS: usize = 64;
 
 pub struct LaunchdPersistenceRule;
 
@@ -104,6 +109,13 @@ impl Rule for LaunchdPersistenceRule {
             findings.push((
                 6,
                 format!("StartInterval {secs}s (< 5 min) — possible beaconing"),
+            ));
+        }
+        if let Some(key) = differing_repeat(&parsed) {
+            let key: String = key.chars().take(MAX_KEY_CHARS).collect();
+            findings.push((
+                DIFFERING_REPEAT_WEIGHT,
+                format!("key '{key}' repeated with differing values (launchd runs the last; plutil shows the first in a binary plist)"),
             ));
         }
         // Location heuristics need a real path — container-extracted content's
@@ -223,6 +235,21 @@ impl<'a> LaunchdJob<'a> {
     fn short_start_interval(&self) -> Option<i64> {
         self.start_interval
             .filter(|&n| n > 0 && n < SHORT_INTERVAL_SECS)
+    }
+}
+
+/// The first key, in any dict of `v`, that a dict repeats with differing
+/// values. Identical repeats return `None`: they carry no differential.
+fn differing_repeat(v: &PlistValue) -> Option<&str> {
+    match v {
+        PlistValue::Dict(entries) => entries
+            .iter()
+            .enumerate()
+            .find(|(i, (k, val))| entries[..*i].iter().any(|(k2, v2)| k2 == k && v2 != val))
+            .map(|(_, (k, _))| k.as_str())
+            .or_else(|| entries.iter().find_map(|(_, val)| differing_repeat(val))),
+        PlistValue::Array(items) => items.iter().find_map(differing_repeat),
+        _ => None,
     }
 }
 
@@ -513,8 +540,44 @@ mod tests {
         </dict></plist>"#;
         let want = eval(path, last_only).unwrap().expect("should fire");
         let got = eval(path, repeated).unwrap().expect("should fire");
-        assert_eq!(got.weight, want.weight);
-        assert_eq!(got.description, want.description);
+        assert_eq!(got.weight, want.weight + DIFFERING_REPEAT_WEIGHT);
+        assert!(got.description.starts_with(&want.description));
+    }
+
+    #[test]
+    fn differing_repeats_corroborate() {
+        let path = "/Users/x/Library/LaunchAgents/com.example.helper.plist";
+        let differing = br#"<plist version="1.0"><dict>
+            <key>Label</key><string>com.example.helper</string>
+            <key>Program</key><string>/usr/local/bin/helper</string>
+            <key>Program</key><string>/usr/local/bin/other</string>
+        </dict></plist>"#;
+        let sig = eval(path, differing).unwrap().expect("should fire");
+        assert_eq!(sig.weight, DIFFERING_REPEAT_WEIGHT);
+        assert!(sig.description.contains("key 'Program' repeated"));
+
+        let nested = br#"<plist version="1.0"><dict>
+            <key>Label</key><string>com.example.helper</string>
+            <key>Program</key><string>/usr/local/bin/helper</string>
+            <key>EnvironmentVariables</key><dict>
+                <key>DYLD_INSERT_LIBRARIES</key><string></string>
+                <key>DYLD_INSERT_LIBRARIES</key><string>/tmp/x.dylib</string>
+            </dict>
+        </dict></plist>"#;
+        let sig = eval(path, nested).unwrap().expect("should fire");
+        assert!(sig.description.contains("DYLD_INSERT_LIBRARIES"));
+    }
+
+    #[test]
+    fn identical_repeats_score_nothing() {
+        let path = "/Users/x/Library/LaunchAgents/com.example.helper.plist";
+        let same = br#"<plist version="1.0"><dict>
+            <key>Label</key><string>com.example.helper</string>
+            <key>Program</key><string>/usr/local/bin/helper</string>
+            <key>EnablePressuredExit</key><true/>
+            <key>EnablePressuredExit</key><true/>
+        </dict></plist>"#;
+        assert!(eval(path, same).unwrap().is_none());
     }
 
     #[test]
