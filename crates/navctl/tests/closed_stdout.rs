@@ -35,13 +35,23 @@ fn closed_stdout(json: bool) {
         let name = format!("{}-{i}.sh", "f".repeat(100));
         std::fs::write(dir.0.join(name), "#!/bin/sh\necho hi\n").unwrap();
     }
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_navctl"));
-    cmd.arg("scan");
-    if json {
-        cmd.arg("--json");
-    }
-    let mut child = cmd
-        .arg(&dir.0)
+    let scan = || {
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_navctl"));
+        cmd.arg("scan");
+        if json {
+            cmd.arg("--json");
+        }
+        cmd.arg(&dir.0);
+        cmd
+    };
+    let drained = scan().output().unwrap();
+    // Enough output to overflow the pipe, so the closed run really hits EPIPE.
+    assert!(
+        drained.stdout.len() > 1 << 17,
+        "{} bytes",
+        drained.stdout.len()
+    );
+    let mut child = scan()
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
@@ -55,7 +65,7 @@ fn closed_stdout(json: bool) {
     let out = child.wait_with_output().unwrap();
     let code = out.status.code();
     let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(matches!(code, Some(0..=4)), "exit {code:?}: {stderr}");
+    assert_eq!(code, drained.status.code(), "{stderr}");
     assert!(!stderr.contains("panicked"), "{stderr}");
 }
 

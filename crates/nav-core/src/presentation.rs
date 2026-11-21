@@ -86,9 +86,10 @@ pub fn terminal_safe(s: &str) -> std::borrow::Cow<'_, str> {
 static STDOUT_CLOSED: AtomicBool = AtomicBool::new(false);
 static STDERR_CLOSED: AtomicBool = AtomicBool::new(false);
 
-/// Writes `text` to stdout (`err` = false) or stderr without panicking. The
-/// first write error (e.g. EPIPE) latches that stream closed and later writes
-/// are no-ops, so the program runs to completion with its normal exit code (§8).
+/// Writes `text` to stdout (`err` = false) or stderr without panicking. A
+/// broken pipe latches that stream closed and later writes are no-ops, so the
+/// program runs to completion with its normal exit code (§8); any other write
+/// error drops only that write.
 #[doc(hidden)]
 pub fn emit(err: bool, text: &str) {
     use std::io::Write;
@@ -101,7 +102,7 @@ pub fn emit(err: bool, text: &str) {
     } else {
         std::io::stdout().lock().write_all(text.as_bytes())
     };
-    if res.is_err() {
+    if res.is_err_and(|e| e.kind() == std::io::ErrorKind::BrokenPipe) {
         flag.store(true, Ordering::Relaxed);
     }
 }
@@ -141,6 +142,7 @@ macro_rules! safe_eprintln {
 /// (JSON) output only.
 #[macro_export]
 macro_rules! raw_println {
+    () => { $crate::presentation::emit(false, "\n") };
     ($($arg:tt)*) => {
         $crate::presentation::emit(false, &::std::format!("{}\n", ::std::format!($($arg)*)))
     };
