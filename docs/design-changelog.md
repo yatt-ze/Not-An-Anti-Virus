@@ -5,6 +5,10 @@ for the current document map. Newest first.
 
 ---
 
+**Changelog from v1.11 (2026-11-21):** The §6.2 container-limits table now states the limits the code enforces (§6.2, §11.12, #196). It listed 2 GB extracted, 500 MB per file, 50,000 files and 60 s per scan, with configurable ranges, none of which the code had: the real defaults are per format (a 256 MiB read-back per `.pkg` or ZIP, 4 MiB per xar entry, 8 MiB per ZIP member, 10,000 entries, 300:1 for ZIP members, 16 GiB / 64 GiB and `hdiutil` timeouts for a mounted image), under the whole-target budget, with no per-scan clock. Decided by the user: the doc follows the code, no limit changes, and the configurable-range column is dropped until Phase 3 picks ranges (`config-candidates.md`).
+
+---
+
 **Changelog from v1.10 (2026-11-21):** A revoked signing certificate keeps a binary `Partial` (§5.2, §11.8, §11.1a, #150). Measured in the benchmark VM: with one byte of a revoked binary's code flipped, `codesign` still reports only the revocation, so it never checks the code hashes, and `invalid-code-signature` cannot say the signature is intact. Decided by the user: no rule change, both signer-check rules stay `NotApplicable` on a revocation. The revocation answer itself depends on `codesign`'s cache (a cold first verify exited 0), so `malware compare` now runs a throwaway warm-up pass before the base and new scans, and mughthesec-01's expected result is now `no-action/partial`.
 
 ---
