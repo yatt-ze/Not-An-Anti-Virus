@@ -278,7 +278,7 @@ fn scan_clone(
     };
     let mut scan = scan_target_with_budget(&mounts, true, &walk_budget)
         .map_err(|e| format!("cannot read the mounted volume: {e}"))?;
-    relabel(&mut scan, label, &entities.volumes);
+    relabel(&mut scan, label, &entities.volumes, entities.candidates > 1);
     let mut gaps = entities.gaps;
     gaps.extend(vanished(&entities.volumes, is_mount_point));
     Ok(ImageReport {
@@ -289,9 +289,9 @@ fn scan_clone(
 }
 
 /// A gap for each of `volumes` no longer mounted where the attach put it.
-fn vanished(volumes: &[PathBuf], mounted: impl Fn(&Path) -> bool) -> Vec<String> {
-    (1..)
-        .zip(volumes)
+fn vanished(volumes: &[(usize, PathBuf)], mounted: impl Fn(&Path) -> bool) -> Vec<String> {
+    volumes
+        .iter()
         .filter(|(_, v)| !mounted(v))
         .map(|(n, _)| format!("volume {n} was unmounted during the scan"))
         .collect()
@@ -403,9 +403,42 @@ fn os(s: &str) -> &OsStr {
 /// Volumes and gaps from an `attach -plist` result.
 #[derive(Debug, Default, PartialEq)]
 struct Attached {
-    /// Mount points under the run directory, in entity order.
-    volumes: Vec<PathBuf>,
+    /// Mount points under the run directory with their volume numbers, in
+    /// number order.
+    volumes: Vec<(usize, PathBuf)>,
+    /// Entities that are or should have been volumes, mounted or not.
+    candidates: usize,
     gaps: Vec<String>,
+}
+
+/// Sort key for a `dev-entry`: `(disk, slice)` for `/dev/diskN` (slice 0)
+/// and `/dev/diskNsM`, compared numerically. `None` for anything else.
+fn dev_key(dev: &str) -> Option<(u64, u64)> {
+    let rest = dev.strip_prefix("/dev/disk")?;
+    let n = rest.bytes().take_while(u8::is_ascii_digit).count();
+    let (disk, tail) = rest.split_at(n);
+    let slice = match tail.strip_prefix('s') {
+        None if tail.is_empty() => 0,
+        Some(m) if !m.is_empty() && m.bytes().all(|b| b.is_ascii_digit()) => m.parse().ok()?,
+        _ => return None,
+    };
+    Some((disk.parse().ok()?, slice))
+}
+
+/// `entities` by `dev-entry` (disk, then slice, numerically), so volume
+/// numbers do not depend on the order `hdiutil` lists them (§6.2, §11.1).
+/// An entity with a missing or unparseable `dev-entry` goes after the
+/// rest, in listing order.
+fn in_slice_order(entities: &[PlistValue]) -> Vec<&PlistValue> {
+    let mut v: Vec<_> = entities.iter().collect();
+    v.sort_by_key(|e| {
+        let key = e
+            .get("dev-entry")
+            .and_then(PlistValue::as_str)
+            .and_then(dev_key);
+        (key.is_none(), key)
+    });
+    v
 }
 
 fn parse_attach(plist: &PlistValue, run: &Path) -> Attached {
@@ -414,15 +447,28 @@ fn parse_attach(plist: &PlistValue, run: &Path) -> Attached {
         .get("system-entities")
         .and_then(PlistValue::as_array)
         .unwrap_or_default();
-    for e in entities {
+    for e in in_slice_order(entities) {
         let mountable = e.get("potentially-mountable").and_then(PlistValue::as_bool);
+        // Every candidate takes a number, mounted or not, so a failed
+        // mount does not renumber the others.
         match e.get("mount-point").and_then(PlistValue::as_str) {
-            Some(mp) if Path::new(mp).starts_with(run) => out.volumes.push(PathBuf::from(mp)),
-            Some(_) => out
-                .gaps
-                .push("a volume mounted outside the scratch directory was not scanned".into()),
+            Some(mp) => {
+                out.candidates += 1;
+                if Path::new(mp).starts_with(run) {
+                    out.volumes.push((out.candidates, PathBuf::from(mp)));
+                } else {
+                    out.gaps.push(format!(
+                        "volume {} was mounted outside the scratch directory and not scanned",
+                        out.candidates
+                    ));
+                }
+            }
             None if mountable == Some(true) => {
-                out.gaps.push("a volume on the image did not mount".into())
+                out.candidates += 1;
+                out.gaps.push(format!(
+                    "volume {} on the image did not mount",
+                    out.candidates
+                ))
             }
             None => {}
         }
@@ -430,18 +476,18 @@ fn parse_attach(plist: &PlistValue, run: &Path) -> Attached {
     out
 }
 
-/// Rewrites every path in `scan` from the mount to `image!path` (with a
-/// 1-based volume number when there are several), and sets the root.
-fn relabel(scan: &mut TargetScan, image: &Path, volumes: &[PathBuf]) {
+/// Rewrites every path in `scan` from the mount to `image!path` (`image!N/path`
+/// with the volume's number when `numbered`), and sets the root.
+fn relabel(scan: &mut TargetScan, image: &Path, volumes: &[(usize, PathBuf)], numbered: bool) {
     let image_str = image.display().to_string();
     let label = |p: &Path| -> PathBuf {
-        for (i, v) in volumes.iter().enumerate() {
+        for (n, v) in volumes {
             if let Ok(rel) = p.strip_prefix(v) {
                 let rel = rel.display();
-                return if volumes.len() == 1 {
-                    PathBuf::from(format!("{image_str}!{rel}"))
+                return if numbered {
+                    PathBuf::from(format!("{image_str}!{n}/{rel}"))
                 } else {
-                    PathBuf::from(format!("{image_str}!{}/{rel}", i + 1))
+                    PathBuf::from(format!("{image_str}!{rel}"))
                 };
             }
         }
@@ -450,7 +496,7 @@ fn relabel(scan: &mut TargetScan, image: &Path, volumes: &[PathBuf]) {
     // `<mount>/x` -> `image!x`, and a bare `<mount>`; longest first, so one
     // mount name that prefixes another can't rewrite the other's paths.
     let mut prefixes: Vec<(String, String)> = Vec::new();
-    for v in volumes {
+    for (_, v) in volumes {
         let to = label(v).display().to_string();
         prefixes.push((format!("{}/", v.display()), to.clone()));
         prefixes.push((v.display().to_string(), to.trim_end_matches('/').into()));
@@ -949,12 +995,18 @@ fn set_signal_handlers(handler: libc::sighandler_t) {
     for sig in [libc::SIGINT, libc::SIGTERM, libc::SIGHUP] {
         // SAFETY: a zeroed sigaction is valid; `on_signal` only does an
         // atomic store, which is async-signal-safe.
-        unsafe {
+        let rc = unsafe {
             let mut sa: libc::sigaction = std::mem::zeroed();
             sa.sa_sigaction = handler;
             sa.sa_flags = libc::SA_RESTART;
             libc::sigemptyset(&mut sa.sa_mask);
-            libc::sigaction(sig, &sa, std::ptr::null_mut());
+            libc::sigaction(sig, &sa, std::ptr::null_mut())
+        };
+        if rc != 0 {
+            nav_core::safe_eprintln!(
+                "navctl: could not set a handler for signal {sig}: {}",
+                std::io::Error::last_os_error()
+            );
         }
     }
 }
@@ -995,11 +1047,87 @@ mod tests {
         assert_eq!(
             got.volumes,
             vec![
-                PathBuf::from("/s/1-ab/dmg.A"),
-                PathBuf::from("/s/1-ab/dmg.B")
+                (1, PathBuf::from("/s/1-ab/dmg.A")),
+                (2, PathBuf::from("/s/1-ab/dmg.B"))
             ]
         );
         assert_eq!(got.gaps.len(), 2, "{:?}", got.gaps);
+    }
+
+    fn numbers(listing: &[PlistValue]) -> Attached {
+        let plist = dict(vec![(
+            "system-entities",
+            PlistValue::Array(listing.to_vec()),
+        )]);
+        parse_attach(&plist, Path::new("/s/1-ab"))
+    }
+
+    #[test]
+    fn volume_numbers_follow_slice_order() {
+        let listing = [
+            entity("/dev/disk5", None, false),
+            entity("/dev/disk5s1", Some("/s/1-ab/a"), true),
+            entity("/dev/disk5s2", Some("/s/1-ab/b"), true),
+            entity("/dev/disk5s10", Some("/s/1-ab/j"), true),
+        ];
+        let want = numbers(&listing);
+        assert_eq!(
+            want.volumes,
+            vec![
+                (1, PathBuf::from("/s/1-ab/a")),
+                (2, PathBuf::from("/s/1-ab/b")),
+                (3, PathBuf::from("/s/1-ab/j")),
+            ]
+        );
+        for order in [[3, 1, 0, 2], [2, 3, 1, 0], [1, 0, 3, 2], [0, 2, 1, 3]] {
+            let shuffled: Vec<_> = order.iter().map(|&i| listing[i].clone()).collect();
+            assert_eq!(numbers(&shuffled), want, "{order:?}");
+        }
+    }
+
+    #[test]
+    fn unmounted_slice_keeps_its_number() {
+        let listing = [
+            entity("/dev/disk5s3", Some("/s/1-ab/c"), true),
+            entity("/dev/disk5s2", None, true),
+            entity("/dev/disk5s1", Some("/s/1-ab/a"), true),
+            entity("/dev/disk5", None, false),
+        ];
+        let got = numbers(&listing);
+        assert_eq!(
+            got.volumes,
+            vec![
+                (1, PathBuf::from("/s/1-ab/a")),
+                (3, PathBuf::from("/s/1-ab/c"))
+            ]
+        );
+        assert_eq!(got.candidates, 3);
+        assert_eq!(got.gaps.len(), 1);
+    }
+
+    #[test]
+    fn odd_dev_entries_sort_last_in_listing_order() {
+        let no_dev = dict(vec![
+            ("potentially-mountable", PlistValue::Bool(true)),
+            ("mount-point", PlistValue::String("/s/1-ab/x".into())),
+        ]);
+        let listing = [
+            no_dev,
+            entity("/dev/disk5sX", Some("/s/1-ab/y"), true),
+            entity("/dev/disk99999999999999999999s1", Some("/s/1-ab/z"), true),
+            entity("/dev/disk5s2", Some("/s/1-ab/b"), true),
+            entity("/dev/disk5s1", Some("/s/1-ab/a"), true),
+        ];
+        let names: Vec<_> = numbers(&listing)
+            .volumes
+            .iter()
+            .map(|(n, p)| (*n, p.file_name().unwrap().to_str().unwrap().to_string()))
+            .collect();
+        let want: Vec<_> = [(1, "a"), (2, "b"), (3, "x"), (4, "y"), (5, "z")]
+            .iter()
+            .map(|(n, s)| (*n, s.to_string()))
+            .collect();
+        assert_eq!(names, want);
     }
 
     #[test]
@@ -1059,7 +1187,7 @@ mod tests {
 
     #[test]
     fn each_volume_gone_from_its_mount_point_is_a_gap() {
-        let vols = [PathBuf::from("/s/a"), PathBuf::from("/s/b")];
+        let vols = [(1, PathBuf::from("/s/a")), (2, PathBuf::from("/s/b"))];
         assert_eq!(vanished(&vols, |_| true), Vec::<String>::new());
         assert_eq!(
             vanished(&vols, |v| v.ends_with("a")),

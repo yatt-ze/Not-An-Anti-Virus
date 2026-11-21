@@ -1,6 +1,6 @@
 # NAV ("Not an Anti-Virus") — System Design Document
 
-**Status:** Living document, v1.03
+**Status:** Living document, v1.10
 **Purpose:** Reference for all future design/planning conversations on this project. Update this doc as decisions change rather than re-deriving them from scratch.
 **Naming:** Project is called **NAV** — "Not an Anti-Virus." Deliberately undersells itself: positioned as a heuristic behavioral monitor, not a signature-based antivirus product, consistent with the honest-coverage-gaps stance in §10. Binaries: `navctl` (CLI), `navtop` (TUI, phase 2). Daemon: `navd`. Per-user notification agent: `navnotify` (background-only, no window — see §9.2). Socket: `/var/run/navd.sock`. Config: `~/.config/navctl/config.toml` (user), `/etc/navd/config.toml` (daemon).
 **"No GUI app" clarified:** the constraint is no *openable* application (nothing with a Dock icon/window the user launches, like a Safari-style app). A background-only per-user LaunchAgent with no UI beyond posting to Notification Center is acceptable — this is how `navnotify` is designed (§9.2).
@@ -69,3 +69,4 @@ messages.
 - **`nav-core`**: the heuristics/scoring engine (§5) lives in its own Rust crate, not inside the `navd` binary — see §2 for why. `navd` and `navctl` are both thin binaries that link `nav-core`; `navtop` will too. This is a build-organization decision as much as a runtime one: it keeps the engine testable and runnable in isolation (important for Phase 0a's corpus/CI harness, §12) without needing a daemon, root, or a socket connection to exercise it.
 - **Thin Swift/Obj-C shim** only where required to call macOS frameworks with poor/no Rust bindings (Security.framework code-signing checks, NSWorkspace, DiskArbitration if needed). FFI bridge between Rust core and Swift shim.
 - Avoid building the heuristics core in Swift — keep untrusted-input parsing in Rust.
+- **Platforms.** NAV is a macOS product. `nav-core` builds on Unix only today: macOS, plus Linux for CI and contributors (#170). On Linux the macOS-only rules report `NotApplicable`, so nothing scanned there is `Complete`. Making `nav-core` portable is an open decision (§14): Linux first-class first, perhaps Windows later. Keep new code free of needless platform assumptions, so that door stays open.

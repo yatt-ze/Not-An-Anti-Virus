@@ -5,6 +5,34 @@ for the current document map. Newest first.
 
 ---
 
+**Changelog from v1.09 (2026-11-21):** Cross-platform `nav-core` is recorded as an open decision (§3, §14, #218). §3 now states the platform position: NAV is a macOS product, and `nav-core` is Unix-only (macOS, plus Linux for CI). §14 records the user's wish to keep a cross-platform `nav-core` possible: Linux first-class, perhaps Windows later. It also sets the prerequisite, a platform-aware rule set that drops rules meaningless on the running OS but still reports a gap for a check that matters to the file and cannot run there (§11.8).
+
+---
+
+**Changelog from v1.08 (2026-11-21):** `navctl scan --quick` and `--full` are removed from the CLI (§8, §6.2). They were declared but unbuilt, exiting 4 since #167. `--quick` was never defined beyond its listing in the §8 CLI surface. `--full` keeps its design meaning: an explicit full walk of a volume that the Phase 2 mount inventory would otherwise only sample. It returns with that work, and today `navctl scan --recursive` already walks everything it is pointed at. Decided by the user: remove both rather than keep placeholders.
+
+---
+
+**Changelog from v1.07 (2026-11-21):** Disk-image volume labels are now stable between runs (§6.2, §11.1, #178). `x.dmg!N/...` numbered volumes in the order `hdiutil attach -plist` listed `system-entities`, which varies. Decided: `N` is the position among the image's volume entities (mounted, mounted elsewhere, or potentially-mountable but unmounted) sorted by `dev-entry` (disk, then slice, numerically), so a volume that failed to mount keeps its number and the others do not shift; an entity with a missing or odd `dev-entry` sorts after the rest in listing order. A single mounted volume among several candidates is therefore still labelled `!N/`. No JSON schema change.
+
+---
+
+**Changelog from v1.06 (2026-11-21):** `navctl scan` on an empty directory exits 3, not 4 (§8, §11.8, #29). `scan` returned `OPERATIONAL_ERROR` for a readable directory with no files while `rules test` and `navd scan-once` returned `INDETERMINATE`; "nothing to inspect" is a failure to check, not a tool failure, so `scan` now matches. Decided: no shared helper, since the decision is one line at each call site; stderr now reads `no files to scan under` in both commands. No JSON change.
+
+---
+
+**Changelog from v1.05 (2026-11-21):** An unmounted disk-image target now says why in its JSON (§8, §6.2, #208). `navctl scan --json x.dmg` printed one `Partial` object and gave the reason it was not mounted (no `hdiutil`, encrypted, size cap, mount failure, timeout) on stderr only. The reason is now a new `not-mounted` coverage gap with a `reason` field on that object, and `--no-mount` gives the reason `--no-mount`. Decided: a per-file gap rather than a target summary line, so a single-file target still gets no summary (#51); the field is additive, so `schema_version` stays `1`. Human `scan` keeps its stderr line, `--json` no longer prints it, and `rules test` shows the gap under `Scan completeness` instead of a separate line above the report.
+
+---
+
+**Changelog from v1.04 (2026-11-21):** Clippy now enforces terminal-safe output in `navctl` and `navd` (§8, #201). A per-crate `clippy.toml` disallows `println!`, `print!`, `eprintln!` and `eprint!`, so a raw std print can no longer bypass the `safe_*` / `raw_println!` macros and reach the terminal unsanitised. Decided: scoped to those two crates so `nav-core` and `xtask` need no allow-attributes; integration tests may still print directly (`navd/tests/scan_once.rs` opts out). No behaviour change.
+
+---
+
+**Changelog from v1.03 (2026-11-21):** A closed stdout no longer panics `navctl` or `navd scan-once` (§8, #160). `navctl scan dir | head -1` exited 101 with a panic, because `println!` panics on EPIPE, and an early exit mid disk-image scan would skip the detach. All output now goes through non-panicking writes in `nav-core`: the `safe_*` macros for human output, and a new `raw_println!` for the `--json` lines. The first write error on a stream latches it closed and later writes are dropped, so the scan finishes and returns its normal exit code. Decided: not resetting SIGPIPE to the default, which would kill the process mid disk-image scan and leave the mount behind; stdout and stderr latch independently.
+
+---
+
 **Changelog from v1.02 (2026-11-21):** `navctl scan --json` ends a directory, bundle or disk-image target with a summary line (§8, §11.12, #51). Target-level coverage (a budget stop, unreadable subdirectories, the not-walked counts) reached stdout only through `rules test --json`, and since #34 a flagged file outranks incompleteness in the exit code, so a script reading `scan --json` and the exit status could not tell that most of a tree was never scanned. The final line is the `rules test` envelope without `results`, plus `files`; per-file objects have no top-level `kind` key, so it identifies the summary. A single-file target is unchanged (one object), and a target with no scored file prints the summary with `files: 0`. Decided: an additive line, no schema bump (`schema_version` stays `1`), stderr notes and exit codes unchanged. `navd scan-once` is scheduled for deletion after spike B3 and still reports target coverage on stderr only.
 
 ---

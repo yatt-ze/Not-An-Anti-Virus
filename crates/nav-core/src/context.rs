@@ -48,7 +48,6 @@ impl ObjectIdentity {
         Some(Self::from_metadata(&std::fs::metadata(path).ok()?))
     }
 
-    #[cfg(unix)]
     fn from_metadata(md: &std::fs::Metadata) -> Self {
         use std::os::unix::fs::MetadataExt;
         Self {
@@ -57,23 +56,6 @@ impl ObjectIdentity {
             size: md.size(),
             mtime_secs: md.mtime(),
             mtime_nanos: md.mtime_nsec(),
-        }
-    }
-
-    #[cfg(not(unix))]
-    fn from_metadata(md: &std::fs::Metadata) -> Self {
-        let (secs, nanos) = md
-            .modified()
-            .ok()
-            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-            .map(|d| (d.as_secs() as i64, d.subsec_nanos() as i64))
-            .unwrap_or((0, 0));
-        Self {
-            dev: 0,
-            inode: 0,
-            size: md.len(),
-            mtime_secs: secs,
-            mtime_nanos: nanos,
         }
     }
 }
@@ -89,6 +71,20 @@ pub enum ContentSource {
     /// label like `installer.pkg!Scripts/preinstall` and names nothing on disk,
     /// so path/filesystem rules must report `NotApplicable`.
     Embedded,
+}
+
+/// Open `path` read-only and return the handle only if it is a regular file.
+/// The open is `O_NONBLOCK`, so a FIFO swapped in after the walker's check
+/// can't block it; a FIFO, device or other non-regular file yields `None`, the
+/// same as an unreadable one (§11.7, §11.8).
+pub(crate) fn open_regular(path: &Path) -> Option<std::fs::File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let mut opts = std::fs::OpenOptions::new();
+    opts.read(true);
+    // O_NOCTTY: a tty swapped in must not become our controlling terminal.
+    opts.custom_flags(libc::O_NONBLOCK | libc::O_NOCTTY);
+    let f = opts.open(path).ok()?;
+    f.metadata().ok()?.is_file().then_some(f)
 }
 
 pub struct ScanContext {
@@ -167,7 +163,7 @@ impl ScanContext {
         };
         // Identity and length come from the *opened* handle, and the bytes are
         // read through it, so a pre-open `stat` can't be raced (§11.7).
-        let Ok(mut f) = std::fs::File::open(path) else {
+        let Some(mut f) = open_regular(path) else {
             return Some(unreadable());
         };
         let Ok(md) = f.metadata() else {
@@ -253,13 +249,11 @@ impl ScanContext {
     }
 
     /// True when [`Self::read_at`]/[`Self::for_each_window`] can actually
-    /// reach bytes past `content`: a real, opened file, on a platform with
-    /// an fd-based `read_at` ([`Self::read_at_file`] is unix-only). A rule
-    /// deciding whether it can stream/range-read past the prefix should
-    /// check this, not [`Self::is_file_backed`] alone — on a non-unix
-    /// platform the latter is true but every such read still fails.
+    /// reach bytes past `content`: a real, opened file. A rule deciding whether
+    /// it can stream/range-read past the prefix should check this, not
+    /// [`Self::is_file_backed`] alone.
     pub fn supports_ranged_reads(&self) -> bool {
-        cfg!(unix) && self.file.is_some()
+        self.file.is_some()
     }
 
     pub fn readable(&self) -> bool {
@@ -325,7 +319,6 @@ impl ScanContext {
 
     /// The disk read behind [`Self::read_file_into`], its allowance already
     /// spent.
-    #[cfg(unix)]
     fn read_spent_into(&self, offset: u64, buf: &mut [u8]) -> Option<()> {
         use std::os::unix::fs::FileExt;
         let file = self.file.as_ref()?;
@@ -333,11 +326,6 @@ impl ScanContext {
         self.bytes_read
             .fetch_add(buf.len() as u64, Ordering::Relaxed);
         file.read_exact_at(buf, offset).ok()
-    }
-
-    #[cfg(not(unix))]
-    fn read_spent_into(&self, _offset: u64, _buf: &mut [u8]) -> Option<()> {
-        None
     }
 
     /// Streams `range` to `f` as successive overlapping windows: each window
@@ -694,13 +682,13 @@ mod tests {
     }
 
     /// A real, opened file supports ranged reads; embedded content (no file
-    /// at all) never does, on any platform (§5.2, #45).
+    /// at all) never does (§5.2, #45).
     #[test]
     fn supports_ranged_reads_requires_an_actual_file_handle() {
         let path = write_temp_file("supports-ranged-reads", b"hello world");
         let ctx = ScanContext::load(&path);
         assert!(ctx.file.is_some());
-        assert_eq!(ctx.supports_ranged_reads(), cfg!(unix));
+        assert!(ctx.supports_ranged_reads());
         let _ = std::fs::remove_file(&path);
 
         let embedded = ScanContext::from_embedded_bytes("x.pkg!member", vec![1, 2, 3], false);
@@ -918,6 +906,26 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
+    /// A FIFO (e.g. swapped in after the walker's check) loads as unreadable
+    /// instead of blocking the scan (§11.7, §11.8).
+    #[test]
+    fn fifo_loads_unreadable() {
+        let dir = std::env::temp_dir().join(format!("nav-fifo-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let fifo = dir.join("pipe");
+        let made = std::process::Command::new("mkfifo").arg(&fifo).status();
+        assert!(made.unwrap().success());
+        let (tx, rx) = std::sync::mpsc::channel();
+        let p = fifo.clone();
+        std::thread::spawn(move || {
+            let ctx = ScanContext::load(&p);
+            let _ = tx.send((ctx.content.is_none(), ctx.file_len.is_none()));
+        });
+        let got = rx.recv_timeout(std::time::Duration::from_secs(10));
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(got, Ok((true, true)));
+    }
+
     fn load_with(path: &Path, allowance: u64) -> ScanContext {
         ScanContext::load_if(path, allowance, |_| true).unwrap()
     }
@@ -982,28 +990,16 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
-    /// The prefix is read to EOF whatever the stat'd length says: a FIFO
-    /// reports 0 but has content.
-    #[cfg(unix)]
+    /// The prefix is read to EOF whatever the stat'd length says: a procfs
+    /// file is regular, reports 0, and has content.
+    #[cfg(target_os = "linux")]
     #[test]
     fn the_prefix_is_read_past_a_zero_stat_length() {
-        let dir = std::env::temp_dir().join(format!(
-            "nav-fifo-{}-{:?}",
-            std::process::id(),
-            std::thread::current().id()
-        ));
-        let _ = std::fs::remove_file(&dir);
-        let made = std::process::Command::new("mkfifo").arg(&dir).status();
-        if !made.is_ok_and(|s| s.success()) {
-            return; // no mkfifo here: nothing to test
-        }
-        let fifo = dir.clone();
-        let writer = std::thread::spawn(move || std::fs::write(fifo, b"piped content"));
-        let ctx = load_with(&dir, 1 << 20);
-        writer.join().unwrap().unwrap();
-        let _ = std::fs::remove_file(&dir);
-        assert_eq!(ctx.content.as_deref(), Some(&b"piped content"[..]));
-        assert_eq!(ctx.bytes_read(), 13);
+        let ctx = load_with(Path::new("/proc/self/status"), 1 << 20);
+        assert_eq!(ctx.file_len, Some(0));
+        let content = ctx.content.as_deref().unwrap();
+        assert!(content.starts_with(b"Name:"));
+        assert_eq!(ctx.bytes_read(), content.len() as u64);
         assert!(!ctx.allowance_hit());
     }
 

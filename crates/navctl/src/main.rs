@@ -73,10 +73,6 @@ enum Command {
         /// List every file of a `.app` bundle before its verdict line.
         #[arg(long)]
         verbose: bool,
-        #[arg(long)]
-        quick: bool,
-        #[arg(long)]
-        full: bool,
         /// Scan a disk image as a file instead of mounting it (§6.2).
         #[arg(long)]
         no_mount: bool,
@@ -202,8 +198,6 @@ fn main() -> ExitCode {
             json,
             recursive,
             verbose,
-            quick: _,
-            full: _,
             no_mount,
             budget,
         } => output::run_scan(&path, recursive, json, verbose, &budget.budget(), no_mount),
