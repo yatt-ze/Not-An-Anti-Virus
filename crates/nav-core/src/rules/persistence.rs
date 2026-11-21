@@ -10,6 +10,7 @@
 //! independent evidence families under §5.1 (NAV-002). `BehavioralConcern` is
 //! reserved for `navd`'s runtime event pipeline (§5.3, Phase 2).
 
+use std::collections::hash_map::{Entry, HashMap};
 use std::path::Path;
 
 use super::{Rule, RuleOutcome};
@@ -115,7 +116,7 @@ impl Rule for LaunchdPersistenceRule {
             let key: String = key.chars().take(MAX_KEY_CHARS).collect();
             findings.push((
                 DIFFERING_REPEAT_WEIGHT,
-                format!("key '{key}' repeated with differing values (launchd runs the last; plutil shows the first in a binary plist)"),
+                format!("key '{key}' repeated with differing values (tools may disagree on which applies)"),
             ));
         }
         // Location heuristics need a real path — container-extracted content's
@@ -242,14 +243,42 @@ impl<'a> LaunchdJob<'a> {
 /// values. Identical repeats return `None`: they carry no differential.
 fn differing_repeat(v: &PlistValue) -> Option<&str> {
     match v {
-        PlistValue::Dict(entries) => entries
-            .iter()
-            .enumerate()
-            .find(|(i, (k, val))| entries[..*i].iter().any(|(k2, v2)| k2 == k && v2 != val))
-            .map(|(_, (k, _))| k.as_str())
-            .or_else(|| entries.iter().find_map(|(_, val)| differing_repeat(val))),
+        PlistValue::Dict(entries) => {
+            let mut seen: HashMap<&str, &PlistValue> = HashMap::with_capacity(entries.len());
+            for (k, val) in entries {
+                match seen.entry(k.as_str()) {
+                    Entry::Occupied(first) if !same_value(first.get(), val) => {
+                        return Some(k.as_str());
+                    }
+                    Entry::Occupied(_) => {}
+                    Entry::Vacant(slot) => {
+                        slot.insert(val);
+                    }
+                }
+            }
+            entries.iter().find_map(|(_, val)| differing_repeat(val))
+        }
         PlistValue::Array(items) => items.iter().find_map(differing_repeat),
         _ => None,
+    }
+}
+
+/// Structural equality with floats compared by bits, so a repeated NaN counts
+/// as identical.
+fn same_value(a: &PlistValue, b: &PlistValue) -> bool {
+    use PlistValue::*;
+    match (a, b) {
+        (Real(x), Real(y)) | (Date(x), Date(y)) => x.to_bits() == y.to_bits(),
+        (Array(x), Array(y)) => {
+            x.len() == y.len() && x.iter().zip(y).all(|(a, b)| same_value(a, b))
+        }
+        (Dict(x), Dict(y)) => {
+            x.len() == y.len()
+                && x.iter()
+                    .zip(y)
+                    .all(|((ka, va), (kb, vb))| ka == kb && same_value(va, vb))
+        }
+        _ => a == b,
     }
 }
 
@@ -566,6 +595,13 @@ mod tests {
         </dict></plist>"#;
         let sig = eval(path, nested).unwrap().expect("should fire");
         assert!(sig.description.contains("DYLD_INSERT_LIBRARIES"));
+    }
+
+    #[test]
+    fn a_repeated_nan_is_identical() {
+        let nan = PlistValue::Real(f64::NAN);
+        let dict = PlistValue::Dict(vec![("X".into(), nan.clone()), ("X".into(), nan)]);
+        assert_eq!(differing_repeat(&dict), None);
     }
 
     #[test]
