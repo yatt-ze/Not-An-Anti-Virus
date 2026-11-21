@@ -341,6 +341,33 @@ fn read_budgeted<'a>(
     src.read_range(off, len)
 }
 
+/// Like [`read_budgeted`], but `known` holds bytes already read from `off`:
+/// those are reused, and only the rest is read and charged.
+fn read_known<'a>(
+    src: &'a (impl ByteSource + ?Sized),
+    budget: &mut RangeBudget,
+    off: u64,
+    len: usize,
+    known: &'a [u8],
+) -> Option<Cow<'a, [u8]>> {
+    if let Some(bytes) = known.get(..len) {
+        return Some(Cow::Borrowed(bytes));
+    }
+    let end = off.checked_add(len as u64)?;
+    let held = src.held_len();
+    if known.is_empty() || end <= held {
+        return read_budgeted(src, budget, off, len);
+    }
+    let rest = off.checked_add(known.len() as u64)?;
+    if !budget.take(end.saturating_sub(held.max(rest))) {
+        return None;
+    }
+    let mut buf = known.to_vec();
+    buf.resize(len, 0);
+    src.read_exact_at(rest, &mut buf[known.len()..])?;
+    Some(Cow::Owned(buf))
+}
+
 /// Parse every Mach-O image in `src` by reading exactly the bytes needed from
 /// their real, absolute offsets — the header and load commands of each
 /// slice, and each slice's code signature (typically near EOF) — so a file
@@ -374,7 +401,7 @@ pub fn scan_ranged(src: &(impl ByteSource + ?Sized)) -> MachOScan {
             scan_ranged_fat(src, &head, head.len() < head_len, source_len, &mut budget)
         }
         Some(magic) => match thin_kind(magic) {
-            Some(_) => match scan_ranged_slice(src, 0, false, source_len, &mut budget) {
+            Some(_) => match scan_ranged_slice(src, 0, &head, false, source_len, &mut budget) {
                 Some(image) => MachOScan {
                     is_macho: true,
                     images: vec![image],
@@ -411,29 +438,53 @@ enum SliceMagic {
 
 /// Classify what's at a declared fat-table offset without assuming a read
 /// failure or an out-of-bounds offset means "no slice here" — see
-/// [`SliceMagic`].
-fn classify_slice_magic(
-    src: &(impl ByteSource + ?Sized),
+/// [`SliceMagic`]. Also returns the slice's header probe (see
+/// [`probe_len`]) when it was read whole, for [`scan_ranged_slice`] to reuse.
+fn classify_slice_magic<'a>(
+    src: &'a (impl ByteSource + ?Sized),
     budget: &mut RangeBudget,
     off: u64,
     source_len: u64,
-) -> SliceMagic {
+) -> (SliceMagic, Option<Cow<'a, [u8]>>) {
     if off >= source_len {
-        return if src.source_len_is_authoritative() {
+        let magic = if src.source_len_is_authoritative() {
             SliceMagic::NotMacho
         } else {
             SliceMagic::Undetermined
         };
+        return (magic, None);
     }
     // Fewer than 4 bytes remain before a true EOF: no magic can be there.
     if source_len - off < 4 && src.source_len_is_authoritative() {
-        return SliceMagic::NotMacho;
+        return (SliceMagic::NotMacho, None);
     }
-    match read_budgeted(src, budget, off, 4) {
-        Some(bytes) if be_u32(&bytes, 0).and_then(thin_kind).is_some() => SliceMagic::Real,
-        Some(_) => SliceMagic::NotMacho,
-        None => SliceMagic::Undetermined,
+    let probe = match probe_len(off, source_len) {
+        len if len >= 4 => read_budgeted(src, budget, off, len),
+        _ => None,
+    };
+    // Classify from 4 bytes alone when the probe can't be read, as before.
+    let classified = match probe.as_deref() {
+        Some(bytes) => magic_of(bytes),
+        None => match read_budgeted(src, budget, off, 4) {
+            Some(bytes) => magic_of(&bytes),
+            None => SliceMagic::Undetermined,
+        },
+    };
+    (classified, probe)
+}
+
+fn magic_of(bytes: &[u8]) -> SliceMagic {
+    if be_u32(bytes, 0).and_then(thin_kind).is_some() {
+        SliceMagic::Real
+    } else {
+        SliceMagic::NotMacho
     }
+}
+
+/// Bytes [`scan_ranged_slice`] reads first at `off`: a full `mach_header_64`,
+/// or up to EOF.
+fn probe_len(off: u64, source_len: u64) -> usize {
+    32u64.min(source_len - off) as usize
 }
 
 /// Walk a fat/universal binary's arch table by offset. `is_macho` only if
@@ -480,10 +531,20 @@ fn scan_ranged_fat(
         .map(|i| fat_arch_offset(head, is_64, i))
         .collect();
 
+    let mut probes: HashMap<u64, Cow<'_, [u8]>> = HashMap::new();
     let magics: Vec<SliceMagic> = offsets
         .iter()
         .map(|off_opt| match off_opt {
-            Some(off) => classify_slice_magic(src, budget, *off, source_len),
+            Some(off) => match probes.get(off) {
+                Some(probe) => magic_of(probe),
+                None => {
+                    let (magic, probe) = classify_slice_magic(src, budget, *off, source_len);
+                    if let Some(probe) = probe {
+                        probes.insert(*off, probe);
+                    }
+                    magic
+                }
+            },
             // This entry's own bytes lie outside the head: real only if the
             // head is the full table region of an authoritative source.
             None if src.source_len_is_authoritative() && !head_is_short => SliceMagic::NotMacho,
@@ -521,7 +582,14 @@ fn scan_ranged_fat(
         match seen.get(&off) {
             Some(true) => {}
             Some(false) => skipped += 1,
-            None => match scan_ranged_slice(src, off, true, source_len, budget) {
+            None => match scan_ranged_slice(
+                src,
+                off,
+                probes.get(&off).map_or(&[], |p| p),
+                true,
+                source_len,
+                budget,
+            ) {
                 Some(img) => {
                     seen.insert(off, true);
                     images.push(img);
@@ -549,10 +617,12 @@ fn scan_ranged_fat(
 /// `None` if the offset is out of bounds, the header/magic doesn't check
 /// out, the declared load commands run past a non-authoritative
 /// `source_len` (a truncated capture), or `sizeofcmds` is unwalkable — the
-/// caller counts that as skipped.
+/// caller counts that as skipped. `known` holds bytes already read from
+/// `off` (possibly none); they aren't read again.
 fn scan_ranged_slice(
     src: &(impl ByteSource + ?Sized),
     off: u64,
+    known: &[u8],
     is_fat: bool,
     source_len: u64,
     budget: &mut RangeBudget,
@@ -560,8 +630,7 @@ fn scan_ranged_slice(
     if off >= source_len {
         return None;
     }
-    let probe_len = 32u64.min(source_len - off) as usize;
-    let probe = read_budgeted(src, budget, off, probe_len)?;
+    let probe = read_known(src, budget, off, probe_len(off, source_len), known)?;
     let (is_64, be) = be_u32(&probe, 0).and_then(thin_kind)?;
     let header_size: usize = if is_64 { 32 } else { 28 };
     if probe.len() < header_size {
@@ -591,7 +660,12 @@ fn scan_ranged_slice(
     }
 
     let want = (walk_end - off) as usize;
-    let buf = read_budgeted(src, budget, off, want)?;
+    let have: &[u8] = if known.len() > probe.len() {
+        known
+    } else {
+        &probe
+    };
+    let buf = read_known(src, budget, off, want, have)?;
     let mut image = parse_thin(&buf, 0, is_64, be, is_fat)?;
 
     let rebase = |range: Option<Range<u64>>| {
@@ -2581,6 +2655,60 @@ mod tests {
             let bytes = self.data.read_range(off, len)?;
             self.served.set(self.served.get() + bytes.len() as u64);
             Some(bytes)
+        }
+    }
+
+    /// A `ByteSource` holding nothing in memory that records every range read.
+    struct RecordingSource<'a> {
+        data: &'a [u8],
+        reads: std::cell::RefCell<Vec<Range<u64>>>,
+    }
+
+    impl ByteSource for RecordingSource<'_> {
+        fn source_len(&self) -> u64 {
+            self.data.source_len()
+        }
+
+        fn read_range(&self, off: u64, len: usize) -> Option<Cow<'_, [u8]>> {
+            self.reads.borrow_mut().push(off..off + len as u64);
+            self.data.read_range(off, len)
+        }
+    }
+
+    /// Past what's held, each fat slice's header is read once: classify,
+    /// probe and load-command reads never overlap, and the result matches a
+    /// fully held scan.
+    #[test]
+    fn fat_slice_headers_are_read_once() {
+        let (a, _, _) = synth_macho_64_full(b"a", &["/usr/lib/libA.dylib"], &[], true, None);
+        let (b, _, _) = synth_macho_64_full(b"b", &["/usr/lib/libB.dylib"], &[], true, None);
+        let offs = [0x10000usize, 0x20000];
+        let mut fat = Vec::new();
+        fat.extend_from_slice(&FAT_MAGIC.to_be_bytes());
+        fat.extend_from_slice(&2u32.to_be_bytes());
+        for (m, off) in [&a, &b].iter().zip(offs) {
+            fat.extend_from_slice(&0x0100_0007u32.to_be_bytes()); // cputype
+            fat.extend_from_slice(&0u32.to_be_bytes()); // cpusubtype
+            fat.extend_from_slice(&(off as u32).to_be_bytes());
+            fat.extend_from_slice(&(m.len() as u32).to_be_bytes());
+            fat.extend_from_slice(&0u32.to_be_bytes()); // align
+        }
+        for (m, off) in [&a, &b].iter().zip(offs) {
+            fat.resize(off, 0);
+            fat.extend_from_slice(m);
+        }
+
+        let src = RecordingSource {
+            data: &fat,
+            reads: std::cell::RefCell::new(Vec::new()),
+        };
+        let scan = scan_ranged(&src);
+        assert_eq!(scan, scan_ranged(&fat[..]));
+        assert_eq!(scan.images.len(), 2);
+        let mut reads = src.reads.into_inner();
+        reads.sort_by_key(|r| r.start);
+        for pair in reads.windows(2) {
+            assert!(pair[0].end <= pair[1].start, "{reads:?}");
         }
     }
 
