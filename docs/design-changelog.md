@@ -5,6 +5,10 @@ for the current document map. Newest first.
 
 ---
 
+**Changelog from v1.13 (2026-11-21):** `suspicious-strings` intent patterns in a Mach-O count only alongside another category (§5.2, §5.1, #191). Ollama 0.40.15, a Developer ID signed Go binary with hardened runtime, embeds `curl … | bash` agent installers and a `curl --data-binary @…` template for `ollama launch`, and scored Notify on those strings alone, the only Notify in the benign corpus. In a Mach-O the patterns' combined weight is now capped at 14, one below Notify; any non-informational signal from another category (ad-hoc or no signature, an invalid signature, entropy, a loader anomaly) still reaches it. Scripts and other text are unchanged. Decided by the user, over demoting only signed hardened-runtime binaries (a signature would then hide the signal) or recording Ollama as a known false positive. Cost on the §11.1a benchmark: zuru-01 (trojanized iTerm2) goes from Notify to no action, and its expected result follows. Its only finding was iTerm2's own `curl -L %@ | bash` shell-integration string, which a genuine iTerm2 also carries, so that Notify did not come from the payload (`libcrypto.2.dylib`, which scores nothing).
+
+---
+
 **Changelog from v1.12 (2026-11-21):** A target scan reports every scan-budget limit it hit, not one (§8, §11.12, #105). The walk kept only the last collection limit (a later `max-files` stop overwrote `max-depth`), and a precedence rule then picked one of that and `max-total-bytes`, so a scan cut short by several limits named only one and raising that flag alone could still leave coverage partial. `BudgetOutcome::Exhausted` now carries the set. In the `scan --json` target summary, `budget_limit` (a label or `null`) is replaced by `budget_limits`, an array of labels in declaration order (`max-files`, `max-total-bytes`, `max-depth`, `max-entries`), `[]` within budget, and `schema_version` becomes `2`. Per-file objects are unchanged, so `xtask corpus`/`malware compare` accept versions 1 and 2. The human notes list every limit, comma-separated. Decided by the user: replace the field with an array and bump schema_version to 2.
 
 ---

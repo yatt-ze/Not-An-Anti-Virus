@@ -734,7 +734,7 @@ member = "ZuRu/A/iTerm.dmg"
 kind = "dmg"
 sha256 = "e5126f74d430ff075d6f7edcae0c95b81a5e389bf47e4c742618a042f378a3fa"
 bytes = 26316055
-expected = "notify/complete"
+expected = "no-action/complete"
 
 [[sample]]
 id = "keranger-01"

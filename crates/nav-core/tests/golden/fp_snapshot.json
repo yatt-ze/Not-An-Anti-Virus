@@ -206,6 +206,14 @@
     ],
     "completeness": "complete"
   },
+  "benign/macho_embedded_install_command": {
+    "score": 14,
+    "recommendation": "no-action",
+    "rule_ids": [
+      "suspicious-strings"
+    ],
+    "completeness": "complete"
+  },
   "benign/macho_leaked_build_rpath": {
     "score": 9,
     "recommendation": "no-action",
@@ -904,6 +912,15 @@
     "recommendation": "notify",
     "rule_ids": [
       "suspicious-strings"
+    ],
+    "completeness": "complete"
+  },
+  "suspicious/unsigned_macho_install_command": {
+    "score": 18,
+    "recommendation": "notify",
+    "rule_ids": [
+      "suspicious-strings",
+      "unsigned-binary"
     ],
     "completeness": "complete"
   }
