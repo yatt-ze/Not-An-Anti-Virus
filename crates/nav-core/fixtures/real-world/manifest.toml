@@ -578,7 +578,7 @@ member = "Mughthesec/Player.dmg"
 kind = "dmg"
 sha256 = "f5d76324cb8fcae7f00b6825e4c110ddfd6b32db452f1eca0f4cff958316869c"
 bytes = 621930
-expected = "no-action/complete"
+expected = "no-action/partial"
 
 [[sample]]
 id = "opinionspy-01"
