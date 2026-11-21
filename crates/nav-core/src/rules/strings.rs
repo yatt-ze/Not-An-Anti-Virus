@@ -20,7 +20,7 @@ struct Marker {
     needle: &'static str,
     note: &'static str,
     /// Require a non-word byte (or end of input) after the needle — see
-    /// `contains_token`. Used for markers that would otherwise match as a
+    /// `ends_token`. Used for markers that would otherwise match as a
     /// prefix of an unrelated word (`| sh` inside `| shasum`).
     bounded: bool,
 }
@@ -63,20 +63,55 @@ const MARKERS: &[Marker] = &[
     },
 ];
 
-/// Whether `needle` occurs in `haystack` as a token, not as a prefix of a
-/// longer word (`| sh` in `| shasum`). A match counts when the byte after it
-/// is not ASCII alphanumeric/`_`/`-`/`.` — a negative class, since content is
-/// lossy-decoded binary too (bplist/Mach-O bytes). A match running off the
-/// end of `haystack` counts only when `is_last`: when scanning one window of
-/// a larger stream, that match's tail is still ahead in the next window's
-/// overlap and gets judged again once the following byte is available.
-fn contains_token(haystack: &str, needle: &str, is_last: bool) -> bool {
-    haystack.match_indices(needle).any(|(start, _)| {
-        match haystack.as_bytes().get(start + needle.len()) {
-            None => is_last,
-            Some(&b) => !is_word(b),
+/// Whether `next`, the byte after a bounded marker (`None`: end of window),
+/// ends it as a token rather than a prefix of a longer word (`| sh` in
+/// `| shasum`). A negative class, since content may be binary. A match
+/// running off a non-final window is judged again in the next window's
+/// overlap, so it counts only when `is_last`.
+fn ends_token(next: Option<&u8>, is_last: bool) -> bool {
+    match next {
+        None => is_last,
+        Some(&b) => !is_word(b),
+    }
+}
+
+/// The intent pattern found by plain substring search, with the markers.
+const TCC_NEEDLE: &[u8] = b"TCC.db";
+
+/// Bytes that start some `MARKERS` needle or [`TCC_NEEDLE`].
+const NEEDLE_STARTS: [bool; 256] = {
+    let mut t = [false; 256];
+    let mut i = 0;
+    while i < MARKERS.len() {
+        t[MARKERS[i].needle.as_bytes()[0] as usize] = true;
+        i += 1;
+    }
+    t[TCC_NEEDLE[0] as usize] = true;
+    t
+};
+
+/// Sets `hits` for every `MARKERS` needle and [`TCC_NEEDLE`] in `bytes`, in
+/// one pass. The needles are ASCII and lossy decoding never adds, drops or
+/// moves an ASCII byte, so this matches a search of the decoded text.
+fn find_needles(bytes: &[u8], is_last: bool, hits: &mut Hits) {
+    for i in 0..bytes.len() {
+        if !NEEDLE_STARTS[bytes[i] as usize] {
+            continue;
         }
-    })
+        let rest = &bytes[i..];
+        for (j, marker) in MARKERS.iter().enumerate() {
+            let needle = marker.needle.as_bytes();
+            if !hits.markers[j]
+                && rest.starts_with(needle)
+                && (!marker.bounded || ends_token(rest.get(needle.len()), is_last))
+            {
+                hits.markers[j] = true;
+            }
+        }
+        if rest.starts_with(TCC_NEEDLE) {
+            hits.patterns[TCC_DATABASE] = true;
+        }
+    }
 }
 
 /// Longest `MARKERS` needle, in bytes.
@@ -632,14 +667,23 @@ fn scan_line(line: &[u8], cut_start: bool, cut_end: bool, hits: &mut [bool; PATT
     }
 }
 
-/// Runs [`scan_line`] over each `\n`/`\r`/NUL-delimited line of `text`; a
+/// Words one of which every [`scan_line`] hit needs.
+const LINE_TRIGGERS: &[&[u8]] = &[b"curl", b"wget", b"base64", b"openssl", b"xxd"];
+
+fn has_trigger(line: &[u8]) -> bool {
+    (0..line.len()).any(|i| {
+        matches!(line[i], b'c' | b'w' | b'b' | b'o' | b'x')
+            && LINE_TRIGGERS.iter().any(|t| line[i..].starts_with(t))
+    })
+}
+
+/// Runs [`scan_line`] over each `\n`/`\r`/NUL-delimited line of `bytes`; a
 /// backslash before `\n` or `\r\n` joins the next line (as one blank).
 /// `is_first`/`is_last` say whether the window's edges are real input edges.
-fn scan_patterns(text: &str, is_first: bool, is_last: bool, hits: &mut [bool; PATTERNS.len()]) {
-    if !hits[TCC_DATABASE] && text.contains("TCC.db") {
-        hits[TCC_DATABASE] = true;
-    }
-    let bytes = text.as_bytes();
+/// Only lines holding a [`LINE_TRIGGERS`] word are lossy-decoded and scanned;
+/// decoding splits cleanly at ASCII bytes, so this equals decoding the whole
+/// window first.
+fn scan_patterns(bytes: &[u8], is_first: bool, is_last: bool, hits: &mut [bool; PATTERNS.len()]) {
     let mut joined: Vec<u8> = Vec::new();
     let mut line_start = 0;
     let mut start = 0;
@@ -665,9 +709,10 @@ fn scan_patterns(text: &str, is_first: bool, is_last: bool, hits: &mut [bool; PA
             joined.extend_from_slice(&bytes[start..end]);
             &joined[..]
         };
-        if !line.is_empty() {
+        if !line.is_empty() && has_trigger(line) {
+            // Decoded, not raw: U+FFFD's width feeds the span limits.
             scan_line(
-                line,
+                String::from_utf8_lossy(line).as_bytes(),
                 line_start == 0 && !is_first,
                 end == bytes.len() && !is_last,
                 hits,
@@ -679,24 +724,12 @@ fn scan_patterns(text: &str, is_first: bool, is_last: bool, hits: &mut [bool; PA
     }
 }
 
-/// Scans one window's lossy-decoded text for `MARKERS` and the intent
-/// patterns, setting `hits`. `is_first`/`is_last` are forwarded to
-/// [`scan_patterns`]; `is_last` also to [`contains_token`].
-fn scan_window(text: &str, is_first: bool, is_last: bool, hits: &mut Hits) {
-    for (i, marker) in MARKERS.iter().enumerate() {
-        if hits.markers[i] {
-            continue;
-        }
-        let matched = if marker.bounded {
-            contains_token(text, marker.needle, is_last)
-        } else {
-            text.contains(marker.needle)
-        };
-        if matched {
-            hits.markers[i] = true;
-        }
-    }
-    scan_patterns(text, is_first, is_last, &mut hits.patterns);
+/// Scans one window for `MARKERS` and the intent patterns, setting `hits`.
+/// `is_first`/`is_last` are forwarded to [`scan_patterns`]; `is_last` also
+/// to [`find_needles`].
+fn scan_window(bytes: &[u8], is_first: bool, is_last: bool, hits: &mut Hits) {
+    find_needles(bytes, is_last, hits);
+    scan_patterns(bytes, is_first, is_last, &mut hits.patterns);
 }
 
 /// Total weight and notes (patterns first, then counted names) for `hits`.
@@ -757,8 +790,7 @@ impl Rule for SuspiciousStringsRule {
             let file_len = ctx.file_len.ok_or(RuleOutcome::NotApplicable)?;
             let mut first = true;
             let ok = ctx.for_each_window(0..file_len, STREAM_OVERLAP, |window, is_last| {
-                // Lossy-decoded: ASCII markers still match, no panic on non-UTF-8.
-                scan_window(&String::from_utf8_lossy(window), first, is_last, &mut hits);
+                scan_window(window, first, is_last, &mut hits);
                 first = false;
             });
             if !ok {
@@ -778,12 +810,7 @@ impl Rule for SuspiciousStringsRule {
             // cap, or no ranged-read support) — a bounded marker ending
             // exactly at that cut is inconclusive, not a real end-of-input
             // match (§10/§11.8).
-            scan_window(
-                &String::from_utf8_lossy(content),
-                true,
-                !ctx.truncated,
-                &mut hits,
-            );
+            scan_window(content, true, !ctx.truncated, &mut hits);
         }
 
         let (weight, notes) = score(&hits, ctx);
@@ -856,10 +883,156 @@ mod tests {
         assert!(!contains_token("curl x | sh", "| sh", false));
     }
 
+    /// Whether the bounded marker `needle` is found in `haystack`.
+    fn contains_token(haystack: &str, needle: &str, is_last: bool) -> bool {
+        let mut hits = Hits::new();
+        find_needles(haystack.as_bytes(), is_last, &mut hits);
+        let i = MARKERS.iter().position(|m| m.needle == needle).unwrap();
+        hits.markers[i]
+    }
+
     fn fired(text: &str) -> [bool; PATTERNS.len()] {
-        let mut hits = [false; PATTERNS.len()];
-        scan_patterns(text, true, true, &mut hits);
+        let mut hits = Hits::new();
+        scan_window(text.as_bytes(), true, true, &mut hits);
+        hits.patterns
+    }
+
+    /// The window scan before #53: lossy-decode the whole window, then
+    /// search the text. The reference [`scan_window`] must match.
+    fn legacy_scan(window: &[u8], is_first: bool, is_last: bool) -> Hits {
+        let text = String::from_utf8_lossy(window);
+        let mut hits = Hits::new();
+        for (i, m) in MARKERS.iter().enumerate() {
+            hits.markers[i] = if m.bounded {
+                text.match_indices(m.needle).any(|(s, _)| {
+                    match text.as_bytes().get(s + m.needle.len()) {
+                        None => is_last,
+                        Some(&b) => !is_word(b),
+                    }
+                })
+            } else {
+                text.contains(m.needle)
+            };
+        }
+        hits.patterns[TCC_DATABASE] = text.contains("TCC.db");
+        let bytes = text.as_bytes();
+        let mut joined: Vec<u8> = Vec::new();
+        let (mut line_start, mut start) = (0, 0);
+        while start <= bytes.len() && !hits.patterns.iter().all(|&h| h) {
+            let end = bytes[start..]
+                .iter()
+                .position(|&b| matches!(b, b'\n' | b'\r' | 0))
+                .map_or(bytes.len(), |p| start + p);
+            let newline_len = match (bytes.get(end), bytes.get(end + 1)) {
+                (Some(b'\n'), _) => 1,
+                (Some(b'\r'), Some(b'\n')) => 2,
+                _ => 0,
+            };
+            if newline_len > 0 && end > start && bytes[end - 1] == b'\\' {
+                joined.extend_from_slice(&bytes[start..end - 1]);
+                joined.push(b' ');
+                start = end + newline_len;
+                continue;
+            }
+            let line = if joined.is_empty() {
+                &bytes[start..end]
+            } else {
+                joined.extend_from_slice(&bytes[start..end]);
+                &joined[..]
+            };
+            if !line.is_empty() {
+                scan_line(
+                    line,
+                    line_start == 0 && !is_first,
+                    end == bytes.len() && !is_last,
+                    &mut hits.patterns,
+                );
+            }
+            joined.clear();
+            start = end + 1;
+            line_start = start;
+        }
         hits
+    }
+
+    fn assert_matches_legacy(window: &[u8]) {
+        for (is_first, is_last) in [(true, true), (true, false), (false, true), (false, false)] {
+            let mut hits = Hits::new();
+            scan_window(window, is_first, is_last, &mut hits);
+            let want = legacy_scan(window, is_first, is_last);
+            assert_eq!(
+                (hits.markers, hits.patterns),
+                (want.markers, want.patterns),
+                "{window:?} first={is_first} last={is_last}"
+            );
+        }
+    }
+
+    /// Invalid UTF-8 before, after and inside needles and at window edges
+    /// (truncated sequences included) scans as the decoded text did.
+    #[test]
+    fn byte_scan_matches_lossy_decoding() {
+        const FRAGMENTS: &[&[u8]] = &[
+            b"curl x ",
+            b"curl",
+            b"| sh",
+            b"| bash",
+            b" | sh",
+            b"wget -qO- y ",
+            b"echo P | base64 -d ",
+            b"osascript -e 'do shell script \"",
+            b"-F a=@f ",
+            b"TCC.db",
+            b"NSAppleScript",
+            b"dlopen",
+            b"SecKeychain",
+            b"\\\n",
+            b"\\\r\n",
+            b"\n",
+            b"\r",
+            b"\0",
+            b" ",
+            b";",
+            b"x",
+            b"\xff",
+            b"\x80",
+            b"\xc3",
+            b"\xc3\xa9",
+            b"\xe2\x82",
+            b"\xe2\x82\xac",
+            b"\xf0\x9f\x98",
+            b"\xed\xa0\x80",
+        ];
+        let mut seed: u64 = 0x5eed;
+        let mut next = |n: usize| {
+            seed = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (seed >> 33) as usize % n
+        };
+        for _ in 0..4000 {
+            let mut window = Vec::new();
+            for _ in 0..1 + next(12) {
+                window.extend_from_slice(FRAGMENTS[next(FRAGMENTS.len())]);
+            }
+            assert_matches_legacy(&window);
+        }
+    }
+
+    /// Each invalid byte decodes to three, and the span limit is judged on
+    /// the decoded width: 1400 raw bytes between `curl` and `| sh` are
+    /// 4200 decoded, past `PATTERN_SPAN`.
+    #[test]
+    fn decoded_width_still_governs_the_span() {
+        let mut window = b"curl x ".to_vec();
+        window.extend(std::iter::repeat_n(0xff, 1400));
+        window.extend_from_slice(b" | sh");
+        assert!(!legacy_scan(&window, true, true).patterns[DOWNLOAD_TO_SHELL]);
+        assert_matches_legacy(&window);
+        window.truncate(7 + 1000);
+        window.extend_from_slice(b" | sh");
+        assert!(legacy_scan(&window, true, true).patterns[DOWNLOAD_TO_SHELL]);
+        assert_matches_legacy(&window);
     }
 
     fn fires(text: &str, pattern: usize) -> bool {
@@ -1046,9 +1219,9 @@ mod tests {
         assert!(none_fire(&line));
         assert!(start.elapsed() < std::time::Duration::from_secs(5));
         let mut hits = [false; PATTERNS.len()];
-        scan_patterns("x\\", true, false, &mut hits);
-        scan_patterns("\\\r", false, true, &mut hits);
-        scan_patterns("\\\n", false, true, &mut hits);
+        scan_patterns(b"x\\", true, false, &mut hits);
+        scan_patterns(b"\\\r", false, true, &mut hits);
+        scan_patterns(b"\\\n", false, true, &mut hits);
     }
 
     #[test]
@@ -1196,9 +1369,9 @@ mod tests {
     #[test]
     fn a_pattern_cut_by_a_non_first_window_edge_is_not_matched() {
         let mut hits = [false; PATTERNS.len()];
-        scan_patterns("curl x | sh", false, true, &mut hits);
+        scan_patterns(b"curl x | sh", false, true, &mut hits);
         assert!(!hits[DOWNLOAD_TO_SHELL]);
-        scan_patterns("a; curl x | sh", false, true, &mut hits);
+        scan_patterns(b"a; curl x | sh", false, true, &mut hits);
         assert!(hits[DOWNLOAD_TO_SHELL]);
     }
 
