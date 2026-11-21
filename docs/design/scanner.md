@@ -142,7 +142,7 @@ Not part of v1. Once enough labeled telemetry exists, a lightweight on-device cl
 ### 6.1 Passive Path (no self-mounting)
 
 - DMG mounts detected via **DiskArbitration** (`DADiskAppearedCallback`), not proactively mounted.
-- **Correction from v0.1:** mounting a volume does *not* generate FSEvents write events for files that already existed on it — those files aren't newly created by the mount operation, so the earlier "treated as freshly-arrived files" framing was wrong. Instead, on a `DiskArbitration`-observed mount of a user-mounted volume: schedule a **bounded metadata inventory** — enumerate top-level `.app`, `.pkg`, `.command`, and executable objects, read signatures/metadata. Do not recursively traverse arbitrary document trees by default (this stays consistent with non-invasiveness even though the user already mounted the volume — reading everything on it isn't automatically justified just because reading *something* is). Full recursive traversal is available via explicit `navctl scan /Volumes/... --full`.
+- **Correction from v0.1:** mounting a volume does *not* generate FSEvents write events for files that already existed on it — those files aren't newly created by the mount operation, so the earlier "treated as freshly-arrived files" framing was wrong. Instead, on a `DiskArbitration`-observed mount of a user-mounted volume: schedule a **bounded metadata inventory** — enumerate top-level `.app`, `.pkg`, `.command`, and executable objects, read signatures/metadata. Do not recursively traverse arbitrary document trees by default (this stays consistent with non-invasiveness even though the user already mounted the volume — reading everything on it isn't automatically justified just because reading *something* is). Full recursive traversal of such a volume is a planned explicit `--full` mode that arrives with this Phase 2 inventory; it is not in the CLI today, where `navctl scan --recursive` already walks everything it is pointed at.
 - Archive extraction (Finder, `unzip`, etc.) produces ordinary file-write events under the extraction target — this part was correct in v0.1 and needs no change; the existing FSEvents write-monitoring pipeline covers it natively since extraction genuinely does write new files to disk.
 - `.pkg` container metadata (xar structure, signature, distribution script contents) can be statically analyzed pre-execution without opening it. This is distinct from **payload** inspection — see below.
 
@@ -194,7 +194,7 @@ navctl setup fda                      # explicitly user-invoked; opens System Se
 navctl service install                # install navd as a root LaunchDaemon and bootstrap it (needs root); see §11.10
 navctl service uninstall              # remove navd and its artifacts (needs root), best-effort/zero-residue; see §11.10
 navctl service status                 # report install state: which artifacts are present + the launchd job status
-navctl scan <path> [--recursive] [--json] [--verbose] [--quick|--full] [--no-mount] [--max-files N] [--max-total-bytes BYTES]   # --quick/--full: not built yet, exit 4
+navctl scan <path> [--recursive] [--json] [--verbose] [--no-mount] [--max-files N] [--max-total-bytes BYTES]
 navctl rules test <path> [--recursive] [--json] [--no-mount] [--max-files N] [--max-total-bytes BYTES]   # full signal breakdown (file / dir / .app bundle §5.8 / disk image §6.2), dry-run, no action taken
 navctl rules list
 navctl rules reload
