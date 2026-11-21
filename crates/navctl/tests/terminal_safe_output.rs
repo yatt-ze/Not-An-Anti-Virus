@@ -94,10 +94,9 @@ fn scan_json_keeps_the_raw_name() {
     let text = String::from_utf8_lossy(&out.stdout);
     let paths: Vec<String> = text
         .lines()
-        .map(|l| {
-            let v: serde_json::Value = serde_json::from_str(l).expect("JSON line");
-            v["path"].as_str().expect("path").to_string()
-        })
+        .map(|l| serde_json::from_str::<serde_json::Value>(l).expect("JSON line"))
+        .filter(|v| v.get("kind").is_none()) // skip the target summary (#51)
+        .map(|v| v["path"].as_str().expect("path").to_string())
         .collect();
     assert_eq!(paths.len(), 2, "{text:?}");
     let want = dir.path().join(FILE_NAME).to_string_lossy().into_owned();

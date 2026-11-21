@@ -187,3 +187,69 @@ fn subdir_note_keeps_exit_code() {
     );
     assert_eq!(out.status.code(), baseline, "stderr: {stderr}");
 }
+
+/// Parse each stdout line of `navctl scan --json` as one JSON object.
+fn json_lines(out: &Output) -> Vec<serde_json::Value> {
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .map(|l| serde_json::from_str(l).expect("each line is one JSON object"))
+        .collect()
+}
+
+/// #51: a directory scan ends with one summary line, the only object with
+/// a `kind` key, whose `files` counts the per-file lines before it.
+#[test]
+fn dir_scan_ends_with_summary() {
+    let dir = TempDir::new("json-summary");
+    std::fs::write(dir.path().join("a.txt"), "hello\n").unwrap();
+    std::fs::write(dir.path().join("b.txt"), "world\n").unwrap();
+    let out = navctl(&["scan", "--json"], dir.path());
+    let lines = json_lines(&out);
+    let (summary, files) = lines.split_last().unwrap();
+    assert_eq!(files.len(), 2);
+    assert!(files.iter().all(|f| f.get("kind").is_none()));
+    assert_eq!(summary["kind"], "directory");
+    assert_eq!(summary["files"], 2);
+    assert_eq!(summary["schema_version"], 1);
+    assert!(summary["coverage_complete"].is_boolean());
+    assert!(summary.get("results").is_none());
+}
+
+/// #51: a budget stop shows in the summary, not only on stderr.
+#[test]
+fn budget_stop_in_summary() {
+    let dir = TempDir::new("json-budget");
+    std::fs::write(dir.path().join("a.txt"), "hello\n").unwrap();
+    std::fs::write(dir.path().join("b.txt"), "world\n").unwrap();
+    let out = navctl(&["scan", "--json", "--max-files", "1"], dir.path());
+    let lines = json_lines(&out);
+    let summary = lines.last().unwrap();
+    assert_eq!(summary["files"], 1);
+    assert_eq!(summary["coverage_complete"], false);
+    assert_eq!(summary["budget_limit"], "max-files");
+}
+
+/// #51: a budget that admits no file still prints the summary, `files: 0`.
+#[test]
+fn empty_scan_prints_summary() {
+    let dir = TempDir::new("json-empty");
+    std::fs::write(dir.path().join("a.txt"), "hello\n").unwrap();
+    let out = navctl(&["scan", "--json", "--max-files", "0"], dir.path());
+    assert_eq!(out.status.code(), Some(3));
+    let lines = json_lines(&out);
+    assert_eq!(lines.len(), 1);
+    assert_eq!(lines[0]["files"], 0);
+    assert_eq!(lines[0]["coverage_complete"], false);
+}
+
+/// #51: a single-file target stays one object with no summary.
+#[test]
+fn file_scan_has_no_summary() {
+    let dir = TempDir::new("json-file");
+    let file = dir.path().join("a.txt");
+    std::fs::write(&file, "hello\n").unwrap();
+    let out = navctl(&["scan", "--json"], &file);
+    let lines = json_lines(&out);
+    assert_eq!(lines.len(), 1);
+    assert!(lines[0].get("kind").is_none());
+}

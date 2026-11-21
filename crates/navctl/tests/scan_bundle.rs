@@ -26,12 +26,18 @@ fn lines(out: &Output) -> Vec<String> {
         .collect()
 }
 
+/// The number of per-file JSON lines; the last line is the target summary
+/// (#51) and its `files` must agree.
 fn assert_json_lines(out: &Output) -> usize {
     let ls = lines(out);
-    for l in &ls {
-        serde_json::from_str::<serde_json::Value>(l).expect("each line is JSON");
-    }
-    ls.len()
+    let values: Vec<serde_json::Value> = ls
+        .iter()
+        .map(|l| serde_json::from_str(l).expect("each line is JSON"))
+        .collect();
+    let (summary, files) = values.split_last().expect("summary line");
+    assert_eq!(summary["kind"], "bundle");
+    assert_eq!(summary["files"], files.len());
+    files.len()
 }
 
 #[test]

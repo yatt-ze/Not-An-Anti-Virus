@@ -5,6 +5,10 @@ for the current document map. Newest first.
 
 ---
 
+**Changelog from v1.02 (2026-11-21):** `navctl scan --json` ends a directory, bundle or disk-image target with a summary line (§8, §11.12, #51). Target-level coverage (a budget stop, unreadable subdirectories, the not-walked counts) reached stdout only through `rules test --json`, and since #34 a flagged file outranks incompleteness in the exit code, so a script reading `scan --json` and the exit status could not tell that most of a tree was never scanned. The final line is the `rules test` envelope without `results`, plus `files`; per-file objects have no top-level `kind` key, so it identifies the summary. A single-file target is unchanged (one object), and a target with no scored file prints the summary with `files: 0`. Decided: an additive line, no schema bump (`schema_version` stays `1`), stderr notes and exit codes unchanged. `navd scan-once` is scheduled for deletion after spike B3 and still reports target coverage on stderr only.
+
+---
+
 **Changelog from v1.01 (2026-11-21):** A target walk notes what it skips (§5.8, §8, #159). Subdirectories not entered without `--recursive`, and symlinks, sockets, FIFOs and devices, were dropped with no record, so `navctl scan ~/Downloads` read as a full answer while covering only the top level. The walk now counts both, and separately the symlinks that resolve outside the target, and prints one note per kind (stderr for `scan` and `navd scan-once`, the breakdown for `rules test`, three counts in the `rules test --json` envelope, additive fields with no schema bump). Links that leave the target are always noted, dangling ones included (judged by the link text when they won't resolve); for a bundle or disk image, `scan` notes the links that stay inside only with `--verbose`, because app frameworks carry hundreds. Decided: the notes do not change completeness or the exit code. Not recursing is the user's choice, and §6.2 already decides a skipped symlink is not a gap. The `scan --json` stream still has no target record (#51).
 
 ---

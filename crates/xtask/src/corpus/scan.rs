@@ -207,11 +207,14 @@ fn run_chunk(navctl: &Path, budget: &[String], chunk: &Chunk, sink: &Mutex<Sink>
         .with_context(|| format!("running {}", navctl.display()))?;
     let code = output.status.code();
     let stderr = String::from_utf8_lossy(&output.stderr);
-    let files = output
+    let objects: Vec<&[u8]> = output
         .stdout
         .split(|&b| b == b'\n')
         .filter(|l| l.first() == Some(&b'{'))
-        .count();
+        .collect();
+    // Only the last object can be the target summary (§8).
+    let summary = objects.last().is_some_and(|l| super::parse::is_summary(l));
+    let files = objects.len() - usize::from(summary);
 
     let mut s = sink.lock().unwrap();
     s.out.write_all(&output.stdout)?;
