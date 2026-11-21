@@ -5,6 +5,10 @@ for the current document map. Newest first.
 
 ---
 
+**Changelog from v1.09 (2026-11-21):** Cross-platform `nav-core` is recorded as an open decision (§3, §14, #218). §3 now states the platform position: NAV is a macOS product, and `nav-core` is Unix-only (macOS, plus Linux for CI). §14 records the user's wish to keep a cross-platform `nav-core` possible: Linux first-class, perhaps Windows later. It also sets the prerequisite, a platform-aware rule set that drops rules meaningless on the running OS but still reports a gap for a check that matters to the file and cannot run there (§11.8).
+
+---
+
 **Changelog from v1.08 (2026-11-21):** `navctl scan --quick` and `--full` are removed from the CLI (§8, §6.2). They were declared but unbuilt, exiting 4 since #167. `--quick` was never defined beyond its listing in the §8 CLI surface. `--full` keeps its design meaning: an explicit full walk of a volume that the Phase 2 mount inventory would otherwise only sample. It returns with that work, and today `navctl scan --recursive` already walks everything it is pointed at. Decided by the user: remove both rather than keep placeholders.
 
 ---
