@@ -1218,7 +1218,7 @@ mod tests {
         assert_eq!(decode(ok), Ok(b"aaa".to_vec()));
 
         let mut body = vec![(0b00, 2), (0b11, 2)];
-        body.extend(std::iter::repeat((1, 1)).take(40));
+        body.extend(std::iter::repeat_n((1, 1), 40));
         let bad = Spec {
             lens: vec![vec![2, 2, 2]; 2],
             body,

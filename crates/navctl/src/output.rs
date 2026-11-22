@@ -565,7 +565,7 @@ fn print_rules_test_multi(scan: &TargetScan, image: Option<&ImageReport>) {
         nav_core::safe_println!("  (* = bundle main executable)");
     }
     nav_core::safe_println!();
-    let covered = image.map_or(true, |r| r.gaps.is_empty());
+    let covered = image.is_none_or(|r| r.gaps.is_empty());
     nav_core::safe_println!(
         "Recommendation: {}",
         recommendation_str(
@@ -638,7 +638,7 @@ fn target_json(
         (None, TargetKind::Bundle) => "bundle",
         _ => "directory",
     };
-    let gaps_ok = image.map_or(true, |r| r.gaps.is_empty());
+    let gaps_ok = image.is_none_or(|r| r.gaps.is_empty());
     let paths = |ps: &[PathBuf]| ps.iter().map(lossy_path::to_value).collect::<Vec<_>>();
     let mut v = serde_json::json!({
         "schema_version": SCAN_JSON_SCHEMA_VERSION,
