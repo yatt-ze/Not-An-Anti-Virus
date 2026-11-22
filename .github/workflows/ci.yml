@@ -245,6 +245,17 @@ jobs:
             echo "::error::fuzz targets failed: $(tr '\n' ' ' <"${logs}/failed")"
             exit 1
           fi
+      # Long ZIPs run apart from the main corpus, which they would slow
+      # for almost no new coverage. Inputs found here are not kept.
+      - name: long ZIP input pass
+        working-directory: crates/nav-core
+        run: |
+          set -euo pipefail
+          seeds=$(mktemp -d)
+          python3 -I fuzz/seeds/gen_zip_long.py "${seeds}"
+          cargo fuzz run --target x86_64-unknown-linux-gnu parse_zip "${seeds}" -- \
+            -max_total_time=10 -len_control=0 -timeout=10 -rss_limit_mb=2048 \
+            -max_len=66560 -dict=fuzz/dicts/zip.dict
       # Crash, timeout and OOM inputs, as libFuzzer writes them.
       - name: upload fuzz artifacts
         if: failure()
