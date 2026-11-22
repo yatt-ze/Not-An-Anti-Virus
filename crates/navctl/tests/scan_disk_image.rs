@@ -5,6 +5,7 @@
 //! `create` can leave its own temporary attach behind.
 #![cfg(target_os = "macos")]
 
+use std::io::Write;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
@@ -140,7 +141,14 @@ fn hdiutil(args: &[&std::ffi::OsStr]) -> bool {
         if out.status.success() {
             return true;
         }
-        if !String::from_utf8_lossy(&out.stderr).contains("temporarily unavailable") {
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        let _ = writeln!(
+            std::io::stderr(),
+            "hdiutil {args:?} attempt {attempt}: {}: {}",
+            out.status,
+            stderr.trim()
+        );
+        if !stderr.contains("temporarily unavailable") {
             return false;
         }
         std::thread::sleep(Duration::from_millis(200 * attempt));
