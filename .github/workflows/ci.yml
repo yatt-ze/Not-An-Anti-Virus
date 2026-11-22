@@ -160,7 +160,10 @@ jobs:
             done
             echo "${target}: $(find "fuzz/corpus/${target}" -type f | wc -l) inputs"
           }
-          seed bzip2 testdata/bzip2/*.in
+          # The multi-block vectors exceed bzip2's -max_len; these fit it.
+          small=$(mktemp -d)
+          python3 -I fuzz/seeds/gen_bzip2_small.py "${small}"
+          seed bzip2 testdata/bzip2/*.in "${small}"/*.in
           # The inflate target tries raw deflate, zlib and gzip on each input.
           seed inflate testdata/inflate/*.in testdata/gzip/*.in
           seed parse_cpio testdata/cpio/*.cpio
@@ -205,9 +208,9 @@ jobs:
           # dict: a file in fuzz/dicts/, or - for none.
           # target    lane secs max_len dict        why that max_len
           settings='
-          inflate      1   450  65536   -           a full 32 KiB window plus stored blocks
+          inflate      1   450  70016   -           a full window; the whole stored-block seed
           bzip2        2   450  32768   bzip2.dict  >18002 selectors and a few small blocks
-          parse_xar    3   450  65536   xar.dict    header + zlib TOC + several heap entries
+          parse_xar    3   450  131072  xar.dict    TOC + heap; the whole over-budget pkg seed
           parse_plist  4   110  16384   plist.dict  nesting past MAX_DEPTH 32, long entity runs
           parse_cpio   4   110  16384   cpio.dict   >64 small entries, past the harness entry cap
           parse_macho  4   110  65536   -           load commands, a 2-slice fat file, a signature
@@ -242,6 +245,17 @@ jobs:
             echo "::error::fuzz targets failed: $(tr '\n' ' ' <"${logs}/failed")"
             exit 1
           fi
+      # Long ZIPs run apart from the main corpus, which they would slow
+      # for almost no new coverage. Inputs found here are not kept.
+      - name: long ZIP input pass
+        working-directory: crates/nav-core
+        run: |
+          set -euo pipefail
+          seeds=$(mktemp -d)
+          python3 -I fuzz/seeds/gen_zip_long.py "${seeds}"
+          cargo fuzz run --target x86_64-unknown-linux-gnu parse_zip "${seeds}" -- \
+            -max_total_time=10 -len_control=0 -timeout=10 -rss_limit_mb=2048 \
+            -max_len=66560 -dict=fuzz/dicts/zip.dict
       # Crash, timeout and OOM inputs, as libFuzzer writes them.
       - name: upload fuzz artifacts
         if: failure()
