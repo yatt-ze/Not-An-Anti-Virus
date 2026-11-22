@@ -19,7 +19,7 @@ pub const ENGINE_VERSION: &str = env!("CARGO_PKG_VERSION");
 /// below can still cap it to "medium".
 const HIGH_SCORE_THRESHOLD: i32 = 45;
 /// Score at/above which a verdict is "medium."
-const MEDIUM_SCORE_THRESHOLD: i32 = 15;
+pub(crate) const MEDIUM_SCORE_THRESHOLD: i32 = 15;
 
 pub fn scan_file(path: &Path) -> ScanResult {
     scan_file_with_rules(path, &default_ruleset())
