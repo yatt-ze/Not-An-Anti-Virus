@@ -1180,9 +1180,8 @@ fn pkg_ref_paths(text: &[u8], query: &RefQuery) -> Option<Vec<usize>> {
     let found = named
         .into_iter()
         .filter(|(id, _)| {
-            runs.as_ref().map_or(true, |ids| {
-                id.as_ref().is_some_and(|i| ids.contains(i.as_str()))
-            })
+            runs.as_ref()
+                .is_none_or(|ids| id.as_ref().is_some_and(|i| ids.contains(i.as_str())))
         })
         .map(|(_, j)| j)
         .filter(|j| seen.insert(*j))
@@ -3052,7 +3051,7 @@ mod tests {
 
     fn signed_toc_ctx(toc_body: &str, tail: usize) -> ScanContext {
         let mut bytes = crate::xar::toc_xar_bytes(toc_body);
-        bytes.extend(std::iter::repeat(0u8).take(tail));
+        bytes.extend(std::iter::repeat_n(0u8, tail));
         ctx("p.pkg", &bytes)
     }
 

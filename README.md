@@ -79,7 +79,7 @@ that they're unavailable rather than pretending to work.
 
 ## Install
 
-Requires Rust 1.75 or newer. macOS is the target platform. NAV also builds
+Requires Rust 1.85 or newer. macOS is the target platform. NAV also builds
 and runs on Linux, but the macOS-only checks (code signing, notarization, the
 quarantine attribute) are skipped there, so results are marked `Partial`.
 
