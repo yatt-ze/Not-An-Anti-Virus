@@ -181,6 +181,12 @@
     ],
     "completeness": "complete"
   },
+  "benign/launchd_identical_repeated_key.plist": {
+    "score": 0,
+    "recommendation": "no-action",
+    "rule_ids": [],
+    "completeness": "complete"
+  },
   "benign/macho_adhoc_debug_get_task_allow": {
     "score": 4,
     "recommendation": "no-action",
@@ -203,6 +209,14 @@
     "rule_ids": [
       "high-entropy-content",
       "unsigned-binary"
+    ],
+    "completeness": "complete"
+  },
+  "benign/macho_embedded_install_command": {
+    "score": 14,
+    "recommendation": "no-action",
+    "rule_ids": [
+      "suspicious-strings"
     ],
     "completeness": "complete"
   },
@@ -712,6 +726,14 @@
     ],
     "completeness": "complete"
   },
+  "suspicious/launchd_differing_repeated_program.plist": {
+    "score": 16,
+    "recommendation": "notify",
+    "rule_ids": [
+      "launchd-persistence-plist"
+    ],
+    "completeness": "complete"
+  },
   "suspicious/macho_adhoc_disable_lib_validation": {
     "score": 22,
     "recommendation": "notify",
@@ -794,6 +816,16 @@
     "recommendation": "notify",
     "rule_ids": [
       "high-entropy-content",
+      "unsigned-binary"
+    ],
+    "completeness": "complete"
+  },
+  "suspicious/macho_rpath_install_command": {
+    "score": 23,
+    "recommendation": "notify",
+    "rule_ids": [
+      "macho-loader-anomaly",
+      "suspicious-strings",
       "unsigned-binary"
     ],
     "completeness": "complete"
@@ -892,7 +924,7 @@
     "completeness": "complete"
   },
   "suspicious/persistence_repeated_keys.plist": {
-    "score": 20,
+    "score": 28,
     "recommendation": "notify",
     "rule_ids": [
       "launchd-persistence-plist"

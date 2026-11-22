@@ -73,15 +73,70 @@ pub enum BudgetLimit {
     Entries,
 }
 
+impl BudgetLimit {
+    /// Every limit, in declaration order.
+    pub const ALL: [BudgetLimit; 4] = [
+        BudgetLimit::Files,
+        BudgetLimit::TotalBytes,
+        BudgetLimit::Depth,
+        BudgetLimit::Entries,
+    ];
+
+    fn bit(self) -> u8 {
+        1 << self as u8
+    }
+}
+
+/// A set of [`BudgetLimit`]s.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct BudgetLimits(u8);
+
+impl BudgetLimits {
+    pub fn insert(&mut self, limit: BudgetLimit) {
+        self.0 |= limit.bit();
+    }
+
+    pub fn contains(self, limit: BudgetLimit) -> bool {
+        self.0 & limit.bit() != 0
+    }
+
+    pub fn is_empty(self) -> bool {
+        self.0 == 0
+    }
+
+    /// The limits in the set, in [`BudgetLimit`] declaration order.
+    pub fn iter(self) -> impl Iterator<Item = BudgetLimit> {
+        BudgetLimit::ALL
+            .into_iter()
+            .filter(move |l| self.contains(*l))
+    }
+}
+
+impl From<BudgetLimit> for BudgetLimits {
+    fn from(limit: BudgetLimit) -> Self {
+        Self(limit.bit())
+    }
+}
+
+impl<const N: usize> From<[BudgetLimit; N]> for BudgetLimits {
+    fn from(limits: [BudgetLimit; N]) -> Self {
+        let mut set = Self::default();
+        for limit in limits {
+            set.insert(limit);
+        }
+        set
+    }
+}
+
 /// Whether a target scan fit inside its [`ScanBudget`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BudgetOutcome {
     /// The whole target was traversed and scored within budget.
     Within,
-    /// A ceiling was hit, so the target was only partially scanned — the
-    /// result must be read as incomplete coverage even if every scored file
-    /// was individually `Complete` (§11.8).
-    Exhausted(BudgetLimit),
+    /// One or more ceilings were hit (never an empty set), so the target was
+    /// only partially scanned — the result must be read as incomplete
+    /// coverage even if every scored file was individually `Complete` (§11.8).
+    Exhausted(BudgetLimits),
 }
 
 /// The outcome of scanning a target path: every file that was scanned, plus
@@ -227,7 +282,7 @@ pub fn scan_target_with_budget(
             skipped,
             unreadable: walk.unreadable,
             not_walked: walk.not_walked,
-            budget: outcome(walk.limit, byte_limit),
+            budget: outcome(walk.limits, byte_limit),
         });
     }
 
@@ -248,21 +303,19 @@ pub fn scan_target_with_budget(
         skipped: Vec::new(),
         unreadable: walk.unreadable,
         not_walked: walk.not_walked,
-        budget: outcome(walk.limit, byte_limit),
+        budget: outcome(walk.limits, byte_limit),
     })
 }
 
-/// Fold the collection-time and scan-time budget limits into one outcome.
-/// When both tripped, the byte limit is reported over `Files` but not over
-/// `Depth`/`Entries`, which no flag can raise (§11.12).
-fn outcome(collect_limit: Option<BudgetLimit>, byte_limit: Option<BudgetLimit>) -> BudgetOutcome {
-    let reported = match collect_limit {
-        Some(BudgetLimit::Files) | None => byte_limit.or(collect_limit),
-        Some(_) => collect_limit,
-    };
-    match reported {
-        Some(limit) => BudgetOutcome::Exhausted(limit),
-        None => BudgetOutcome::Within,
+/// Every limit hit while collecting or scanning, as one outcome (§11.12).
+fn outcome(mut collect_limits: BudgetLimits, byte_limit: Option<BudgetLimit>) -> BudgetOutcome {
+    if let Some(limit) = byte_limit {
+        collect_limits.insert(limit);
+    }
+    if collect_limits.is_empty() {
+        BudgetOutcome::Within
+    } else {
+        BudgetOutcome::Exhausted(collect_limits)
     }
 }
 
@@ -302,8 +355,8 @@ fn scan_within_bytes(
 struct Walk {
     /// Regular files, sorted.
     files: Vec<PathBuf>,
-    /// The budget ceiling that stopped the walk, if any.
-    limit: Option<BudgetLimit>,
+    /// The budget ceilings the walk hit; empty if none.
+    limits: BudgetLimits,
     /// Directories that could not be listed, sorted.
     unreadable: Vec<PathBuf>,
     not_walked: NotWalked,
@@ -311,8 +364,9 @@ struct Walk {
 
 /// Depth-first file collection under `root`, sorted for determinism (§11.1).
 /// Directory symlinks are not followed (traversal cycles, scan escape).
-/// Stops early if the budget's file-count or depth ceiling is reached,
-/// returning which limit was hit so the target can be marked partial.
+/// Stops early at the file-count or entry ceiling and skips subdirectories
+/// past the depth ceiling, returning every limit hit so the target can be
+/// marked partial.
 ///
 /// `root` itself failing to read (`depth == 0`) is an operational error and
 /// propagates via `?` — there's nothing to traverse or report partial
@@ -322,7 +376,7 @@ struct Walk {
 /// (§11.8).
 fn collect_files(root: &Path, recursive: bool, budget: &ScanBudget) -> io::Result<Walk> {
     let mut out = Vec::new();
-    let mut limit_hit = None;
+    let mut limits_hit = BudgetLimits::default();
     let mut unreadable: BTreeSet<PathBuf> = BTreeSet::new();
     let mut not_walked = NotWalked::default();
     let real_root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
@@ -348,7 +402,7 @@ fn collect_files(root: &Path, recursive: bool, budget: &ScanBudget) -> io::Resul
         for entry in read_dir {
             entries_seen += 1;
             if entries_seen > budget.max_entries {
-                limit_hit = Some(BudgetLimit::Entries);
+                limits_hit.insert(BudgetLimit::Entries);
                 break 'walk;
             }
             let entry = match entry {
@@ -373,14 +427,14 @@ fn collect_files(root: &Path, recursive: bool, budget: &ScanBudget) -> io::Resul
                     if depth < budget.max_depth {
                         stack.push((path, depth + 1));
                     } else {
-                        limit_hit.get_or_insert(BudgetLimit::Depth);
+                        limits_hit.insert(BudgetLimit::Depth);
                     }
                 } else {
                     not_walked.subdirs += 1;
                 }
             } else if file_type.is_file() {
                 if out.len() >= budget.max_files {
-                    limit_hit = Some(BudgetLimit::Files);
+                    limits_hit.insert(BudgetLimit::Files);
                     break 'walk;
                 }
                 out.push(path);
@@ -396,7 +450,7 @@ fn collect_files(root: &Path, recursive: bool, budget: &ScanBudget) -> io::Resul
     out.sort();
     Ok(Walk {
         files: out,
-        limit: limit_hit,
+        limits: limits_hit,
         unreadable: unreadable.into_iter().collect(),
         not_walked,
     })
@@ -624,7 +678,10 @@ mod tests {
         };
         let scan = scan_target_with_budget(dir.path(), true, &budget).unwrap();
         assert_eq!(scan.results.len(), 2);
-        assert_eq!(scan.budget, BudgetOutcome::Exhausted(BudgetLimit::Files));
+        assert_eq!(
+            scan.budget,
+            BudgetOutcome::Exhausted(BudgetLimit::Files.into())
+        );
         assert!(!scan.coverage_complete());
     }
 
@@ -646,7 +703,10 @@ mod tests {
             .results
             .iter()
             .any(|r| r.path.ends_with("sub/deep.txt")));
-        assert_eq!(scan.budget, BudgetOutcome::Exhausted(BudgetLimit::Depth));
+        assert_eq!(
+            scan.budget,
+            BudgetOutcome::Exhausted(BudgetLimit::Depth.into())
+        );
     }
 
     fn bytes_read_scanning(path: &Path) -> u64 {
@@ -680,7 +740,7 @@ mod tests {
         assert_eq!(scan.results.len(), 1);
         assert_eq!(
             scan.budget,
-            BudgetOutcome::Exhausted(BudgetLimit::TotalBytes)
+            BudgetOutcome::Exhausted(BudgetLimit::TotalBytes.into())
         );
     }
 
@@ -811,10 +871,10 @@ mod tests {
         assert!(read < 16 * 1024 * 1024, "{read}");
     }
 
-    /// Both limits hit: the byte limit is reported, since it stopped scoring
-    /// before the collected files ran out.
+    /// The walk stops at `max_files` and scoring then stops at the byte
+    /// limit: both are reported (§11.12).
     #[test]
-    fn a_byte_stop_is_reported_over_a_file_limit() {
+    fn files_and_bytes_reported() {
         let dir = TempDir::new("budget-both");
         for name in ["a.bin", "b.bin", "c.bin"] {
             fs::write(dir.path().join(name), vec![0u8; 4096]).unwrap();
@@ -828,16 +888,57 @@ mod tests {
         assert_eq!(scan.results.len(), 1);
         assert_eq!(
             scan.budget,
-            BudgetOutcome::Exhausted(BudgetLimit::TotalBytes)
+            BudgetOutcome::Exhausted([BudgetLimit::Files, BudgetLimit::TotalBytes].into())
+        );
+    }
+
+    /// A subdirectory past `max_depth` and a later `max_files` stop are both
+    /// reported: the file stop doesn't overwrite the depth one.
+    #[test]
+    fn depth_and_files_reported() {
+        let dir = TempDir::new("budget-depth-files");
+        fs::create_dir(dir.path().join("a")).unwrap();
+        fs::write(dir.path().join("a/deep.txt"), b"d").unwrap();
+        for name in ["b.txt", "c.txt", "d.txt"] {
+            fs::write(dir.path().join(name), b"x").unwrap();
+        }
+        let budget = ScanBudget {
+            max_files: 2,
+            max_depth: 0,
+            ..ScanBudget::default()
+        };
+        let scan = scan_target_with_budget(dir.path(), true, &budget).unwrap();
+        assert_eq!(scan.results.len(), 2);
+        assert_eq!(
+            scan.budget,
+            BudgetOutcome::Exhausted([BudgetLimit::Files, BudgetLimit::Depth].into())
+        );
+    }
+
+    /// Every limit hit is reported, collection-time and byte alike.
+    #[test]
+    fn every_limit_is_reported() {
+        for fixed in [BudgetLimit::Depth, BudgetLimit::Entries] {
+            let both = outcome(fixed.into(), Some(BudgetLimit::TotalBytes));
+            assert_eq!(
+                both,
+                BudgetOutcome::Exhausted([fixed, BudgetLimit::TotalBytes].into())
+            );
+        }
+        assert_eq!(
+            outcome(BudgetLimits::default(), None),
+            BudgetOutcome::Within
         );
     }
 
     #[test]
-    fn a_fixed_collection_limit_is_reported_over_a_byte_stop() {
-        let both = outcome(Some(BudgetLimit::Depth), Some(BudgetLimit::TotalBytes));
-        assert_eq!(both, BudgetOutcome::Exhausted(BudgetLimit::Depth));
-        let both = outcome(Some(BudgetLimit::Entries), Some(BudgetLimit::TotalBytes));
-        assert_eq!(both, BudgetOutcome::Exhausted(BudgetLimit::Entries));
+    fn limits_iterate_in_order() {
+        let set: BudgetLimits = [BudgetLimit::Entries, BudgetLimit::Files].into();
+        assert_eq!(
+            set.iter().collect::<Vec<_>>(),
+            [BudgetLimit::Files, BudgetLimit::Entries]
+        );
+        assert!(!set.contains(BudgetLimit::Depth));
     }
 
     #[test]
@@ -855,7 +956,7 @@ mod tests {
         assert_eq!(scan.results.len(), 1);
         assert_eq!(
             scan.budget,
-            BudgetOutcome::Exhausted(BudgetLimit::TotalBytes)
+            BudgetOutcome::Exhausted(BudgetLimit::TotalBytes.into())
         );
     }
 
@@ -873,7 +974,10 @@ mod tests {
         };
         let scan = scan_target_with_budget(dir.path(), true, &budget).unwrap();
         assert!(scan.results.is_empty());
-        assert_eq!(scan.budget, BudgetOutcome::Exhausted(BudgetLimit::Entries));
+        assert_eq!(
+            scan.budget,
+            BudgetOutcome::Exhausted(BudgetLimit::Entries.into())
+        );
         assert!(!scan.coverage_complete());
     }
 

@@ -14,8 +14,9 @@ pub fn is_summary(line: &[u8]) -> bool {
 }
 
 /// Parses JSONL from `reader`, skipping lines that don't start with `{` and
-/// the target summary. Errors on malformed JSON or any `schema_version`
-/// other than [`SCAN_JSON_SCHEMA_VERSION`].
+/// the target summary. Errors on malformed JSON or a `schema_version` that is
+/// missing or outside 1..=[`SCAN_JSON_SCHEMA_VERSION`]; per-file lines are
+/// unchanged across those versions, so an older base build still compares.
 pub fn parse_jsonl(reader: impl BufRead) -> Result<Vec<ScanResult>> {
     let mut out = Vec::new();
     for (i, line) in reader.lines().enumerate() {
@@ -28,9 +29,9 @@ pub fn parse_jsonl(reader: impl BufRead) -> Result<Vec<ScanResult>> {
         let value: serde_json::Value =
             serde_json::from_str(line).with_context(|| format!("line {n}: invalid JSON"))?;
         let version = value.get("schema_version").and_then(|v| v.as_u64());
-        if version != Some(u64::from(SCAN_JSON_SCHEMA_VERSION)) {
+        if !version.is_some_and(|v| (1..=u64::from(SCAN_JSON_SCHEMA_VERSION)).contains(&v)) {
             bail!(
-                "line {n}: schema_version {version:?}, expected {SCAN_JSON_SCHEMA_VERSION}; \
+                "line {n}: schema_version {version:?}, expected 1..={SCAN_JSON_SCHEMA_VERSION}; \
                  rebuild both navctl binaries from compatible revisions"
             );
         }
@@ -74,8 +75,17 @@ mod tests {
     }
 
     #[test]
-    fn rejects_wrong_schema_version() {
-        let bad = LINE.replace("\"schema_version\":1", "\"schema_version\":999");
+    fn accepts_every_known_version() {
+        for v in 1..=SCAN_JSON_SCHEMA_VERSION {
+            let line = LINE.replace("\"schema_version\":1", &format!("\"schema_version\":{v}"));
+            assert_eq!(parse_jsonl(line.as_bytes()).unwrap().len(), 1, "{v}");
+        }
+    }
+
+    #[test]
+    fn rejects_newer_schema_version() {
+        let newer = format!("\"schema_version\":{}", SCAN_JSON_SCHEMA_VERSION + 1);
+        let bad = LINE.replace("\"schema_version\":1", &newer);
         let err = parse_jsonl(bad.as_bytes()).unwrap_err().to_string();
         assert!(err.contains("schema_version"), "{err}");
     }

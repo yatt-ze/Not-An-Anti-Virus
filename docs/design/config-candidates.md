@@ -166,7 +166,7 @@ All Boundary: a user-chosen tool path runs that binary, and the service paths ar
 | Ruleset hot-reload + rollback | roadmap.md Phase 3 | Boundary |
 | Opt-in auto-quarantine | scanner.md §7 | Boundary (acts on files without confirmation) |
 | Allowlist / denylist | scanner.md §8; roadmap.md Phase 3 | Detection |
-| Container limits with configurable ranges | scanner.md §6.2 table | Resource |
+| Container limits (defaults in the §6.2 table; config ranges not yet chosen, #196) | scanner.md §6.2 | Resource |
 | Opt-in `CloudFeedProvider` | scanner.md | Privacy |
 | Full process args (redaction opt-out) | platform.md | Privacy |
 | Event log retention | roadmap.md Phase 3 | Privacy |

@@ -777,7 +777,7 @@ pub(super) fn apple_anchor_check(ctx: &ScanContext) -> AnchorCheck {
     if !ctx.tool_allowed() {
         return AnchorCheck::Skipped;
     }
-    match ctx.run_object_bound(|| spawn_strict_anchor_check(&ctx.path)) {
+    match ctx.strict_anchor_check(|| spawn_strict_anchor_check(&ctx.path)) {
         Some(0) => AnchorCheck::Verified,
         _ => AnchorCheck::NotVerified,
     }
@@ -1053,6 +1053,8 @@ mod tests {
         let path = crate::test_support::write_temp_file("anchor-skip", &[7u8; 1000]);
         let ctx = ScanContext::load_if(&path, 1500, |_| true).unwrap();
         let _ = std::fs::remove_file(&path);
+        // A warm cache must not bypass the allowance check (#106).
+        ctx.strict_anchor_cache.set(Some(0)).unwrap();
         assert_eq!(apple_anchor_check(&ctx), AnchorCheck::Skipped);
         assert!(!verifies_apple_anchor(&ctx, "some-rule"));
         assert!(ctx.marked_incomplete("some-rule"));

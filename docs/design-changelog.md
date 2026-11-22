@@ -5,6 +5,22 @@ for the current document map. Newest first.
 
 ---
 
+**Changelog from v1.14 (2026-11-21):** `suspicious-strings` intent patterns in a Mach-O count only alongside another category (§5.2, §5.1, #191). Ollama 0.40.15, a Developer ID signed Go binary with hardened runtime, embeds `curl … | bash` agent installers and a `curl --data-binary @…` template for `ollama launch`, and scored Notify on those strings alone, the only Notify in the benign corpus. In a Mach-O (at least one slice parsed: bare magic followed by a newline still runs as a script, so it is not enough) the patterns' combined weight is now capped at 14, one below Notify; any non-informational signal from another category (ad-hoc or no signature, an invalid signature, entropy, a loader anomaly) still reaches it. Scripts and other text are unchanged. Decided by the user, over demoting only signed hardened-runtime binaries (a signature would then hide the signal) or recording Ollama as a known false positive. Cost on the §11.1a benchmark: zuru-01 (trojanized iTerm2) goes from Notify to no action, and its expected result follows. Its only finding was iTerm2's own `curl -L %@ | bash` shell-integration string, which a genuine iTerm2 also carries, so that Notify did not come from the payload (`libcrypto.2.dylib`, which scores nothing).
+
+---
+
+**Changelog from v1.13 (2026-11-21):** A launchd job that repeats a key with differing values scores 8 in `launchd-persistence-plist` (§5.2, #192). launchd runs the last occurrence while CoreFoundation, and so `plutil`, shows the first in a binary plist, so such a job can show an analyst one program and run another (#183). Any dict in the job counts, so a repeated `EnvironmentVariables` entry does too. Identical repeats score nothing: a survey of 903 launchd plists and 2,706 `Info.plist`s found 17 repeats, all identical, and none differing. The weight is corroboration-only (§5.1): alone it stays below Notify, and with `RunAtLoad` + `KeepAlive` (8) it reaches 16. Decided by the user: implement once the survey showed no benign differing repeats. `Info.plist` is not scored for it.
+
+---
+
+**Changelog from v1.12 (2026-11-21):** A target scan reports every scan-budget limit it hit, not one (§8, §11.12, #105). The walk kept only the last collection limit (a later `max-files` stop overwrote `max-depth`), and a precedence rule then picked one of that and `max-total-bytes`, so a scan cut short by several limits named only one and raising that flag alone could still leave coverage partial. `BudgetOutcome::Exhausted` now carries the set. In the `scan --json` target summary, `budget_limit` (a label or `null`) is replaced by `budget_limits`, an array of labels in declaration order (`max-files`, `max-total-bytes`, `max-depth`, `max-entries`), `[]` within budget, and `schema_version` becomes `2`. Per-file objects are unchanged, so `xtask corpus`/`malware compare` accept versions 1 and 2. The human notes list every limit, comma-separated. Decided by the user: replace the field with an array and bump schema_version to 2.
+
+---
+
+**Changelog from v1.11 (2026-11-21):** The §6.2 container-limits table now states the limits the code enforces (§6.2, §11.12, #196). It listed 2 GB extracted, 500 MB per file, 50,000 files and 60 s per scan, with configurable ranges, none of which the code had: the real defaults are per format (a 256 MiB read-back per `.pkg` or ZIP, 4 MiB per xar entry, 8 MiB per ZIP member, 10,000 entries, 300:1 for ZIP members, 16 GiB / 64 GiB and `hdiutil` timeouts for a mounted image), under the whole-target budget, with no per-scan clock. Decided by the user: the doc follows the code, no limit changes, and the configurable-range column is dropped until Phase 3 picks ranges (`config-candidates.md`).
+
+---
+
 **Changelog from v1.10 (2026-11-21):** A revoked signing certificate keeps a binary `Partial` (§5.2, §11.8, §11.1a, #150). Measured in the benchmark VM: with one byte of a revoked binary's code flipped, `codesign` still reports only the revocation, so it never checks the code hashes, and `invalid-code-signature` cannot say the signature is intact. Decided by the user: no rule change, both signer-check rules stay `NotApplicable` on a revocation. The revocation answer itself depends on `codesign`'s cache (a cold first verify exited 0), so `malware compare` now runs a throwaway warm-up pass before the base and new scans, and mughthesec-01's expected result is now `no-action/partial`.
 
 ---
