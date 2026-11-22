@@ -60,11 +60,11 @@ fuzz_target!(|data: &[u8]| {
     }
 });
 
-/// `CpioStream` over `data` in pieces sized by its last byte agrees with
-/// `parse` with no byte ceiling. Not the first byte: it is `0` in any valid
-/// archive, which would fix the piece size at 48.
+/// `CpioStream` over `data` in pieces sized by the XOR of its bytes agrees
+/// with `parse` with no byte ceiling. A single byte won't do: a valid archive
+/// starts with `0` and usually ends in NUL.
 fn check_stream(data: &[u8]) {
-    let chunk = usize::from(data.last().copied().unwrap_or(1)).max(1);
+    let chunk = usize::from(data.iter().fold(0, |sum, b| sum ^ b)).max(1);
     let max_entries = 64;
     let mut walk = CpioStream::new(StreamLimits {
         max_entries,
