@@ -2,8 +2,9 @@
 
 Companion to the roadmap (`docs/design/roadmap.md` §12). The roadmap holds the
 *scope* and go/no-go of Phase 0b; this file holds the *sequence* — what order to
-attack it in, what each spike asks and how it passes, and where the Developer ID
-enters. Section numbers (`§10`, `§11.10`, …) refer to the design doc.
+attack it in, what each spike asks and how it passes, and what the
+Release-Readiness Gate still checks. Section numbers (`§10`, `§11.10`, …) refer
+to the design doc.
 
 ## Framing
 
@@ -12,12 +13,11 @@ macOS daemon at all?" Several of those answers can invalidate design
 assumptions, so this phase is **spike-first**: cheap feasibility checks run
 before the daemon is built in earnest, and the build is gated on them.
 
-**The whole phase runs on ad-hoc signatures.** The Developer ID is deferred to a
-one-time Release-Readiness Gate immediately before first distribution (§13), so
-nothing here requires the paid Apple Developer Program. Go/no-go is cleared
-*provisionally* on ad-hoc results; the one criterion that can't be settled that
-way (FDA grant durability across upgrades) is carried as "expected, unverified"
-until the gate.
+**The whole phase runs on ad-hoc signatures.** NAV doesn't sign with a
+Developer ID (§13), so nothing here, or later, requires the Apple Developer
+Program. FDA grant durability across upgrades (B2) is tested ad-hoc and with a
+stable self-signed certificate; if neither keeps the grant, re-granting after a
+`navd` upgrade is documented as a known gap rather than blocking the phase.
 
 **Scope discipline:** no daemon / socket / root / FDA / network code lands until
 the spike it depends on has been run and the user has said go (CLAUDE.md).
@@ -52,8 +52,7 @@ Just enough to make the spikes runnable. Everything here is ad-hoc-signed.
   (§10)** — the user-invoked FDA helper and the per-area probes
   (`Downloads: verified`, `Documents: degraded`, …) B1 measures against.
 
-> The notarization pipeline (would-be A0) is **not** here — it needs a Developer
-> ID and moves to the Release-Readiness Gate.
+> There is no notarization pipeline (would-be A0): NAV doesn't notarize (§13).
 
 **Test protocol for every spike:** `install → test → uninstall → assert-clean`.
 Each run starts from a verified-clean baseline, so results (especially B1/B2's
@@ -69,7 +68,7 @@ parallel.
 | # | Spike | Method | Pass bar |
 |---|---|---|---|
 | **B1** | FDA grantable to a bare daemon? | Drag ad-hoc `navd` into the FDA pane; run the A3 probe matrix; exercise the Tahoe 26.1/26.2 FDA-list bug. | Grant works + probe matrix documented, **or** §10 coverage gap scoped precisely (which paths degrade). |
-| **B2** | FDA scope & durability | Grant, then reinstall / bump version / renew cert / update CLI-only (§11.10). | **Deferred to the gate** — ad-hoc identity changes each build, so only the negative is observable now. Carry as "expected, unverified." |
+| **B2** | FDA scope & durability | Grant, then reinstall / bump version / renew cert / update CLI-only (§11.10), once ad-hoc and once signed with a stable self-signed certificate. | Durability measured for both. If neither keeps the grant, re-grant-after-upgrade is documented (§10) and the install UX says so. Not a blocker. |
 | **B3** | Interactive vs headless TCC | Compare `navctl rules test` (terminal) vs `navd` headless read of a protected path. | Behavior confirmed either way; on-demand scan may work without a `navd` grant. |
 | **B4** | `navnotify` delivery (§9.2) | Bare LaunchAgent vs `LSUIElement` app; post via UserNotifications; test Fast User Switching routing. | A form that posts correctly-attributed notifications, **or** CLI-only fallback with `navctl status` showing `notify delivery: degraded`. |
 | **B5** | Homebrew root-daemon attack (§11.10) | With A1 installed, attempt the Cellar-writable-binary → root swap; test Homebrew upgrade while `navd` runs. | Attack confirmed closed (plist runs only the root-owned copy); a regression test proving it. |
@@ -92,31 +91,24 @@ The Phase 0b deliverables, now de-risked, still ad-hoc:
   guardrails (§6.2, limits already locked). **Carries its own privileged /
   disk-mount threat model — treat as a sub-review, not a bolt-on.**
 
-## Release-Readiness Gate (terminal step, before first distribution)
+## Release-Readiness Gate (terminal step, before the first Homebrew release)
 
-The *only* place the Developer ID appears. Run once, after the product is judged
-releasable (§13):
+Run once, before the first Homebrew release (§13). No Developer ID:
 
-1. Acquire Developer ID; stand up notarization; sign + notarize `navctl`,
-   `navd`, `navnotify`.
-2. Settle the deferred Developer-ID-dependent checks: **B2** grant durability
-   across the four §11.10 upgrade scenarios; **B4-final** production-attribution
-   delivery; fresh-user download → Gatekeeper → `navctl service install` → FDA
-   first-run UX.
-3. Package the Homebrew formula + `.pkg` fallback (§13) → first distribution.
+1. Fix the signing identity: ad-hoc, or the self-signed certificate if B2
+   showed it keeps the FDA grant.
+2. Re-check under that identity: **B2** grant durability across the four §11.10
+   upgrade scenarios; **B4-final** notification attribution; fresh-user install
+   (script or tap) → `navctl service install` → FDA first-run UX.
+3. Package the Homebrew tap formula and the install script's release assets
+   (§13) → first Homebrew release.
 
-**No-Developer-ID fallback delivery:** build-from-source (`git clone && make`, or
-`brew install --build-from-source` from the tap) — auditable, reaches the same
-ad-hoc-signed end state, and for an open-source security tool the auditability is
-a feature. Explicitly **not** `curl … | sh`: a piped-shell install is the exact
-inline-loader pattern NAV's own rules flag (§5.2), so the product must not ship
-its install that way. It stays a technical-user fallback, never the recommended
-path (an unsigned root daemon still asks for `sudo` + FDA).
+The install script (§13) can ship pre-release builds before the gate.
 
 ## Dependencies & risks
 
 - **Biggest risk to the phase:** the active Tahoe FDA-list bug (§10) could make
   B1 a "no" on current macOS — why it runs first, and why §10 already designs
   the fallback (visible per-event `NOT SCANNED`).
-- **External dependency (deferred):** the Apple Developer Program membership —
-  now isolated to the Release-Readiness Gate, so it blocks nothing in 0b.
+- **No Developer ID** (§13): `navd`'s FDA grant may not survive upgrades. B2
+  measures it; the self-signed certificate is the mitigation being tested.
