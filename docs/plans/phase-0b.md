@@ -103,7 +103,7 @@ Run once, before the first Homebrew release (§13). No Developer ID:
 3. Package the Homebrew tap formula and the install script's release assets
    (§13) → first Homebrew release.
 
-The install script (§13) can ship pre-release `navctl` builds before the gate.
+The install script (§13) can ship pre-release builds before the gate.
 
 ## Dependencies & risks
 
