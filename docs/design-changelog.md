@@ -5,6 +5,14 @@ for the current document map. Newest first.
 
 ---
 
+**Changelog from v1.18 (2026-11-25):** Directories on the way to a target are opened search-only (§11.7, #253). The no-follow walk opened every directory component `O_RDONLY`, which needs the read bit, so a non-root scan of a file under a directory it could search but not list (mode `0711`) reported a gap; the by-path open it replaced needed only the execute bit. The root and intermediate components now open `O_PATH` on Linux and `O_SEARCH` (`O_EXEC | O_DIRECTORY`, set by raw bits since rustix lacks it) on macOS. A directory that is listed still opens `O_RDONLY`. Decided: search-only opens, not a retry on `EACCES`.
+
+---
+
+**Changelog from v1.17 (2026-11-25):** Directories are listed through a no-follow descriptor beneath the scan root (§11.7, #252). The walker listed each directory by path, following symlinks, so a parent swapped for a symlink before it was listed exposed the outside directory's entry names as unreadable paths. Each directory is now reopened by the same `openat` walk as files (`O_NOFOLLOW | O_DIRECTORY` per component) and read through that descriptor; one that won't open that way is a gap (§11.8). The walk keeps relative paths, not descriptors, so at most one directory descriptor is held. Still by path: `codesign`/`spctl` themselves and the `links_outside` count of where a symlink points.
+
+---
+
 **Changelog from v1.16 (2026-11-25):** Scanned files are opened without following a symlink below the target (§11.7, §11.8, #239). The walker listed files and later opened each by path, following symlinks in every component, so a file or parent directory swapped mid-scan could make a root scan read a file outside the target and report it under the listed path (threat-model E1). The named target is now resolved once and held open; each file is opened by an `openat` walk from it with `O_NOFOLLOW` on every component, and one that won't open that way is reported unreadable, a gap, never clean. The quarantine xattr, the `.app` exemption and the codesign/spctl identity re-check now describe the opened object; the re-check also stats the path the tool used, so a root or parent renamed aside and replaced is caught too. Directories are opened `O_RDONLY`, so a file under a search-only (`0711`) directory is now a gap (#253). Decided: a no-follow descriptor walk, not comparing the opened file's path with the expected one, which would gap hard-linked files. Still by path: `codesign`/`spctl` themselves and the directory listing (entry names only). Hard links out of the target stay out of scope (R2).
 
 ---
