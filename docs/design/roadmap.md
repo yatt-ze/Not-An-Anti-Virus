@@ -33,6 +33,7 @@ Daemon skeleton, `EventSource` abstraction + capability struct, FSEvents watcher
   - Reading a cloud placeholder can be made to fail instead of downloading (B).
   - A user can hard-link a file they cannot read (R2).
   - How a root-initiated `hdiutil attach` treats setuid bits, device nodes and ownership by default (R9, E5).
+  - Worker uid (§14): run the worker as a dedicated role account and as the file's owner, and compare. For each: whether it can mount a disk image through DiskArbitration with no login session, whether the removable-volume prompt (#187) blocks or denies it, whether its sandbox can allow the disk-image and DiskArbitration services while staying closed otherwise, and whether the mount comes out with setuid and device files disabled and ownership ignored (§6.2, §11.13).
   - `fs::copy` carries an ACL onto the installed binary, and whether `codesign -f` drops it (E3).
   - `sudo` on stock macOS keeps the caller's `PATH` and clears `TMPDIR` (#157, E5).
 
@@ -83,6 +84,9 @@ Quarantine manager (findings bound to identity and digest, acted on with the own
 
 ## 14. Open Decisions (Still Not Locked)
 
+- **Scan worker uid** (§11.13). A dedicated role account (a uid boundary against malware running as the file's owner) or the file's owner (no extra account; likelier to be allowed to mount disk images). The user leans against role accounts; the Phase 0b spike runs both (§12).
+- **Automatic disk-image mounting: on by default or opt-in** (§6.2). On by default reaches DMGs, the main delivery format, before the user opens them, but the kernel's filesystem code then reads every downloaded image, not only those the user opens.
+- **Where behavioural scoring runs** (Phase 2). The correlator and behavioural engine are not placed in §11.13 yet. Settled: anything that parses file content, such as a plist that became persistence-capable, goes through the worker; event metadata may be scored in the broker.
 - **Per-user agent as an opt-in deployment mode.** Not ruled out. For users who don't want a root daemon, a per-user agent can feed the same scan worker (§11.13) in place of the root broker, so the confused-deputy problem does not arise. Its guarantee is weaker: malware running as the same user can stop the agent or tamper with its results and record. The root broker is the default (§2). The design keeps the worker's interface independent of who feeds it so this mode stays possible; whether and when to build it is open.
 - Whether, and how far, to make `nav-core` cross-platform (§3): Linux as a first-class scan target, perhaps Windows later. NAV itself stays macOS-only until decided. The prerequisite is a platform-aware rule set. A rule that is meaningless on the running OS is left out and adds no gap. A rule that matters for the file but cannot run there still reports one, because hiding it would turn "couldn't check" into "clean" (§10, §11.8). Portable file access must keep the no-follow walk's guarantees (`ScanRoot::open_file`, §11.7: no symlink in any component below the target, regular files only, a non-blocking open), and #170's Unix-only `compile_error!` is lifted last. Tracked in #218.
 - Specific cloud domain-reputation API to integrate with `CloudFeedProvider`, once built.
