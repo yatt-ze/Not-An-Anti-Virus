@@ -194,6 +194,10 @@ or misses something it should have caught, please
 - where the file came from (a download link for legitimate software is ideal)
 - **never attach live malware**: share its SHA-256 hash instead
 
+A vulnerability in NAV itself, such as a crash on crafted input or a hole in
+the root service install, should be reported privately instead: see
+[SECURITY.md](SECURITY.md).
+
 ## Contributing
 
 Contributions are welcome.
