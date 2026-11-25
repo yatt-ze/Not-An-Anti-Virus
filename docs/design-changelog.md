@@ -5,6 +5,10 @@ for the current document map. Newest first.
 
 ---
 
+**Changelog from v1.22 (2026-11-26):** ZIPs inside an app bundle are read and scored like any other (§6.2, §11.7, §11.8; #244 gap 1). The exemption for real files under `X.app/Contents/` hid both their members and the unread-container gap, so an app could carry a payload in a resource ZIP unseen. A `/Applications` corpus run (358,585 files) changed no recommendation; 25 resource ZIPs gained low `zip-member-suspicious` scores (at most +12) and 19 became `Partial`, mostly over the 8 MiB read limit, at about 15–20% more scan time on the ZIP-heaviest apps. Decided by the user: scan them, with read performance (§11.12) and configurable limits expected to narrow the `Partial`s.
+
+---
+
 **Changelog from v1.21 (2026-11-26):** The scan worker's uid is reopened, and the worker may mount disk images for daemon-triggered scans (§2, §6.2, §11.13, §12, §14; follow-up to #240). v1.20 ran the worker as a dedicated role account and removed daemon mounting entirely, which would leave the daemon unable to look inside a downloaded DMG, the main delivery format. Root still never mounts. The worker mounts its own copy, read-only with setuid and device files disabled and ownership ignored, flags verified, under a `0700` directory, with a per-uid mount budget and the startup sweep covering its mounts; if that proves infeasible, the image is reported as not inspected and the user is told to run `navctl scan`. Whether the worker runs as a role account or as the file's owner is now open (§14), and a Phase 0b spike runs both, including whether each can mount with no login session and how the removable-volume prompt (#187) behaves. §14 also gains whether automatic mounting is on by default, and where the Phase 2 behavioural engine runs (anything parsing file content goes through the worker). Decided by the user: spike both worker uids, leaning against role accounts; record behavioural-scoring placement as open.
 
 ---

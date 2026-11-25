@@ -4,7 +4,7 @@
 use std::io;
 
 use super::{zip_member, Rule, RuleOutcome};
-use crate::context::{ContentSource, ScanContext};
+use crate::context::ScanContext;
 use crate::model::{MatchedSignal, SignalCategory};
 use crate::source::ByteSource;
 use crate::{xar, zip};
@@ -136,27 +136,6 @@ fn detect_zip(ctx: &ScanContext) -> Option<bool> {
     Some(zip::is_zip_format(&head, &tail))
 }
 
-/// True for a real file at `<...>/X.app/Contents/...` (§6.2): apps ship ZIP
-/// resources, so those are not flagged. Embedded content is never exempt.
-pub(super) fn inside_app_bundle(ctx: &ScanContext) -> bool {
-    if ctx.source != ContentSource::File {
-        return false;
-    }
-    // Judge where the opened file really is, not how its path is spelled.
-    let Some(real) = ctx.real_path() else {
-        return false;
-    };
-    let mut parts = real.components().map(|c| c.as_os_str()).peekable();
-    while let Some(name) = parts.next() {
-        let b = name.as_encoded_bytes();
-        let is_app = b.len() > 4 && b[b.len() - 4..].eq_ignore_ascii_case(b".app");
-        if is_app && parts.peek().is_some_and(|n| *n == "Contents") {
-            return true;
-        }
-    }
-    false
-}
-
 /// Gaps shown in the description before the rest are counted.
 const SHOWN_GAPS: usize = 3;
 
@@ -205,7 +184,6 @@ impl Rule for UninspectedContainerRule {
             Some(None) => match is_zip(ctx) {
                 None => Err(RuleOutcome::NotApplicable),
                 Some(false) => Ok(None),
-                Some(true) if inside_app_bundle(ctx) => Ok(None),
                 Some(true) => match zip_member::inspection(ctx) {
                     None => Ok(Some(self.signal(
                         ctx,
@@ -430,26 +408,14 @@ mod tests {
     }
 
     #[test]
-    fn zip_inside_app_bundle_is_exempt_only_for_real_files() {
+    fn zip_in_app_bundle_flagged() {
         let tmp = temp_dir("zip-app");
-        let dir = &tmp.0;
         let zip = b"PK\x03\x04rest";
-        assert!(!fires(&file_in(dir, "X.app/Contents/Resources/r.zip", zip)));
-        assert!(!fires(&file_in(dir, "y.APP/Contents/r.zip", zip)));
-        assert!(fires(&file_in(dir, "r.zip", zip)));
-        assert!(fires(&file_in(dir, "X.app/Other/r.zip", zip)));
-        assert!(fires(&file_in(dir, "X.app/r.zip", zip)));
-        let label = ScanContext::from_embedded_bytes("X.app/Contents/r.zip", zip.to_vec(), false);
-        assert!(fires(&label));
-        let mut dmg = vec![0u8; 1024];
-        dmg[512..516].copy_from_slice(b"koly");
-        assert!(fires(&file_in(dir, "X.app/Contents/Resources/i.dmg", &dmg)));
-        // The spelling of the path must not create an exemption.
-        let dotdot = dir.join("X.app/Contents/../../r.zip");
-        assert!(fires(&ScanContext::load(&dotdot)));
-        let link = dir.join("X.app/Contents/Resources/link.zip");
-        std::os::unix::fs::symlink(dir.join("r.zip"), &link).unwrap();
-        assert!(fires(&ScanContext::load(&link)));
+        assert!(fires(&file_in(
+            &tmp.0,
+            "X.app/Contents/Resources/r.zip",
+            zip
+        )));
     }
 
     #[test]
