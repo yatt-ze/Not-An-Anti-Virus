@@ -15,7 +15,9 @@ Building `nav-core` (§3) and exercising it directly through `navctl scan <path>
 
 **Phase 0b — macOS platform integration feasibility**
 
-Daemon skeleton, `EventSource` abstraction + capability struct, FSEvents watcher, DiskArbitration mount watcher, `navctl status`, socket protocol plumbing, container/`.pkg` handling with the scratch-mount machinery (§6) and decompression-bomb guardrails (§6.2). Feasibility spikes, treated as go/no-go checks rather than assumed:
+**Gate (threat model §7, §8): no event source (FSEvents, DiskArbitration) is wired to a scan until the broker/worker split of §11.13 exists:** the owner-credential opener (A), descriptor-only reads (B), the sandboxed worker (C), path tools run on a snapshot (D), and a broker that validates the worker's verdict (E). The first spike below is the one the opener depends on.
+
+Daemon skeleton, `EventSource` abstraction + capability struct, FSEvents watcher, DiskArbitration mount watcher, `navctl status`, socket protocol plumbing, container/`.pkg` handling (§6) and decompression-bomb guardrails (§6.2). Feasibility spikes, treated as go/no-go checks rather than assumed:
 - **Full Disk Access grant behavior with no app bundle** — confirm whether `navd` can be added to the FDA pane in System Settings as a bare binary/daemon, track the active macOS Tahoe 26.1/26.2 FDA-list bug (§10), document exact steps, and run the per-area coverage probe matrix against real Downloads/Desktop/Documents access.
 - Whether `navd`'s FDA grant is a one-time system-wide grant or needs repeating per logged-in user.
 - Whether `navctl rules test` (interactive, user-invoked) has meaningfully different TCC exposure than `navd`'s headless background scanning (§10). Measured via `navd scan-once <path> [--json] [--recursive]` (Phase 0b A2), a one-shot self-scan added to `navd` purely to give this spike a headless/root read to observe — **explicitly temporary, not §8's stable CLI surface**, and not a daemon-owned scan service or RPC (§9.1 is unchanged: on-demand scanning is and stays `navctl`'s job, in-process against `nav-core`). Removed once this spike is answered, tracked in the phase-0b plan; if `scan-once` was the only user of `navd`'s `clap` dependency, that comes out with it.
@@ -23,6 +25,16 @@ Daemon skeleton, `EventSource` abstraction + capability struct, FSEvents watcher
 - `navnotify` delivery mechanism and final packaging form — bare LaunchAgent vs. minimal agent-style `.app` bundle (§9.2) — and Multi-user/Fast User Switching behavior.
 - Homebrew upgrade behavior while `navd` is running, and confirmation that the root-daemon binary (§11.10) resists replacement via a user-writable path.
 - FSEvents behavior under high event volume (coalescing, loss/resync).
+- Broker/worker claims the design depends on and nobody has run on macOS (threat model §9):
+  - An FDA grant still applies after the opener drops to another uid, and to a descriptor passed to a process without the grant (§11.13, A and C).
+  - The no-follow descriptor walk (§11.7) behaves the same on the minimum supported macOS (B).
+  - The worker can sandbox itself with a custom profile, and `codesign`/`spctl` still work inside it and on a bare clone outside its bundle (C, D).
+  - Per-process memory limits are enforceable for the worker (C).
+  - Reading a cloud placeholder can be made to fail instead of downloading (B).
+  - A user can hard-link a file they cannot read (R2).
+  - How a root-initiated `hdiutil attach` treats setuid bits, device nodes and ownership by default (R9, E5).
+  - `fs::copy` carries an ACL onto the installed binary, and whether `codesign -f` drops it (E3).
+  - `sudo` on stock macOS keeps the caller's `PATH` and clears `TMPDIR` (#157, E5).
 
 **Go/no-go**: `navnotify` delivers without requiring an openable app, or the design explicitly falls back to CLI-only per §9.2; the Homebrew-Cellar-writable-binary attack (§11.10) is confirmed closed; Full Disk Access can be granted to `navd` without an app bundle and the grant UX is documented, or the static-analysis coverage gap in §10 is scoped precisely (which paths are actually affected) rather than left as a vague caveat.
 
@@ -50,7 +62,7 @@ Builds on 0a's proven scanner core: category-based, interaction-term scoring (§
 Polling (process/socket snapshots), NSWorkspace lifecycle, Packet Capture (BPF/libpcap + bounded ClientHello reconstruction + SNI parsing + event-triggered attribution, with the fuzzing/minimization discipline from §11.9), Correlator/identity-based dedup layer, verdict cache, `navctl events tail`. Only claim detections actually supported by what Phase 0c's feasibility spikes measured — not aspirational coverage.
 
 **Phase 3 — Quarantine, config, hardening**
-Quarantine manager, allow/denylist, config file support ([candidate options](config-candidates.md), including an opt-in to copy a disk image on another volume from the scratch directory so `navctl` can mount it, at the cost of a longer scan; §6.2, #176), ruleset hot-reload + rollback, daemon self-termination detection, event log privacy hardening (redaction, retention), socket protocol hardening (§9.1), safe root-daemon installation path (§11.10), `navnotify` install/uninstall, clean uninstall path.
+Quarantine manager (findings bound to identity and digest, acted on with the owner's credentials, §11.7), allow/denylist, config file support ([candidate options](config-candidates.md), including an opt-in to copy a disk image on another volume from the scratch directory so `navctl` can mount it, at the cost of a longer scan; §6.2, #176), ruleset hot-reload + rollback, daemon self-termination detection, event log privacy hardening (redaction, retention), request audit log (§9.1), safe root-daemon installation path (§11.10), `navnotify` install/uninstall, clean uninstall path.
 
 **Phase 4 — Polish / stretch**
 `navtop` TUI, ruleset update distribution channel, optional on-device ML scoring layer, optional ESF-backed edition if the entitlement/packaging tradeoff is ever revisited.
@@ -71,6 +83,7 @@ Quarantine manager, allow/denylist, config file support ([candidate options](con
 
 ## 14. Open Decisions (Still Not Locked)
 
+- **Per-user agent as an opt-in deployment mode.** Not ruled out. For users who don't want a root daemon, a per-user agent can feed the same scan worker (§11.13) in place of the root broker, so the confused-deputy problem does not arise. Its guarantee is weaker: malware running as the same user can stop the agent or tamper with its results and record. The root broker is the default (§2). The design keeps the worker's interface independent of who feeds it so this mode stays possible; whether and when to build it is open.
 - Whether, and how far, to make `nav-core` cross-platform (§3): Linux as a first-class scan target, perhaps Windows later. NAV itself stays macOS-only until decided. The prerequisite is a platform-aware rule set. A rule that is meaningless on the running OS is left out and adds no gap. A rule that matters for the file but cannot run there still reports one, because hiding it would turn "couldn't check" into "clean" (§10, §11.8). Portable file access must keep the no-follow walk's guarantees (`ScanRoot::open_file`, §11.7: no symlink in any component below the target, regular files only, a non-blocking open), and #170's Unix-only `compile_error!` is lifted last. Tracked in #218.
 - Specific cloud domain-reputation API to integrate with `CloudFeedProvider`, once built.
 - Exact behavior of `navnotify` under multi-user/Fast User Switching — pending Phase 0b spike.
