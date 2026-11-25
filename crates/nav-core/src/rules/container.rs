@@ -142,9 +142,8 @@ pub(super) fn inside_app_bundle(ctx: &ScanContext) -> bool {
     if ctx.source != ContentSource::File {
         return false;
     }
-    // Judge where the file really is, not how its path is spelled (`..`,
-    // symlinks, relative paths).
-    let Ok(real) = std::fs::canonicalize(&ctx.path) else {
+    // Judge where the opened file really is, not how its path is spelled.
+    let Some(real) = ctx.real_path() else {
         return false;
     };
     let mut parts = real.components().map(|c| c.as_os_str()).peekable();

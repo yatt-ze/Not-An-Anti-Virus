@@ -29,7 +29,11 @@ impl Rule for QuarantineXattrRule {
         if !ctx.is_file_backed() {
             return Err(RuleOutcome::NotApplicable);
         }
-        has_quarantine_xattr(&ctx.path)
+        // Read through the opened handle, so it describes the scanned object.
+        match &ctx.file {
+            Some(file) => has_quarantine_xattr(file),
+            None => Err(RuleOutcome::NotApplicable),
+        }
     }
 
     /// Reads an xattr, never `ctx.content` — the content cap is irrelevant.
@@ -39,8 +43,9 @@ impl Rule for QuarantineXattrRule {
 }
 
 #[cfg(target_os = "macos")]
-fn has_quarantine_xattr(path: &std::path::Path) -> Result<Option<MatchedSignal>, RuleOutcome> {
-    match xattr::get(path, "com.apple.quarantine") {
+fn has_quarantine_xattr(file: &std::fs::File) -> Result<Option<MatchedSignal>, RuleOutcome> {
+    use xattr::FileExt;
+    match file.get_xattr("com.apple.quarantine") {
         Ok(Some(_)) => Ok(Some(MatchedSignal {
             id: "quarantine-xattr-present".to_string(),
             weight: 0,
@@ -54,7 +59,7 @@ fn has_quarantine_xattr(path: &std::path::Path) -> Result<Option<MatchedSignal>,
 }
 
 #[cfg(not(target_os = "macos"))]
-fn has_quarantine_xattr(_path: &std::path::Path) -> Result<Option<MatchedSignal>, RuleOutcome> {
+fn has_quarantine_xattr(_file: &std::fs::File) -> Result<Option<MatchedSignal>, RuleOutcome> {
     Err(RuleOutcome::NotApplicable)
 }
 
