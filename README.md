@@ -53,7 +53,7 @@ macOS's built-in defences turned on.
 
 ## Status
 
-NAV is in **early development** (v0.15.1).
+NAV is in **early development** (v0.16.0).
 
 - [x] `navctl scan`: a verdict for a file, a folder or a `.app` bundle
 - [x] `navctl rules test`: the full signal-by-signal breakdown, as text or JSON
@@ -193,6 +193,10 @@ or misses something it should have caught, please
 - the output of `navctl rules test <file> --json`
 - where the file came from (a download link for legitimate software is ideal)
 - **never attach live malware**: share its SHA-256 hash instead
+
+A vulnerability in NAV itself, such as a crash on crafted input or a hole in
+the root service install, should be reported privately instead: see
+[SECURITY.md](SECURITY.md).
 
 ## Contributing
 

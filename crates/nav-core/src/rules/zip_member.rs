@@ -4,7 +4,7 @@
 //! `uninspected-container` reports what could not be read.
 
 use super::codesign::member_signature;
-use super::container::{inside_app_bundle, is_zip, unread_container_reasons};
+use super::container::{is_zip, unread_container_reasons};
 use super::{embedded_content_ruleset, Rule, RuleOutcome};
 use crate::context::ScanContext;
 use crate::model::{MatchedSignal, ScanCompleteness, SignalCategory};
@@ -114,7 +114,7 @@ fn inspect_with_rules(
     rules: &[Box<dyn Rule>],
 ) -> Option<ZipInspection> {
     let content = ctx.content.as_deref()?;
-    if ctx.truncated || is_zip(ctx) != Some(true) || inside_app_bundle(ctx) {
+    if ctx.truncated || is_zip(ctx) != Some(true) {
         return None;
     }
     let mut findings = Listing::default();
@@ -770,8 +770,9 @@ mod tests {
         );
     }
 
+    /// A ZIP inside an app bundle is read and scored like any other (#244).
     #[test]
-    fn a_zip_under_an_app_bundle_is_not_read() {
+    fn app_bundle_zip_read() {
         let dir = crate::test_support::write_temp_file("zip-app", b"");
         std::fs::remove_file(&dir).unwrap();
         let path = dir.join("X.app/Contents/Resources/r.zip");
@@ -781,8 +782,8 @@ mod tests {
         let read = inspection(&ctx).is_some();
         let signal = member_signal(&ctx);
         let _ = std::fs::remove_dir_all(&dir);
-        assert!(!read);
-        assert!(signal.is_none());
+        assert!(read);
+        assert!(signal.is_some());
     }
 
     #[test]

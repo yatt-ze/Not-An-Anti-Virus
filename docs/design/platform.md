@@ -121,9 +121,17 @@ If requirements ever change (e.g., BSM's removal or a future auth-time-blocking 
 
 ### 9.1 Daemon ↔ CLI Communication
 
-Local Unix domain socket (e.g., `/var/run/navd.sock`), length-prefixed JSON-RPC-ish protocol. Used for anything that only the daemon owns — live event stream, quarantine state, config, ruleset reload, notification relay — **not for on-demand scans**, which `navctl` runs locally against `nav-core` (§2, §3) whether or not `navd` is installed. Auth via socket file permissions (root + admin group) for connection access; **per-method authorization on top of that** for sensitive operations (`quarantine purge`, `config set`, `rules reload`, `uninstall` should not be treated as equivalent to `status`/`events tail`). Chosen over XPC for easier reuse across future Rust-native tooling (`navtop`, scripting).
+Local Unix domain socket (e.g., `/var/run/navd.sock`), length-prefixed JSON-RPC-ish protocol. Used for anything that only the daemon owns — live event stream, quarantine state, config, ruleset reload, notification relay — **not for on-demand scans**, which `navctl` runs locally against `nav-core` (§2, §3) whether or not `navd` is installed. The socket lives in a directory only root can write. Every connection is checked against the peer's credentials from the first commit that adds the socket (threat model §7 G), and methods fall into three tiers:
 
-Hardening items deferred to Phase 3 (§11): versioned request framing with max frame size, peer credential checks per-method, request audit log with sensitive-argument redaction, protection against socket replacement/symlink attacks at startup.
+| Tier | Methods | Who |
+|---|---|---|
+| Read own | `status`, events and verdicts about the caller's own files | Any local user |
+| Read all | All users' events, logs | Root, or an admin after an authorization prompt |
+| Change | `allowlist`, `denylist`, `config set`, `rules reload`/`rollback`, `notify disable`, `quarantine restore`/`purge`, `uninstall` | Root, or a fresh interactive authorization. Never group membership alone |
+
+**`navd` never scans, mounts, reads or reports on a path a client names** (§2). A verdict a client submits (the best-effort push after a `navctl` scan) goes in a separate table tagged with the peer's uid and rate-limited. It is never used for a cache hit, a notification or an action. Chosen over XPC for easier reuse across future Rust-native tooling (`navtop`, scripting).
+
+Versioned request framing with a maximum frame size lands with the socket itself. Deferred to Phase 3 (§11): a request audit log with sensitive-argument redaction.
 
 ### 9.2 Notification Delivery (`navnotify`)
 
@@ -144,8 +152,8 @@ Notification Center (UserNotifications framework)
 ```
 
 - **Configurable and opt-out by default respected**: `navctl notify disable` turns this off. When disabled, `navd` does not attempt delivery at all — it doesn't queue notifications the user will never see, it simply stops trying, consistent with "if the user doesn't want notifications, we don't deliver them."
-- **Multi-user / Fast User Switching**: `navnotify` runs per logged-in GUI session, not system-wide — a verdict needs to reach whichever session(s) are actually active. Exact behavior here (which session gets notified for a system-wide event vs. a user-specific one) is a Phase 0b feasibility question, not an assumption (§12).
-- **One-click quarantine action adds real attack surface — it reuses transport, not risk.** The action handler needs `navnotify` to relay a "quarantine this" request back to `navd` over the same authenticated local channel as §9.1, which limits duplicated infrastructure, but a notification action is still a new privileged request path: a new peer type, a new user-session identity to bind to, and a window between the original alert and the user's click where the target file could change. The request must carry an opaque finding reference and a nonce, never a raw filesystem path, and `navd` must re-resolve and revalidate the original evidence before acting rather than trusting the action payload directly:
+- **Multi-user / Fast User Switching**: `navnotify` runs per logged-in GUI session, not system-wide — a verdict about a user's file is routed to that file owner's session. Which session(s) get a system-wide event is a Phase 0b feasibility question, not an assumption (§12).
+- **One-click quarantine action adds real attack surface — it reuses transport, not risk.** The action handler needs `navnotify` to relay a "quarantine this" request back to `navd` over the same authenticated local channel as §9.1, which limits duplicated infrastructure, but a notification action is still a new privileged request path: a new peer type, a new user-session identity to bind to, and a window between the original alert and the user's click where the target file could change. The request must carry an opaque finding reference and a nonce, never a raw filesystem path. It is bound to the uid and login session that received the notification, expires, and is single use (threat model §7 I). `navd` must re-resolve and revalidate the original evidence before acting rather than trusting the action payload directly:
   ```rust
   struct NotificationActionRequest { finding_id: FindingId, action: NotificationAction, nonce: ActionNonce }
   ```
