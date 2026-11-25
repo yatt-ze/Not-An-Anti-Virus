@@ -5,6 +5,10 @@ for the current document map. Newest first.
 
 ---
 
+**Changelog from v1.23 (2026-11-26):** Bundle-level signing signals (§5.8, §5.2; #90). `bundle-signer-mismatch` flags a Mach-O main executable not signed by the Team ID that signed most of the app's other code (weight 4, 6 with no real identity, +2 without hardened runtime, max 8), and `bundle-load-from-resources` flags a load command that reaches a scanned file under `Contents/Resources/` outside any framework (weight 6). Both attach to an existing member's result, so the JSON contract is unchanged, and reuse the per-file `codesign` data. The ceiling is §5.1's: a self-signed main executable already scores 5, so the mismatch's maximum of 8 stays at 13, under Notify. Measured on `/Applications` (86 apps): unrefined, the checks hit one cracked app plus ZAP, Steam and VLC; the Mach-O, framework and existence conditions leave only the cracked app. Decided by the user (2026-11-25): attach to the main executable's result, corroboration only.
+
+---
+
 **Changelog from v1.22 (2026-11-26):** ZIPs inside an app bundle are read and scored like any other (§6.2, §11.7, §11.8; #244 gap 1). The exemption for real files under `X.app/Contents/` hid both their members and the unread-container gap, so an app could carry a payload in a resource ZIP unseen. A `/Applications` corpus run (358,585 files) changed no recommendation; 25 resource ZIPs gained low `zip-member-suspicious` scores (at most +12) and 19 became `Partial`, mostly over the 8 MiB read limit, at about 15–20% more scan time on the ZIP-heaviest apps. Decided by the user: scan them, with read performance (§11.12) and configurable limits expected to narrow the `Partial`s.
 
 ---

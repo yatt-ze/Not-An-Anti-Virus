@@ -21,6 +21,7 @@ pub(crate) mod base64;
 pub(crate) mod beneath;
 pub(crate) mod budget;
 pub mod bundle;
+pub(crate) mod bundle_signals;
 pub mod bzip2;
 pub mod context;
 pub mod cpio;

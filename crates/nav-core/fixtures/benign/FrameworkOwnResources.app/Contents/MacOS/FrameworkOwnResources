@@ -1,0 +1,3 @@
+#!/bin/sh
+# Benign stub executable for the fixture bundle.
+exit 0

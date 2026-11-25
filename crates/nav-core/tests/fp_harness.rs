@@ -183,6 +183,10 @@ const SUB_THRESHOLD_ALLOWLIST: &[(&str, &str)] = &[
         "suspicious/installer_distribution_js_shell_launch.pkg",
         "corroboration-only marker by design (§5.1); needs a second signal",
     ),
+    (
+        "suspicious/ResourcesLoad.app",
+        "bundle-load-from-resources is corroboration-only (§5.8, §5.1); needs a second signal",
+    ),
 ];
 
 fn sub_threshold_reason(key: &str) -> Option<&'static str> {
@@ -242,6 +246,21 @@ fn disguised_bundle_members_are_each_scored() {
             .unwrap_or_else(|| panic!("{member} was not scanned"));
         assert_ne!(r.recommendation, Recommendation::NoAction, "{member}");
     }
+}
+
+/// A framework loading an ad-hoc dylib out of `Contents/Resources/` is
+/// flagged; the same load staying inside the framework's own `Resources/`
+/// is not (§5.8).
+#[test]
+fn resources_load_is_flagged_only_outside_a_framework() {
+    let bad = scan(&fixtures_dir("suspicious").join("ResourcesLoad.app"));
+    assert!(
+        fired_rule_ids(&bad).contains(&"bundle-load-from-resources".to_string()),
+        "{:?}",
+        fired_rule_ids(&bad)
+    );
+    let good = scan(&fixtures_dir("benign").join("FrameworkOwnResources.app"));
+    assert!(!fired_rule_ids(&good).contains(&"bundle-load-from-resources".to_string()));
 }
 
 #[test]
