@@ -373,19 +373,11 @@ struct Walk {
     not_walked: NotWalked,
 }
 
-/// Depth-first file collection under `root` (the path `anchor` was opened
-/// from), sorted for determinism (§11.1). Each directory is listed through a
-/// descriptor opened beneath `anchor` with no symlink followed (§11.7), so a
-/// directory symlink is never walked, even one swapped in mid-walk. Returned
-/// paths are `root` joined with the path beneath it. Stops early at the
-/// file-count or entry ceiling and skips subdirectories past the depth
-/// ceiling, returning every limit hit so the target can be marked partial.
-///
-/// `root` itself failing to list (`depth == 0`) is an operational error and
-/// propagates — there's nothing to traverse or report partial coverage over.
-/// A deeper directory that can't be opened or listed, or an entry that errors
-/// while listing one, is recorded in the returned set instead, and the walk
-/// continues; a failing entry is just skipped (§11.8).
+/// Sorted regular files under `root` (the path `anchor` was opened from),
+/// each directory listed beneath `anchor` with no symlink followed (§11.7).
+/// Returned paths are `root` joined with the path beneath it, plus every
+/// budget limit hit. Errors only if `root` itself can't be listed; a deeper
+/// directory or entry that fails is recorded as unreadable (§11.8).
 fn collect_files(
     anchor: &ScanRoot,
     root: &Path,
