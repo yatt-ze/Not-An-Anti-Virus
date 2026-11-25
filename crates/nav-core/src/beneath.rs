@@ -12,7 +12,8 @@ use rustix::fs::{openat, statat, AtFlags, Dir, FileType, Mode, OFlags};
 
 /// A directory held open as the trusted anchor for a scan. Its own path is
 /// resolved once (symlinks followed — the caller named it); nothing beneath it
-/// is ever resolved through a symlink.
+/// is ever resolved through a symlink. `dir` is search-only (`O_PATH` on
+/// Linux): use it only as an `openat` dirfd.
 #[derive(Debug)]
 pub(crate) struct ScanRoot {
     dir: File,
@@ -23,7 +24,7 @@ impl ScanRoot {
     /// Canonicalize `path` and hold it open as a directory.
     pub(crate) fn open(path: &Path) -> io::Result<Self> {
         let path = path.canonicalize()?;
-        let flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC;
+        let flags = search_flags() & !OFlags::NOFOLLOW;
         let fd = openat(rustix::fs::CWD, &path, flags, Mode::empty())?;
         Ok(ScanRoot {
             dir: File::from(fd),
@@ -62,15 +63,17 @@ impl ScanRoot {
     /// `.`/`..`, each typed as by `lstat` (a symlink is never followed).
     pub(crate) fn list_dir(&self, rel: &Path) -> io::Result<DirList> {
         let names = normal_names(rel)?;
-        let fd = match self.open_dirs(&names)? {
-            Some(dir) => dir,
-            None => File::from(openat(&self.dir, ".", dir_flags(), Mode::empty())?),
+        let (parent, name) = match names.split_last() {
+            Some((leaf, dirs)) => (self.open_dirs(dirs)?, *leaf),
+            None => (None, OsStr::new(".")),
         };
+        let parent = parent.as_ref().unwrap_or(&self.dir);
+        let fd = openat(parent, name, list_flags(), Mode::empty())?;
         Ok(DirList(Dir::new(fd)?))
     }
 
-    /// Open each of `dirs` in turn beneath the root with no symlink followed.
-    /// `None` when `dirs` is empty (the root itself).
+    /// Open each of `dirs` in turn, search-only, beneath the root with no
+    /// symlink followed. `None` when `dirs` is empty (the root itself).
     fn open_dirs(&self, dirs: &[&OsStr]) -> io::Result<Option<File>> {
         let mut held: Option<File> = None;
         for name in dirs {
@@ -78,7 +81,7 @@ impl ScanRoot {
             held = Some(File::from(openat(
                 parent,
                 *name,
-                dir_flags(),
+                search_flags(),
                 Mode::empty(),
             )?));
         }
@@ -86,8 +89,31 @@ impl ScanRoot {
     }
 }
 
-fn dir_flags() -> OFlags {
+/// Flags for a directory that is listed: needs read permission.
+fn list_flags() -> OFlags {
     OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC
+}
+
+/// Flags for a directory only passed through: needs search permission alone,
+/// so a `0711` directory on the way to a target still opens (#253).
+fn search_flags() -> OFlags {
+    search_mode() | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn search_mode() -> OFlags {
+    OFlags::PATH
+}
+
+/// `O_EXEC`, which with `O_DIRECTORY` is Apple's `O_SEARCH`; rustix lacks it.
+#[cfg(target_vendor = "apple")]
+fn search_mode() -> OFlags {
+    OFlags::from_bits_retain(0x4000_0000)
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "android", target_vendor = "apple")))]
+fn search_mode() -> OFlags {
+    OFlags::RDONLY
 }
 
 /// `rel`'s components, or `InvalidInput` if any is not a normal name.
@@ -206,6 +232,29 @@ mod tests {
         }
         assert!(root.list_dir(Path::new("sub/deeper")).is_ok());
         fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A search-only directory (no read bit) is passed through, as the root
+    /// or below it, but not listed. Root ignores modes, hence the comparison.
+    #[test]
+    fn search_only_dirs() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = temp_root("beneath-search");
+        let sub = dir.join("sub");
+        fs::create_dir(sub.join("deeper")).unwrap();
+        fs::set_permissions(&sub, fs::Permissions::from_mode(0o100)).unwrap();
+        let root = ScanRoot::open(&dir).unwrap();
+        let file_ok = root.open_file(Path::new("sub/f")).is_ok();
+        let as_root = ScanRoot::open(&sub).and_then(|r| r.open_file(Path::new("f")));
+        let deeper_ok = root.list_dir(Path::new("sub/deeper")).is_ok();
+        let list_err = root.list_dir(Path::new("sub")).is_err();
+        let std_err = fs::read_dir(&sub).is_err();
+        fs::set_permissions(&sub, fs::Permissions::from_mode(0o755)).unwrap();
+        fs::remove_dir_all(&dir).unwrap();
+        assert!(file_ok);
+        assert!(as_root.is_ok());
+        assert!(deeper_ok);
+        assert_eq!(list_err, std_err);
     }
 
     #[test]
