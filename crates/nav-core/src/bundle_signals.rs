@@ -89,10 +89,11 @@ pub(crate) fn findings(members: &[Member], main: Option<usize>) -> Vec<(usize, F
             Mismatch::Fires(signal) => out.push((m, Finding::Signal(signal))),
         }
     }
-    let by_rel: HashMap<&Path, usize> = members
+    // Folded: dyld resolves against a case-insensitive volume by default.
+    let by_rel: HashMap<String, usize> = members
         .iter()
         .enumerate()
-        .map(|(i, m)| (m.rel.as_path(), i))
+        .map(|(i, m)| (fold(&m.rel), i))
         .collect();
     let main_rel = main.map(|m| members[m].rel.as_path());
     for (i, member) in members.iter().enumerate() {
@@ -105,7 +106,7 @@ pub(crate) fn findings(members: &[Member], main: Option<usize>) -> Vec<(usize, F
             .iter()
             .filter_map(|load| resolve_load(load, &member.rel, main_rel))
             .filter(|rel| in_plain_resources(rel))
-            .find_map(|rel| by_rel.get(rel.as_path()).copied());
+            .find_map(|rel| by_rel.get(&fold(&rel)).copied());
         if let Some(t) = target {
             out.push((i, Finding::Signal(load_signal(&members[t].facts))));
         }
@@ -115,16 +116,18 @@ pub(crate) fn findings(members: &[Member], main: Option<usize>) -> Vec<(usize, F
 }
 
 /// Trim later signals so each member's bundle signals sum to at most
-/// [`MAX_PER_MEMBER`].
-fn cap_per_member(out: &mut [(usize, Finding)]) {
+/// [`MAX_PER_MEMBER`]; one trimmed to nothing is dropped.
+fn cap_per_member(out: &mut Vec<(usize, Finding)>) {
     let mut added: HashMap<usize, i32> = HashMap::new();
-    for (i, finding) in out.iter_mut() {
-        if let Finding::Signal(signal) = finding {
-            let sum = added.entry(*i).or_default();
-            signal.weight = signal.weight.min(MAX_PER_MEMBER - *sum).max(0);
-            *sum += signal.weight;
-        }
-    }
+    out.retain_mut(|(i, finding)| {
+        let Finding::Signal(signal) = finding else {
+            return true;
+        };
+        let sum = added.entry(*i).or_default();
+        signal.weight = signal.weight.min(MAX_PER_MEMBER - *sum);
+        *sum += signal.weight.max(0);
+        signal.weight > 0
+    });
 }
 
 enum Mismatch {
@@ -151,8 +154,11 @@ fn signer_mismatch(members: &[Member], main: usize) -> Mismatch {
     let Some(signing) = main_facts.signing.as_ref() else {
         return Mismatch::Unchecked;
     };
-    if signing.team_id.as_deref() == Some(team) {
-        return Mismatch::Clean;
+    match trusted_team(signing) {
+        Some(t) if t == team => return Mismatch::Clean,
+        // A real identity whose Team ID couldn't be read: not comparable.
+        None if signing.kind == SigningKind::Signed => return Mismatch::Unchecked,
+        _ => {}
     }
     let weak = signing.kind.lacks_identity();
     let mut weight = if weak {
@@ -181,13 +187,21 @@ fn signer_mismatch(members: &[Member], main: usize) -> Mismatch {
     })
 }
 
+/// `summary`'s Team ID, only for a real (Apple-anchored) identity:
+/// `codesign -dv` prints the CodeDirectory's claim unverified.
+fn trusted_team(summary: &SigningSummary) -> Option<&str> {
+    (summary.kind == SigningKind::Signed)
+        .then_some(summary.team_id.as_deref())
+        .flatten()
+}
+
 /// The Team ID shared by at least 2/3 of `siblings`, if there are enough of them.
 fn majority_team<'a>(siblings: &[&'a SigningSummary]) -> Option<&'a str> {
     if siblings.len() < MIN_SIBLINGS {
         return None;
     }
     let mut counts: HashMap<&str, usize> = HashMap::new();
-    for team in siblings.iter().filter_map(|s| s.team_id.as_deref()) {
+    for team in siblings.iter().filter_map(|s| trusted_team(s)) {
         *counts.entry(team).or_default() += 1;
     }
     counts
@@ -250,9 +264,12 @@ fn in_nested_app(rel: &Path) -> bool {
 
 /// Under `Contents/Resources/` and not inside a `*.framework/`.
 fn in_plain_resources(rel: &Path) -> bool {
-    rel.starts_with("Contents/Resources")
-        && rel != Path::new("Contents/Resources")
-        && !has_suffix_component(rel, ".framework")
+    fold(rel).starts_with("contents/resources/") && !has_suffix_component(rel, ".framework")
+}
+
+/// `rel` ASCII-lowercased, for comparing paths as a case-insensitive volume does.
+fn fold(rel: &Path) -> String {
+    rel.to_string_lossy().to_ascii_lowercase()
 }
 
 #[cfg(test)]
@@ -457,7 +474,7 @@ mod tests {
     #[test]
     fn combined_signals_are_capped() {
         use crate::model::Recommendation;
-        let main = summary(SigningKind::SelfSigned, None, false);
+        let main = summary(SigningKind::SelfSigned, None, true);
         let mut members = bundle(Some(main), 4, true);
         members[0].facts.dylibs = vec!["@executable_path/../Resources/libX.dylib".into()];
         members.push(member(
@@ -487,6 +504,45 @@ mod tests {
             crate::scan::score_signals(&signals).1,
             Recommendation::NoAction
         );
+    }
+
+    /// Once the cap is spent, a further signal is dropped, not kept at 0.
+    #[test]
+    fn spent_cap_drops_signal() {
+        let main = summary(SigningKind::SelfSigned, None, false);
+        let mut members = bundle(Some(main), 4, true);
+        members[0].facts.dylibs = vec!["@executable_path/../Resources/libX.dylib".into()];
+        members.push(member("Contents/Resources/libX.dylib", None, &[]));
+        let f = findings(&members, Some(0));
+        assert!(
+            matches!(f.as_slice(), [(0, Finding::Signal(s))] if s.id == MISMATCH_ID && s.weight == 8)
+        );
+    }
+
+    /// A Team ID claimed by a signature without a real identity is not trusted.
+    #[test]
+    fn forged_team_still_mismatches() {
+        let main = summary(SigningKind::SelfSigned, Some(TEAM), true);
+        assert_eq!(mismatch_weight(&bundle(Some(main), 4, true)), Some(6));
+    }
+
+    #[test]
+    fn signed_main_without_team_unchecked() {
+        let main = summary(SigningKind::Signed, None, true);
+        let f = findings(&bundle(Some(main), 4, true), Some(0));
+        assert!(matches!(
+            f.as_slice(),
+            [(0, Finding::NotApplicable(MISMATCH_ID))]
+        ));
+    }
+
+    /// dyld resolves on a case-insensitive volume, so the check does too.
+    #[test]
+    fn resources_match_ignores_case() {
+        let mut members = bundle(Some(dev(TEAM, true)), 4, true);
+        members[0].facts.dylibs = vec!["@executable_path/../resources/LIBX.dylib".into()];
+        members.push(member("Contents/Resources/libX.dylib", None, &[]));
+        assert_eq!(load_findings(&members).len(), 1);
     }
 
     fn load_findings(members: &[Member]) -> Vec<(usize, String)> {
