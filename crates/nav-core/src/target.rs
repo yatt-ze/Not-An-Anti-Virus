@@ -10,6 +10,8 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use rustix::fs::FileType;
+
 use crate::beneath::ScanRoot;
 use crate::bundle::{self, BundleLayout};
 use crate::context::{ScanContext, MAX_STREAM_BYTES};
@@ -270,7 +272,7 @@ pub fn scan_target_with_budget(
     if let Some(layout) = BundleLayout::detect(path) {
         let anchor = Arc::new(ScanRoot::open(path)?);
         // A bundle is always traversed in full; `recursive` doesn't apply.
-        let walk = collect_files(path, true, budget)?;
+        let walk = collect_files(&anchor, path, true, budget)?;
         let (to_scan, skipped): (Vec<PathBuf>, Vec<PathBuf>) =
             walk.files.into_iter().partition(|p| {
                 let rel = p.strip_prefix(path).unwrap_or(p);
@@ -297,7 +299,7 @@ pub fn scan_target_with_budget(
     }
 
     let anchor = Arc::new(ScanRoot::open(path)?);
-    let walk = collect_files(path, recursive, budget)?;
+    let walk = collect_files(&anchor, path, recursive, budget)?;
     let (results, byte_limit, _) = scan_within_bytes(&anchor, path, &walk.files, budget);
     Ok(TargetScan {
         root: path.to_path_buf(),
@@ -371,34 +373,59 @@ struct Walk {
     not_walked: NotWalked,
 }
 
-/// Depth-first file collection under `root`, sorted for determinism (§11.1).
-/// Directory symlinks are not followed (traversal cycles, scan escape).
-/// Stops early at the file-count or entry ceiling and skips subdirectories
-/// past the depth ceiling, returning every limit hit so the target can be
-/// marked partial.
+/// Depth-first file collection under `root` (the path `anchor` was opened
+/// from), sorted for determinism (§11.1). Each directory is listed through a
+/// descriptor opened beneath `anchor` with no symlink followed (§11.7), so a
+/// directory symlink is never walked, even one swapped in mid-walk. Returned
+/// paths are `root` joined with the path beneath it. Stops early at the
+/// file-count or entry ceiling and skips subdirectories past the depth
+/// ceiling, returning every limit hit so the target can be marked partial.
 ///
-/// `root` itself failing to read (`depth == 0`) is an operational error and
-/// propagates via `?` — there's nothing to traverse or report partial
-/// coverage over. A deeper directory that can't be read (or a `DirEntry`/
-/// `file_type()` that errors while listing one) is recorded in the returned
-/// set instead, and the walk continues; a failing entry is just skipped
-/// (§11.8).
-fn collect_files(root: &Path, recursive: bool, budget: &ScanBudget) -> io::Result<Walk> {
+/// `root` itself failing to list (`depth == 0`) is an operational error and
+/// propagates — there's nothing to traverse or report partial coverage over.
+/// A deeper directory that can't be opened or listed, or an entry that errors
+/// while listing one, is recorded in the returned set instead, and the walk
+/// continues; a failing entry is just skipped (§11.8).
+fn collect_files(
+    anchor: &ScanRoot,
+    root: &Path,
+    recursive: bool,
+    budget: &ScanBudget,
+) -> io::Result<Walk> {
+    walk_files(anchor, root, recursive, budget, |_| {})
+}
+
+/// [`collect_files`], calling `after_list` with each directory's path beneath
+/// the root once it has been listed (a test seam for swaps mid-walk).
+fn walk_files(
+    anchor: &ScanRoot,
+    root: &Path,
+    recursive: bool,
+    budget: &ScanBudget,
+    mut after_list: impl FnMut(&Path),
+) -> io::Result<Walk> {
     let mut out = Vec::new();
     let mut limits_hit = BudgetLimits::default();
     let mut unreadable: BTreeSet<PathBuf> = BTreeSet::new();
     let mut not_walked = NotWalked::default();
-    let real_root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
     // Every directory entry examined, across the whole walk — bounds breadth
     // (and, since each queued directory was itself one such entry, the stack)
     // so an all-empty-directory tree can't run unbounded past `max_files`.
     let mut entries_seen = 0usize;
+    // Relative paths, not descriptors: the stack can hold `max_entries`
+    // directories, so each is reopened beneath the anchor when popped.
     // Depth is measured relative to `root`, which sits at depth 0.
-    let mut stack = vec![(root.to_path_buf(), 0usize)];
+    let mut stack = vec![(PathBuf::new(), 0usize)];
 
-    'walk: while let Some((dir, depth)) = stack.pop() {
-        let read_dir = match std::fs::read_dir(&dir) {
-            Ok(rd) => rd,
+    'walk: while let Some((rel, depth)) = stack.pop() {
+        // Not `root.join("")`, which would add a trailing separator.
+        let dir = if depth == 0 {
+            root.to_path_buf()
+        } else {
+            root.join(&rel)
+        };
+        let listing = match anchor.list_dir(&rel) {
+            Ok(list) => list,
             Err(e) => {
                 if depth == 0 {
                     return Err(e);
@@ -408,52 +435,51 @@ fn collect_files(root: &Path, recursive: bool, budget: &ScanBudget) -> io::Resul
             }
         };
 
-        for entry in read_dir {
+        for entry in listing {
             entries_seen += 1;
             if entries_seen > budget.max_entries {
                 limits_hit.insert(BudgetLimit::Entries);
                 break 'walk;
             }
-            let entry = match entry {
+            let (name, file_type) = match entry {
                 Ok(e) => e,
                 Err(_) => {
                     unreadable.insert(dir.clone());
                     continue;
                 }
             };
-            // `DirEntry::file_type` does not traverse a symlink.
-            let file_type = match entry.file_type() {
-                Ok(ft) => ft,
-                Err(_) => {
-                    unreadable.insert(dir.clone());
-                    continue;
-                }
-            };
-            let path = entry.path();
+            let child = rel.join(&name);
 
-            if file_type.is_dir() {
-                if recursive {
-                    if depth < budget.max_depth {
-                        stack.push((path, depth + 1));
+            match file_type {
+                FileType::Directory => {
+                    if recursive {
+                        if depth < budget.max_depth {
+                            stack.push((child, depth + 1));
+                        } else {
+                            limits_hit.insert(BudgetLimit::Depth);
+                        }
                     } else {
-                        limits_hit.insert(BudgetLimit::Depth);
+                        not_walked.subdirs += 1;
                     }
-                } else {
-                    not_walked.subdirs += 1;
                 }
-            } else if file_type.is_file() {
-                if out.len() >= budget.max_files {
-                    limits_hit.insert(BudgetLimit::Files);
-                    break 'walk;
+                FileType::RegularFile => {
+                    if out.len() >= budget.max_files {
+                        limits_hit.insert(BudgetLimit::Files);
+                        break 'walk;
+                    }
+                    out.push(root.join(child));
                 }
-                out.push(path);
-            } else {
-                not_walked.links_and_special += 1;
-                if file_type.is_symlink() && points_outside(&path, &real_root) {
-                    not_walked.links_outside += 1;
+                other => {
+                    not_walked.links_and_special += 1;
+                    if other == FileType::Symlink
+                        && points_outside(&root.join(child), anchor.path())
+                    {
+                        not_walked.links_outside += 1;
+                    }
                 }
             }
         }
+        after_list(&rel);
     }
 
     out.sort();
@@ -763,8 +789,8 @@ mod tests {
             max_total_bytes,
             ..ScanBudget::default()
         };
-        let walk = collect_files(dir, true, &budget).unwrap();
         let anchor = Arc::new(ScanRoot::open(dir).unwrap());
+        let walk = collect_files(&anchor, dir, true, &budget).unwrap();
         scan_within_bytes(&anchor, dir, &walk.files, &budget)
     }
 
@@ -1089,7 +1115,7 @@ mod tests {
     fn scan_after(root: &Path, swap: impl FnOnce()) -> Vec<ScanResult> {
         let budget = ScanBudget::default();
         let anchor = Arc::new(ScanRoot::open(root).unwrap());
-        let walk = collect_files(root, true, &budget).unwrap();
+        let walk = collect_files(&anchor, root, true, &budget).unwrap();
         swap();
         scan_within_bytes(&anchor, root, &walk.files, &budget).0
     }
@@ -1131,6 +1157,27 @@ mod tests {
             std::os::unix::fs::symlink(outside.path(), sub).unwrap();
         });
         assert_gap(&results, "sub/note.sh");
+    }
+
+    /// A subdirectory swapped to a symlink after its parent is listed but
+    /// before it is listed is unreadable; no outside name is collected (§11.7).
+    #[test]
+    fn swapped_dir_not_listed() {
+        let (root, outside) = (TempDir::new("list-root"), TempDir::new("list-out"));
+        fs::create_dir(root.path().join("sub")).unwrap();
+        fs::write(root.path().join("sub/note.sh"), b"echo hi\n").unwrap();
+        fs::write(outside.path().join("outside-only.sh"), DROPPER).unwrap();
+        let anchor = ScanRoot::open(root.path()).unwrap();
+        let sub = root.path().join("sub");
+        let walk = walk_files(&anchor, root.path(), true, &ScanBudget::default(), |rel| {
+            if rel.as_os_str().is_empty() {
+                fs::rename(&sub, root.path().join("aside")).unwrap();
+                std::os::unix::fs::symlink(outside.path(), &sub).unwrap();
+            }
+        })
+        .unwrap();
+        assert!(walk.files.is_empty(), "{:?}", walk.files);
+        assert_eq!(walk.unreadable, vec![sub]);
     }
 
     /// A target named through a symlink, and a hard link inside it, scan in
