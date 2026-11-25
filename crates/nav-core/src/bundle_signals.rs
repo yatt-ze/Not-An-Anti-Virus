@@ -15,6 +15,9 @@ const MISMATCH_WEAK_WEIGHT: i32 = 6;
 const NO_RUNTIME_BONUS: i32 = 2;
 /// Weight for a load command that reaches into `Contents/Resources/`.
 const LOAD_FROM_RESOURCES_WEIGHT: i32 = 6;
+/// Most that bundle signals may add to one member, so a self-signed main
+/// executable (+5 from `unanchored-signing-identity`) stays under Notify (§5.1).
+const MAX_PER_MEMBER: i32 = 8;
 /// Fewest other Mach-O members with a signing summary for a signer majority to mean anything.
 const MIN_SIBLINGS: usize = 3;
 
@@ -107,7 +110,21 @@ pub(crate) fn findings(members: &[Member], main: Option<usize>) -> Vec<(usize, F
             out.push((i, Finding::Signal(load_signal(&members[t].facts))));
         }
     }
+    cap_per_member(&mut out);
     out
+}
+
+/// Trim later signals so each member's bundle signals sum to at most
+/// [`MAX_PER_MEMBER`].
+fn cap_per_member(out: &mut [(usize, Finding)]) {
+    let mut added: HashMap<usize, i32> = HashMap::new();
+    for (i, finding) in out.iter_mut() {
+        if let Finding::Signal(signal) = finding {
+            let sum = added.entry(*i).or_default();
+            signal.weight = signal.weight.min(MAX_PER_MEMBER - *sum).max(0);
+            *sum += signal.weight;
+        }
+    }
 }
 
 enum Mismatch {
@@ -433,6 +450,43 @@ mod tests {
         let (score, rec) = crate::scan::score_signals(&[unanchored, mismatch]);
         assert_eq!(score, 13);
         assert_eq!(rec, Recommendation::NoAction);
+    }
+
+    /// A self-signed main executable that also loads from Resources gets no
+    /// more than the cap in total, so it still stays under Notify.
+    #[test]
+    fn combined_signals_are_capped() {
+        use crate::model::Recommendation;
+        let main = summary(SigningKind::SelfSigned, None, false);
+        let mut members = bundle(Some(main), 4, true);
+        members[0].facts.dylibs = vec!["@executable_path/../Resources/libX.dylib".into()];
+        members.push(member(
+            "Contents/Resources/libX.dylib",
+            Some(adhoc(false)),
+            &[],
+        ));
+        let mut signals: Vec<MatchedSignal> = findings(&members, Some(0))
+            .into_iter()
+            .filter_map(|(i, f)| match f {
+                Finding::Signal(s) if i == 0 => Some(s),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(signals.len(), 2);
+        assert_eq!(
+            signals.iter().map(|s| s.weight).sum::<i32>(),
+            MAX_PER_MEMBER
+        );
+        signals.push(MatchedSignal {
+            id: "unanchored-signing-identity".into(),
+            weight: 5,
+            description: String::new(),
+            category: SignalCategory::ProvenanceConcern,
+        });
+        assert_eq!(
+            crate::scan::score_signals(&signals).1,
+            Recommendation::NoAction
+        );
     }
 
     fn load_findings(members: &[Member]) -> Vec<(usize, String)> {
