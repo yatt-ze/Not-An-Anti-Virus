@@ -87,7 +87,7 @@ Explicit internal target (e.g., <1% average CPU, low Energy Impact rating in Act
 
 ### 11.4 Event Log Privacy
 
-Local SQLite log contains file paths, process args (redacted by default, see §4.2's `Sensitive<T>`), possibly hostnames. Needs encryption-at-rest consideration, retention/rotation policy, and access controls so another local user can't read root's log without permission.
+Local SQLite log contains file paths, process args (redacted by default, see §4.2's `Sensitive<T>`), possibly hostnames. Needs encryption-at-rest consideration and a retention policy. State and config directories are `0700` and the process umask is `077` (a `Umask` key in the launchd plist), so another local user can't read root's log. The log rotates at a size cap.
 
 ### 11.5 Clean Uninstall
 
@@ -106,6 +106,12 @@ A path referenced by an event may be replaced before it's scanned. Scan through 
 **Files are opened without following a symlink below the target (#239, threat-model E1).** The target the user named is resolved once (symlinks followed: that is the user's intent) and held open as a directory. Every file under it is opened by an `openat` walk from that descriptor: each directory component `O_NOFOLLOW | O_DIRECTORY`, opened search-only (`O_PATH` on Linux, `O_SEARCH` on macOS) so passing through it needs only the execute bit (#253), the file itself `O_NOFOLLOW | O_NONBLOCK | O_NOCTTY`, then `fstat` must show a regular file. A single-file target is resolved the same way and its leaf opened beneath its parent. Directories are listed the same way: each is reopened by that walk from the root descriptor, `O_RDONLY` since listing needs the read bit, and read through the result, so a parent swapped to a symlink before it is listed is reported unreadable and none of the outside directory's names appear (#252). So a file, or a parent directory, swapped to a symlink after the walk listed it fails to open, and the file is reported unreadable, a coverage gap, never clean (§11.8). It is not read through the link. Later steps describe the opened object: the quarantine xattr is read through the held handle, the `.app`-bundle exemption (§6.2) judges the canonical root joined with the symlink-free relative path, and bundle `Info.plist` and signature-manifest reads use the same walk. The post-tool identity re-check above re-opens through the same walk and `fstat`s the result, and also `stat`s the path the tool resolved; both must match the load-time identity. So a path swapped to a symlink, even one back to the same file, and a parent or the root itself renamed aside and replaced, both drop the tool's result. The walk is safe Rust (`rustix`); `nav-core` keeps `forbid(unsafe_code)`. The root descriptor is the seam the daemon can later hand in from a broker (threat model §7).
 
 This deliberately *narrows*, not closes, the window, and must not be presented as a complete TOCTOU guarantee. What remains: `codesign` and `spctl` still run by path, and the re-check runs after them, so a swap reverted before the re-check, or a same-size, same-mtime swap into a reused inode, goes unseen. A hard link to a file outside the target is a regular file inside it and is scanned (threat model R2, out of scope here). The full close — binding a cryptographic digest of the scanned bytes into the reported result (JSON provenance), and an unprivileged worker handed descriptors by a broker — remains for when the privileged daemon acts on verdicts (Phase 0b+), where a wrong-object trust decision becomes a security boundary, not only a correctness bug.
+
+**Daemon side (planned, §11.13; threat model §7 A, B, D, I).** The broker, not `nav-core`, makes the open that the descriptor walk above starts from:
+- **Owner's credentials.** It finds the uid that owns the watched location (the home directory owner; the user who mounted a volume; a fixed unprivileged uid for world-readable system locations such as `/Library/LaunchAgents`) and opens in a short-lived child that drops privileges permanently, then sends the descriptor back. A symlink, hard link or swapped parent that leads to something that user cannot read fails with `EACCES`, so the kernel enforces the boundary instead of path checks.
+- **Descriptor only.** Open with no symlink followed in any component, non-blocking, close-on-exec; `fstat` must show a regular file; record device, inode, size, mtime and ctime. The worker reads through the descriptor and never names a path. Files that would be fetched on read are reported as not scanned. Only local volumes are scanned automatically.
+- **Snapshot for path tools.** The worker clones the descriptor into its scratch directory (a copy-on-write clone on the same APFS volume, a bounded copy otherwise) and runs `codesign`/`spctl` on the clone, by absolute path, with a cleared environment, a deadline and an output cap. The object verified is then the object scanned, which closes the gap the paragraph above leaves. Bundle-seal validation needs the whole bundle, so in daemon mode it is reported as not checked rather than walking the attacker's tree by path.
+- **Digest binding.** Each finding is bound to device, inode and a digest of the scanned bytes. Verdict cache keys include ctime or a content digest. Quarantine (Phase 3) reopens as above, compares identity and digest, and refuses on mismatch; the removal is performed with the owner's credentials, so root never moves a file that user could not. Restore uses the owner's credentials, refuses to follow symlinks or overwrite, clears setuid bits, and refuses when the original parent is no longer the same object unless the user picks a destination.
 
 ### 11.8 Loss/Degradation Reporting
 
@@ -150,3 +156,28 @@ The per-file read cap (§3) and per-container extraction limits (§6.2) bound th
 A budget ceiling isn't the only way traversal can come up short: a subdirectory encountered mid-walk can itself be unreadable (permission denied, a race). `collect_files` treats this the same honest way as a ceiling — the directory's path is recorded (deduped, sorted for determinism §11.1) and traversal continues past it rather than aborting the scan (#32). `TargetScan::unreadable` carries the affected paths and folds into `coverage_complete()` alongside the budget outcome, so an unreadable subtree raises an otherwise-clean target to exit `3` through the existing `for_target` completeness check with no separate code path; `navctl rules test --json` on a directory/bundle target gained an additive `unreadable` array (no schema bump at the time) and the `navctl scan --json` target summary carries the same array (#51); `navd scan-once --json` reports unreadable directories on stderr only, same as its human output. This is unlike the named target *root* itself being unreadable, which stays an operational error (exit `4`, §8) — there's no partial traversal to report when nothing was ever entered.
 
 **External tools are bounded too (#158).** Each `codesign`/`spctl` spawn runs by absolute path (#157), is killed after 60 s and keeps at most 1 MiB of each output stream; a timeout or cut capture makes the rules depending on it `NotApplicable` (§11.8). Real runs over `/Applications` peaked at 10.3 s (Xcode, `codesign --verify --deep`). Per file the scan spawns at most six: `-dv`, the signer check and `spctl` (each cached on the scan), `--verify --deep` for revocation, and the strict anchor check, up to once each in `high-entropy-content` and `macho-loader-anomaly`. The worst-case stall is 6 x 60 s = 6 minutes a file. There is no wall-clock limit on the whole target: the byte budget bounds container decoding deterministically instead (#166).
+
+### 11.13 Privilege Separation: Broker and Worker
+
+Root `navd` never parses attacker-controlled bytes (§3, threat model §7). Scanning is split across two processes joined by a descriptor and a fixed-schema reply (§2).
+
+**Broker (`navd`, root, holds the FDA grant).**
+- Receives event paths as hints, never as objects. Queues them: bounded, coalesced by identity (device, inode), a fair share per uid so one account's flood degrades only that account's coverage, and every drop counted and reported (§11.8).
+- Opens each object with the owner's credentials and passes a read-only descriptor plus a job id to the worker over `SCM_RIGHTS` (§11.7).
+- Enforces the deadline and the per-object byte budget. It attaches the path and owner it recorded for the job id; the worker cannot name a path.
+- Validates the verdict: fixed schema, caps on counts and string lengths. All strings are escaped before they reach a log, a terminal or a notification.
+- Owns the socket and its authorization (§9.1), the event log, the verdict store and policy (§11.4).
+- Extracts nothing to disk and mounts nothing (§6.2); the worker reads archive members in memory. Image mounting stays in `navctl`, as the invoking user.
+
+**Worker.**
+- Runs as a dedicated role account created at install, never the file's owner (a same-uid process could stop or kill it). Links `nav-core`; the Security.framework shim and the `codesign`/`spctl` calls run here.
+- Sandboxes itself before reading any job: no network, no file access outside its scratch directory, exec limited to the Apple tools it needs.
+- Takes one job per process, or is recycled after a small number.
+
+**Deadlines and poison records.** The broker kills a worker at a wall-clock deadline. A killed or crashed worker yields `Indeterminate` for that object, and a poison record keyed by identity stops a restart from retrying it at once. The per-object byte and time budget (#104, #166) applies to directly named objects too.
+
+**Same worker, other feeders.** The worker's interface is a descriptor in and a fixed-schema verdict out, whoever supplies the descriptor. A per-user agent can feed it in place of a root broker (§14).
+
+**Packet capture (Phase 0c/2).** The same split: the broker opens the capture device, sets and locks the filter, and passes the descriptor to an unprivileged sandboxed parser.
+
+**Gate.** No event source is wired to a scan until the broker's opener, the descriptor-only reads, the worker, its sandbox and the verdict validation exist (§12).
