@@ -167,10 +167,10 @@ Root `navd` never parses attacker-controlled bytes (§3, threat model §7). Scan
 - Enforces the deadline and the per-object byte budget. It attaches the path and owner it recorded for the job id; the worker cannot name a path.
 - Validates the verdict: fixed schema, caps on counts and string lengths. All strings are escaped before they reach a log, a terminal or a notification.
 - Owns the socket and its authorization (§9.1), the event log, the verdict store and policy (§11.4).
-- Extracts nothing to disk and mounts nothing (§6.2); the worker reads archive members in memory. Image mounting stays in `navctl`, as the invoking user.
+- Extracts nothing to disk and mounts nothing (§6.2); the worker reads archive members in memory. Image mounting is `navctl`'s, as the invoking user, or the worker's for a daemon-triggered scan (§6.2).
 
 **Worker.**
-- Runs as a dedicated role account created at install, never the file's owner (a same-uid process could stop or kill it). Links `nav-core`; the Security.framework shim and the `codesign`/`spctl` calls run here.
+- Runs unprivileged, as either a dedicated role account created at install or the file's owner. Which is open (§14) and decided by a Phase 0b spike (§12): a role account keeps a uid boundary against malware running as the owner; the owner's uid needs no extra account and is likelier to be allowed to mount a disk image. Links `nav-core`; the Security.framework shim and the `codesign`/`spctl` calls run here.
 - Sandboxes itself before reading any job: no network, no file access outside its scratch directory, exec limited to the Apple tools it needs.
 - Takes one job per process, or is recycled after a small number.
 
