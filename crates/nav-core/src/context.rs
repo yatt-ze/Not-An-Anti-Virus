@@ -525,13 +525,6 @@ impl ScanContext {
         (held == by_path).then_some(held)
     }
 
-    /// The loaded file's real path: the canonical root joined with the
-    /// symlink-free path beneath it. `None` unless loaded from disk.
-    pub(crate) fn real_path(&self) -> Option<PathBuf> {
-        let o = self.origin.as_ref()?;
-        Some(o.root.path().join(&o.rel))
-    }
-
     /// Runs [`crate::macho::scan_ranged`] against this context at most once
     /// per scan and returns the cached result — the offset-based Mach-O scan
     /// several rules ask about (§5.2, #45). An unreadable context (no
