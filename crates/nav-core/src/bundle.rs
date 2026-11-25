@@ -11,6 +11,8 @@
 use std::io::Read;
 use std::path::{Component, Path, PathBuf};
 
+use crate::beneath::ScanRoot;
+
 /// Cap on the `Contents/Info.plist` read; a larger one is corrupt or hostile,
 /// and the convention fallback covers both.
 const MAX_INFO_PLIST_BYTES: u64 = 1 << 20; // 1 MiB
@@ -44,7 +46,7 @@ impl BundleLayout {
         }
 
         let stem = &name[..name.len() - ".app".len()];
-        let main_executable = executable_from_info_plist(&contents)
+        let main_executable = executable_from_info_plist(path, &contents)
             .or_else(|| resolve_main_executable(&contents, stem));
 
         Some(BundleLayout {
@@ -57,13 +59,12 @@ impl BundleLayout {
 /// `Contents/MacOS/<CFBundleExecutable>` if the plist names one and it exists.
 /// The value is reduced to its final component, so a hostile
 /// `../../elsewhere` can't escape `Contents/MacOS/`.
-fn executable_from_info_plist(contents: &Path) -> Option<PathBuf> {
-    let info = contents.join("Info.plist");
-    if !is_real_file(&info) {
-        return None;
-    }
+fn executable_from_info_plist(bundle: &Path, contents: &Path) -> Option<PathBuf> {
     let mut buf = Vec::new();
-    crate::context::open_regular(&info)?
+    ScanRoot::open(bundle)
+        .ok()?
+        .open_file(Path::new("Contents/Info.plist"))
+        .ok()?
         .take(MAX_INFO_PLIST_BYTES)
         .read_to_end(&mut buf)
         .ok()?;
@@ -125,25 +126,22 @@ fn is_real_file(path: &Path) -> bool {
 }
 
 /// Whether a bundle member is a code-signature manifest, the one member
-/// traversed but not scored (§5.8): `rel` (relative to the bundle root) ends
-/// in `_CodeSignature/CodeResources`, and `abs` is a regular file, not a
-/// symlink, whose content starts `<?xml` or `bplist00`. Anything unreadable
-/// or mismatched returns `false`, so it is scored (§11.8).
-pub fn is_signature_manifest(rel: &Path, abs: &Path) -> bool {
+/// traversed but not scored (§5.8): `rel` (beneath the bundle `root`) ends in
+/// `_CodeSignature/CodeResources`, and opens without following a symlink as a
+/// regular file whose content starts `<?xml` or `bplist00`. Anything
+/// unreadable or mismatched returns `false`, so it is scored (§11.8).
+pub(crate) fn is_signature_manifest(root: &ScanRoot, rel: &Path) -> bool {
     let mut tail = rel.components().rev();
     let named = matches!(
         (tail.next(), tail.next()),
         (Some(Component::Normal(f)), Some(Component::Normal(d)))
             if f == "CodeResources" && d == "_CodeSignature"
     );
-    named && starts_as_plist(abs)
+    named && starts_as_plist(root, rel)
 }
 
-fn starts_as_plist(path: &Path) -> bool {
-    if !is_real_file(path) {
-        return false;
-    }
-    let Some(file) = crate::context::open_regular(path) else {
+fn starts_as_plist(root: &ScanRoot, rel: &Path) -> bool {
+    let Ok(file) = root.open_file(rel) else {
         return false;
     };
     let mut head = Vec::with_capacity(8);
@@ -342,35 +340,34 @@ mod tests {
         fs::create_dir_all(&sig).unwrap();
         let rel = Path::new("Contents/_CodeSignature/CodeResources");
         let abs = sig.join("CodeResources");
+        let root = ScanRoot::open(&tmp.0).unwrap();
+        let is_manifest = |rel: &Path| is_signature_manifest(&root, rel);
 
         fs::write(&abs, b"<?xml version=\"1.0\"?><plist/>").unwrap();
-        assert!(is_signature_manifest(rel, &abs));
+        assert!(is_manifest(rel));
         fs::write(&abs, b"bplist00\xd0\x08").unwrap();
-        assert!(is_signature_manifest(rel, &abs));
+        assert!(is_manifest(rel));
 
         // Named right but not a plist: scored.
         fs::write(&abs, b"#!/bin/sh\necho hi\n").unwrap();
-        assert!(!is_signature_manifest(rel, &abs));
+        assert!(!is_manifest(rel));
         fs::write(&abs, b"<?xm").unwrap();
-        assert!(!is_signature_manifest(rel, &abs));
+        assert!(!is_manifest(rel));
 
         // A plist under any other name or directory: scored.
         let other = sig.join("CodeDirectory");
         fs::write(&other, b"<?xml version=\"1.0\"?>").unwrap();
-        assert!(!is_signature_manifest(
-            Path::new("Contents/_CodeSignature/CodeDirectory"),
-            &other
-        ));
-        assert!(!is_signature_manifest(
-            Path::new("Contents/Info.plist"),
-            &abs
-        ));
+        assert!(!is_manifest(Path::new(
+            "Contents/_CodeSignature/CodeDirectory"
+        )));
+        fs::write(tmp.0.join("Contents/Info.plist"), b"<?xml ?>").unwrap();
+        assert!(!is_manifest(Path::new("Contents/Info.plist")));
 
         // A symlink to a real manifest, and a missing file: scored.
         fs::write(&other, b"<?xml version=\"1.0\"?>").unwrap();
         fs::remove_file(&abs).unwrap();
-        assert!(!is_signature_manifest(rel, &abs));
+        assert!(!is_manifest(rel));
         std::os::unix::fs::symlink(&other, &abs).unwrap();
-        assert!(!is_signature_manifest(rel, &abs));
+        assert!(!is_manifest(rel));
     }
 }
