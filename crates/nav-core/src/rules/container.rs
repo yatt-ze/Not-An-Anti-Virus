@@ -407,14 +407,22 @@ mod tests {
         ScanContext::load(&path)
     }
 
+    /// Containers inside an app bundle get no exemption (§6.2, #244).
     #[test]
-    fn zip_in_app_bundle_flagged() {
+    fn bundle_containers_flagged() {
         let tmp = temp_dir("zip-app");
         let zip = b"PK\x03\x04rest";
         assert!(fires(&file_in(
             &tmp.0,
             "X.app/Contents/Resources/r.zip",
             zip
+        )));
+        let mut dmg = vec![0u8; 1024];
+        dmg[512..516].copy_from_slice(b"koly");
+        assert!(fires(&file_in(
+            &tmp.0,
+            "X.app/Contents/Resources/i.dmg",
+            &dmg
         )));
     }
 

@@ -770,6 +770,7 @@ mod tests {
         );
     }
 
+    /// A ZIP inside an app bundle is read and scored like any other (#244).
     #[test]
     fn app_bundle_zip_read() {
         let dir = crate::test_support::write_temp_file("zip-app", b"");
