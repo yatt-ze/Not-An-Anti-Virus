@@ -512,15 +512,17 @@ impl ScanContext {
         }
     }
 
-    /// Identity of what the loaded path names now, re-opened the same
-    /// no-follow way it was loaded; a plain `stat` only for a context built
-    /// without an origin.
+    /// Identity of what the loaded path names now: re-opened the same no-follow
+    /// way it was loaded, and also `stat`ed by path as the tool resolved it.
+    /// `None` unless both agree; only the `stat` for a context without an origin.
     fn identity_now(&self) -> Option<ObjectIdentity> {
+        let by_path = ObjectIdentity::of_path(&self.path)?;
         let Some(o) = &self.origin else {
-            return ObjectIdentity::of_path(&self.path);
+            return Some(by_path);
         };
         let md = o.root.open_file(&o.rel).ok()?.metadata().ok()?;
-        Some(ObjectIdentity::from_metadata(&md))
+        let held = ObjectIdentity::from_metadata(&md);
+        (held == by_path).then_some(held)
     }
 
     /// The loaded file's real path: the canonical root joined with the
@@ -747,6 +749,25 @@ mod tests {
         assert_eq!(ctx.run_object_bound(|| Some(())), None);
         let _ = std::fs::remove_file(&path);
         let _ = std::fs::remove_file(&aside);
+    }
+
+    /// The held root still reaches the original file after its directory is
+    /// renamed aside, but the tool ran on the new one by path, so the result drops.
+    #[test]
+    fn recheck_refuses_swapped_parent() {
+        let file = write_temp_file("recheck-parent", b"original bytes");
+        let dir = file.with_extension("d");
+        std::fs::create_dir(&dir).unwrap();
+        let path = dir.join("f");
+        std::fs::rename(&file, &path).unwrap();
+        let ctx = ScanContext::load(&path);
+        let aside = dir.with_extension("aside");
+        std::fs::rename(&dir, &aside).unwrap();
+        std::fs::create_dir(&dir).unwrap();
+        std::fs::write(&path, b"other bytes").unwrap();
+        assert_eq!(ctx.run_object_bound(|| Some(())), None);
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&aside);
     }
 
     /// Two rules ask for the strict anchor check; `codesign` runs once (#106).
