@@ -18,6 +18,7 @@
 compile_error!("nav-core is unix-only");
 
 pub(crate) mod base64;
+pub(crate) mod beneath;
 pub(crate) mod budget;
 pub mod bundle;
 pub mod bzip2;

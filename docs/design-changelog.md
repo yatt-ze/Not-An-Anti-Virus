@@ -5,6 +5,10 @@ for the current document map. Newest first.
 
 ---
 
+**Changelog from v1.16 (2026-11-25):** Scanned files are opened without following a symlink below the target (§11.7, §11.8, #239). The walker listed files and later opened each by path, following symlinks in every component, so a file or parent directory swapped mid-scan could make a root scan read a file outside the target and report it under the listed path (threat-model E1). The named target is now resolved once and held open; each file is opened by an `openat` walk from it with `O_NOFOLLOW` on every component, and one that won't open that way is reported unreadable, a gap, never clean. The quarantine xattr, the `.app` exemption and the codesign/spctl identity re-check now describe the opened object. Decided: a no-follow descriptor walk, not comparing the opened file's path with the expected one, which would gap hard-linked files. Still by path: `codesign`/`spctl` themselves and the directory listing (entry names only). Hard links out of the target stay out of scope (R2).
+
+---
+
 **Changelog from v1.15 (2026-11-23):** NAV drops Developer ID signing and accepts `curl … | sh` as an install channel (§13, §12, §11.10). Shipped binaries carry the toolchain's ad-hoc signature, or a stable self-signed certificate if that turns out to keep `navd`'s FDA grant. There is no Apple Developer Program membership and no notarization. Without notarization, a browser-downloaded `.pkg`/`.dmg` would be blocked by Gatekeeper, so the channels are ones that skip the quarantine attribute: an install script and a Homebrew tap formula. Build-from-source stays supported. FDA grant durability across upgrades (Phase 0b B2) is now tested ad-hoc and with a self-signed certificate; if neither holds, re-granting after a `navd` upgrade becomes a documented gap, not a blocker. The Release-Readiness Gate stays as a pre-Homebrew check without the Developer ID step. Decided by the user. Replaces the §13 points "Developer ID is acquired at the release boundary" and "build-from-source … deliberately *not* `curl … | sh`".
 
 ---

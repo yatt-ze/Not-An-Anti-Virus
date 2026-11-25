@@ -8,7 +8,9 @@ use std::borrow::Cow;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
+
+use crate::beneath::ScanRoot;
 
 /// Cap on how much of a file is read into memory for content rules. Static
 /// analysis never needs the whole file, and an unbounded read of hostile input
@@ -25,13 +27,10 @@ pub const STREAM_CHUNK: usize = 1024 * 1024; // 1 MiB
 pub const MAX_STREAM_BYTES: u64 = 512 * 1024 * 1024; // 512 MiB
 
 /// A best-effort stable identity for a file on disk, captured at load so an
-/// external check (codesign/spctl) can confirm it still names the same object
-/// it read (§11.7). It narrows, not closes, the TOCTOU window: the re-stat runs
-/// *after* the tool, so it catches the ordinary "swap the path and leave it
-/// swapped" race, but not a swap reverted before the re-stat, nor — given
-/// `mtime` granularity and inode reuse — a same-size, same-mtime swap into a
-/// reused inode. Not a security guarantee; fd-based scanning (§11.7) is the
-/// real close, deferred to Phase 0b+.
+/// external check (codesign/spctl), which must run by path, can confirm the
+/// path still names the object read (§11.7). The re-check runs *after* the
+/// tool, so it narrows, not closes, that window: a swap reverted before it, or
+/// a same-size, same-mtime swap into a reused inode, goes unseen.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ObjectIdentity {
     pub dev: u64,
@@ -73,18 +72,20 @@ pub enum ContentSource {
     Embedded,
 }
 
-/// Open `path` read-only and return the handle only if it is a regular file.
-/// The open is `O_NONBLOCK`, so a FIFO swapped in after the walker's check
-/// can't block it; a FIFO, device or other non-regular file yields `None`, the
-/// same as an unreadable one (§11.7, §11.8).
-pub(crate) fn open_regular(path: &Path) -> Option<std::fs::File> {
-    use std::os::unix::fs::OpenOptionsExt;
-    let mut opts = std::fs::OpenOptions::new();
-    opts.read(true);
-    // O_NOCTTY: a tty swapped in must not become our controlling terminal.
-    opts.custom_flags(libc::O_NONBLOCK | libc::O_NOCTTY);
-    let f = opts.open(path).ok()?;
-    f.metadata().ok()?.is_file().then_some(f)
+/// Where a loaded file sits: `rel`, symlink-free, beneath a held root.
+#[derive(Debug, Clone)]
+pub(crate) struct Origin {
+    pub(crate) root: Arc<ScanRoot>,
+    pub(crate) rel: PathBuf,
+}
+
+/// Resolve `path` once (a named symlink is the caller's intent) and split it
+/// into its held parent and leaf name.
+fn anchor(path: &Path) -> Option<Origin> {
+    let real = path.canonicalize().ok()?;
+    let rel = PathBuf::from(real.file_name()?);
+    let root = Arc::new(ScanRoot::open(real.parent()?).ok()?);
+    Some(Origin { root, rel })
 }
 
 pub struct ScanContext {
@@ -109,6 +110,9 @@ pub struct ScanContext {
     /// same object `identity` describes, never a fresh open by path (§11.7).
     /// `None` for embedded content or when the open/read failed.
     pub(crate) file: Option<std::fs::File>,
+    /// How `file` was reached, so a later check re-opens the same way (§11.7).
+    /// `None` wherever `file` is.
+    pub(crate) origin: Option<Origin>,
     /// Memoized `codesign -dv` spawn (§5.2) — `None` means the spawn failed
     /// or the platform can't run it. Several rules ask about the same file.
     /// `pub(crate)` so test helpers elsewhere can build a `ScanContext` by
@@ -159,13 +163,33 @@ impl ScanContext {
         allowance: u64,
         admit: impl FnOnce(u64) -> bool,
     ) -> Option<Self> {
+        match anchor(path) {
+            Some(o) => Self::load_beneath(&o.root, &o.rel, path.to_path_buf(), allowance, admit),
+            None => Some(ScanContext {
+                allowance: AtomicU64::new(allowance),
+                ..Self::empty(path.to_path_buf(), ContentSource::File)
+            }),
+        }
+    }
+
+    /// [`Self::load_if`] for the file at `rel` beneath `root`, opened without
+    /// following a symlink in any component (§11.7); `path` is the label
+    /// reported. A file that can't be opened that way, or isn't a regular
+    /// file, loads as unreadable — a gap, never clean (§11.8).
+    pub(crate) fn load_beneath(
+        root: &Arc<ScanRoot>,
+        rel: &Path,
+        path: PathBuf,
+        allowance: u64,
+        admit: impl FnOnce(u64) -> bool,
+    ) -> Option<Self> {
         let unreadable = || ScanContext {
             allowance: AtomicU64::new(allowance),
-            ..Self::empty(path.to_path_buf(), ContentSource::File)
+            ..Self::empty(path.clone(), ContentSource::File)
         };
         // Identity and length come from the *opened* handle, and the bytes are
         // read through it, so a pre-open `stat` can't be raced (§11.7).
-        let Some(mut f) = open_regular(path) else {
+        let Ok(mut f) = root.open_file(rel) else {
             return Some(unreadable());
         };
         let Ok(md) = f.metadata() else {
@@ -198,6 +222,10 @@ impl ScanContext {
             file_len: Some(file_len),
             identity: Some(ObjectIdentity::from_metadata(&md)),
             file: Some(f),
+            origin: Some(Origin {
+                root: Arc::clone(root),
+                rel: rel.to_path_buf(),
+            }),
             ..ctx
         })
     }
@@ -231,6 +259,7 @@ impl ScanContext {
             identity: None,
             source,
             file: None,
+            origin: None,
             codesign_dv_cache: OnceLock::new(),
             spctl_cache: OnceLock::new(),
             signer_check_cache: OnceLock::new(),
@@ -478,9 +507,27 @@ impl ScanContext {
         }
         let out = spawn()?;
         match self.identity {
-            Some(at_load) if ObjectIdentity::of_path(&self.path) != Some(at_load) => None,
+            Some(at_load) if self.identity_now() != Some(at_load) => None,
             _ => Some(out),
         }
+    }
+
+    /// Identity of what the loaded path names now, re-opened the same
+    /// no-follow way it was loaded; a plain `stat` only for a context built
+    /// without an origin.
+    fn identity_now(&self) -> Option<ObjectIdentity> {
+        let Some(o) = &self.origin else {
+            return ObjectIdentity::of_path(&self.path);
+        };
+        let md = o.root.open_file(&o.rel).ok()?.metadata().ok()?;
+        Some(ObjectIdentity::from_metadata(&md))
+    }
+
+    /// The loaded file's real path: the canonical root joined with the
+    /// symlink-free path beneath it. `None` unless loaded from disk.
+    pub(crate) fn real_path(&self) -> Option<PathBuf> {
+        let o = self.origin.as_ref()?;
+        Some(o.root.path().join(&o.rel))
     }
 
     /// Runs [`crate::macho::scan_ranged`] against this context at most once
@@ -685,6 +732,21 @@ mod tests {
         );
 
         let _ = std::fs::remove_file(&path);
+    }
+
+    /// The post-tool re-check re-opens without following symlinks, so a leaf
+    /// swapped to a symlink — even one back to the same file — drops the
+    /// tool's result (§11.7).
+    #[test]
+    fn recheck_refuses_symlinked_leaf() {
+        let path = write_temp_file("recheck-link", b"original bytes");
+        let ctx = ScanContext::load(&path);
+        let aside = path.with_extension("aside");
+        std::fs::rename(&path, &aside).unwrap();
+        std::os::unix::fs::symlink(&aside, &path).unwrap();
+        assert_eq!(ctx.run_object_bound(|| Some(())), None);
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(&aside);
     }
 
     /// Two rules ask for the strict anchor check; `codesign` runs once (#106).

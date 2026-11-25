@@ -8,7 +8,9 @@
 use std::collections::BTreeSet;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
+use crate::beneath::ScanRoot;
 use crate::bundle::{self, BundleLayout};
 use crate::context::{ScanContext, MAX_STREAM_BYTES};
 use crate::model::{Recommendation, ScanCompleteness, ScanResult};
@@ -266,14 +268,15 @@ pub fn scan_target_with_budget(
     }
 
     if let Some(layout) = BundleLayout::detect(path) {
+        let anchor = Arc::new(ScanRoot::open(path)?);
         // A bundle is always traversed in full; `recursive` doesn't apply.
         let walk = collect_files(path, true, budget)?;
         let (to_scan, skipped): (Vec<PathBuf>, Vec<PathBuf>) =
             walk.files.into_iter().partition(|p| {
                 let rel = p.strip_prefix(path).unwrap_or(p);
-                !bundle::is_signature_manifest(rel, p)
+                !bundle::is_signature_manifest(&anchor, rel)
             });
-        let (results, byte_limit, _) = scan_within_bytes(&to_scan, budget);
+        let (results, byte_limit, _) = scan_within_bytes(&anchor, path, &to_scan, budget);
         return Ok(TargetScan {
             root: path.to_path_buf(),
             kind: TargetKind::Bundle,
@@ -293,8 +296,9 @@ pub fn scan_target_with_budget(
         ));
     }
 
+    let anchor = Arc::new(ScanRoot::open(path)?);
     let walk = collect_files(path, recursive, budget)?;
-    let (results, byte_limit, _) = scan_within_bytes(&walk.files, budget);
+    let (results, byte_limit, _) = scan_within_bytes(&anchor, path, &walk.files, budget);
     Ok(TargetScan {
         root: path.to_path_buf(),
         kind: TargetKind::Directory,
@@ -319,14 +323,17 @@ fn outcome(mut collect_limits: BudgetLimits, byte_limit: Option<BudgetLimit>) ->
     }
 }
 
-/// Scan `files` in order, each with a hard allowance of what is left of
-/// `max_total_bytes` (§11.12): its disk reads and decoded bytes are charged
-/// as they happen, and work past the allowance is refused. After the first
-/// file, a file is started only if its length, clipped to `MAX_STREAM_BYTES`,
-/// fits in what is left. Returns the results scored, `Some(TotalBytes)` if a
-/// file was refused or one's allowance cut its scan short, and the bytes
-/// spent.
+/// Scan `files` (paths under `base`, each opened beneath `anchor` without
+/// following a symlink, §11.7) in order, each with a hard allowance of what
+/// is left of `max_total_bytes` (§11.12): its disk reads and decoded bytes are
+/// charged as they happen, and work past the allowance is refused. After the
+/// first file, a file is started only if its length, clipped to
+/// `MAX_STREAM_BYTES`, fits in what is left. Returns the results scored,
+/// `Some(TotalBytes)` if a file was refused or one's allowance cut its scan
+/// short, and the bytes spent.
 fn scan_within_bytes(
+    anchor: &Arc<ScanRoot>,
+    base: &Path,
     files: &[PathBuf],
     budget: &ScanBudget,
 ) -> (Vec<ScanResult>, Option<BudgetLimit>, u64) {
@@ -339,7 +346,9 @@ fn scan_within_bytes(
         // Always allow the first file through, so one large file still scans.
         let first = results.is_empty();
         let admit = |len: u64| first || len.min(MAX_STREAM_BYTES) <= left;
-        let Some(ctx) = ScanContext::load_if(f, left, admit) else {
+        // Not under `base` can't happen; the absolute path then fails to open.
+        let rel = f.strip_prefix(base).unwrap_or(f);
+        let Some(ctx) = ScanContext::load_beneath(anchor, rel, f.clone(), left, admit) else {
             return (results, Some(BudgetLimit::TotalBytes), used);
         };
         results.push(scan_context(&ctx, &rules));
@@ -485,6 +494,7 @@ fn points_outside(link: &Path, real_root: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::CoverageGap;
     use std::fs;
 
     /// A throwaway directory under the system temp dir, removed on drop.
@@ -754,7 +764,8 @@ mod tests {
             ..ScanBudget::default()
         };
         let walk = collect_files(dir, true, &budget).unwrap();
-        scan_within_bytes(&walk.files, &budget)
+        let anchor = Arc::new(ScanRoot::open(dir).unwrap());
+        scan_within_bytes(&anchor, dir, &walk.files, &budget)
     }
 
     /// A file whose re-reads would pass the budget is cut at it: the reads
@@ -1070,5 +1081,83 @@ mod tests {
             .any(|r| r.path.ends_with("readable.txt")));
         assert_eq!(scan.unreadable, vec![locked]);
         assert!(!scan.coverage_complete());
+    }
+
+    const DROPPER: &[u8] = include_bytes!("../fixtures/suspicious/dropper.sh");
+
+    /// Walk `root`, run `swap` between the walk and the scan, then scan.
+    fn scan_after(root: &Path, swap: impl FnOnce()) -> Vec<ScanResult> {
+        let budget = ScanBudget::default();
+        let anchor = Arc::new(ScanRoot::open(root).unwrap());
+        let walk = collect_files(root, true, &budget).unwrap();
+        swap();
+        scan_within_bytes(&anchor, root, &walk.files, &budget).0
+    }
+
+    /// The listed path's result: unreadable, and nothing from outside.
+    fn assert_gap(results: &[ScanResult], name: &str) {
+        let r = results.iter().find(|r| r.path.ends_with(name)).unwrap();
+        assert!(r.coverage_gaps.contains(&CoverageGap::Unreadable), "{r:?}");
+        assert_ne!(r.completeness, ScanCompleteness::Complete);
+        assert_eq!(r.recommendation, Recommendation::NoAction);
+        assert!(r.signals.iter().all(|s| s.weight == 0), "{r:?}");
+    }
+
+    /// A collected file swapped to a symlink before it is opened is a gap,
+    /// not a read of the link's target (§11.7, §11.8).
+    #[test]
+    fn swapped_leaf_is_gap() {
+        let (root, outside) = (TempDir::new("leaf-root"), TempDir::new("leaf-out"));
+        fs::write(root.path().join("note.sh"), b"echo hi\n").unwrap();
+        fs::write(outside.path().join("secret.sh"), DROPPER).unwrap();
+        let results = scan_after(root.path(), || {
+            let note = root.path().join("note.sh");
+            fs::remove_file(&note).unwrap();
+            std::os::unix::fs::symlink(outside.path().join("secret.sh"), note).unwrap();
+        });
+        assert_gap(&results, "note.sh");
+    }
+
+    /// A parent directory swapped to a symlink is a gap the same way.
+    #[test]
+    fn swapped_parent_is_gap() {
+        let (root, outside) = (TempDir::new("parent-root"), TempDir::new("parent-out"));
+        fs::create_dir(root.path().join("sub")).unwrap();
+        fs::write(root.path().join("sub/note.sh"), b"echo hi\n").unwrap();
+        fs::write(outside.path().join("note.sh"), DROPPER).unwrap();
+        let results = scan_after(root.path(), || {
+            let sub = root.path().join("sub");
+            fs::rename(&sub, root.path().join("aside")).unwrap();
+            std::os::unix::fs::symlink(outside.path(), sub).unwrap();
+        });
+        assert_gap(&results, "sub/note.sh");
+    }
+
+    /// A target named through a symlink, and a hard link inside it, scan in
+    /// full: only components beneath the resolved root are refused.
+    #[test]
+    fn linked_root_scans_fully() {
+        let (real, links) = (TempDir::new("linked-real"), TempDir::new("linked-via"));
+        fs::create_dir_all(real.path().join("a/b")).unwrap();
+        fs::write(real.path().join("a/b/drop.sh"), DROPPER).unwrap();
+        fs::write(real.path().join("plain.txt"), b"hello\n").unwrap();
+        fs::hard_link(real.path().join("a/b/drop.sh"), real.path().join("hard.sh")).unwrap();
+        let via = links.path().join("root");
+        std::os::unix::fs::symlink(real.path(), &via).unwrap();
+        let scan = scan_target(&via, true).unwrap();
+        assert!(scan.coverage_complete());
+        assert_eq!(scan.results.len(), 3);
+        for r in &scan.results {
+            assert!(r.path.starts_with(&via), "{r:?}");
+            assert!(!r.coverage_gaps.contains(&CoverageGap::Unreadable), "{r:?}");
+        }
+        for name in ["drop.sh", "hard.sh"] {
+            let r = scan
+                .results
+                .iter()
+                .find(|r| r.path.ends_with(name))
+                .unwrap();
+            assert_ne!(r.recommendation, Recommendation::NoAction, "{r:?}");
+        }
     }
 }

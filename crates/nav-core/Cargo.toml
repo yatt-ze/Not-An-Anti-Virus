@@ -10,6 +10,7 @@ rust-version.workspace = true
 serde = { workspace = true }
 serde_json = { workspace = true }
 libc = { workspace = true }
+rustix = { version = "1", default-features = false, features = ["fs", "std"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 xattr = "1"
