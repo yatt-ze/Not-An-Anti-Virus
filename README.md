@@ -89,7 +89,7 @@ cd Not-An-Anti-Virus
 cargo install --locked --path crates/navctl
 ```
 
-This puts `navctl` in `~/.cargo/bin`. Homebrew and signed release binaries
+This puts `navctl` in `~/.cargo/bin`. An install script and a Homebrew tap
 are planned.
 
 ## Usage
