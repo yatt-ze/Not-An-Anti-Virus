@@ -11,6 +11,12 @@
     "rule_ids": [],
     "completeness": "complete"
   },
+  "benign/FrameworkOwnResources.app": {
+    "score": 0,
+    "recommendation": "no-action",
+    "rule_ids": [],
+    "completeness": "complete"
+  },
   "benign/Hello.class": {
     "score": 0,
     "recommendation": "no-action",
@@ -341,6 +347,14 @@
     "recommendation": "notify",
     "rule_ids": [
       "suspicious-strings"
+    ],
+    "completeness": "complete"
+  },
+  "suspicious/ResourcesLoad.app": {
+    "score": 6,
+    "recommendation": "no-action",
+    "rule_ids": [
+      "bundle-load-from-resources"
     ],
     "completeness": "complete"
   },
