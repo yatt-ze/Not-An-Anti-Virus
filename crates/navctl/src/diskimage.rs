@@ -552,7 +552,7 @@ fn relabel(scan: &mut TargetScan, image: &Path, volumes: &[(usize, PathBuf)], nu
 /// owned by us and closed to others. Returned canonical, as hdiutil
 /// reports mount points.
 fn scratch_root() -> io::Result<PathBuf> {
-    let root = user_temp_dir().join(SCRATCH_DIR_NAME);
+    let root = user_temp_dir()?.join(SCRATCH_DIR_NAME);
     match std::fs::DirBuilder::new().mode(0o700).create(&root) {
         Ok(()) => {}
         Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {}
@@ -570,10 +570,9 @@ fn scratch_root() -> io::Result<PathBuf> {
     std::fs::canonicalize(&root)
 }
 
-/// `temp_dir()`, except as root: then the per-uid Darwin temp dir, ignoring
-/// `TMPDIR`, which under `sudo -E` names a dir the invoking user controls
-/// (#241). Falls back to `temp_dir()` off macOS or if `confstr` fails.
-fn user_temp_dir() -> PathBuf {
+/// `temp_dir()`, except as root on macOS: the per-uid `confstr` temp dir,
+/// never `TMPDIR` (§6.2). Errors as root if `confstr` fails.
+fn user_temp_dir() -> io::Result<PathBuf> {
     #[cfg(target_os = "macos")]
     // SAFETY: getuid takes no arguments and never fails.
     if unsafe { libc::getuid() } == 0 {
@@ -589,10 +588,11 @@ fn user_temp_dir() -> PathBuf {
         };
         // n counts the NUL; n > buf.len() means truncated.
         if n > 1 && n <= buf.len() {
-            return PathBuf::from(OsStr::from_bytes(&buf[..n - 1]));
+            return Ok(PathBuf::from(OsStr::from_bytes(&buf[..n - 1])));
         }
+        return Err(io::Error::other("no per-user temp directory for root"));
     }
-    std::env::temp_dir()
+    Ok(std::env::temp_dir())
 }
 
 /// A fresh 0700 `<pid>-<random>` directory under `root`, with its 0700
@@ -1082,6 +1082,15 @@ mod tests {
             e.push(("mount-point", PlistValue::String(m.into())));
         }
         dict(e)
+    }
+
+    /// A writable, suid-allowing volume fails the check; the mount tests in
+    /// `tests/scan_disk_image.rs` cover a real image passing it.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn writable_volume_not_locked() {
+        assert!(!locked_down(&std::env::temp_dir()));
+        assert!(!locked_down(Path::new("/no/such/path")));
     }
 
     #[test]
