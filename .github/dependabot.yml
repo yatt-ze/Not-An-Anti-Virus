@@ -18,5 +18,8 @@ updates:
     schedule:
       interval: monthly
     groups:
+      # Majors come as their own PRs: they can raise the MSRV or change
+      # a parser's behaviour.
       cargo:
         patterns: ["*"]
+        update-types: [minor, patch]

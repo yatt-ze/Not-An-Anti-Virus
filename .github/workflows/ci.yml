@@ -121,8 +121,10 @@ jobs:
       - uses: rustsec/audit-check@69366f33c96575abad1ee0dba8212993eecbe998 # v2.0.0
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
-      # The fuzz crate is its own workspace with its own lockfile.
+      # The fuzz crate is its own workspace with its own lockfile; audit it
+      # even when the root audit failed.
       - name: audit fuzz lockfile
+        if: ${{ !cancelled() }}
         uses: rustsec/audit-check@69366f33c96575abad1ee0dba8212993eecbe998 # v2.0.0
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
