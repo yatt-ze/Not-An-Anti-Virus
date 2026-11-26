@@ -1,10 +1,10 @@
 //! Static ZIP reader (§6.2, #86): decodes members from in-memory bytes and
 //! never writes them to disk. It reads both views a tool might use, the
-//! central directory and a walk of local headers from the first one that
-//! skips junk to the next local header, and
-//! decodes each distinct interpretation once, so a zip that tools read
-//! differently cannot hide a member behind the view we did not read
-//! (§11.8). Stored, deflate and bzip2 are decoded; anything else is a gap.
+//! central directory and a walk of local headers from the first one
+//! (resyncing past junk), and decodes each distinct interpretation once,
+//! so a zip that tools read differently cannot hide a member behind the
+//! view we did not read (§11.8). Stored, deflate and bzip2 are decoded;
+//! anything else is a gap.
 //!
 //! Every gap (encryption, an unsupported method, a limit, damage, a
 //! disagreement between views) is reported; none of them is a finding.
@@ -531,11 +531,14 @@ enum Resumed {
 struct Resync {
     /// Ranges already searched, start -> end, non-empty and merged.
     searched: BTreeMap<usize, usize>,
-    /// Signatures found in `searched`; true for a local header.
+    /// Every signature that starts inside `searched`; true for a local
+    /// header. A search stops at its first hit, so this stays complete.
     found: BTreeMap<usize, bool>,
 }
 
 impl Resync {
+    /// Records `start..end` as searched, merging touching ranges; ignores
+    /// an empty range.
     fn mark(&mut self, mut start: usize, mut end: usize) {
         if start >= end {
             return;
