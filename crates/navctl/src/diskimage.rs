@@ -240,6 +240,8 @@ fn scan_clone(
             os("-nobrowse"),
             os("-noautoopen"),
             os("-noautofsck"),
+            os("-owners"),
+            os("off"),
             os("-verify"),
             os("-stdinpass"),
             os("-plist"),
@@ -268,6 +270,11 @@ fn scan_clone(
     let entities = parse_attach(&attached, &mounts);
     if entities.volumes.is_empty() {
         return Err("no volume on the image mounted".into());
+    }
+    if let Some((n, _)) = entities.volumes.iter().find(|(_, v)| !locked_down(v)) {
+        return Err(format!(
+            "volume {n} was not mounted read-only, nosuid and nodev, so it was not scanned"
+        ));
     }
 
     // Volumes sit one level below `mounts`, so their contents keep the
@@ -316,6 +323,28 @@ fn is_mount_point(path: &Path) -> bool {
 
 #[cfg(not(target_os = "macos"))]
 fn is_mount_point(_: &Path) -> bool {
+    true
+}
+
+/// Whether the volume at `path` is mounted read-only, nosuid and nodev, as
+/// the system defaults for disk images; asserted since root scans mount too.
+#[cfg(target_os = "macos")]
+fn locked_down(path: &Path) -> bool {
+    use std::os::unix::ffi::OsStrExt;
+    let Ok(c) = std::ffi::CString::new(path.as_os_str().as_bytes()) else {
+        return false;
+    };
+    // SAFETY: a zeroed statfs is a valid out-buffer and `c` is NUL-terminated.
+    let mut fs: libc::statfs = unsafe { std::mem::zeroed() };
+    if unsafe { libc::statfs(c.as_ptr(), &mut fs) } != 0 {
+        return false;
+    }
+    let want = (libc::MNT_RDONLY | libc::MNT_NOSUID | libc::MNT_NODEV) as u32;
+    fs.f_flags & want == want
+}
+
+#[cfg(not(target_os = "macos"))]
+fn locked_down(_: &Path) -> bool {
     true
 }
 
@@ -519,11 +548,11 @@ fn relabel(scan: &mut TargetScan, image: &Path, volumes: &[(usize, PathBuf)], nu
     scan.root = image.to_path_buf();
 }
 
-/// `<temp_dir>/navctl-scratch`, created 0700; must be a real directory
+/// `<user temp dir>/navctl-scratch`, created 0700; must be a real directory
 /// owned by us and closed to others. Returned canonical, as hdiutil
 /// reports mount points.
 fn scratch_root() -> io::Result<PathBuf> {
-    let root = std::env::temp_dir().join(SCRATCH_DIR_NAME);
+    let root = user_temp_dir()?.join(SCRATCH_DIR_NAME);
     match std::fs::DirBuilder::new().mode(0o700).create(&root) {
         Ok(()) => {}
         Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {}
@@ -539,6 +568,31 @@ fn scratch_root() -> io::Result<PathBuf> {
         )));
     }
     std::fs::canonicalize(&root)
+}
+
+/// `temp_dir()`, except as root on macOS: the per-uid `confstr` temp dir,
+/// never `TMPDIR` (§6.2). Errors as root if `confstr` fails.
+fn user_temp_dir() -> io::Result<PathBuf> {
+    #[cfg(target_os = "macos")]
+    // SAFETY: getuid takes no arguments and never fails.
+    if unsafe { libc::getuid() } == 0 {
+        use std::os::unix::ffi::OsStrExt;
+        let mut buf = [0u8; libc::PATH_MAX as usize];
+        // SAFETY: confstr writes at most buf.len() bytes, NUL-terminated.
+        let n = unsafe {
+            libc::confstr(
+                libc::_CS_DARWIN_USER_TEMP_DIR,
+                buf.as_mut_ptr().cast(),
+                buf.len(),
+            )
+        };
+        // n counts the NUL; n > buf.len() means truncated.
+        if n > 1 && n <= buf.len() {
+            return Ok(PathBuf::from(OsStr::from_bytes(&buf[..n - 1])));
+        }
+        return Err(io::Error::other("no per-user temp directory for root"));
+    }
+    Ok(std::env::temp_dir())
 }
 
 /// A fresh 0700 `<pid>-<random>` directory under `root`, with its 0700
@@ -1028,6 +1082,15 @@ mod tests {
             e.push(("mount-point", PlistValue::String(m.into())));
         }
         dict(e)
+    }
+
+    /// A writable, suid-allowing volume fails the check; the mount tests in
+    /// `tests/scan_disk_image.rs` cover a real image passing it.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn writable_volume_not_locked() {
+        assert!(!locked_down(&std::env::temp_dir()));
+        assert!(!locked_down(Path::new("/no/such/path")));
     }
 
     #[test]
