@@ -519,11 +519,11 @@ fn relabel(scan: &mut TargetScan, image: &Path, volumes: &[(usize, PathBuf)], nu
     scan.root = image.to_path_buf();
 }
 
-/// `<temp_dir>/navctl-scratch`, created 0700; must be a real directory
+/// `<user temp dir>/navctl-scratch`, created 0700; must be a real directory
 /// owned by us and closed to others. Returned canonical, as hdiutil
 /// reports mount points.
 fn scratch_root() -> io::Result<PathBuf> {
-    let root = std::env::temp_dir().join(SCRATCH_DIR_NAME);
+    let root = user_temp_dir().join(SCRATCH_DIR_NAME);
     match std::fs::DirBuilder::new().mode(0o700).create(&root) {
         Ok(()) => {}
         Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {}
@@ -539,6 +539,31 @@ fn scratch_root() -> io::Result<PathBuf> {
         )));
     }
     std::fs::canonicalize(&root)
+}
+
+/// `temp_dir()`, except as root: then the per-uid Darwin temp dir, ignoring
+/// `TMPDIR`, which under `sudo -E` names a dir the invoking user controls
+/// (#241). Falls back to `temp_dir()` off macOS or if `confstr` fails.
+fn user_temp_dir() -> PathBuf {
+    #[cfg(target_os = "macos")]
+    // SAFETY: getuid takes no arguments and never fails.
+    if unsafe { libc::getuid() } == 0 {
+        use std::os::unix::ffi::OsStrExt;
+        let mut buf = [0u8; libc::PATH_MAX as usize];
+        // SAFETY: confstr writes at most buf.len() bytes, NUL-terminated.
+        let n = unsafe {
+            libc::confstr(
+                libc::_CS_DARWIN_USER_TEMP_DIR,
+                buf.as_mut_ptr().cast(),
+                buf.len(),
+            )
+        };
+        // n counts the NUL; n > buf.len() means truncated.
+        if n > 1 && n <= buf.len() {
+            return PathBuf::from(OsStr::from_bytes(&buf[..n - 1]));
+        }
+    }
+    std::env::temp_dir()
 }
 
 /// A fresh 0700 `<pid>-<random>` directory under `root`, with its 0700

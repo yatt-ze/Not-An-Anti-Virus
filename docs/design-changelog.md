@@ -5,6 +5,10 @@ for the current document map. Newest first.
 
 ---
 
+**Changelog from v1.25 (2026-11-26):** `navctl`'s disk-image scratch root ignores `TMPDIR` (§6.2; #241, threat-model E5). It was `temp_dir()/navctl-scratch`, so a root scan run with `sudo -E` kept the invoking user's `TMPDIR` and put root's mount directory inside a directory that user controls: they could pre-create `navctl-scratch` and switch off image mounting for root (the ownership check fails closed), or race the tree under it. The root is now under the per-uid `confstr(_CS_DARWIN_USER_TEMP_DIR)` directory, which no other user can create; off macOS it falls back to `temp_dir()`. With `TMPDIR` unset, current Rust already resolved `temp_dir()` there, so the `/tmp` case in E5 did not arise. No architecture, phase or scope change.
+
+---
+
 **Changelog from v1.24 (2026-11-26):** `bundle-load-from-resources` resolves `@rpath/` loads (§5.8; #268). Only `@loader_path/` and `@executable_path/` loads were resolved, so rewriting a load as `@rpath/x.dylib` with an `LC_RPATH` of `@loader_path/../Resources` avoided the signal. The load now expands against the member's `LC_RPATH`s, then the main executable's, and the first scanned file found is the one judged, as dyld loads the first hit; an earlier copy outside `Resources/` keeps it clean. Expansions are capped at 4096 per member, past which the check is a coverage gap rather than clean (§11.8). Measured on `/Applications` (358,585 files): no recommendation or completeness changed; five Ollama files that sit in `Resources/` and load sibling dylibs through `@rpath` gain +6 and stay no-action. Decided by the user: accept that, rather than exempt loaders that are themselves in `Resources/`.
 
 ---
