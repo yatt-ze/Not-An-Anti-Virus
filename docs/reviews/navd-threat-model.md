@@ -117,7 +117,7 @@ not executed, usually because it needs macOS.
 | E2 | A file swapped for a FIFO blocks the scan forever, and results already computed are lost | Run | Same | #161 |
 | E3 | `service install` trusts the `navd` beside `navctl`, and the copy inherits that file's metadata | Read | Whoever can write `navctl`'s directory, when an admin runs `sudo navctl service install` | #163, #157, #24; the metadata point is new |
 | E4 | State directory is `0755` and launchd creates the log files world-readable | Read | No impact while the logs hold one start line | #163 |
-| E5 | `navctl` mounting as root: checks and attach resolve the image path separately; scratch root falls back to `/tmp` | Read | `sudo navctl scan x.dmg` | New, low |
+| E5 | `navctl` mounting as root: checks and attach resolve the image path separately; scratch root falls back to `/tmp` | Read | `sudo navctl scan x.dmg` | Closed (#241) |
 | E6 | `codesign`/`spctl` have no timeout or output cap; tools resolved through `PATH`; a leading `-` in a path is an option; raw paths in terminal output | Read | `navctl` users today | #158, #157, #162, #156 |
 
 ### E1. Root follows a swapped path (EXISTING, low today)
@@ -207,6 +207,14 @@ meant to be independent of the user-writable source after install.
   user can create that directory first. The ownership check then refuses to
   mount, so the result is `Partial` with a reason: it fails closed, but one
   user can switch off image mounting for root.
+
+**Status (2026-11-26, #241):** closed. Since #197 every check and the attach
+read a clone in the run directory, so swapping the image by path no longer
+reaches them. The attach passes `-owners off`, and each volume must be
+read-only, `nosuid` and `nodev` or it is not scanned. As root, the scratch
+root ignores `TMPDIR` and uses the per-uid `confstr` temp dir. With
+`TMPDIR` unset, `temp_dir()` already resolved there, so the `/tmp` case did
+not arise; `sudo -E` keeping the user's `TMPDIR` did.
 
 ## 6. Risks in planned functionality
 

@@ -240,6 +240,8 @@ fn scan_clone(
             os("-nobrowse"),
             os("-noautoopen"),
             os("-noautofsck"),
+            os("-owners"),
+            os("off"),
             os("-verify"),
             os("-stdinpass"),
             os("-plist"),
@@ -268,6 +270,11 @@ fn scan_clone(
     let entities = parse_attach(&attached, &mounts);
     if entities.volumes.is_empty() {
         return Err("no volume on the image mounted".into());
+    }
+    if let Some((n, _)) = entities.volumes.iter().find(|(_, v)| !locked_down(v)) {
+        return Err(format!(
+            "volume {n} was not mounted read-only, nosuid and nodev, so it was not scanned"
+        ));
     }
 
     // Volumes sit one level below `mounts`, so their contents keep the
@@ -316,6 +323,28 @@ fn is_mount_point(path: &Path) -> bool {
 
 #[cfg(not(target_os = "macos"))]
 fn is_mount_point(_: &Path) -> bool {
+    true
+}
+
+/// Whether the volume at `path` is mounted read-only, nosuid and nodev, as
+/// the system defaults for disk images; asserted since root scans mount too.
+#[cfg(target_os = "macos")]
+fn locked_down(path: &Path) -> bool {
+    use std::os::unix::ffi::OsStrExt;
+    let Ok(c) = std::ffi::CString::new(path.as_os_str().as_bytes()) else {
+        return false;
+    };
+    // SAFETY: a zeroed statfs is a valid out-buffer and `c` is NUL-terminated.
+    let mut fs: libc::statfs = unsafe { std::mem::zeroed() };
+    if unsafe { libc::statfs(c.as_ptr(), &mut fs) } != 0 {
+        return false;
+    }
+    let want = (libc::MNT_RDONLY | libc::MNT_NOSUID | libc::MNT_NODEV) as u32;
+    fs.f_flags & want == want
+}
+
+#[cfg(not(target_os = "macos"))]
+fn locked_down(_: &Path) -> bool {
     true
 }
 
