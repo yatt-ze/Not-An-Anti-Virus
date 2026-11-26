@@ -122,15 +122,7 @@ pub fn scan_context(ctx: &ScanContext, rules: &[Box<dyn Rule>]) -> ScanResult {
         ScanCompleteness::Partial
     };
 
-    let score: i32 = signals.iter().map(|s| s.weight).sum();
-
-    let non_informational_categories: HashSet<SignalCategory> = signals
-        .iter()
-        .filter(|s| s.category != SignalCategory::Informational)
-        .map(|s| s.category)
-        .collect();
-
-    let recommendation = classify(score, non_informational_categories.len());
+    let (score, recommendation) = score_signals(&signals);
 
     // A rule that evaluated but was marked incomplete counts like one that
     // couldn't run.
@@ -151,6 +143,18 @@ pub fn scan_context(ctx: &ScanContext, rules: &[Box<dyn Rule>]) -> ScanResult {
         engine_version: ENGINE_VERSION.to_string(),
         evaluated_at: SystemTime::now(),
     }
+}
+
+/// Score and recommendation for a set of signals: the one place both are
+/// derived, so a signal added after the scan scores like one found during it.
+pub(crate) fn score_signals(signals: &[MatchedSignal]) -> (i32, Recommendation) {
+    let score: i32 = signals.iter().map(|s| s.weight).sum();
+    let categories: HashSet<SignalCategory> = signals
+        .iter()
+        .filter(|s| s.category != SignalCategory::Informational)
+        .map(|s| s.category)
+        .collect();
+    (score, classify(score, categories.len()))
 }
 
 /// The §5.1 scoring invariant: a high-severity recommendation needs signals

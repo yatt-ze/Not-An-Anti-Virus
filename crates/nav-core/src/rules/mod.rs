@@ -16,6 +16,7 @@ mod quarantine_xattr;
 mod strings;
 mod zip_member;
 
+pub(crate) use codesign::signing_summary;
 pub use codesign::{
     AdHocSignedRule, InvalidSignatureRule, NotarizedRule, RevokedSignatureRule,
     UnanchoredIdentityRule, UnnotarizedSignedRule, UnsignedBinaryRule,

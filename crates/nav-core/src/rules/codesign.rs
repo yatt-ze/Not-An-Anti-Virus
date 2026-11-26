@@ -10,6 +10,7 @@ use std::ffi::OsStr;
 use std::time::Duration;
 
 use super::{Rule, RuleOutcome};
+use crate::bundle_signals::{SigningKind, SigningSummary};
 use crate::context::ScanContext;
 use crate::macho::{MachOImage, CS_ADHOC, CS_LINKER_SIGNED};
 use crate::model::{MatchedSignal, SignalCategory};
@@ -1027,6 +1028,47 @@ fn run_codesign_dv(ctx: &ScanContext) -> Result<DvStatus, RuleOutcome> {
     classify_dv(success, &stderr)
 }
 
+/// `CS_RUNTIME`: the hardened runtime, from `<Security/CSCommon.h>`.
+const CS_RUNTIME: u32 = 0x10000;
+
+/// The sole `TeamIdentifier=` value of a `codesign -dv` report. `None` for
+/// "not set", a malformed ID, or more than one such line (a forged echo, #31).
+fn team_identifier(stderr: &str) -> Option<String> {
+    let mut lines = stderr
+        .lines()
+        .filter_map(|l| l.trim().strip_prefix("TeamIdentifier="));
+    let id = lines.next()?;
+    let well_formed = id.len() == 10 && id.bytes().all(|b| b.is_ascii_alphanumeric());
+    (lines.next().is_none() && well_formed).then(|| id.to_string())
+}
+
+/// Summary of a file's signing from reports the rules already cached on
+/// `ctx`; never spawns a tool. `None` if `codesign -dv` did not run or did
+/// not give a usable report.
+pub(crate) fn signing_summary(ctx: &ScanContext) -> Option<SigningSummary> {
+    let (success, stderr) = ctx.codesign_dv_cache.get()?.as_ref()?;
+    let status = classify_dv(*success, stderr).ok()?;
+    let flags = single_code_directory_line(stderr).and_then(code_directory_flags);
+    let kind = match status {
+        DvStatus::Unsigned => SigningKind::Unsigned,
+        DvStatus::AdHocManual => SigningKind::AdHoc,
+        DvStatus::AdHocLinkerSigned => SigningKind::LinkerSigned,
+        DvStatus::Signed => match ctx.signer_check_cache.get() {
+            Some(Some((Some(3), _))) => SigningKind::SelfSigned,
+            _ => SigningKind::Signed,
+        },
+    };
+    Some(SigningSummary {
+        kind,
+        team_id: if status == DvStatus::Signed {
+            team_identifier(stderr)
+        } else {
+            None
+        },
+        hardened: flags.is_some_and(|f| f & CS_RUNTIME != 0),
+    })
+}
+
 #[cfg(target_os = "macos")]
 fn spawn_codesign_dv(path: &std::path::Path) -> Result<(bool, String), RuleOutcome> {
     let arg = process::path_arg(path);
@@ -1045,6 +1087,50 @@ mod tests {
     use super::*;
     use crate::context::ScanContext;
     use std::path::PathBuf;
+
+    fn dv(flags: &str, team: &str) -> String {
+        format!(
+            "Executable=/x\nCodeDirectory v=20500 size=1 flags={flags} hashes=1\nTeamIdentifier={team}\n"
+        )
+    }
+
+    #[test]
+    fn team_identifier_is_one_well_formed_line() {
+        let ok = dv("0x10000(runtime)", "ABCDE12345");
+        assert_eq!(team_identifier(&ok).as_deref(), Some("ABCDE12345"));
+        assert_eq!(team_identifier(&dv("0x0(none)", "not set")), None);
+        let forged = format!("{ok}TeamIdentifier=ZZZZZ99999\n");
+        assert_eq!(team_identifier(&forged), None);
+    }
+
+    #[test]
+    fn summary_reads_cached_report_only() {
+        let c = ctx("a", b"x");
+        assert_eq!(signing_summary(&c), None);
+        let report = dv("0x10000(runtime)", "ABCDE12345");
+        c.codesign_dv_cache.set(Some((true, report))).unwrap();
+        let s = signing_summary(&c).unwrap();
+        assert_eq!(s.kind, SigningKind::Signed);
+        assert_eq!(s.team_id.as_deref(), Some("ABCDE12345"));
+        assert!(s.hardened);
+
+        let c = ctx("b", b"x");
+        c.codesign_dv_cache
+            .set(Some((true, dv("0x2(adhoc)", "not set"))))
+            .unwrap();
+        let s = signing_summary(&c).unwrap();
+        assert_eq!(s.kind, SigningKind::AdHoc);
+        assert!(!s.hardened);
+
+        let c = ctx("c", b"x");
+        c.codesign_dv_cache
+            .set(Some((true, dv("0x0(none)", "not set"))))
+            .unwrap();
+        c.signer_check_cache
+            .set(Some((Some(3), String::new())))
+            .unwrap();
+        assert_eq!(signing_summary(&c).unwrap().kind, SigningKind::SelfSigned);
+    }
 
     /// A skipped anchor check is unknown, not "not verified": the rule keeps
     /// its undemoted weight but is marked incomplete (§11.12, #104).

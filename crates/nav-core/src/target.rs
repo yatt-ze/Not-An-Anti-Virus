@@ -14,10 +14,11 @@ use rustix::fs::FileType;
 
 use crate::beneath::ScanRoot;
 use crate::bundle::{self, BundleLayout};
+use crate::bundle_signals::{self, Finding, Member, MemberFacts};
 use crate::context::{ScanContext, MAX_STREAM_BYTES};
-use crate::model::{Recommendation, ScanCompleteness, ScanResult};
-use crate::rules::default_ruleset;
-use crate::scan::{scan_context, scan_file};
+use crate::model::{CoverageGap, EvidenceConfidence, Recommendation, ScanCompleteness, ScanResult};
+use crate::rules::{default_ruleset, signing_summary};
+use crate::scan::{scan_context, scan_file, score_signals};
 
 /// What the named target turned out to be.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -278,7 +279,8 @@ pub fn scan_target_with_budget(
                 let rel = p.strip_prefix(path).unwrap_or(p);
                 !bundle::is_signature_manifest(&anchor, rel)
             });
-        let (results, byte_limit, _) = scan_within_bytes(&anchor, path, &to_scan, budget);
+        let (mut results, byte_limit, _, facts) = scan_members(&anchor, path, &to_scan, budget);
+        apply_bundle_signals(&mut results, facts, path, layout.main_executable.as_deref());
         return Ok(TargetScan {
             root: path.to_path_buf(),
             kind: TargetKind::Bundle,
@@ -339,8 +341,21 @@ fn scan_within_bytes(
     files: &[PathBuf],
     budget: &ScanBudget,
 ) -> (Vec<ScanResult>, Option<BudgetLimit>, u64) {
+    let (results, hit, used, _) = scan_members(anchor, base, files, budget);
+    (results, hit, used)
+}
+
+/// [`scan_within_bytes`], also returning each result's [`MemberFacts`] (same
+/// order) for the bundle signals.
+fn scan_members(
+    anchor: &Arc<ScanRoot>,
+    base: &Path,
+    files: &[PathBuf],
+    budget: &ScanBudget,
+) -> (Vec<ScanResult>, Option<BudgetLimit>, u64, Vec<MemberFacts>) {
     let rules = default_ruleset();
     let mut results = Vec::new();
+    let mut facts = Vec::new();
     let mut used: u64 = 0;
     let mut hit = None;
     for f in files {
@@ -351,15 +366,76 @@ fn scan_within_bytes(
         // Not under `base` can't happen; the absolute path then fails to open.
         let rel = f.strip_prefix(base).unwrap_or(f);
         let Some(ctx) = ScanContext::load_beneath(anchor, rel, f.clone(), left, admit) else {
-            return (results, Some(BudgetLimit::TotalBytes), used);
+            return (results, Some(BudgetLimit::TotalBytes), used, facts);
         };
         results.push(scan_context(&ctx, &rules));
+        facts.push(member_facts(&ctx));
         used += left - ctx.allowance_left();
         if ctx.allowance_hit() {
             hit = Some(BudgetLimit::TotalBytes);
         }
     }
-    (results, hit, used)
+    (results, hit, used, facts)
+}
+
+/// What a scanned member tells the bundle signals, read from state the
+/// rules already computed; nothing is spawned or parsed here.
+fn member_facts(ctx: &ScanContext) -> MemberFacts {
+    let Some(macho) = ctx.macho_cache.get().filter(|m| m.is_macho) else {
+        return MemberFacts::default();
+    };
+    let mut dylibs: Vec<String> = Vec::new();
+    for load in macho.images.iter().flat_map(|i| &i.dylibs) {
+        if !dylibs.contains(load) {
+            dylibs.push(load.clone());
+        }
+    }
+    MemberFacts {
+        is_macho: true,
+        signing: signing_summary(ctx),
+        dylibs,
+    }
+}
+
+/// Append the §5.8 bundle-level findings to the members they attach to and
+/// rescore those members. A finding that could not be checked becomes a
+/// coverage gap, so the member is no longer `Complete`.
+fn apply_bundle_signals(
+    results: &mut [ScanResult],
+    facts: Vec<MemberFacts>,
+    root: &Path,
+    main: Option<&Path>,
+) {
+    let members: Vec<Member> = results
+        .iter()
+        .zip(facts)
+        .map(|(r, facts)| Member {
+            rel: r.path.strip_prefix(root).unwrap_or(&r.path).to_path_buf(),
+            facts,
+        })
+        .collect();
+    let main_idx = main.and_then(|m| results.iter().position(|r| r.path == m));
+    for (i, finding) in bundle_signals::findings(&members, main_idx) {
+        let result = &mut results[i];
+        match finding {
+            Finding::Signal(signal) => {
+                if result.signals.iter().any(|s| s.id == signal.id) {
+                    continue;
+                }
+                result.signals.push(signal);
+                (result.score, result.recommendation) = score_signals(&result.signals);
+            }
+            Finding::NotApplicable(rule) => {
+                result
+                    .coverage_gaps
+                    .push(CoverageGap::RuleNotApplicable { rule: rule.into() });
+                if result.completeness == ScanCompleteness::Complete {
+                    result.completeness = ScanCompleteness::Partial;
+                    result.confidence = EvidenceConfidence::Medium;
+                }
+            }
+        }
+    }
 }
 
 /// What [`collect_files`] found.
