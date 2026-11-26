@@ -5,7 +5,7 @@ for the current document map. Newest first.
 
 ---
 
-**Changelog from v1.24 (2026-11-26):** `bundle-load-from-resources` resolves `@rpath/` loads (§5.8; #268). Only `@loader_path/` and `@executable_path/` loads were resolved, so rewriting a load as `@rpath/x.dylib` with an `LC_RPATH` of `@loader_path/../Resources` avoided the signal. The load now expands against the member's `LC_RPATH`s, then the main executable's, and the first scanned file found is the one judged, as dyld loads the first hit; an earlier copy outside `Resources/` keeps it clean. Expansions are capped at 4096 per member, past which the check is a coverage gap rather than clean (§11.8).
+**Changelog from v1.24 (2026-11-26):** `bundle-load-from-resources` resolves `@rpath/` loads (§5.8; #268). Only `@loader_path/` and `@executable_path/` loads were resolved, so rewriting a load as `@rpath/x.dylib` with an `LC_RPATH` of `@loader_path/../Resources` avoided the signal. The load now expands against the member's `LC_RPATH`s, then the main executable's, and the first scanned file found is the one judged, as dyld loads the first hit; an earlier copy outside `Resources/` keeps it clean. Expansions are capped at 4096 per member, past which the check is a coverage gap rather than clean (§11.8). Measured on `/Applications` (358,585 files): no recommendation or completeness changed; five Ollama files that sit in `Resources/` and load sibling dylibs through `@rpath` gain +6 and stay no-action. Decided by the user: accept that, rather than exempt loaders that are themselves in `Resources/`.
 
 ---
 
