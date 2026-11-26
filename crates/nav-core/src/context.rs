@@ -134,6 +134,9 @@ pub struct ScanContext {
     pub(crate) zip_cache: OnceLock<Option<crate::rules::ZipInspection>>,
     /// Memoized ZIP-format detection, shared by the same two rules.
     pub(crate) zip_format_cache: OnceLock<Option<bool>>,
+    /// Memoized streaming pass shared by `suspicious-strings` and
+    /// `high-entropy-content` (§11.12, #53). `None` inside: it doesn't apply.
+    pub(crate) shared_stream_cache: OnceLock<Option<crate::rules::SharedStream>>,
     /// Ids of rules that evaluated but could not cover everything they should
     /// have this scan (§10/§11.8). Keyed per rule so one rule's gap can't
     /// clobber another's.
@@ -267,6 +270,7 @@ impl ScanContext {
             macho_cache: OnceLock::new(),
             zip_cache: OnceLock::new(),
             zip_format_cache: OnceLock::new(),
+            shared_stream_cache: OnceLock::new(),
             incomplete_rules: std::sync::Mutex::new(Vec::new()),
             bytes_read: AtomicU64::new(0),
             decoded_bytes: AtomicU64::new(0),

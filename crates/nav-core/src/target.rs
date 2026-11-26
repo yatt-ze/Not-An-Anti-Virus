@@ -826,11 +826,12 @@ mod tests {
         ctx.bytes_read()
     }
 
-    /// A Mach-O whose `__text` runs past the 8 MiB prefix is read twice past
-    /// it (strings streams the file, entropy streams `__text`); the budget
-    /// is charged both reads, not the file's length once (#53).
+    /// A Mach-O whose `__text` runs past the 8 MiB prefix is read once past
+    /// it (strings and entropy share one stream, #53); the budget is charged
+    /// the bytes actually read, so a second file that no longer fits is not
+    /// started.
     #[test]
-    fn total_bytes_charges_re_reads_not_file_length() {
+    fn total_bytes_charges_bytes_read() {
         const MIB: usize = 1024 * 1024;
         let payload: Vec<u8> = (0..12 * MIB).map(|i| (i % 251) as u8).collect();
         let (image, _) = crate::macho::tests_support::synth_macho_64(&payload);
@@ -840,11 +841,11 @@ mod tests {
 
         let len = image.len() as u64;
         let read = bytes_read_scanning(&dir.path().join("a"));
-        assert!(read > len + 3 * MIB as u64, "{read}");
+        assert!((len..len + MIB as u64).contains(&read), "{read}");
 
-        // Both files fit when each is charged its length; the re-reads don't.
+        // The second file's length no longer fits what the first left.
         let budget = ScanBudget {
-            max_total_bytes: 2 * len + MIB as u64,
+            max_total_bytes: len + MIB as u64,
             ..ScanBudget::default()
         };
         let scan = scan_target_with_budget(dir.path(), true, &budget).unwrap();
@@ -869,7 +870,7 @@ mod tests {
         scan_within_bytes(&anchor, dir, &walk.files, &budget)
     }
 
-    /// A file whose re-reads would pass the budget is cut at it: the reads
+    /// A file whose reads would pass the budget is cut at it: the reads
     /// it can't afford are refused, so the total never exceeds the budget
     /// and the file is not reported complete (§11.12, #104).
     #[test]
@@ -881,9 +882,9 @@ mod tests {
         fs::write(dir.path().join("a"), &image).unwrap();
         fs::write(dir.path().join("b"), b"#!/bin/sh\necho hi\n").unwrap();
         let len = image.len() as u64;
-        assert!(bytes_read_scanning(&dir.path().join("a")) > len + 3 * MIB as u64);
+        assert!(bytes_read_scanning(&dir.path().join("a")) >= len);
 
-        for max in [100, MIB as u64, len, len + MIB as u64, len + 2 * MIB as u64] {
+        for max in [100, MIB as u64, len - MIB as u64] {
             let (results, limit, spent) = scan_dir_within(dir.path(), max);
             assert!(spent <= max, "{spent} > {max}");
             assert_eq!(limit, Some(BudgetLimit::TotalBytes), "{max}");
