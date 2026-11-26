@@ -390,10 +390,17 @@ fn member_facts(ctx: &ScanContext) -> MemberFacts {
             dylibs.push(load.clone());
         }
     }
+    let mut rpaths: Vec<String> = Vec::new();
+    for rpath in macho.images.iter().flat_map(|i| &i.rpaths) {
+        if !rpaths.contains(rpath) {
+            rpaths.push(rpath.clone());
+        }
+    }
     MemberFacts {
         is_macho: true,
         signing: signing_summary(ctx),
         dylibs,
+        rpaths,
     }
 }
 

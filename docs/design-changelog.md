@@ -5,6 +5,10 @@ for the current document map. Newest first.
 
 ---
 
+**Changelog from v1.24 (2026-11-26):** `bundle-load-from-resources` resolves `@rpath/` loads (§5.8; #268). Only `@loader_path/` and `@executable_path/` loads were resolved, so rewriting a load as `@rpath/x.dylib` with an `LC_RPATH` of `@loader_path/../Resources` avoided the signal. The load now expands against the member's `LC_RPATH`s, then the main executable's, and the first scanned file found is the one judged, as dyld loads the first hit; an earlier copy outside `Resources/` keeps it clean. Expansions are capped at 4096 per member, past which the check is a coverage gap rather than clean (§11.8). Measured on `/Applications` (358,585 files): no recommendation or completeness changed; five Ollama files that sit in `Resources/` and load sibling dylibs through `@rpath` gain +6 and stay no-action. Decided by the user: accept that, rather than exempt loaders that are themselves in `Resources/`.
+
+---
+
 **Changelog from v1.23 (2026-11-26):** Bundle-level signing signals (§5.8, §5.2; #90). `bundle-signer-mismatch` flags a Mach-O main executable not signed by the Team ID that signed most of the app's other code (weight 4, 6 with no real identity, +2 without hardened runtime, max 8), and `bundle-load-from-resources` flags a load command that reaches a scanned file under `Contents/Resources/` outside any framework (weight 6). Both attach to an existing member's result, so the JSON contract is unchanged, and reuse the per-file `codesign` data. The ceiling is §5.1's: a self-signed main executable already scores 5, so bundle signals add at most 8 to any one member in total, keeping it at 13, under Notify. Measured on `/Applications` (86 apps): unrefined, the checks hit one cracked app plus ZAP, Steam and VLC; the Mach-O, framework and existence conditions leave only the cracked app. Decided by the user (2026-11-25): attach to the main executable's result, corroboration only.
 
 ---
