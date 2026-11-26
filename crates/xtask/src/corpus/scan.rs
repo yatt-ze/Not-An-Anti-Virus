@@ -140,7 +140,7 @@ pub fn run(targets: &[Target], planned: &Plan, jobs: Option<usize>) -> Result<Ve
                     }
                 }
                 let d = done.fetch_add(1, Ordering::Relaxed) + 1;
-                if d % step == 0 || d == total {
+                if d.is_multiple_of(step) || d == total {
                     println!("{d}/{total} chunks");
                 }
             });

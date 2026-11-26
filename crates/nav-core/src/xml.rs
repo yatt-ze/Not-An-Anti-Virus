@@ -470,8 +470,7 @@ impl<'a> Scanner<'a> {
 /// UTF-16 code units of `body` (BOM already removed), read in the given byte
 /// order. A trailing odd byte is not a unit and is skipped.
 pub(crate) fn utf16_units(body: &[u8], big_endian: bool) -> impl Iterator<Item = u16> + '_ {
-    body.chunks_exact(2).map(move |c| {
-        let pair = [c[0], c[1]];
+    body.as_chunks::<2>().0.iter().map(move |&pair| {
         if big_endian {
             u16::from_be_bytes(pair)
         } else {

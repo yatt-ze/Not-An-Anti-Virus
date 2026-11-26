@@ -1947,7 +1947,7 @@ mod tests {
             self.0.extend((0..n).rev().map(|i| (v >> i) & 1 == 1));
         }
         fn align(&mut self) {
-            while self.0.len() % 8 != 0 {
+            while !self.0.len().is_multiple_of(8) {
                 self.0.push(false);
             }
         }
