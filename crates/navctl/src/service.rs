@@ -6,7 +6,8 @@
 use std::process::ExitCode;
 
 use nav_service::{
-    install, navd_beside_current_exe, uninstall, Layout, RealSystemOps, SystemOps, LABEL,
+    install, install_owners, navd_beside_current_exe, uninstall, Layout, RealSystemOps, SystemOps,
+    LABEL,
 };
 
 use crate::exit;
@@ -15,18 +16,6 @@ use crate::exit;
 fn is_root() -> bool {
     // SAFETY: geteuid takes no arguments, has no preconditions, and never fails.
     unsafe { libc::geteuid() == 0 }
-}
-
-/// Uids allowed to own the navd source: root plus the `sudo` invoker, if known.
-fn allowed_owners() -> Vec<u32> {
-    let mut owners = vec![0];
-    if let Some(uid) = std::env::var("SUDO_UID")
-        .ok()
-        .and_then(|v| v.parse::<u32>().ok())
-    {
-        owners.push(uid);
-    }
-    owners
 }
 
 pub fn run_install() -> ExitCode {
@@ -47,7 +36,7 @@ pub fn run_install() -> ExitCode {
         &Layout::system(),
         &RealSystemOps,
         &navd_src,
-        &allowed_owners(),
+        &install_owners(),
     ) {
         Ok(report) => {
             nav_core::safe_println!(

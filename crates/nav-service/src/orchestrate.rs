@@ -142,7 +142,12 @@ pub fn install(
 /// Copy `src` to a new file at `dst`, returning the lowercase-hex SHA-256 of
 /// the bytes copied.
 fn copy_hashed(src: &mut fs::File, dst: &Path) -> Result<String> {
-    let mut out = fs::File::create(dst)?;
+    // Owner-only until install sets the final mode, whatever the umask.
+    let mut out = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o700)
+        .open(dst)?;
     let mut hasher = Sha256::new();
     let mut buf = [0u8; 64 * 1024];
     loop {
@@ -153,6 +158,7 @@ fn copy_hashed(src: &mut fs::File, dst: &Path) -> Result<String> {
         hasher.update(&buf[..n]);
         out.write_all(&buf[..n])?;
     }
+    out.sync_all()?;
     Ok(hasher
         .finalize()
         .iter()
@@ -399,6 +405,7 @@ mod tests {
     fn fake_navd(tp: &TempPrefix) -> PathBuf {
         let src = tp.0.join("navd-src");
         fs::write(&src, b"#!/bin/sh\nsleep 1\n").unwrap();
+        fs::set_permissions(&src, fs::Permissions::from_mode(0o755)).unwrap();
         src
     }
 
@@ -479,6 +486,7 @@ mod tests {
         let tp = TempPrefix::new();
         let src = tp.0.join("navd-abc");
         fs::write(&src, b"abc").unwrap();
+        fs::set_permissions(&src, fs::Permissions::from_mode(0o755)).unwrap();
         let report = install(&tp.layout(), &FakeSystemOps::new(), &src, &[me()]).unwrap();
         assert_eq!(
             report.sha256,

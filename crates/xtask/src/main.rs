@@ -16,8 +16,8 @@ use anyhow::{bail, ensure, Context, Result};
 use clap::{Parser, Subcommand};
 
 use nav_service::{
-    install, navd_beside_current_exe, residue, uninstall, FakeSystemOps, Layout, RealSystemOps,
-    CODESIGN_ID, LABEL,
+    install, install_owners, navd_beside_current_exe, residue, uninstall, FakeSystemOps, Layout,
+    RealSystemOps, CODESIGN_ID, LABEL,
 };
 
 #[derive(Parser)]
@@ -82,6 +82,11 @@ fn run_verify_fake(tempdir: &std::path::Path) -> Result<()> {
     let placeholder = tempdir.join("navd-placeholder");
     std::fs::write(&placeholder, b"navd")
         .with_context(|| format!("writing {}", placeholder.display()))?;
+    // install refuses a group-writable source, which a 002 umask would give.
+    std::fs::set_permissions(
+        &placeholder,
+        std::os::unix::fs::PermissionsExt::from_mode(0o755),
+    )?;
 
     let layout = Layout::under(tempdir);
     let ops = FakeSystemOps::new();
@@ -170,14 +175,7 @@ fn verify_real() -> Result<()> {
     let ops = RealSystemOps;
 
     println!("installing...");
-    let mut owners = vec![0];
-    if let Some(uid) = std::env::var("SUDO_UID")
-        .ok()
-        .and_then(|v| v.parse::<u32>().ok())
-    {
-        owners.push(uid);
-    }
-    let report = install(&layout, &ops, &navd, &owners)?;
+    let report = install(&layout, &ops, &navd, &install_owners())?;
     println!(
         "installed navd from {} (sha256 {})",
         report.source.display(),
