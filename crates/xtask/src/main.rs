@@ -16,8 +16,8 @@ use anyhow::{bail, ensure, Context, Result};
 use clap::{Parser, Subcommand};
 
 use nav_service::{
-    install, navd_beside_current_exe, residue, uninstall, FakeSystemOps, Layout, RealSystemOps,
-    CODESIGN_ID, LABEL,
+    install, install_owners, navd_beside_current_exe, residue, uninstall, FakeSystemOps, Layout,
+    RealSystemOps, CODESIGN_ID, LABEL,
 };
 
 #[derive(Parser)]
@@ -82,12 +82,19 @@ fn run_verify_fake(tempdir: &std::path::Path) -> Result<()> {
     let placeholder = tempdir.join("navd-placeholder");
     std::fs::write(&placeholder, b"navd")
         .with_context(|| format!("writing {}", placeholder.display()))?;
+    // install refuses a group-writable source, which a 002 umask would give.
+    std::fs::set_permissions(
+        &placeholder,
+        std::os::unix::fs::PermissionsExt::from_mode(0o755),
+    )?;
 
     let layout = Layout::under(tempdir);
     let ops = FakeSystemOps::new();
 
     println!("installing...");
-    install(&layout, &ops, &placeholder)?;
+    // SAFETY: getuid takes no arguments and never fails.
+    let uid = unsafe { libc::getuid() };
+    install(&layout, &ops, &placeholder, &[uid])?;
 
     ensure!(layout.helper_binary().is_file(), "helper binary missing");
     ensure!(layout.plist_path().is_file(), "plist missing");
@@ -122,7 +129,7 @@ fn run_verify_fake(tempdir: &std::path::Path) -> Result<()> {
     println!("install: OK");
 
     // Re-install must be idempotent and tear out the now-loaded job first.
-    install(&layout, &ops, &placeholder)?;
+    install(&layout, &ops, &placeholder, &[uid])?;
     ensure!(
         ops.calls()
             .contains(&nav_service::Call::Bootout(LABEL.into())),
@@ -168,7 +175,12 @@ fn verify_real() -> Result<()> {
     let ops = RealSystemOps;
 
     println!("installing...");
-    install(&layout, &ops, &navd)?;
+    let report = install(&layout, &ops, &navd, &install_owners())?;
+    println!(
+        "installed navd from {} (sha256 {})",
+        report.source.display(),
+        report.sha256
+    );
     println!("install: OK");
 
     let report = uninstall(&layout, &ops);

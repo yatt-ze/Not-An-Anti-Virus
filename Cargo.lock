@@ -253,6 +253,8 @@ name = "nav-service"
 version = "0.18.2"
 dependencies = [
  "anyhow",
+ "libc",
+ "sha2",
 ]
 
 [[package]]

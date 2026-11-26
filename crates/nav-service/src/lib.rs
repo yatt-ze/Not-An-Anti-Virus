@@ -34,6 +34,19 @@ pub fn navd_beside_current_exe() -> Result<PathBuf> {
     Ok(dir.join("navd"))
 }
 
+/// Uids a real install accepts as owner of the `navd` source: root plus the
+/// `sudo` invoker (`SUDO_UID`), when set and valid.
+pub fn install_owners() -> Vec<u32> {
+    let mut owners = vec![0];
+    if let Some(uid) = std::env::var("SUDO_UID")
+        .ok()
+        .and_then(|v| v.parse::<u32>().ok())
+    {
+        owners.push(uid);
+    }
+    owners
+}
+
 /// launchd job label and system-domain service name.
 pub const LABEL: &str = "com.nav.navd";
 /// Stable adhoc signing identity applied to the copied binary, so TCC has a

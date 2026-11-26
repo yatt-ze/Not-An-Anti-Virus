@@ -6,7 +6,8 @@
 use std::process::ExitCode;
 
 use nav_service::{
-    install, navd_beside_current_exe, uninstall, Layout, RealSystemOps, SystemOps, LABEL,
+    install, install_owners, navd_beside_current_exe, uninstall, Layout, RealSystemOps, SystemOps,
+    LABEL,
 };
 
 use crate::exit;
@@ -31,8 +32,18 @@ pub fn run_install() -> ExitCode {
             return exit::code(exit::OPERATIONAL_ERROR);
         }
     };
-    match install(&Layout::system(), &RealSystemOps, &navd_src) {
-        Ok(()) => {
+    match install(
+        &Layout::system(),
+        &RealSystemOps,
+        &navd_src,
+        &install_owners(),
+    ) {
+        Ok(report) => {
+            nav_core::safe_println!(
+                "installed navd from {} (sha256 {})",
+                report.source.display(),
+                report.sha256
+            );
             nav_core::safe_println!("navd installed and bootstrapped ({LABEL}).");
             exit::code(exit::CLEAN)
         }
