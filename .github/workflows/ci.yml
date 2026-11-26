@@ -12,9 +12,9 @@ on:
   push:
     branches: [main]
   pull_request:
-  # Drives fuzz-run only (see its `if`) — bounded fuzzing stays off the PR
-  # path so it doesn't slow every push. workflow_dispatch allows an ad hoc
-  # opt-in run.
+  # Drives fuzz-run and audit (see their `if`s) — bounded fuzzing stays off
+  # the PR path so it doesn't slow every push. workflow_dispatch allows an ad
+  # hoc opt-in fuzz run.
   schedule:
     - cron: "17 5 * * *"
   workflow_dispatch:
@@ -106,11 +106,14 @@ jobs:
 
   audit:
     name: cargo audit
-    if: github.event_name == 'push' || github.event_name == 'pull_request'
+    # Also nightly, so an advisory against a locked dependency shows up
+    # without a push; scheduled runs open an issue per advisory.
+    if: github.event_name != 'workflow_dispatch'
     runs-on: ubuntu-latest
     permissions:
       contents: read
       checks: write
+      issues: write
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:
@@ -118,6 +121,12 @@ jobs:
       - uses: rustsec/audit-check@69366f33c96575abad1ee0dba8212993eecbe998 # v2.0.0
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
+      # The fuzz crate is its own workspace with its own lockfile.
+      - name: audit fuzz lockfile
+        uses: rustsec/audit-check@69366f33c96575abad1ee0dba8212993eecbe998 # v2.0.0
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          working-directory: crates/nav-core/fuzz
 
   fuzz-build:
     name: fuzz targets build (compile-only)
