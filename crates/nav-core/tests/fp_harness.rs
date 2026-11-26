@@ -187,6 +187,10 @@ const SUB_THRESHOLD_ALLOWLIST: &[(&str, &str)] = &[
         "suspicious/ResourcesLoad.app",
         "bundle-load-from-resources is corroboration-only (§5.8, §5.1); needs a second signal",
     ),
+    (
+        "suspicious/RpathLoad.app",
+        "bundle-load-from-resources is corroboration-only (§5.8, §5.1); needs a second signal",
+    ),
 ];
 
 fn sub_threshold_reason(key: &str) -> Option<&'static str> {
@@ -261,6 +265,18 @@ fn resources_load_is_flagged_only_outside_a_framework() {
     );
     let good = scan(&fixtures_dir("benign").join("FrameworkOwnResources.app"));
     assert!(!fired_rule_ids(&good).contains(&"bundle-load-from-resources".to_string()));
+}
+
+/// The same flag fires when the load is `@rpath/` resolved through an
+/// `LC_RPATH` entry (§5.8).
+#[test]
+fn rpath_load_is_flagged() {
+    let bad = scan(&fixtures_dir("suspicious").join("RpathLoad.app"));
+    assert!(
+        fired_rule_ids(&bad).contains(&"bundle-load-from-resources".to_string()),
+        "{:?}",
+        fired_rule_ids(&bad)
+    );
 }
 
 #[test]
