@@ -815,7 +815,11 @@ fn stop_when_mounted(sb: &Sandbox, args: &[&str], image: &Path) -> (Child, Optio
         scratch_volume(&sb.scratch()).is_some_and(|v| !has_child(pid) && reading_volume(pid, &v))
     };
     while !walking() {
-        assert!(Instant::now() < deadline, "no volume was mounted");
+        assert!(
+            Instant::now() < deadline,
+            "navctl never walked a mounted volume (mounted: {:?})",
+            scratch_volume(&sb.scratch())
+        );
         if child.try_wait().unwrap().is_some() {
             return (child, None);
         }
