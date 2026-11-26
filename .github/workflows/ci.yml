@@ -12,9 +12,9 @@ on:
   push:
     branches: [main]
   pull_request:
-  # Drives fuzz-run only (see its `if`) — bounded fuzzing stays off the PR
-  # path so it doesn't slow every push. workflow_dispatch allows an ad hoc
-  # opt-in run.
+  # Drives fuzz-run and audit (see their `if`s) — bounded fuzzing stays off
+  # the PR path so it doesn't slow every push. workflow_dispatch allows an ad
+  # hoc opt-in fuzz run.
   schedule:
     - cron: "17 5 * * *"
   workflow_dispatch:
@@ -29,6 +29,10 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
+# Jobs that need more ask for it themselves.
+permissions:
+  contents: read
+
 env:
   CARGO_TERM_COLOR: always
   # Dated, so the fuzz jobs' rust-cache entries survive between runs.
@@ -40,9 +44,12 @@ jobs:
     if: github.event_name == 'push' || github.event_name == 'pull_request'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1 (2026-10-15)
+        with:
+          toolchain: stable
           components: rustfmt
       - run: cargo fmt --all -- --check
 
@@ -57,11 +64,14 @@ jobs:
         # macOS-only); Linux keeps the cross-platform fallback paths honest.
         os: [ubuntu-latest, macos-latest]
     steps:
-      - uses: actions/checkout@v5
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1 (2026-10-15)
+        with:
+          toolchain: stable
           components: clippy
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       - name: clippy
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - name: test
@@ -78,7 +88,9 @@ jobs:
       matrix:
         os: [ubuntu-latest, macos-latest]
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
       - name: read rust-version
         id: msrv
         # A two-part version would otherwise install that minor's latest patch.
@@ -89,21 +101,34 @@ jobs:
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1 (2026-10-15)
         with:
           toolchain: ${{ steps.msrv.outputs.version }}
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       - run: cargo check --workspace --all-targets --locked
 
   audit:
     name: cargo audit
-    if: github.event_name == 'push' || github.event_name == 'pull_request'
+    # Also nightly, so an advisory against a locked dependency shows up
+    # without a push; scheduled runs open an issue per advisory.
+    if: github.event_name != 'workflow_dispatch'
     runs-on: ubuntu-latest
     permissions:
       contents: read
       checks: write
+      issues: write
     steps:
-      - uses: actions/checkout@v5
-      - uses: rustsec/audit-check@v2
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
+      - uses: rustsec/audit-check@69366f33c96575abad1ee0dba8212993eecbe998 # v2.0.0
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
+      # The fuzz crate is its own workspace with its own lockfile; audit it
+      # even when the root audit failed.
+      - name: audit fuzz lockfile
+        if: ${{ !cancelled() }}
+        uses: rustsec/audit-check@69366f33c96575abad1ee0dba8212993eecbe998 # v2.0.0
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          working-directory: crates/nav-core/fuzz
 
   fuzz-build:
     name: fuzz targets build (compile-only)
