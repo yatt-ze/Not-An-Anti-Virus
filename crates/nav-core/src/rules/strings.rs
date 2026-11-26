@@ -154,7 +154,7 @@ const CONTEXT_LOOKBACK: usize = 64;
 
 /// Streaming overlap: any marker or pattern lands whole, with its left
 /// context, in some window.
-const STREAM_OVERLAP: usize = if MAX_MARKER_LEN > PATTERN_SPAN + CONTEXT_LOOKBACK {
+pub(super) const STREAM_OVERLAP: usize = if MAX_MARKER_LEN > PATTERN_SPAN + CONTEXT_LOOKBACK {
     MAX_MARKER_LEN
 } else {
     PATTERN_SPAN + CONTEXT_LOOKBACK
@@ -196,13 +196,14 @@ const PATTERNS: &[IntentPattern] = &[
 ];
 
 /// Which markers and patterns have matched so far.
-struct Hits {
+#[derive(Clone)]
+pub(super) struct Hits {
     markers: Vec<bool>,
     patterns: [bool; PATTERNS.len()],
 }
 
 impl Hits {
-    fn new() -> Self {
+    pub(super) fn new() -> Self {
         Hits {
             markers: vec![false; MARKERS.len()],
             patterns: [false; PATTERNS.len()],
@@ -778,7 +779,7 @@ fn for_each_line(
 /// Scans one window for `MARKERS` and the intent patterns, setting `hits`.
 /// `is_first`/`is_last` are forwarded to [`scan_patterns`]; `is_last` also
 /// to [`find_needles`].
-fn scan_window(bytes: &[u8], is_first: bool, is_last: bool, hits: &mut Hits) {
+pub(super) fn scan_window(bytes: &[u8], is_first: bool, is_last: bool, hits: &mut Hits) {
     find_needles(bytes, is_last, hits);
     scan_patterns(bytes, is_first, is_last, &mut hits.patterns);
 }
@@ -841,13 +842,22 @@ impl Rule for SuspiciousStringsRule {
         }
         let mut hits = Hits::new();
 
-        if ctx.truncated && can_stream(ctx) {
+        if streams_truncated(ctx) {
             let file_len = ctx.file_len.ok_or(RuleOutcome::NotApplicable)?;
-            let mut first = true;
-            let ok = ctx.for_each_window(0..file_len, STREAM_OVERLAP, |window, is_last| {
-                scan_window(window, first, is_last, &mut hits);
-                first = false;
-            });
+            let ok = match super::shared_stream::shared_stream(ctx) {
+                Some(shared) => {
+                    let (shared_hits, ok) = shared.strings();
+                    hits = shared_hits;
+                    ok
+                }
+                None => {
+                    let mut first = true;
+                    ctx.for_each_window(0..file_len, STREAM_OVERLAP, |window, is_last| {
+                        scan_window(window, first, is_last, &mut hits);
+                        first = false;
+                    })
+                }
+            };
             if !ok {
                 ctx.mark_incomplete(self.id());
             }
@@ -897,6 +907,12 @@ impl Rule for SuspiciousStringsRule {
 /// actually attempted didn't fail.
 fn can_stream(ctx: &ScanContext) -> bool {
     ctx.supports_ranged_reads() && ctx.file_len.is_some_and(|len| len <= MAX_STREAM_BYTES)
+}
+
+/// Whether `evaluate` streams the whole file: it is truncated, streamable,
+/// and not scored through its zip members.
+pub(super) fn streams_truncated(ctx: &ScanContext) -> bool {
+    !super::zip_member::scored_through_members(ctx) && ctx.truncated && can_stream(ctx)
 }
 
 #[cfg(test)]

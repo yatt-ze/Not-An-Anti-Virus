@@ -5,6 +5,10 @@ for the current document map. Newest first.
 
 ---
 
+**Changelog from v1.26 (2026-11-26):** `suspicious-strings` and `high-entropy-content` share one streaming pass over a truncated file (§11.12; #53). Each used to read the bytes past the 8 MiB prefix itself, so a Mach-O cost its length twice or more against the byte budget. The pass runs once per scan, whichever rule asks first, feeding the strings hits and a per-range entropy accumulator with only the new bytes of each window. Scores, signals and coverage are unchanged; a range the pass did not fully deliver is streamed by `high-entropy-content` as before, so a failed stream degrades exactly as it did.
+
+---
+
 **Changelog from v1.25 (2026-11-26):** `navctl`'s disk-image scratch root ignores `TMPDIR` (§6.2; #241, threat-model E5). It was `temp_dir()/navctl-scratch`, so a root scan run with `sudo -E` kept the invoking user's `TMPDIR` and put root's mount directory inside a directory that user controls: they could pre-create `navctl-scratch` and switch off image mounting for root (the ownership check fails closed), or race the tree under it. The root is now under the per-uid `confstr(_CS_DARWIN_USER_TEMP_DIR)` directory, which no other user can create; if `confstr` fails, root gets no scratch directory and the scan is `Partial`. Off macOS it falls back to `temp_dir()`. With `TMPDIR` unset, current Rust already resolved `temp_dir()` there, so the `/tmp` case in E5 did not arise. The rest of E5 is closed too: since #197 every check reads the clone, and the attach now passes `-owners off`, and a volume not mounted read-only, `nosuid` and `nodev` makes navctl fall back to the unmounted `Partial` scan instead of being assumed safe. No architecture, phase or scope change.
 
 ---
