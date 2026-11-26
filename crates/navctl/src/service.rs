@@ -17,6 +17,18 @@ fn is_root() -> bool {
     unsafe { libc::geteuid() == 0 }
 }
 
+/// Uids allowed to own the navd source: root plus the `sudo` invoker, if known.
+fn allowed_owners() -> Vec<u32> {
+    let mut owners = vec![0];
+    if let Some(uid) = std::env::var("SUDO_UID")
+        .ok()
+        .and_then(|v| v.parse::<u32>().ok())
+    {
+        owners.push(uid);
+    }
+    owners
+}
+
 pub fn run_install() -> ExitCode {
     if !is_root() {
         nav_core::safe_eprintln!(
@@ -31,8 +43,18 @@ pub fn run_install() -> ExitCode {
             return exit::code(exit::OPERATIONAL_ERROR);
         }
     };
-    match install(&Layout::system(), &RealSystemOps, &navd_src) {
-        Ok(()) => {
+    match install(
+        &Layout::system(),
+        &RealSystemOps,
+        &navd_src,
+        &allowed_owners(),
+    ) {
+        Ok(report) => {
+            nav_core::safe_println!(
+                "installed navd from {} (sha256 {})",
+                report.source.display(),
+                report.sha256
+            );
             nav_core::safe_println!("navd installed and bootstrapped ({LABEL}).");
             exit::code(exit::CLEAN)
         }

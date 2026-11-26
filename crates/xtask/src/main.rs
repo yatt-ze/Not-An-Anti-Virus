@@ -87,7 +87,9 @@ fn run_verify_fake(tempdir: &std::path::Path) -> Result<()> {
     let ops = FakeSystemOps::new();
 
     println!("installing...");
-    install(&layout, &ops, &placeholder)?;
+    // SAFETY: getuid takes no arguments and never fails.
+    let uid = unsafe { libc::getuid() };
+    install(&layout, &ops, &placeholder, &[uid])?;
 
     ensure!(layout.helper_binary().is_file(), "helper binary missing");
     ensure!(layout.plist_path().is_file(), "plist missing");
@@ -122,7 +124,7 @@ fn run_verify_fake(tempdir: &std::path::Path) -> Result<()> {
     println!("install: OK");
 
     // Re-install must be idempotent and tear out the now-loaded job first.
-    install(&layout, &ops, &placeholder)?;
+    install(&layout, &ops, &placeholder, &[uid])?;
     ensure!(
         ops.calls()
             .contains(&nav_service::Call::Bootout(LABEL.into())),
@@ -168,7 +170,19 @@ fn verify_real() -> Result<()> {
     let ops = RealSystemOps;
 
     println!("installing...");
-    install(&layout, &ops, &navd)?;
+    let mut owners = vec![0];
+    if let Some(uid) = std::env::var("SUDO_UID")
+        .ok()
+        .and_then(|v| v.parse::<u32>().ok())
+    {
+        owners.push(uid);
+    }
+    let report = install(&layout, &ops, &navd, &owners)?;
+    println!(
+        "installed navd from {} (sha256 {})",
+        report.source.display(),
+        report.sha256
+    );
     println!("install: OK");
 
     let report = uninstall(&layout, &ops);
