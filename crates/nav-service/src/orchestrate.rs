@@ -17,6 +17,8 @@ use crate::ops::SystemOps;
 use crate::{FsKind, Layout, CODESIGN_ID, LABEL, TCC_SERVICE};
 
 const DIR_MODE: u32 = 0o755;
+/// The state dir holds navd's logs, so it is not world-readable.
+const STATE_DIR_MODE: u32 = 0o750;
 const PLIST_MODE: u32 = 0o644;
 const BIN_MODE: u32 = 0o755;
 
@@ -81,9 +83,12 @@ pub fn install(
     }
 
     // Root-owned config and state dirs; state holds the helper-dir marker.
-    for dir in [layout.config_dir(), layout.state_dir()] {
+    for (dir, mode) in [
+        (layout.config_dir(), DIR_MODE),
+        (layout.state_dir(), STATE_DIR_MODE),
+    ] {
         fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
-        fs::set_permissions(&dir, fs::Permissions::from_mode(DIR_MODE))?;
+        fs::set_permissions(&dir, fs::Permissions::from_mode(mode))?;
         ops.chown_root(&dir)?;
     }
 
@@ -417,6 +422,16 @@ mod tests {
         fs::set_permissions(&src, fs::Permissions::from_mode(mode)).unwrap();
         let err = install(&tp.layout(), &FakeSystemOps::new(), &src, &[me()]).unwrap_err();
         format!("{err:#}")
+    }
+
+    #[test]
+    fn state_dir_private() {
+        let tp = TempPrefix::new();
+        let layout = tp.layout();
+        install(&layout, &FakeSystemOps::new(), &fake_navd(&tp), &[me()]).unwrap();
+        let mode = |p: PathBuf| fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(layout.state_dir()), 0o750);
+        assert_eq!(mode(layout.config_dir()), 0o755);
     }
 
     #[test]
