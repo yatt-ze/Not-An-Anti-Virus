@@ -842,7 +842,7 @@ impl Rule for SuspiciousStringsRule {
         }
         let mut hits = Hits::new();
 
-        if ctx.truncated && can_stream(ctx) {
+        if streams_truncated(ctx) {
             let file_len = ctx.file_len.ok_or(RuleOutcome::NotApplicable)?;
             let ok = match super::shared_stream::shared_stream(ctx) {
                 Some(shared) => {

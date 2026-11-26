@@ -882,9 +882,10 @@ mod tests {
         fs::write(dir.path().join("a"), &image).unwrap();
         fs::write(dir.path().join("b"), b"#!/bin/sh\necho hi\n").unwrap();
         let len = image.len() as u64;
-        assert!(bytes_read_scanning(&dir.path().join("a")) >= len);
+        let read = bytes_read_scanning(&dir.path().join("a"));
+        assert!(read >= len);
 
-        for max in [100, MIB as u64, len - MIB as u64] {
+        for max in [100, MIB as u64, len - MIB as u64, read - 1] {
             let (results, limit, spent) = scan_dir_within(dir.path(), max);
             assert!(spent <= max, "{spent} > {max}");
             assert_eq!(limit, Some(BudgetLimit::TotalBytes), "{max}");
