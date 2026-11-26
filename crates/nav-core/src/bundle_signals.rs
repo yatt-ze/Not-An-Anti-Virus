@@ -15,6 +15,8 @@ const MISMATCH_WEAK_WEIGHT: i32 = 6;
 const NO_RUNTIME_BONUS: i32 = 2;
 /// Weight for a load command that reaches into `Contents/Resources/`.
 const LOAD_FROM_RESOURCES_WEIGHT: i32 = 6;
+/// Most `@rpath/` expansions checked per member; past it the load check is a gap.
+const MAX_RPATH_LOOKUPS: usize = 4096;
 /// Most that bundle signals may add to one member, so a self-signed main
 /// executable (+5 from `unanchored-signing-identity`) stays under Notify (§5.1).
 const MAX_PER_MEMBER: i32 = 8;
@@ -65,6 +67,8 @@ pub(crate) struct MemberFacts {
     pub(crate) signing: Option<SigningSummary>,
     /// Load paths of every slice.
     pub(crate) dylibs: Vec<String>,
+    /// `LC_RPATH` entries of every slice, in load-command order.
+    pub(crate) rpaths: Vec<String>,
 }
 
 /// A scanned member: its path under the bundle root and its facts.
@@ -95,20 +99,14 @@ pub(crate) fn findings(members: &[Member], main: Option<usize>) -> Vec<(usize, F
         .enumerate()
         .map(|(i, m)| (fold(&m.rel), i))
         .collect();
-    let main_rel = main.map(|m| members[m].rel.as_path());
     for (i, member) in members.iter().enumerate() {
         if in_nested_app(&member.rel) {
             continue;
         }
-        let target = member
-            .facts
-            .dylibs
-            .iter()
-            .filter_map(|load| resolve_load(load, &member.rel, main_rel))
-            .filter(|rel| in_plain_resources(rel))
-            .find_map(|rel| by_rel.get(&fold(&rel)).copied());
-        if let Some(t) = target {
-            out.push((i, Finding::Signal(load_signal(&members[t].facts))));
+        match load_target(members, i, main, &by_rel) {
+            Ok(Some(t)) => out.push((i, Finding::Signal(load_signal(&members[t].facts)))),
+            Ok(None) => {}
+            Err(()) => out.push((i, Finding::NotApplicable(LOAD_FROM_RESOURCES_ID))),
         }
     }
     cap_per_member(&mut out);
@@ -226,6 +224,54 @@ fn load_signal(target: &MemberFacts) -> MatchedSignal {
     }
 }
 
+/// Index of the plain-Resources member that one of `member`'s loads reaches.
+/// Each load resolves to the first bundle file dyld's search order finds.
+/// `Err` when the `@rpath/` expansions pass [`MAX_RPATH_LOOKUPS`].
+fn load_target(
+    members: &[Member],
+    i: usize,
+    main: Option<usize>,
+    by_rel: &HashMap<String, usize>,
+) -> Result<Option<usize>, ()> {
+    let member = &members[i];
+    let main = main.map(|m| &members[m]);
+    let main_rel = main.map(|m| m.rel.as_path());
+    // dyld searches the loader's own rpaths, then those of the images that
+    // loaded it; the main executable stands in for that chain.
+    let mut rpath_owners = vec![member];
+    rpath_owners.extend(main.filter(|m| !std::ptr::eq(*m, member)));
+    let mut lookups = 0;
+    for load in &member.facts.dylibs {
+        let found = match load.strip_prefix("@rpath/") {
+            None => resolve_load(load, &member.rel, main_rel)
+                .and_then(|rel| by_rel.get(&fold(&rel)).copied()),
+            Some(rest) => {
+                let mut found = None;
+                'search: for owner in &rpath_owners {
+                    for rpath in &owner.facts.rpaths {
+                        lookups += 1;
+                        if lookups > MAX_RPATH_LOOKUPS {
+                            return Err(());
+                        }
+                        let expanded = format!("{rpath}/{rest}");
+                        let hit = resolve_load(&expanded, &owner.rel, main_rel)
+                            .and_then(|rel| by_rel.get(&fold(&rel)).copied());
+                        if hit.is_some() {
+                            found = hit;
+                            break 'search;
+                        }
+                    }
+                }
+                found
+            }
+        };
+        if let Some(t) = found.filter(|&t| in_plain_resources(&members[t].rel)) {
+            return Ok(Some(t));
+        }
+    }
+    Ok(None)
+}
+
 /// Resolve an `@loader_path/` or `@executable_path/` load path to a path
 /// under the bundle root, lexically. `None` for any other form, or if it
 /// leaves the bundle.
@@ -303,6 +349,7 @@ mod tests {
                 is_macho: true,
                 signing,
                 dylibs: dylibs.iter().map(|s| s.to_string()).collect(),
+                rpaths: Vec::new(),
             },
         }
     }
@@ -636,5 +683,90 @@ mod tests {
             let b = loading("Contents/MacOS/x", load, &["Contents/Resources/lib.dylib"]);
             assert!(load_findings(&b).is_empty(), "{load}");
         }
+    }
+
+    /// `loading` with the loader (index 1) given `rpaths`.
+    fn with_rpaths(loader: &str, load: &str, rpaths: &[&str], extra: &[&str]) -> Vec<Member> {
+        let mut b = loading(loader, load, extra);
+        b[1].facts.rpaths = rpaths.iter().map(|s| s.to_string()).collect();
+        b
+    }
+
+    /// An absolute rpath is skipped; a trailing slash is harmless.
+    #[test]
+    fn rpath_reaches_resources() {
+        let b = with_rpaths(
+            "Contents/Frameworks/V.dylib",
+            "@rpath/lib.dylib",
+            &["/usr/lib/swift", "@loader_path/../Resources/"],
+            &["Contents/Resources/lib.dylib"],
+        );
+        let f = load_findings(&b);
+        assert_eq!(f.len(), 1);
+        assert_eq!(f[0].0, 1);
+    }
+
+    /// A loader with no rpaths uses main's; `@loader_path` there is main's directory.
+    #[test]
+    fn main_rpaths_fallback() {
+        let mut b = loading(
+            "Contents/Frameworks/V.dylib",
+            "@rpath/lib.dylib",
+            &["Contents/Resources/lib.dylib"],
+        );
+        b[0].facts.rpaths = vec!["@loader_path/../Resources".to_string()];
+        let f = load_findings(&b);
+        assert_eq!(f.len(), 1);
+        assert_eq!(f[0].0, 1);
+    }
+
+    /// dyld takes the first rpath that has the file, so the Frameworks copy wins.
+    #[test]
+    fn first_rpath_hit_wins() {
+        let b = with_rpaths(
+            "Contents/Frameworks/V.dylib",
+            "@rpath/lib.dylib",
+            &["@loader_path/../Frameworks", "@loader_path/../Resources"],
+            &[
+                "Contents/Frameworks/lib.dylib",
+                "Contents/Resources/lib.dylib",
+            ],
+        );
+        assert!(load_findings(&b).is_empty());
+    }
+
+    /// `@executable_path` in an rpath entry resolves against main.
+    #[test]
+    fn executable_path_rpath() {
+        let b = with_rpaths(
+            "Contents/Frameworks/V.dylib",
+            "@rpath/lib.dylib",
+            &["@executable_path/../Resources"],
+            &["Contents/Resources/lib.dylib"],
+        );
+        assert_eq!(load_findings(&b).len(), 1);
+    }
+
+    /// An rpath that leaves the bundle resolves to nothing.
+    #[test]
+    fn escaping_rpath_ignored() {
+        let b = with_rpaths(
+            "Contents/Frameworks/V.dylib",
+            "@rpath/lib.dylib",
+            &["@loader_path/../../../../Resources"],
+            &["Contents/Resources/lib.dylib"],
+        );
+        assert!(load_findings(&b).is_empty());
+    }
+
+    /// Past [`MAX_RPATH_LOOKUPS`] the check is a gap, not clean and not a signal.
+    #[test]
+    fn rpath_cap_is_gap() {
+        let mut b = loading("Contents/Frameworks/V.dylib", "@rpath/lib.dylib", &[]);
+        b[1].facts.rpaths = vec!["@loader_path/x".to_string(); MAX_RPATH_LOOKUPS + 1];
+        let all = findings(&b, Some(0));
+        assert!(all.iter().any(|(i, f)| *i == 1
+            && matches!(f, Finding::NotApplicable(id) if *id == LOAD_FROM_RESOURCES_ID)));
+        assert!(load_findings(&b).is_empty());
     }
 }
