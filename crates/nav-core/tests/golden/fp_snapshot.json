@@ -515,6 +515,14 @@
     ],
     "completeness": "complete"
   },
+  "suspicious/dropper_in_zip_behind_pk_junk.zip": {
+    "score": 19,
+    "recommendation": "notify",
+    "rule_ids": [
+      "zip-member-suspicious"
+    ],
+    "completeness": "complete"
+  },
   "suspicious/dropper_osascript_fetch.sh": {
     "score": 19,
     "recommendation": "notify",

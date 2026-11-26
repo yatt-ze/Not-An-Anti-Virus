@@ -431,6 +431,23 @@ fn budgeted_ranges(ctx: &ScanContext, images: &[macho::MachOImage]) -> (Vec<Cand
     (included, all_scored)
 }
 
+/// The ranges `evaluate` would score for a Mach-O, or `None` when it
+/// wouldn't take the Mach-O path (empty/unread content, zip members, no
+/// walkable image). Used by the shared stream (§11.12).
+pub(super) fn streamed_ranges(ctx: &ScanContext) -> Option<Vec<Range<u64>>> {
+    if ctx.content.as_ref().is_none_or(Vec::is_empty)
+        || super::zip_member::scored_through_members(ctx)
+    {
+        return None;
+    }
+    let images = &ctx.macho().images;
+    if images.is_empty() {
+        return None;
+    }
+    let (included, _) = budgeted_ranges(ctx, images);
+    Some(included.into_iter().map(|(_, range)| range).collect())
+}
+
 impl HighEntropyRule {
     /// `evaluate` with the Apple-anchor check injected; `anchored` runs at
     /// most once, and only when it could change the result (see
@@ -560,6 +577,12 @@ impl HighEntropyRule {
         // the slice, no streaming/windowing needed (§5.2).
         if range.end <= content.len() as u64 {
             return (self.macho_signal_from_content(content, range, region), true);
+        }
+
+        if let Some(acc) =
+            super::shared_stream::shared_stream(ctx).and_then(|shared| shared.entropy(&range))
+        {
+            return (self.macho_signal(acc, region), true);
         }
 
         let mut acc = TextEntropy::new();
@@ -1083,7 +1106,8 @@ fn clip_to_file_len(ctx: &ScanContext, range: Range<u64>) -> Range<u64> {
 /// Accumulates a `__TEXT` range's whole-range histogram and the highest
 /// Miller–Madow entropy over its 64 KiB windows ([`WINDOW_BLOCK_BYTES`]).
 /// Results do not depend on how the bytes are split across `feed` calls.
-struct TextEntropy {
+#[derive(Clone)]
+pub(super) struct TextEntropy {
     counts: [u64; 256],
     len: u64,
     block: [u64; 256],
@@ -1093,7 +1117,7 @@ struct TextEntropy {
 }
 
 impl TextEntropy {
-    fn new() -> Self {
+    pub(super) fn new() -> Self {
         Self {
             counts: [0; 256],
             len: 0,
@@ -1104,7 +1128,7 @@ impl TextEntropy {
         }
     }
 
-    fn feed(&mut self, mut bytes: &[u8]) {
+    pub(super) fn feed(&mut self, mut bytes: &[u8]) {
         while !bytes.is_empty() {
             let take = bytes.len().min(WINDOW_BLOCK_BYTES - self.block_len);
             let (head, rest) = bytes.split_at(take);
