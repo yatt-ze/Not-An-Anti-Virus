@@ -226,7 +226,8 @@ fn load_signal(target: &MemberFacts) -> MatchedSignal {
 
 /// Index of the plain-Resources member that one of `member`'s loads reaches.
 /// Each load resolves to the first bundle file dyld's search order finds.
-/// `Err` when the `@rpath/` expansions pass [`MAX_RPATH_LOOKUPS`].
+/// `Err` when nothing fired and the `@rpath/` expansions passed
+/// [`MAX_RPATH_LOOKUPS`]; non-`@rpath` loads are still checked past the cap.
 fn load_target(
     members: &[Member],
     i: usize,
@@ -241,17 +242,20 @@ fn load_target(
     let mut rpath_owners = vec![member];
     rpath_owners.extend(main.filter(|m| !std::ptr::eq(*m, member)));
     let mut lookups = 0;
+    let mut capped = false;
     for load in &member.facts.dylibs {
         let found = match load.strip_prefix("@rpath/") {
             None => resolve_load(load, &member.rel, main_rel)
                 .and_then(|rel| by_rel.get(&fold(&rel)).copied()),
+            Some(_) if capped => None,
             Some(rest) => {
                 let mut found = None;
                 'search: for owner in &rpath_owners {
                     for rpath in &owner.facts.rpaths {
                         lookups += 1;
                         if lookups > MAX_RPATH_LOOKUPS {
-                            return Err(());
+                            capped = true;
+                            break 'search;
                         }
                         let expanded = format!("{rpath}/{rest}");
                         let hit = resolve_load(&expanded, &owner.rel, main_rel)
@@ -269,7 +273,11 @@ fn load_target(
             return Ok(Some(t));
         }
     }
-    Ok(None)
+    if capped {
+        Err(())
+    } else {
+        Ok(None)
+    }
 }
 
 /// Resolve an `@loader_path/` or `@executable_path/` load path to a path
@@ -768,5 +776,20 @@ mod tests {
         assert!(all.iter().any(|(i, f)| *i == 1
             && matches!(f, Finding::NotApplicable(id) if *id == LOAD_FROM_RESOURCES_ID)));
         assert!(load_findings(&b).is_empty());
+    }
+
+    /// Hitting the cap still checks the member's direct loads.
+    #[test]
+    fn cap_keeps_direct_loads() {
+        let mut b = loading(
+            "Contents/MacOS/x",
+            "@rpath/lib.dylib",
+            &["Contents/Resources/lib.dylib"],
+        );
+        b[1].facts.rpaths = vec!["@loader_path/x".to_string(); MAX_RPATH_LOOKUPS + 1];
+        b[1].facts
+            .dylibs
+            .push("@loader_path/../Resources/lib.dylib".into());
+        assert_eq!(load_findings(&b).len(), 1);
     }
 }
