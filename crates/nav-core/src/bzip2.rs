@@ -862,7 +862,7 @@ mod tests {
     impl BitWriter {
         fn put(&mut self, value: u64, n: u32) {
             for i in (0..n).rev() {
-                if self.nbits % 8 == 0 {
+                if self.nbits.is_multiple_of(8) {
                     self.bytes.push(0);
                 }
                 let bit = ((value >> i) & 1) as u8;

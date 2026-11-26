@@ -179,7 +179,7 @@ fn utf16_starts_xml(body: &[u8], big_endian: bool) -> bool {
 /// Strict UTF-16 decode: `None` on an odd byte count or an unpaired surrogate,
 /// both measured as refused by launchd.
 fn utf16_to_string(body: &[u8], big_endian: bool) -> Option<String> {
-    if body.len() % 2 != 0 {
+    if !body.len().is_multiple_of(2) {
         return None;
     }
     char::decode_utf16(crate::xml::utf16_units(body, big_endian))
@@ -354,8 +354,10 @@ mod binary {
                 let end = start.checked_add(byte_len)?;
                 let bytes = ctx.data.get(start..end)?;
                 let u16s: Vec<u16> = bytes
-                    .chunks_exact(2)
-                    .map(|c| u16::from_be_bytes([c[0], c[1]]))
+                    .as_chunks::<2>()
+                    .0
+                    .iter()
+                    .map(|&pair| u16::from_be_bytes(pair))
                     .collect();
                 let s = char::decode_utf16(u16s)
                     .collect::<Result<String, _>>()

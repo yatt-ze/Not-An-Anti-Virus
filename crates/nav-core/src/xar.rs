@@ -1508,7 +1508,7 @@ fn resolve_paths(nodes: &[Node], limits: &XarLimits) -> Vec<XarFile> {
 fn base64_name(text: &str) -> Option<String> {
     let t = text.trim_matches([' ', '\t', '\n', '\r']);
     let body = t.trim_end_matches('=');
-    let canonical = t.len() % 4 == 0
+    let canonical = t.len().is_multiple_of(4)
         && t.len() - body.len() <= 2
         && body.bytes().all(|b| crate::base64::char_value(b).is_some());
     if !canonical {
