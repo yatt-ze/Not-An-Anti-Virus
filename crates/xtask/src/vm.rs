@@ -51,7 +51,7 @@ pub fn validate_sha(s: &str) -> Result<()> {
     }
 }
 
-/// `<prefix><secs>`; `prefix` also drives the stale-VM check.
+/// The run's VM name, `<prefix><secs>`.
 pub fn vm_name(prefix: &str, secs: u64) -> String {
     format!("{prefix}{secs}")
 }
@@ -187,7 +187,8 @@ impl Drop for TempFile {
     }
 }
 
-/// Stops and (unless `keep`) deletes the VM on drop.
+/// Stops and (unless `keep`) deletes the VM on drop. `child`, when set, must
+/// be the `tart run` process so [`wait_for_agent`] can detect an early exit.
 pub struct VmGuard {
     pub name: String,
     pub keep: bool,
