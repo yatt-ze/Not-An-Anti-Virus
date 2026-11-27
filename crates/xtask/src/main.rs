@@ -46,7 +46,7 @@ enum Command {
     /// Real-world malware benchmark: fetch, verify, scan and compare the sample store; `vm` runs it in Tart (§11.1a).
     #[command(subcommand)]
     Malware(malware::MalwareCommand),
-    /// Benign survey set for rule research: fetch and verify the download cache (§11.1b).
+    /// Benign survey set for rule research: fetch, verify, prepare; `vm survey` runs it in Tart (§11.1b).
     #[command(subcommand)]
     Benign(benign::BenignCommand),
 }

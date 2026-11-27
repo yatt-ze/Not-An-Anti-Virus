@@ -29,6 +29,22 @@ pub enum Category {
     Installer,
 }
 
+impl Category {
+    /// The manifest spelling.
+    pub fn label(self) -> &'static str {
+        match self {
+            Category::AdminScripts => "admin-scripts",
+            Category::DevTools => "dev-tools",
+            Category::Drm => "drm",
+            Category::Credentials => "credentials",
+            Category::Messaging => "messaging",
+            Category::SecurityAgent => "security-agent",
+            Category::RemoteAccess => "remote-access",
+            Category::Installer => "installer",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Kind {
@@ -42,13 +58,27 @@ pub enum Kind {
     Git,
 }
 
+impl Kind {
+    /// The manifest spelling.
+    pub fn label(self) -> &'static str {
+        match self {
+            Kind::Dmg => "dmg",
+            Kind::Pkg => "pkg",
+            Kind::Zip => "zip",
+            Kind::Tar => "tar",
+            Kind::App => "app",
+            Kind::Script => "script",
+            Kind::Git => "git",
+        }
+    }
+}
+
 /// One survey item. A `url` item carries `sha256` and `bytes` once recorded;
 /// a `git` item carries `repo` and `commit` instead.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Item {
     pub id: String,
-    #[expect(dead_code, reason = "read by prepare once it lands")]
     pub category: Category,
     pub kind: Kind,
     pub url: Option<String>,
