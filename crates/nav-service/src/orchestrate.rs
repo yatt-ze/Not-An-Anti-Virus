@@ -18,8 +18,8 @@ use crate::ops::SystemOps;
 use crate::{FsKind, Layout, CODESIGN_ID, LABEL, TCC_SERVICE};
 
 const DIR_MODE: u32 = 0o755;
-/// The state dir holds navd's logs, so it is not world-readable.
-const STATE_DIR_MODE: u32 = 0o750;
+/// Config and state dirs: root only, so other users can't read navd's logs (§11.4).
+const PRIVATE_DIR_MODE: u32 = 0o700;
 const PLIST_MODE: u32 = 0o644;
 const BIN_MODE: u32 = 0o755;
 
@@ -100,6 +100,11 @@ pub fn install(
         meta.uid(),
         allowed_owners
     );
+    let helper_dir = layout.helper_dir();
+    let helper_preexists = helper_dir.symlink_metadata().is_ok();
+    if helper_preexists {
+        check_shared_dir(&helper_dir, layout.prefix())?;
+    }
 
     // Tear out a still-loaded prior job so the new plist bootstraps cleanly.
     // ETXTBSY on the copy below is avoided by the unlink before `fs::copy`,
@@ -109,12 +114,9 @@ pub fn install(
     }
 
     // Root-owned config and state dirs; state holds the helper-dir marker.
-    for (dir, mode) in [
-        (layout.config_dir(), DIR_MODE),
-        (layout.state_dir(), STATE_DIR_MODE),
-    ] {
+    for dir in [layout.config_dir(), layout.state_dir()] {
         fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
-        fs::set_permissions(&dir, fs::Permissions::from_mode(mode))?;
+        fs::set_permissions(&dir, fs::Permissions::from_mode(PRIVATE_DIR_MODE))?;
         ops.chown_root(&dir)?;
     }
 
@@ -123,8 +125,7 @@ pub fn install(
     // 0755 perms only when we created it — never re-permission a dir another
     // installer already owns, and don't leave the perms to root's umask.
     // Marker first, so a failure after creating the dir can't leave it unmarked.
-    let helper_dir = layout.helper_dir();
-    if !helper_dir.exists() {
+    if !helper_preexists {
         let marker = layout.helper_dir_marker();
         fs::write(&marker, b"").with_context(|| format!("writing marker {}", marker.display()))?;
         fs::set_permissions(&marker, fs::Permissions::from_mode(PLIST_MODE))?;
@@ -163,6 +164,27 @@ pub fn install(
     }
     ops.bootstrap(&plist)?;
     Ok(InstallReport { source, sha256 })
+}
+
+/// Refuse a pre-existing shared `dir` that is a symlink, is group- or
+/// world-writable, or isn't owned by `prefix`'s owner (root for the real `/`):
+/// its owner could swap the root daemon's binary (threat model §7 K).
+fn check_shared_dir(dir: &Path, prefix: &Path) -> Result<()> {
+    let root_uid = fs::metadata(prefix)?.uid();
+    let meta = fs::symlink_metadata(dir)?;
+    anyhow::ensure!(meta.is_dir(), "refusing {}: not a directory", dir.display());
+    anyhow::ensure!(
+        meta.mode() & 0o022 == 0,
+        "refusing {}: group- or world-writable",
+        dir.display()
+    );
+    anyhow::ensure!(
+        meta.uid() == root_uid,
+        "refusing {}: owned by uid {}, not {root_uid}",
+        dir.display(),
+        meta.uid()
+    );
+    Ok(())
 }
 
 /// Copy `src` to a new file at `dst`, returning the lowercase-hex SHA-256 of
@@ -463,8 +485,34 @@ mod tests {
         let layout = tp.layout();
         install(&layout, &FakeSystemOps::new(), &fake_navd(&tp), &[me()]).unwrap();
         let mode = |p: PathBuf| fs::metadata(p).unwrap().permissions().mode() & 0o777;
-        assert_eq!(mode(layout.state_dir()), 0o750);
-        assert_eq!(mode(layout.config_dir()), 0o755);
+        assert_eq!(mode(layout.state_dir()), 0o700);
+        assert_eq!(mode(layout.config_dir()), 0o700);
+    }
+
+    #[test]
+    fn refuses_writable_helper_dir() {
+        let tp = TempPrefix::new();
+        let layout = tp.layout();
+        fs::create_dir_all(layout.helper_dir()).unwrap();
+        fs::set_permissions(layout.helper_dir(), fs::Permissions::from_mode(0o775)).unwrap();
+        let ops = FakeSystemOps::new();
+        let err = install(&layout, &ops, &fake_navd(&tp), &[me()]).unwrap_err();
+        assert!(format!("{err:#}").contains("writable"));
+        assert!(!layout.helper_binary().exists());
+        assert!(!ops.calls().iter().any(|c| matches!(c, Call::Bootstrap(_))));
+    }
+
+    #[test]
+    fn refuses_symlinked_helper_dir() {
+        let tp = TempPrefix::new();
+        let layout = tp.layout();
+        let elsewhere = tp.0.join("elsewhere");
+        fs::create_dir_all(&elsewhere).unwrap();
+        fs::create_dir_all(layout.helper_dir().parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink(&elsewhere, layout.helper_dir()).unwrap();
+        let err = install(&layout, &FakeSystemOps::new(), &fake_navd(&tp), &[me()]).unwrap_err();
+        assert!(format!("{err:#}").contains("not a directory"));
+        assert!(!elsewhere.join("navd").exists());
     }
 
     #[test]
