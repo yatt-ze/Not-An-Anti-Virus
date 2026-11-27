@@ -6,28 +6,71 @@
 //! under a temp dir); only the privileged operations go through the seam.
 
 use std::fs;
-use std::os::unix::fs::PermissionsExt;
+use std::io::{Read, Write};
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
+use sha2::{Digest, Sha256};
 
 use crate::ops::SystemOps;
 use crate::{FsKind, Layout, CODESIGN_ID, LABEL, TCC_SERVICE};
 
 const DIR_MODE: u32 = 0o755;
+/// The state dir holds navd's logs, so it is not world-readable.
+const STATE_DIR_MODE: u32 = 0o750;
 const PLIST_MODE: u32 = 0o644;
 const BIN_MODE: u32 = 0o755;
+
+/// What [`install`] copied.
+#[derive(Debug, Clone)]
+pub struct InstallReport {
+    /// The source after following symlinks.
+    pub source: PathBuf,
+    /// Lowercase-hex SHA-256 of the source bytes, taken while copying, before
+    /// the ad-hoc codesign step changes the installed file.
+    pub sha256: String,
+}
 
 /// Copy `navd` to its root-owned home, lay down state dirs and the plist, and
 /// bootstrap the daemon. Idempotent: safe to re-run over an existing install.
 ///
-/// `navd_src` is the binary to copy (resolved next to `navctl` by the caller).
+/// `navd_src` is resolved (symlinks followed), then opened with `O_NOFOLLOW`
+/// and checked on the open handle: it must be a regular file, not group- or
+/// world-writable, and owned by a uid in `allowed_owners`. The copy reads from
+/// that same handle. Hardening only: it cannot stop code running as an allowed
+/// owner from swapping the file (§11.10).
 /// Requires the privileges `ops` implies — real installs run as root.
-pub fn install(layout: &Layout, ops: &dyn SystemOps, navd_src: &Path) -> Result<()> {
+pub fn install(
+    layout: &Layout,
+    ops: &dyn SystemOps,
+    navd_src: &Path,
+    allowed_owners: &[u32],
+) -> Result<InstallReport> {
+    let source = fs::canonicalize(navd_src)
+        .with_context(|| format!("navd binary not found at {}", navd_src.display()))?;
+    let mut src_file = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(&source)
+        .with_context(|| format!("opening {}", source.display()))?;
+    let meta = src_file.metadata()?;
     anyhow::ensure!(
-        navd_src.is_file(),
-        "navd binary not found at {}",
-        navd_src.display()
+        meta.is_file(),
+        "refusing {}: not a regular file",
+        source.display()
+    );
+    anyhow::ensure!(
+        meta.mode() & 0o022 == 0,
+        "refusing {}: group- or world-writable (fix: chmod go-w)",
+        source.display()
+    );
+    anyhow::ensure!(
+        allowed_owners.contains(&meta.uid()),
+        "refusing {}: owned by uid {}, allowed uids are {:?} (fix: chown to one of them)",
+        source.display(),
+        meta.uid(),
+        allowed_owners
     );
 
     // Tear out a still-loaded prior job so the new plist bootstraps cleanly.
@@ -40,9 +83,12 @@ pub fn install(layout: &Layout, ops: &dyn SystemOps, navd_src: &Path) -> Result<
     }
 
     // Root-owned config and state dirs; state holds the helper-dir marker.
-    for dir in [layout.config_dir(), layout.state_dir()] {
+    for (dir, mode) in [
+        (layout.config_dir(), DIR_MODE),
+        (layout.state_dir(), STATE_DIR_MODE),
+    ] {
         fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
-        fs::set_permissions(&dir, fs::Permissions::from_mode(DIR_MODE))?;
+        fs::set_permissions(&dir, fs::Permissions::from_mode(mode))?;
         ops.chown_root(&dir)?;
     }
 
@@ -67,7 +113,8 @@ pub fn install(layout: &Layout, ops: &dyn SystemOps, navd_src: &Path) -> Result<
     // old inode open, so `fs::copy` creates a fresh one instead of truncating
     // the one in use — this, not the `bootout` above, is what avoids ETXTBSY.
     remove_file_if_present(&bin).with_context(|| format!("removing old {}", bin.display()))?;
-    fs::copy(navd_src, &bin).with_context(|| format!("copying navd to {}", bin.display()))?;
+    let sha256 = copy_hashed(&mut src_file, &bin)
+        .with_context(|| format!("copying navd to {}", bin.display()))?;
     fs::set_permissions(&bin, fs::Permissions::from_mode(BIN_MODE))?;
     ops.chown_root(&bin)?;
     ops.codesign_adhoc(&bin, CODESIGN_ID)?;
@@ -89,7 +136,34 @@ pub fn install(layout: &Layout, ops: &dyn SystemOps, navd_src: &Path) -> Result<
         ops.enable(LABEL)?;
     }
     ops.bootstrap(&plist)?;
-    Ok(())
+    Ok(InstallReport { source, sha256 })
+}
+
+/// Copy `src` to a new file at `dst`, returning the lowercase-hex SHA-256 of
+/// the bytes copied.
+fn copy_hashed(src: &mut fs::File, dst: &Path) -> Result<String> {
+    // Owner-only until install sets the final mode, whatever the umask.
+    let mut out = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o700)
+        .open(dst)?;
+    let mut hasher = Sha256::new();
+    let mut buf = [0u8; 64 * 1024];
+    loop {
+        let n = src.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+        out.write_all(&buf[..n])?;
+    }
+    out.sync_all()?;
+    Ok(hasher
+        .finalize()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect())
 }
 
 /// What an uninstall managed to do. Best-effort: every artifact is attempted
@@ -331,7 +405,93 @@ mod tests {
     fn fake_navd(tp: &TempPrefix) -> PathBuf {
         let src = tp.0.join("navd-src");
         fs::write(&src, b"#!/bin/sh\nsleep 1\n").unwrap();
+        fs::set_permissions(&src, fs::Permissions::from_mode(0o755)).unwrap();
         src
+    }
+
+    /// The current uid, read off a file this process creates.
+    fn me() -> u32 {
+        static N: AtomicU32 = AtomicU32::new(0);
+        let p = std::env::temp_dir().join(format!(
+            "nav-service-uid-{}-{}",
+            std::process::id(),
+            N.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::write(&p, b"").unwrap();
+        let uid = fs::metadata(&p).unwrap().uid();
+        let _ = fs::remove_file(&p);
+        uid
+    }
+
+    fn mode_err(mode: u32) -> String {
+        let tp = TempPrefix::new();
+        let src = fake_navd(&tp);
+        fs::set_permissions(&src, fs::Permissions::from_mode(mode)).unwrap();
+        let err = install(&tp.layout(), &FakeSystemOps::new(), &src, &[me()]).unwrap_err();
+        format!("{err:#}")
+    }
+
+    #[test]
+    fn state_dir_private() {
+        let tp = TempPrefix::new();
+        let layout = tp.layout();
+        install(&layout, &FakeSystemOps::new(), &fake_navd(&tp), &[me()]).unwrap();
+        let mode = |p: PathBuf| fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(layout.state_dir()), 0o750);
+        assert_eq!(mode(layout.config_dir()), 0o755);
+    }
+
+    #[test]
+    fn refuses_group_writable() {
+        assert!(mode_err(0o775).contains("writable"));
+    }
+
+    #[test]
+    fn refuses_world_writable() {
+        assert!(mode_err(0o757).contains("writable"));
+    }
+
+    /// An owner outside the allowed list is refused and nothing is installed.
+    #[test]
+    fn refuses_other_owner() {
+        let tp = TempPrefix::new();
+        let layout = tp.layout();
+        let src = fake_navd(&tp);
+        let other = me().wrapping_add(1);
+        let err = install(&layout, &FakeSystemOps::new(), &src, &[other]).unwrap_err();
+        assert!(format!("{err:#}").contains("allowed uids"));
+        assert!(!layout.helper_binary().exists());
+    }
+
+    /// A symlinked source (Homebrew style) is followed; the report names the
+    /// resolved target.
+    #[test]
+    fn follows_symlink() {
+        let tp = TempPrefix::new();
+        let layout = tp.layout();
+        let real = fs::canonicalize(fake_navd(&tp)).unwrap();
+        let link = tp.0.join("navd-link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let report = install(&layout, &FakeSystemOps::new(), &link, &[me()]).unwrap();
+        assert_eq!(report.source, real);
+        assert_eq!(
+            fs::read(layout.helper_binary()).unwrap(),
+            fs::read(&real).unwrap()
+        );
+    }
+
+    /// SHA-256 of "abc" is a published test vector.
+    #[test]
+    fn reports_sha256() {
+        let tp = TempPrefix::new();
+        let src = tp.0.join("navd-abc");
+        fs::write(&src, b"abc").unwrap();
+        fs::set_permissions(&src, fs::Permissions::from_mode(0o755)).unwrap();
+        let report = install(&tp.layout(), &FakeSystemOps::new(), &src, &[me()]).unwrap();
+        assert_eq!(
+            report.sha256,
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
     }
 
     #[test]
@@ -339,7 +499,7 @@ mod tests {
         let tp = TempPrefix::new();
         let layout = tp.layout();
         let ops = FakeSystemOps::new();
-        install(&layout, &ops, &fake_navd(&tp)).unwrap();
+        install(&layout, &ops, &fake_navd(&tp), &[me()]).unwrap();
 
         assert!(layout.helper_binary().is_file());
         assert!(layout.config_dir().is_dir());
@@ -363,7 +523,7 @@ mod tests {
         let tp = TempPrefix::new();
         let layout = tp.layout();
         let ops = FakeSystemOps::new();
-        install(&layout, &ops, &fake_navd(&tp)).unwrap();
+        install(&layout, &ops, &fake_navd(&tp), &[me()]).unwrap();
         assert!(
             ops.calls().contains(&Call::ChownRoot(layout.helper_dir())),
             "a helper dir we create must be chowned root:wheel, not left to umask"
@@ -376,7 +536,7 @@ mod tests {
         let layout = tp.layout();
         fs::create_dir_all(layout.helper_dir()).unwrap();
         let ops = FakeSystemOps::new();
-        install(&layout, &ops, &fake_navd(&tp)).unwrap();
+        install(&layout, &ops, &fake_navd(&tp), &[me()]).unwrap();
         assert!(
             !ops.calls().contains(&Call::ChownRoot(layout.helper_dir())),
             "must not chown a shared helper dir another installer already owns"
@@ -389,9 +549,9 @@ mod tests {
         let layout = tp.layout();
         let ops = FakeSystemOps::new();
         let src = fake_navd(&tp);
-        install(&layout, &ops, &src).unwrap();
-        install(&layout, &ops, &src).unwrap(); // must not error
-                                               // Second install saw a loaded job and tore it out before re-bootstrapping.
+        install(&layout, &ops, &src, &[me()]).unwrap();
+        install(&layout, &ops, &src, &[me()]).unwrap(); // must not error
+                                                        // Second install saw a loaded job and tore it out before re-bootstrapping.
         assert!(ops.calls().contains(&Call::Bootout(LABEL.into())));
     }
 
@@ -405,7 +565,7 @@ mod tests {
         let ops = FakeSystemOps::new();
         let src = fake_navd(&tp);
 
-        install(&layout, &ops, &src).unwrap();
+        install(&layout, &ops, &src, &[me()]).unwrap();
 
         assert_eq!(fs::read(&bin).unwrap(), fs::read(&src).unwrap());
     }
@@ -415,7 +575,7 @@ mod tests {
         let tp = TempPrefix::new();
         let layout = tp.layout();
         let ops = FakeSystemOps::new();
-        install(&layout, &ops, &fake_navd(&tp)).unwrap();
+        install(&layout, &ops, &fake_navd(&tp), &[me()]).unwrap();
 
         let calls = ops.calls();
         assert!(
@@ -430,7 +590,7 @@ mod tests {
         let tp = TempPrefix::new();
         let layout = tp.layout();
         let ops = FakeSystemOps::preloaded();
-        install(&layout, &ops, &fake_navd(&tp)).unwrap();
+        install(&layout, &ops, &fake_navd(&tp), &[me()]).unwrap();
 
         let calls = ops.calls();
         assert!(
@@ -445,7 +605,7 @@ mod tests {
         let tp = TempPrefix::new();
         let layout = tp.layout();
         let ops = FakeSystemOps::new();
-        install(&layout, &ops, &fake_navd(&tp)).unwrap();
+        install(&layout, &ops, &fake_navd(&tp), &[me()]).unwrap();
 
         let report = uninstall(&layout, &ops);
         assert!(report.is_ok(), "uninstall errors: {:?}", report.errors);
@@ -464,7 +624,7 @@ mod tests {
             residue(&layout, &ops).unwrap().is_clean(),
             "a pre-existing empty dir is not residue before any install"
         );
-        install(&layout, &ops, &fake_navd(&tp)).unwrap();
+        install(&layout, &ops, &fake_navd(&tp), &[me()]).unwrap();
         assert!(!layout.helper_dir_marker().exists());
 
         let report = uninstall(&layout, &ops);
@@ -481,10 +641,10 @@ mod tests {
         let tp = TempPrefix::new();
         let layout = tp.layout();
         let ops = FakeSystemOps::new();
-        install(&layout, &ops, &fake_navd(&tp)).unwrap();
+        install(&layout, &ops, &fake_navd(&tp), &[me()]).unwrap();
         assert!(layout.helper_dir_marker().is_file());
         // A re-install over our own dir keeps the marker.
-        install(&layout, &ops, &fake_navd(&tp)).unwrap();
+        install(&layout, &ops, &fake_navd(&tp), &[me()]).unwrap();
         assert!(layout.helper_dir_marker().is_file());
 
         uninstall(&layout, &ops);
@@ -497,7 +657,7 @@ mod tests {
         let tp = TempPrefix::new();
         let layout = tp.layout();
         let ops = FakeSystemOps::new();
-        install(&layout, &ops, &fake_navd(&tp)).unwrap();
+        install(&layout, &ops, &fake_navd(&tp), &[me()]).unwrap();
         // Helper dir gone, marker (in the state dir) not yet removed.
         fs::remove_file(layout.helper_binary()).unwrap();
         fs::remove_dir(layout.helper_dir()).unwrap();
@@ -529,7 +689,7 @@ mod tests {
         let tp = TempPrefix::new();
         let layout = tp.layout();
         let ops = FakeSystemOps::new();
-        install(&layout, &ops, &fake_navd(&tp)).unwrap();
+        install(&layout, &ops, &fake_navd(&tp), &[me()]).unwrap();
         fs::remove_file(layout.helper_binary()).unwrap();
         let dir = layout.helper_dir();
         // An unreadable dir makes the emptiness check fail.
@@ -555,7 +715,7 @@ mod tests {
         let tp = TempPrefix::new();
         let layout = tp.layout();
         let ops = FakeSystemOps::new();
-        install(&layout, &ops, &fake_navd(&tp)).unwrap();
+        install(&layout, &ops, &fake_navd(&tp), &[me()]).unwrap();
         // Another installer's helper lands in the shared dir.
         let foreign = layout.helper_dir().join("other-helper");
         fs::write(&foreign, b"not ours").unwrap();
@@ -578,7 +738,7 @@ mod tests {
         let tp = TempPrefix::new();
         let layout = tp.layout();
         let ops = FakeSystemOps::new();
-        install(&layout, &ops, &fake_navd(&tp)).unwrap();
+        install(&layout, &ops, &fake_navd(&tp), &[me()]).unwrap();
         // Simulate a teardown that missed the state dir.
         fs::remove_file(layout.helper_binary()).unwrap();
         fs::remove_file(layout.plist_path()).unwrap();
@@ -610,7 +770,7 @@ mod tests {
         let tp = TempPrefix::new();
         let layout = tp.layout();
         let ops = FakeSystemOps::new();
-        install(&layout, &ops, &fake_navd(&tp)).unwrap();
+        install(&layout, &ops, &fake_navd(&tp), &[me()]).unwrap();
         // A foreign file that merely contains "navd" as a substring, not ours —
         // keeps the shared helper dir non-empty across uninstall (like the
         // `uninstall_leaves_a_nonempty_shared_dir_alone` case).
@@ -631,7 +791,7 @@ mod tests {
         let tp = TempPrefix::new();
         let layout = tp.layout();
         let ops = FakeSystemOps::new();
-        install(&layout, &ops, &fake_navd(&tp)).unwrap();
+        install(&layout, &ops, &fake_navd(&tp), &[me()]).unwrap();
         // Simulate a teardown that left a broken symlink where the binary was.
         fs::remove_file(layout.helper_binary()).unwrap();
         std::os::unix::fs::symlink("/nonexistent/target", layout.helper_binary()).unwrap();
@@ -658,7 +818,7 @@ mod tests {
         let tp = TempPrefix::new();
         let layout = tp.layout();
         let ops = FakeSystemOps::new();
-        install(&layout, &ops, &fake_navd(&tp)).unwrap();
+        install(&layout, &ops, &fake_navd(&tp), &[me()]).unwrap();
 
         let report = uninstall(&layout, &ops);
         assert!(report.is_ok(), "uninstall errors: {:?}", report.errors);

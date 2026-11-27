@@ -775,9 +775,28 @@ fn big_image(sb: &Sandbox) -> PathBuf {
     sb.image("big.dmg", "UDZO")
 }
 
-/// Starts navctl `args image` and SIGSTOPs it once a volume is mounted
-/// under the scratch root. Also returns the mount point if the volume was
-/// still mounted once navctl stopped.
+/// Whether `pid` has a file open under `volume`, so its walk has begun
+/// (after the mount checks, which only `statfs`).
+fn reading_volume(pid: i32, volume: &Path) -> bool {
+    let Ok(volume) = volume.canonicalize() else {
+        return false;
+    };
+    let Ok(out) = Command::new("/usr/sbin/lsof")
+        .args(["-a", "-p", &pid.to_string(), "-Fn"])
+        .stderr(Stdio::null())
+        .output()
+    else {
+        return false;
+    };
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .filter_map(|l| l.strip_prefix('n'))
+        .any(|name| Path::new(name).starts_with(&volume))
+}
+
+/// Starts navctl `args image` and SIGSTOPs it once it is walking a volume
+/// mounted under the scratch root. Also returns the mount point if the
+/// volume was still mounted once navctl stopped.
 fn stop_when_mounted(sb: &Sandbox, args: &[&str], image: &Path) -> (Child, Option<PathBuf>) {
     let mut child = Command::new(env!("CARGO_BIN_EXE_navctl"))
         .args(args)
@@ -789,10 +808,18 @@ fn stop_when_mounted(sb: &Sandbox, args: &[&str], image: &Path) -> (Child, Optio
         .spawn()
         .unwrap();
     let deadline = Instant::now() + Duration::from_secs(60);
-    // The volume appears before `hdiutil attach` exits; wait for both.
+    // The volume appears before `hdiutil attach` exits, and navctl checks its
+    // mount flags before walking it: stopping earlier fails that check.
     let pid = child.id() as i32;
-    while scratch_volume(&sb.scratch()).is_none() || has_child(pid) {
-        assert!(Instant::now() < deadline, "no volume was mounted");
+    let walking = || {
+        scratch_volume(&sb.scratch()).is_some_and(|v| !has_child(pid) && reading_volume(pid, &v))
+    };
+    while !walking() {
+        assert!(
+            Instant::now() < deadline,
+            "navctl never walked a mounted volume (mounted: {:?})",
+            scratch_volume(&sb.scratch())
+        );
         if child.try_wait().unwrap().is_some() {
             return (child, None);
         }
@@ -854,7 +881,7 @@ fn a_volume_unmounted_during_the_scan_is_a_gap() {
         let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
         let gaps = v["mount_gaps"].to_string();
         if mounted.is_none() || !gaps.contains("unmounted during the scan") {
-            // navctl was past the check when it stopped.
+            // The walk had finished when navctl stopped.
             assert!(attempt < 3, "never detached during the walk: {gaps}");
             continue;
         }
