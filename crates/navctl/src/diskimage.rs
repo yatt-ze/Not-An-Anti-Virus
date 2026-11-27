@@ -494,15 +494,30 @@ fn parse_attach(plist: &PlistValue, run: &Path) -> Attached {
             }
             None if mountable == Some(true) => {
                 out.candidates += 1;
-                out.gaps.push(format!(
-                    "volume {} on the image did not mount",
-                    out.candidates
-                ))
+                out.gaps.push(if is_efi(e) {
+                    // `-nobrowse` never mounts it (#299).
+                    format!(
+                        "volume {} (EFI system partition) was not mounted",
+                        out.candidates
+                    )
+                } else {
+                    format!("volume {} on the image did not mount", out.candidates)
+                })
             }
             None => {}
         }
     }
     out
+}
+
+/// GPT type GUID of an EFI system partition.
+const EFI_PARTITION_TYPE: &str = "C12A7328-F81F-11D2-BA4B-00A0C93EC93B";
+
+/// Whether an attach entity is an EFI system partition, by its GPT type.
+fn is_efi(entity: &PlistValue) -> bool {
+    let hint = |k| entity.get(k).and_then(PlistValue::as_str);
+    hint("content-hint") == Some("EFI")
+        || hint("unmapped-content-hint").is_some_and(|h| h.eq_ignore_ascii_case(EFI_PARTITION_TYPE))
 }
 
 /// Rewrites every path in `scan` from the mount to `image!path` (`image!N/path`
@@ -1115,6 +1130,39 @@ mod tests {
             ]
         );
         assert_eq!(got.gaps.len(), 2, "{:?}", got.gaps);
+    }
+
+    /// An unmounted EFI slice is still a gap, named as such (#299).
+    #[test]
+    fn efi_slice_gap_named() {
+        let efi = |hint: (&str, &str)| {
+            let PlistValue::Dict(mut e) = entity("/dev/disk6s1", None, true) else {
+                unreachable!()
+            };
+            e.push((hint.0.into(), PlistValue::String(hint.1.into())));
+            PlistValue::Dict(e)
+        };
+        for hint in [
+            ("content-hint", "EFI"),
+            (
+                "unmapped-content-hint",
+                "c12a7328-f81f-11d2-ba4b-00a0c93ec93b",
+            ),
+        ] {
+            let plist = dict(vec![(
+                "system-entities",
+                PlistValue::Array(vec![
+                    efi(hint),
+                    entity("/dev/disk7s1", Some("/s/1-ab/dmg.A"), true),
+                ]),
+            )]);
+            let got = parse_attach(&plist, Path::new("/s/1-ab"));
+            assert_eq!(got.volumes, vec![(2, PathBuf::from("/s/1-ab/dmg.A"))]);
+            assert_eq!(
+                got.gaps,
+                vec!["volume 1 (EFI system partition) was not mounted".to_string()]
+            );
+        }
     }
 
     fn numbers(listing: &[PlistValue]) -> Attached {
