@@ -161,6 +161,7 @@ impl Layout {
 
     /// The LaunchDaemon plist, naming the canonical system paths regardless of
     /// prefix (a real launchd never sees the prefix; see module docs).
+    /// `Umask` is decimal: 63 is `0o077` (§11.4).
     pub fn render_plist(&self) -> String {
         format!(
             "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
@@ -179,6 +180,8 @@ impl Layout {
              \t<true/>\n\
              \t<key>UserName</key>\n\
              \t<string>root</string>\n\
+             \t<key>Umask</key>\n\
+             \t<integer>63</integer>\n\
              \t<key>StandardOutPath</key>\n\
              \t<string>{stdout}</string>\n\
              \t<key>StandardErrorPath</key>\n\
