@@ -172,6 +172,8 @@ pub struct FakeSystemOps {
     calls: std::cell::RefCell<Vec<Call>>,
     loaded: std::cell::Cell<bool>,
     disable_record: std::cell::Cell<Option<bool>>,
+    bootout_lag: std::cell::Cell<u32>,
+    lag_left: std::cell::Cell<u32>,
 }
 
 impl FakeSystemOps {
@@ -186,6 +188,12 @@ impl FakeSystemOps {
         f.loaded.set(true);
         f.disable_record.set(Some(true));
         f
+    }
+
+    /// After each `bootout`, report the job loaded for `polls` more
+    /// `is_loaded` calls, like real launchd tearing a job down (#291).
+    pub fn set_bootout_lag(&self, polls: u32) {
+        self.bootout_lag.set(polls);
     }
 
     pub fn calls(&self) -> Vec<Call> {
@@ -213,12 +221,16 @@ impl SystemOps for FakeSystemOps {
 
     fn bootstrap(&self, plist: &Path) -> Result<()> {
         self.record(Call::Bootstrap(plist.to_path_buf()));
+        self.lag_left.set(0);
         self.loaded.set(true);
         Ok(())
     }
 
     fn bootout(&self, label: &str) -> Result<()> {
         self.record(Call::Bootout(label.to_string()));
+        if self.loaded.get() {
+            self.lag_left.set(self.bootout_lag.get());
+        }
         self.loaded.set(false);
         Ok(())
     }
@@ -231,6 +243,11 @@ impl SystemOps for FakeSystemOps {
     }
 
     fn is_loaded(&self, _label: &str) -> Result<bool> {
+        let lag = self.lag_left.get();
+        if lag > 0 {
+            self.lag_left.set(lag - 1);
+            return Ok(true);
+        }
         Ok(self.loaded.get())
     }
 

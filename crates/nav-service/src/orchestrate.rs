@@ -9,6 +9,7 @@ use std::fs;
 use std::io::{Read, Write};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use sha2::{Digest, Sha256};
@@ -21,6 +22,33 @@ const DIR_MODE: u32 = 0o755;
 const STATE_DIR_MODE: u32 = 0o750;
 const PLIST_MODE: u32 = 0o644;
 const BIN_MODE: u32 = 0o755;
+
+/// How long to wait for launchd to drop a job after `bootout`. launchd's
+/// default `ExitTimeOut` SIGKILLs at 20s, so this leaves it room to finish.
+const BOOTOUT_WAIT: Duration = Duration::from_secs(30);
+const BOOTOUT_POLL: Duration = Duration::from_millis(100);
+
+/// `bootout` `label`, then wait up to `timeout` until launchd no longer lists
+/// it. `bootout` returns before the job is gone, so a bootstrap straight after
+/// it fails with EIO (#291). Errors name the label if it is still loaded.
+fn bootout_and_wait(
+    ops: &dyn SystemOps,
+    label: &str,
+    timeout: Duration,
+    poll: Duration,
+) -> Result<()> {
+    ops.bootout(label)?;
+    let deadline = Instant::now() + timeout;
+    while ops.is_loaded(label)? {
+        anyhow::ensure!(
+            Instant::now() < deadline,
+            "{label} still loaded {}s after bootout",
+            timeout.as_secs()
+        );
+        std::thread::sleep(poll);
+    }
+    Ok(())
+}
 
 /// What [`install`] copied.
 #[derive(Debug, Clone)]
@@ -74,12 +102,10 @@ pub fn install(
     );
 
     // Tear out a still-loaded prior job so the new plist bootstraps cleanly.
-    // `bootout` returns before the process actually exits, so it does *not*
-    // by itself avoid ETXTBSY on the copy below — the unlink right before
-    // `fs::copy` is what does that (a still-running process keeps its old
-    // inode open; the copy just creates a fresh one).
+    // ETXTBSY on the copy below is avoided by the unlink before `fs::copy`,
+    // not by this.
     if ops.is_loaded(LABEL)? {
-        ops.bootout(LABEL)?;
+        bootout_and_wait(ops, LABEL, BOOTOUT_WAIT, BOOTOUT_POLL)?;
     }
 
     // Root-owned config and state dirs; state holds the helper-dir marker.
@@ -205,7 +231,7 @@ pub fn uninstall(layout: &Layout, ops: &dyn SystemOps) -> UninstallReport {
             report.errors.push(format!("enable {LABEL}: {e:#}"));
         }
     }
-    if let Err(e) = ops.bootout(LABEL) {
+    if let Err(e) = bootout_and_wait(ops, LABEL, BOOTOUT_WAIT, BOOTOUT_POLL) {
         report.errors.push(format!("bootout {LABEL}: {e:#}"));
     }
 
@@ -598,6 +624,36 @@ mod tests {
             "a real disable override must be cleared"
         );
         assert!(calls.contains(&Call::Bootstrap(layout.plist_path())));
+    }
+
+    #[test]
+    fn bootout_waits_for_unload() {
+        let ops = FakeSystemOps::preloaded();
+        ops.set_bootout_lag(3);
+        bootout_and_wait(&ops, LABEL, BOOTOUT_WAIT, Duration::ZERO).unwrap();
+        assert!(!ops.is_loaded(LABEL).unwrap());
+    }
+
+    #[test]
+    fn bootout_wait_times_out() {
+        let ops = FakeSystemOps::preloaded();
+        ops.set_bootout_lag(u32::MAX);
+        let err = bootout_and_wait(&ops, LABEL, Duration::ZERO, Duration::ZERO).unwrap_err();
+        assert!(err.to_string().contains(LABEL), "{err:#}");
+    }
+
+    #[test]
+    fn lagging_bootout_still_clean() {
+        let tp = TempPrefix::new();
+        let layout = tp.layout();
+        let ops = FakeSystemOps::new();
+        ops.set_bootout_lag(2);
+        let src = fake_navd(&tp);
+        install(&layout, &ops, &src, &[me()]).unwrap();
+        install(&layout, &ops, &src, &[me()]).unwrap();
+        let report = uninstall(&layout, &ops);
+        assert!(report.is_ok(), "uninstall errors: {:?}", report.errors);
+        assert!(residue(&layout, &ops).unwrap().is_clean());
     }
 
     #[test]
