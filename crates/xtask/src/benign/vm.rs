@@ -1,6 +1,6 @@
-//! `benign vm survey`: prepares the survey set in a throwaway clone of the
-//! golden Tart VM and runs the maintainer's script over it, from the host
-//! (§11.1b). Only the script's UTF-8 text output crosses back.
+//! `benign vm survey` and `benign vm compare`: run the survey set in a
+//! throwaway clone of the golden Tart VM, from the host (§11.1b). Only
+//! commits go in; only UTF-8 text results come back.
 
 use std::fs::File;
 use std::io::Read;
@@ -13,8 +13,8 @@ use clap::{Args, Subcommand};
 
 use crate::build::{git, resolve_dirs};
 use crate::vm::{
-    check_tart, copy_in, make_bundle, map_exit, resolve_sha, tart, vm_name, wait_for_agent,
-    warn_stale_vms, TempFile, VmGuard,
+    check_tart, copy_in, copy_out, make_bundle, map_exit, resolve_sha, tart, vm_name,
+    wait_for_agent, warn_stale_vms, TempFile, VmGuard,
 };
 
 const VM_PREFIX: &str = "nav-benign-run-";
@@ -26,6 +26,51 @@ const MAX_OUTPUT: u64 = 16 << 20;
 pub enum VmCommand {
     /// Prepare the set in a clone of the golden VM and run a script over it (host side).
     Survey(SurveyArgs),
+    /// Fetch, then build base and new navctl and diff their scans of the set (host side).
+    Compare(VmCompareArgs),
+}
+
+#[derive(Args)]
+pub struct VmCompareArgs {
+    /// Revision under test.
+    #[arg(long, default_value = "HEAD")]
+    branch: String,
+    /// Base revision (`origin/*` is fetched first).
+    #[arg(long, default_value = "origin/main")]
+    base: String,
+    /// Keep the cloned VM instead of deleting it.
+    #[arg(long)]
+    keep: bool,
+    /// Golden Tart VM to clone.
+    #[arg(long, default_value = "nav-bench-golden")]
+    golden: String,
+}
+
+const RESULT_FILES: [&str; 3] = ["report.txt", "base.jsonl", "new.jsonl"];
+
+/// Guest script for `compare`. Positionals: new commit, base commit, bundle
+/// ref namespace. `fetch` exiting 2 does not stop the run: `compare` reports
+/// every item it could not stage.
+const COMPARE_SCRIPT: &str = r#"set -eu
+if [ -f "$HOME/.cargo/env" ]; then . "$HOME/.cargo/env"; fi
+cd "$HOME"
+new=$1; base=$2; ns=$3
+rm -rf nav out
+git init --quiet nav
+cd nav
+git fetch --quiet ../nav.bundle "refs/$ns/*:refs/$ns/*"
+git checkout --quiet --detach "$new"
+st=0
+cargo xtask benign fetch || st=$?
+case $st in 0|2) ;; *) exit 1 ;; esac
+st=0
+cargo xtask benign compare --base "$base" --out-dir "$HOME/out" || st=$?
+exit $st
+"#;
+
+/// Positional args for [`COMPARE_SCRIPT`] after the `zsh` argv0.
+fn compare_args(new: &str, base: &str) -> Vec<String> {
+    vec![new.to_string(), base.to_string(), REF_NS.to_string()]
 }
 
 #[derive(Args)]
@@ -127,6 +172,7 @@ fn copy_survey(name: &str, dest: &Path) -> Result<()> {
 pub fn run(cmd: VmCommand) -> Result<ExitCode> {
     match cmd {
         VmCommand::Survey(a) => survey(a),
+        VmCommand::Compare(a) => compare(a),
     }
 }
 
@@ -165,6 +211,41 @@ fn boot(golden: &str, secs: u64, keep: bool, out_dir: &Path) -> Result<VmGuard> 
     );
     wait_for_agent(&mut guard)?;
     Ok(guard)
+}
+
+fn compare(a: VmCompareArgs) -> Result<ExitCode> {
+    check_tart()?;
+    check_golden(&a.golden)?;
+    let repo = PathBuf::from(git(Path::new("."), &["rev-parse", "--show-toplevel"])?);
+    if a.base.starts_with("origin/") {
+        git(&repo, &["fetch", "origin"])?;
+    }
+    let secs = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
+    let new = resolve_sha(&repo, &a.branch)?;
+    let base = resolve_sha(&repo, &a.base)?;
+    println!("new: {} ({new})\nbase: {} ({base})", a.branch, a.base);
+    let dirty = !git(&repo, &["status", "--porcelain"])?.is_empty();
+    if dirty && new == resolve_sha(&repo, "HEAD")? {
+        println!("note: working tree is dirty; uncommitted changes are NOT in the VM run");
+    }
+    let (_, out_dir) = resolve_dirs(&repo, None, REF_NS)?;
+    let bundle = out_dir.join("src.bundle");
+    let _bundle_file = TempFile(bundle.clone());
+    make_bundle(&repo, REF_NS, &new, &base, &bundle, secs)?;
+
+    let guard = boot(&a.golden, secs, a.keep, &out_dir)?;
+    let name = guard.name.clone();
+    copy_in(&name, &bundle, "nav.bundle")?;
+    let status = tart()
+        .args(["exec", &name, "/bin/zsh", "-c", COMPARE_SCRIPT, "zsh"])
+        .args(compare_args(&new, &base))
+        .status()
+        .context("spawning tart exec")?;
+    for f in RESULT_FILES {
+        copy_out(&name, f, &out_dir);
+    }
+    println!("results: {}", out_dir.display());
+    Ok(ExitCode::from(map_exit(status.code())))
 }
 
 fn survey(a: SurveyArgs) -> Result<ExitCode> {
@@ -216,6 +297,13 @@ mod tests {
         assert_eq!(guest_args("c", false)[2], "no");
         // User input (script path, golden name) never reaches the guest argv or script text.
         assert!(!GUEST_SCRIPT.contains("xtask-benign-vm"));
+    }
+
+    #[test]
+    fn compare_args_are_fixed() {
+        let (n, b) = ("n".repeat(40), "b".repeat(40));
+        assert_eq!(compare_args(&n, &b), [n, b, REF_NS.to_string()]);
+        assert!(!COMPARE_SCRIPT.contains(REF_NS));
     }
 
     #[test]
