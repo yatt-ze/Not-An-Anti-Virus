@@ -11,6 +11,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use anyhow::{bail, ensure, Context, Result};
 use clap::{Args, Subcommand};
 
+use super::manifest::Manifest;
 use crate::build::{git, resolve_dirs};
 use crate::vm::{
     check_tart, copy_in, make_bundle, map_exit, resolve_sha, tart, vm_name, wait_for_agent,
@@ -124,6 +125,25 @@ fn copy_survey(name: &str, dest: &Path) -> Result<()> {
     std::fs::write(dest, text).with_context(|| dest.display().to_string())
 }
 
+/// Fails if HEAD's manifest has an unrecorded url item: the survey VM would
+/// have to download it, and recording happens in the golden image first.
+fn check_recorded(repo: &Path) -> Result<()> {
+    let spec = "HEAD:crates/nav-core/fixtures/real-world/benign.toml";
+    let manifest = Manifest::parse(&git(repo, &["show", spec])?)?;
+    let missing: Vec<&str> = manifest
+        .items
+        .iter()
+        .filter(|i| !i.recorded())
+        .map(|i| i.id.as_str())
+        .collect();
+    ensure!(
+        missing.is_empty(),
+        "unrecorded manifest items: {}; boot the golden image, run `cargo xtask benign fetch --record` there and commit the rewritten benign.toml",
+        missing.join(", ")
+    );
+    Ok(())
+}
+
 pub fn run(cmd: VmCommand) -> Result<ExitCode> {
     match cmd {
         VmCommand::Survey(a) => survey(a),
@@ -141,6 +161,7 @@ fn survey(a: SurveyArgs) -> Result<ExitCode> {
     let repo = PathBuf::from(git(Path::new("."), &["rev-parse", "--show-toplevel"])?);
     let secs = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
     let commit = resolve_sha(&repo, "HEAD")?;
+    check_recorded(&repo)?;
     println!("commit: HEAD ({commit})");
     if !git(&repo, &["status", "--porcelain"])?.is_empty() {
         println!("note: working tree is dirty; uncommitted changes are NOT in the VM run");
@@ -181,10 +202,20 @@ fn survey(a: SurveyArgs) -> Result<ExitCode> {
         .status()
         .context("spawning tart exec")?;
     let dest = out_dir.join("survey.txt");
-    copy_survey(&name, &dest)
-        .context("survey output discarded; nothing was copied out of the VM")?;
-    println!("results: {}", dest.display());
-    Ok(ExitCode::from(map_exit(status.code())))
+    let guest = map_exit(status.code());
+    match copy_survey(&name, &dest) {
+        Ok(()) => {
+            println!("results: {}", dest.display());
+            Ok(ExitCode::from(guest))
+        }
+        Err(e) => {
+            eprintln!("error: survey output discarded; nothing was copied out of the VM: {e:#}");
+            if guest != 0 {
+                eprintln!("error: the guest run itself exited with status {guest}");
+            }
+            Ok(ExitCode::from(1))
+        }
+    }
 }
 
 #[cfg(test)]
