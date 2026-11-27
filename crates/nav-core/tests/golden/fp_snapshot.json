@@ -37,6 +37,14 @@
     ],
     "completeness": "complete"
   },
+  "benign/admin_filevault_prompt.sh": {
+    "score": 2,
+    "recommendation": "no-action",
+    "rule_ids": [
+      "suspicious-strings"
+    ],
+    "completeness": "complete"
+  },
   "benign/admin_reset_prefs.sh": {
     "score": 0,
     "recommendation": "no-action",
@@ -50,6 +58,12 @@
     "completeness": "complete"
   },
   "benign/app_settings.json": {
+    "score": 0,
+    "recommendation": "no-action",
+    "rule_ids": [],
+    "completeness": "complete"
+  },
+  "benign/browser_profile_paths.txt": {
     "score": 0,
     "recommendation": "no-action",
     "rule_ids": [],
@@ -966,6 +980,14 @@
     "recommendation": "notify",
     "rule_ids": [
       "launchd-persistence-plist"
+    ],
+    "completeness": "complete"
+  },
+  "suspicious/stealer_password_phish.applescript": {
+    "score": 15,
+    "recommendation": "notify",
+    "rule_ids": [
+      "credential-phish"
     ],
     "completeness": "complete"
   },
