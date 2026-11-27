@@ -125,6 +125,11 @@ pub struct ScanContext {
     pub(crate) signer_check_cache: OnceLock<Option<(Option<i32>, String)>>,
     /// Memoized strict Apple-anchor check exit code (§5.2, #106).
     pub(crate) strict_anchor_cache: OnceLock<Option<i32>>,
+    /// Memoized Apple's-own-signature check exit code (§5.2, #305).
+    pub(crate) apple_own_cache: OnceLock<Option<i32>>,
+    /// Memoized `suspicious-strings` scan, shared with `credential-phish`;
+    /// `None` inside: not applicable (§5.2, #305).
+    pub(crate) strings_cache: OnceLock<Option<(crate::rules::StringHits, bool)>>,
     /// Memoized offset-based Mach-O scan (§5.2, #45) — several rules ask
     /// about the same file. `pub(crate)` for the same reason as the caches
     /// above; use [`ScanContext::macho`] to read it.
@@ -267,6 +272,8 @@ impl ScanContext {
             spctl_cache: OnceLock::new(),
             signer_check_cache: OnceLock::new(),
             strict_anchor_cache: OnceLock::new(),
+            apple_own_cache: OnceLock::new(),
+            strings_cache: OnceLock::new(),
             macho_cache: OnceLock::new(),
             zip_cache: OnceLock::new(),
             zip_format_cache: OnceLock::new(),
@@ -498,6 +505,13 @@ impl ScanContext {
     pub fn strict_anchor_check(&self, spawn: impl FnOnce() -> Option<i32>) -> Option<i32> {
         *self
             .strict_anchor_cache
+            .get_or_init(|| self.spawn_if_object_stable(spawn))
+    }
+
+    /// [`Self::strict_anchor_check`] for the `anchor apple` requirement.
+    pub fn apple_own_check(&self, spawn: impl FnOnce() -> Option<i32>) -> Option<i32> {
+        *self
+            .apple_own_cache
             .get_or_init(|| self.spawn_if_object_stable(spawn))
     }
 

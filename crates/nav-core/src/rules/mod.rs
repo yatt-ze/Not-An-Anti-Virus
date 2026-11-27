@@ -8,6 +8,7 @@ use crate::model::{MatchedSignal, SignalCategory};
 
 mod codesign;
 mod container;
+mod credential_phish;
 mod entropy;
 mod macho_structure;
 mod package;
@@ -25,12 +26,14 @@ pub use codesign::{
 pub use container::{
     disk_image_format_of_file, UninspectedContainerRule, UNINSPECTED_CONTAINER_ID,
 };
+pub use credential_phish::CredentialPhishRule;
 pub use entropy::HighEntropyRule;
 pub use macho_structure::MachOStructureRule;
 pub use package::{InstallerScriptRule, UnsignedPackageRule};
 pub use persistence::LaunchdPersistenceRule;
 pub use quarantine_xattr::QuarantineXattrRule;
 pub(crate) use shared_stream::SharedStream;
+pub(crate) use strings::Hits as StringHits;
 pub use strings::SuspiciousStringsRule;
 pub(crate) use zip_member::ZipInspection;
 pub use zip_member::{ZipMemberRule, ZipMemberUnsignedRule};
@@ -93,6 +96,7 @@ pub fn default_ruleset() -> Vec<Box<dyn Rule>> {
     vec![
         Box::new(HighEntropyRule),
         Box::new(SuspiciousStringsRule),
+        Box::new(CredentialPhishRule),
         Box::new(UnsignedBinaryRule),
         Box::new(AdHocSignedRule),
         Box::new(UnanchoredIdentityRule),
@@ -115,5 +119,9 @@ pub fn default_ruleset() -> Vec<Box<dyn Rule>> {
 /// content-only ones. Excludes anything needing a file on disk, and the
 /// package rules — so a `.pkg` in a `.pkg`'s scripts can't loop the scanner.
 pub fn embedded_content_ruleset() -> Vec<Box<dyn Rule>> {
-    vec![Box::new(HighEntropyRule), Box::new(SuspiciousStringsRule)]
+    vec![
+        Box::new(HighEntropyRule),
+        Box::new(SuspiciousStringsRule),
+        Box::new(CredentialPhishRule),
+    ]
 }
