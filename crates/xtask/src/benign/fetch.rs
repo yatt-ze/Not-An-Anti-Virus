@@ -12,6 +12,9 @@ use crate::malware::fetch::{unique_name, Cleanup};
 use crate::malware::hash::file_digest;
 use crate::malware::{Problem, Report};
 
+/// curl's `--max-filesize`: 16 GiB, so a hijacked URL cannot fill the VM disk.
+const MAX_DOWNLOAD: &str = "17179869184";
+
 /// Ref the bundled commit is stored under.
 const PIN_REF: &str = "refs/nav/pin";
 
@@ -78,6 +81,8 @@ fn curl_download(url: &str, dest: &Path) -> Result<(), Problem> {
             "1000",
             "--speed-time",
             "120",
+            "--max-filesize",
+            MAX_DOWNLOAD,
             "--retry",
             "2",
             "-o",
@@ -195,13 +200,25 @@ pub fn check_bundle(bundle: &Path, commit: &str) -> Result<(), Problem> {
     Ok(())
 }
 
+/// Adds the cached file's path to a `Fail`, so the fix (delete it) is obvious.
+fn name_path(r: Result<(), Problem>, path: &Path) -> Result<(), Problem> {
+    r.map_err(|e| match e {
+        Problem::Fail(why) => {
+            Problem::Fail(format!("{why} (delete {} and refetch)", path.display()))
+        }
+        tool => tool,
+    })
+}
+
 /// Hashes the cached `blob` against the item's recorded `sha256` and `bytes`.
 fn check_blob(item: &Item, blob: &Path) -> Result<(), Problem> {
     let m = file_digest(blob)?;
     if Some(&m.sha256) != item.sha256.as_ref() || Some(m.bytes) != item.bytes {
         return Err(Problem::Fail(format!(
-            "cached file is corrupt: {} bytes, sha256 {} does not match the manifest",
-            m.bytes, m.sha256
+            "cached file is corrupt: {} bytes, sha256 {} does not match the manifest (delete {} and refetch)",
+            m.bytes,
+            m.sha256,
+            blob.display()
         )));
     }
     Ok(())
@@ -258,7 +275,7 @@ fn fetch_git(item: &Item, cache: &Path, src: &Sources) -> Result<Done, Problem> 
     );
     let dest = bundle_path(cache, commit);
     if dest.is_file() {
-        check_bundle(&dest, commit)?;
+        name_path(check_bundle(&dest, commit), &dest)?;
         return Ok(Done::Ok);
     }
     let tmp = cache.join("git").join(unique_name("bundle"));
@@ -320,7 +337,7 @@ pub fn verify(items: &[&Item], cache: &Path) -> Result<Summary> {
             (Kind::Git, _, Some(c)) => {
                 let b = bundle_path(cache, c);
                 if b.is_file() {
-                    check_bundle(&b, c)
+                    name_path(check_bundle(&b, c), &b)
                 } else {
                     Err(Problem::Fail("bundle not in the cache".into()))
                 }
@@ -428,6 +445,7 @@ mod tests {
         let (s, calls, _) = run(&t, &text, b"pkg", false);
         assert_eq!((s.report.failed, s.refreshed, calls), (1, 0, 0));
         assert!(s.report.failures[0].1.contains("corrupt"));
+        assert!(s.report.failures[0].1.contains("delete "));
         let m = Manifest::parse(&text).unwrap();
         let v = verify(&m.items.iter().collect::<Vec<_>>(), &t.path().join("cache")).unwrap();
         assert_eq!(v.report.failed, 1);

@@ -7,6 +7,9 @@
 # A url item records `sha256` and `bytes`; a git item pins a full `commit`.
 # New items are added without hashes, then recorded inside the VM with
 # `cargo xtask benign fetch --record` and the rewritten file committed.
+# `benign vm survey` refuses to run while any url item is unrecorded, so do
+# this first: boot the golden image, record there, commit, then survey.
+# To refresh a pinned item, delete its cached blob in the golden first.
 
 [[item]]
 id = "installomator-repo"
