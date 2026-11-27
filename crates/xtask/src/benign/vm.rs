@@ -130,35 +130,27 @@ pub fn run(cmd: VmCommand) -> Result<ExitCode> {
     }
 }
 
-fn survey(a: SurveyArgs) -> Result<ExitCode> {
-    check_tart()?;
-    ensure!(a.script.is_file(), "{} is not a file", a.script.display());
+/// Rejects a golden VM name that `tart` would read as a flag.
+fn check_golden(golden: &str) -> Result<()> {
     ensure!(
-        !a.golden.starts_with('-'),
-        "--golden {:?} looks like a flag",
-        a.golden
+        !golden.starts_with('-'),
+        "--golden {golden:?} looks like a flag"
     );
-    let repo = PathBuf::from(git(Path::new("."), &["rev-parse", "--show-toplevel"])?);
-    let secs = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
-    let commit = resolve_sha(&repo, "HEAD")?;
-    println!("commit: HEAD ({commit})");
-    if !git(&repo, &["status", "--porcelain"])?.is_empty() {
-        println!("note: working tree is dirty; uncommitted changes are NOT in the VM run");
-    }
-    let (_, out_dir) = resolve_dirs(&repo, None, REF_NS)?;
-    let bundle = out_dir.join("src.bundle");
-    let _bundle_file = TempFile(bundle.clone());
-    make_bundle(&repo, REF_NS, &commit, &commit, &bundle, secs)?;
+    Ok(())
+}
 
+/// Clones `golden` as `nav-benign-run-<secs>`, boots it headless (log in
+/// `out_dir/tart-run.log`) and waits for the guest agent.
+fn boot(golden: &str, secs: u64, keep: bool, out_dir: &Path) -> Result<VmGuard> {
     let name = vm_name(VM_PREFIX, secs);
     warn_stale_vms(VM_PREFIX, &name);
-    let st = tart().args(["clone", &a.golden, &name]).status()?;
+    let st = tart().args(["clone", golden, &name]).status()?;
     if !st.success() {
-        bail!("`tart clone {} {name}` failed ({st})", a.golden);
+        bail!("`tart clone {golden} {name}` failed ({st})");
     }
     let mut guard = VmGuard {
         name: name.clone(),
-        keep: a.keep,
+        keep,
         child: None,
     };
     let log = File::create(out_dir.join("tart-run.log"))?;
@@ -172,7 +164,27 @@ fn survey(a: SurveyArgs) -> Result<ExitCode> {
             .context("spawning tart run")?,
     );
     wait_for_agent(&mut guard)?;
+    Ok(guard)
+}
 
+fn survey(a: SurveyArgs) -> Result<ExitCode> {
+    check_tart()?;
+    ensure!(a.script.is_file(), "{} is not a file", a.script.display());
+    check_golden(&a.golden)?;
+    let repo = PathBuf::from(git(Path::new("."), &["rev-parse", "--show-toplevel"])?);
+    let secs = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
+    let commit = resolve_sha(&repo, "HEAD")?;
+    println!("commit: HEAD ({commit})");
+    if !git(&repo, &["status", "--porcelain"])?.is_empty() {
+        println!("note: working tree is dirty; uncommitted changes are NOT in the VM run");
+    }
+    let (_, out_dir) = resolve_dirs(&repo, None, REF_NS)?;
+    let bundle = out_dir.join("src.bundle");
+    let _bundle_file = TempFile(bundle.clone());
+    make_bundle(&repo, REF_NS, &commit, &commit, &bundle, secs)?;
+
+    let guard = boot(&a.golden, secs, a.keep, &out_dir)?;
+    let name = guard.name.clone();
     copy_in(&name, &bundle, "nav.bundle")?;
     copy_in(&name, &a.script, "survey-script")?;
     let status = tart()
@@ -190,6 +202,12 @@ fn survey(a: SurveyArgs) -> Result<ExitCode> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn golden_flag_rejected() {
+        assert!(check_golden("nav-bench-golden").is_ok());
+        assert!(check_golden("--help").is_err());
+    }
 
     #[test]
     fn guest_args_are_fixed() {
