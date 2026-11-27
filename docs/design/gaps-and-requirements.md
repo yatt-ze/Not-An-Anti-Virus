@@ -77,6 +77,22 @@ Each sample's result is the strongest recommendation and the worst completeness 
 
 **Known gaps.** The collection has no Adload, the most common macOS adware family. Only 22 of its ~380 Mach-O files are arm64-only, so the benchmark leans heavily on x86_64 and universal code. Some member names contain CR or newline characters, so tooling must treat paths as opaque bytes.
 
+### 11.1b Benign Survey Set
+
+The §11.1 corpus covers one Mac's apps plus system and Homebrew folders. Rule research also needs benign software that the corpus does not hold but a candidate rule could hit: admin and MDM scripts (`csrutil status`, `chflags hidden`), debuggers and anti-tamper or DRM code (`_ptrace`, `PT_DENY_ATTACH`), password managers and wallets, messaging apps, security agents, VPN and remote-access tools, and current stub and `curl | sh` installers. The benign survey set is a pinned, scripted collection of these. Like §11.1a it is maintainer-only, and `cargo test` must never depend on it.
+
+**Manifest.** `crates/nav-core/fixtures/real-world/benign.toml` lists one entry per item: `id`; `category` (`admin-scripts`, `dev-tools`, `drm`, `credentials`, `messaging`, `security-agent`, `remote-access` or `installer`); `kind` (`dmg`, `pkg`, `zip`, `tar`, `app`, `script` or `git`); and its source. That is either a `url` with the `sha256` and `bytes` recorded when it was added, or for `git` a `repo` and a full `commit`, which git itself verifies. Large items (Office, Adobe Creative Cloud) are included. Apps sold only through the Mac App Store, and agents only available through a vendor's sales process, are out of scope.
+
+**Isolation and cache.** Items are fetched, unpacked and scanned only inside a throwaway clone of the §11.1a golden Tart image, never on the host. The golden image holds the downloads as published at `~/nav-benign-cache/<sha256>`, and git sources as bundles at `~/nav-benign-cache/git/<commit>.bundle`, next to the malware cache; its disk was grown to 128 GB for them. Nothing is executed: no installer runs, and `postinstall` scripts are only read.
+
+**Drift.** Vendor links change. When the cache lacks an item and its `url` now serves different bytes, `fetch` prints `refresh: <id> <old sha256> -> <new sha256>`, leaves the item out, and does not count it as a failure; `fetch --record` accepts the new bytes and rewrites `sha256` and `bytes`. A cached file that no longer matches its recorded hash is corruption, not drift, and fails as in §11.1a.
+
+**Tooling.** `cargo xtask benign fetch` fills the cache from the manifest (taking each item from the cache, or downloading it), and `benign verify` re-hashes the cache without network access. Both refuse to run unless `kern.hv_vmm_present` reports a hypervisor, and exit 0, 2 (an item missing or mismatched, drift excluded) or 1 (tool failure). New items are added by booting the golden image itself, running `fetch --record` there, and committing the rewritten manifest.
+
+`cargo xtask benign vm survey <script> [--with-malware]` runs on the host. It clones the golden image, prepares the set under `~/nav-benign/<id>/` (disk images attached `-readonly -nobrowse -noautoopen`, packages expanded with `pkgutil --expand-full`, `zip` and `tar` items unpacked, git bundles checked out), and runs the maintainer's script as `<script> ~/nav-benign [<malware store>]`, where `--with-malware` also fetches the §11.1a store. Only the script's stdout and stderr come back, to `target/xtask-benign-vm/<unix-seconds>/survey.txt`. Output that is not valid UTF-8 or exceeds 16 MiB is discarded and the run exits 1, so sample bytes cannot reach the host this way. The clone is then deleted.
+
+`cargo xtask benign vm compare` is the benign counterpart of `malware vm`. It sends `--branch` and `--base` as a git bundle, builds both navctl, scans the cached downloads as published (navctl opens disk images and packages itself) and the git checkouts with each, and diffs them with `corpus diff`. The gate is §11.1's benign direction: exit 2 when a file's recommendation or completeness gets worse, a new file is above no-action, or a file goes missing; exit 1 for a tool failure. The baseline is 0 Notify; a rule PR that moves scores reports this result next to `corpus compare`.
+
 ### 11.2 Ruleset Rollback
 
 `navctl rules rollback`, since there's no cloud-based auto-tuning safety net; a bad rule update needs a fast, user-triggerable reversion path.
