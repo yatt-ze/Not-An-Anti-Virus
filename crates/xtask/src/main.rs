@@ -7,6 +7,7 @@
 mod build;
 mod corpus;
 mod malware;
+mod vm;
 
 use std::process::ExitCode;
 
