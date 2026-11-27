@@ -5,6 +5,8 @@ for the current document map. Newest first.
 
 ---
 
+**Changelog from v1.29 (2026-11-27):** `navctl service install` applies the state-directory and install hardening from threat model §7 H and K that had not landed yet (§11.4, §11.10, #247). The config dir `/etc/navd` and state dir `/private/var/db/navd` are now `0700` (were `0755` and `0750`), matching §11.4, and the LaunchDaemon plist sets `Umask` to `077`. Install refuses a pre-existing `/Library/PrivilegedHelperTools` that is a symlink, group- or world-writable, or not root-owned, before it boots out a running daemon. Not done here and filed separately: an ACL check on the installed files (#295) and log rotation (#296). The verdict-store items in §7 H (client-submitted verdicts, cache keys) are already specified in §9.1 and §11.7 and wait for the socket and cache.
+
 **Changelog from v1.28 (2026-11-27):** `navctl service install` checks the `navd` it copies into the root daemon (§11.10, #163). It used to copy whatever file sat beside `navctl` after checking only that it existed. It now follows symlinks to the real file, opens it with `O_NOFOLLOW`, and refuses it unless the open file is regular, not group- or world-writable, and owned by root or the `SUDO_UID` user. It copies from that open file and prints the source path and SHA-256. The state directory `/private/var/db/navd`, which holds `navd`'s logs, is now `0750` instead of `0755`. The limit is stated in §11.10: a swap by code running as the invoking user passes these checks; the published release checksums (#250) and a pinned project signature (#289) are the answers to that.
 
 ---
