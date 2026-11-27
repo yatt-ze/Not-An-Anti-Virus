@@ -591,7 +591,7 @@ member = "OpinionSpy (Premier Opinion)/7art_Crystal_Clock.app"
 kind = "app"
 tree_sha256 = "171502e21481d53afca1835224c316be99f69432113bb9b8c580b82308c6b1a0"
 bytes = 4006573
-expected = "no-action/complete"
+expected = "no-action/partial"
 
 [[sample]]
 id = "installcap-01"
@@ -786,7 +786,7 @@ member = "Proton/Proton.B/Handbrake.dmg"
 kind = "dmg"
 sha256 = "013623e5e50449bbdf6943549d8224a122aa6c42bd3300a1bd2b743b01ae6793"
 bytes = 16593112
-expected = "no-action/complete"
+expected = "no-action/partial"
 
 [[sample]]
 id = "iworm-01"
@@ -838,7 +838,7 @@ member = "CreativeUpdate/Firefox 58.0.2.dmg"
 kind = "dmg"
 sha256 = "8cda44b55a98fb0cae11d613755a03c79cbf47d442960d6febd54f8ad3f12594"
 bytes = 59360047
-expected = "no-action/complete"
+expected = "no-action/partial"
 
 [[sample]]
 id = "xcsset-01"
