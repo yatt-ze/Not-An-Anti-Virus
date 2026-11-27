@@ -197,9 +197,10 @@ const PATTERNS: &[IntentPattern] = &[
 
 /// Which markers and patterns have matched so far.
 #[derive(Clone)]
-pub(super) struct Hits {
+pub(crate) struct Hits {
     markers: Vec<bool>,
     patterns: [bool; PATTERNS.len()],
+    pub(super) phish: super::credential_phish::PhishHits,
 }
 
 impl Hits {
@@ -207,6 +208,7 @@ impl Hits {
         Hits {
             markers: vec![false; MARKERS.len()],
             patterns: [false; PATTERNS.len()],
+            phish: Default::default(),
         }
     }
 }
@@ -782,6 +784,7 @@ fn for_each_line(
 pub(super) fn scan_window(bytes: &[u8], is_first: bool, is_last: bool, hits: &mut Hits) {
     find_needles(bytes, is_last, hits);
     scan_patterns(bytes, is_first, is_last, &mut hits.patterns);
+    super::credential_phish::scan(bytes, &mut hits.phish);
 }
 
 /// Total weight and notes (patterns first, then counted names) for `hits`.
@@ -840,45 +843,19 @@ impl Rule for SuspiciousStringsRule {
         if super::zip_member::scored_through_members(ctx) {
             return Ok(None);
         }
-        let mut hits = Hits::new();
-
-        if streams_truncated(ctx) {
-            let file_len = ctx.file_len.ok_or(RuleOutcome::NotApplicable)?;
-            let ok = match super::shared_stream::shared_stream(ctx) {
-                Some(shared) => {
-                    let (shared_hits, ok) = shared.strings();
-                    hits = shared_hits;
-                    ok
-                }
-                None => {
-                    let mut first = true;
-                    ctx.for_each_window(0..file_len, STREAM_OVERLAP, |window, is_last| {
-                        scan_window(window, first, is_last, &mut hits);
-                        first = false;
-                    })
-                }
-            };
-            if !ok {
-                ctx.mark_incomplete(self.id());
-            }
-            // A stream that failed partway still reported real hits from
-            // before the failure — keep those rather than discard them; a
-            // failure with nothing that scores is NotApplicable, not clean
-            // (a name in a binary scores 0 but could have hidden a pattern).
-            if !ok && score(&hits, ctx).0 == 0 {
-                return Err(RuleOutcome::NotApplicable);
-            }
-        } else {
-            let content = ctx.content.as_ref().ok_or(RuleOutcome::NotApplicable)?;
-            // `ctx.truncated` means `content` stops short of the real end of
-            // input (an embedded/container budget, a file past the stream
-            // cap, or no ranged-read support) — a bounded marker ending
-            // exactly at that cut is inconclusive, not a real end-of-input
-            // match (§10/§11.8).
-            scan_window(content, true, !ctx.truncated, &mut hits);
+        let (hits, ok) = scan_hits(ctx).ok_or(RuleOutcome::NotApplicable)?;
+        if !ok {
+            ctx.mark_incomplete(self.id());
+        }
+        // A stream that failed partway still reported real hits from before
+        // the failure — keep those rather than discard them; a failure with
+        // nothing that scores is NotApplicable, not clean (a name in a binary
+        // scores 0 but could have hidden a pattern).
+        if !ok && score(hits, ctx).0 == 0 {
+            return Err(RuleOutcome::NotApplicable);
         }
 
-        let (weight, notes) = score(&hits, ctx);
+        let (weight, notes) = score(hits, ctx);
         if weight == 0 {
             return Ok(None);
         }
@@ -901,11 +878,48 @@ impl Rule for SuspiciousStringsRule {
     }
 }
 
+/// The memoized scan of `ctx` for markers, patterns and credential-phish
+/// needles, with whether all of the file was covered; `None` when the content
+/// or length is unavailable. Shared by `suspicious-strings` and
+/// `credential-phish` so the file is read once.
+pub(super) fn scan_hits(ctx: &ScanContext) -> Option<&(Hits, bool)> {
+    ctx.strings_cache.get_or_init(|| run_scan(ctx)).as_ref()
+}
+
+fn run_scan(ctx: &ScanContext) -> Option<(Hits, bool)> {
+    let mut hits = Hits::new();
+    if streams_truncated(ctx) {
+        let file_len = ctx.file_len?;
+        let ok = match super::shared_stream::shared_stream(ctx) {
+            Some(shared) => {
+                let (shared_hits, ok) = shared.strings();
+                hits = shared_hits;
+                ok
+            }
+            None => {
+                let mut first = true;
+                ctx.for_each_window(0..file_len, STREAM_OVERLAP, |window, is_last| {
+                    scan_window(window, first, is_last, &mut hits);
+                    first = false;
+                })
+            }
+        };
+        Some((hits, ok))
+    } else {
+        let content = ctx.content.as_ref()?;
+        // `ctx.truncated` means `content` stops short of the real end of
+        // input — a bounded marker ending exactly at that cut is
+        // inconclusive, not a real end-of-input match (§10/§11.8).
+        scan_window(content, true, !ctx.truncated, &mut hits);
+        Some((hits, true))
+    }
+}
+
 /// Whether `evaluate` can stream `ctx` past the prefix at all: ranged reads
 /// are actually possible, and the file is within the streaming cap.
 /// Separate from `covers_truncation`, which also requires that a stream
 /// actually attempted didn't fail.
-fn can_stream(ctx: &ScanContext) -> bool {
+pub(super) fn can_stream(ctx: &ScanContext) -> bool {
     ctx.supports_ranged_reads() && ctx.file_len.is_some_and(|len| len <= MAX_STREAM_BYTES)
 }
 

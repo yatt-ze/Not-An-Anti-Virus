@@ -1,0 +1,6 @@
+Profile files a browser reads, listed for documentation. No password prompt here.
+~/Library/Application Support/Google/Chrome/Default/Login Data
+~/Library/Application Support/Firefox/Profiles/x/logins.json
+~/Library/Application Support/Firefox/Profiles/x/key4.db
+~/Library/Keychains/login.keychain-db
+Chrome Safe Storage

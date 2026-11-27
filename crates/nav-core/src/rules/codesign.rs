@@ -797,6 +797,46 @@ pub(super) fn verifies_apple_anchor(ctx: &ScanContext, rule_id: &'static str) ->
     }
 }
 
+/// Requirement text for any Apple-anchored signature, Developer ID included.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))] // only the macOS spawns use it
+const APPLE_GENERIC: &str = "anchor apple generic";
+
+/// Requirement text for Apple's own signature only (no Developer ID).
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))] // only the macOS spawns use it
+const APPLE_OWN: &str = "anchor apple";
+
+/// Whether `codesign --verify --strict --all-architectures -R="anchor apple"`
+/// accepts the scanned file: every slice is signed by Apple itself, not a
+/// Developer ID. Memoized per scan. `NotVerified` for embedded content, off
+/// macOS, a swapped object, a spawn failure or any verification failure;
+/// `Skipped` when the byte allowance can't cover the tool (§5.2, #305).
+pub(super) fn apple_own_check(ctx: &ScanContext) -> AnchorCheck {
+    if ctx.source != crate::context::ContentSource::File {
+        return AnchorCheck::NotVerified;
+    }
+    if !ctx.tool_allowed() {
+        return AnchorCheck::Skipped;
+    }
+    match ctx.apple_own_check(|| spawn_apple_own_check(&ctx.path)) {
+        Some(0) => AnchorCheck::Verified,
+        _ => AnchorCheck::NotVerified,
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn spawn_apple_own_check(path: &std::path::Path) -> Option<i32> {
+    anchor_exit_code(run_anchor_verify(
+        &["--strict", "--all-architectures"],
+        APPLE_OWN,
+        path,
+    ))
+}
+
+#[cfg(not(target_os = "macos"))]
+fn spawn_apple_own_check(_path: &std::path::Path) -> Option<i32> {
+    None
+}
+
 /// Whole signature, including the bundle seal, must verify. Used only to lower weights.
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))] // only the macOS spawns use it
 const STRICT_ANCHOR_FLAGS: &[&str] = &["--strict"];
@@ -810,18 +850,23 @@ const SIGNER_ANCHOR_FLAGS: &[&str] = &["--ignore-resources", "--all-architecture
 /// `None` if it was killed by a signal or failed to spawn.
 /// Runs `codesign --verify <flags> -R="anchor apple generic" <path>`.
 #[cfg(target_os = "macos")]
-fn run_anchor_verify(flags: &[&str], path: &std::path::Path) -> Option<Captured> {
+fn run_anchor_verify(
+    flags: &[&str],
+    requirement: &str,
+    path: &std::path::Path,
+) -> Option<Captured> {
     let arg = process::path_arg(path);
     let mut args: Vec<&OsStr> = vec!["--verify".as_ref()];
     args.extend(flags.iter().map(OsStr::new));
-    args.push("-R=anchor apple generic".as_ref());
+    let requirement = format!("-R={requirement}");
+    args.push(requirement.as_ref());
     args.push(arg.as_os_str());
     run_tool(CODESIGN, &args)
 }
 
 #[cfg(target_os = "macos")]
 fn spawn_strict_anchor_check(path: &std::path::Path) -> Option<i32> {
-    anchor_exit_code(run_anchor_verify(STRICT_ANCHOR_FLAGS, path))
+    anchor_exit_code(run_anchor_verify(STRICT_ANCHOR_FLAGS, APPLE_GENERIC, path))
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -834,7 +879,7 @@ fn spawn_strict_anchor_check(_path: &std::path::Path) -> Option<i32> {
 /// if it failed to spawn.
 #[cfg(target_os = "macos")]
 fn spawn_signer_check(path: &std::path::Path) -> Option<(Option<i32>, String)> {
-    signer_report(run_anchor_verify(SIGNER_ANCHOR_FLAGS, path))
+    signer_report(run_anchor_verify(SIGNER_ANCHOR_FLAGS, APPLE_GENERIC, path))
 }
 
 #[cfg(not(target_os = "macos"))]

@@ -110,7 +110,7 @@ member = "KoiStealer/VisualStudioHelper"
 kind = "macho"
 sha256 = "adde2970b40634e91b9ef8520f8e50eaa7901a65f9230e65d7995ac1a47700ef"
 bytes = 5636672
-expected = "no-action/complete"
+expected = "notify/complete"
 
 [[sample]]
 id = "mac-c-01"
@@ -279,7 +279,7 @@ member = "Cthulhu/CleanMyMac.dmg"
 kind = "dmg"
 sha256 = "96f80fef3323e5bc0ce067cd7a93b9739174e29f786b09357125550a033b0288"
 bytes = 21660330
-expected = "no-action/complete"
+expected = "notify/complete"
 
 [[sample]]
 id = "cointhief-01"
@@ -370,7 +370,7 @@ member = "Banshee/banshee"
 kind = "macho"
 sha256 = "11aa6eeca2547fcf807129787bec0d576de1a29b56945c5a8fb16ed8bf68f782"
 bytes = 920200
-expected = "no-action/complete"
+expected = "notify/complete"
 
 [[sample]]
 id = "crashstealer-02"
@@ -422,7 +422,7 @@ member = "Mac.c/stealer.scpt"
 kind = "source"
 sha256 = "393acc8ef94ab8ba0abf7a769e451d5434d4acdbda0b60966bfac4b40e4d6875"
 bytes = 16308
-expected = "no-action/complete"
+expected = "notify/complete"
 
 [[sample]]
 id = "macstealer-02"
