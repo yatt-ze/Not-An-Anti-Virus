@@ -221,6 +221,7 @@ impl SystemOps for FakeSystemOps {
 
     fn bootstrap(&self, plist: &Path) -> Result<()> {
         self.record(Call::Bootstrap(plist.to_path_buf()));
+        self.lag_left.set(0);
         self.loaded.set(true);
         Ok(())
     }
