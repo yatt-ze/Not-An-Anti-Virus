@@ -17,6 +17,10 @@ use nav_core::process::{path_arg, run_capped, Captured};
 use nav_core::{plist, scan_target_with_budget, PlistValue, ScanBudget, TargetScan};
 
 const HDIUTIL: &str = "/usr/bin/hdiutil";
+#[cfg(target_os = "macos")]
+const DISKUTIL: &str = "/usr/sbin/diskutil";
+/// EFI slices navctl mounts per image; each costs up to a diskutil timeout.
+const MAX_EFI_MOUNTS: usize = 1;
 
 /// Largest image file navctl mounts.
 pub const MAX_IMAGE_BYTES: u64 = 16 * 1024 * 1024 * 1024;
@@ -276,6 +280,27 @@ fn scan_clone(
             "volume {n} was not mounted read-only, nosuid and nodev, so it was not scanned"
         ));
     }
+    let mut outcomes = Vec::new();
+    for (i, (n, dev)) in entities.efi.iter().enumerate() {
+        if i >= MAX_EFI_MOUNTS {
+            outcomes.push((
+                *n,
+                Err(format!(
+                    "only {MAX_EFI_MOUNTS} EFI system partition is mounted per image"
+                )),
+            ));
+            continue;
+        }
+        if cancelled() {
+            return Err("interrupted".into());
+        }
+        outcomes.push((*n, mount_efi(*n, dev, &mounts)?));
+        if cancelled() {
+            return Err("interrupted".into());
+        }
+    }
+    let candidates = entities.candidates;
+    let (volumes, mut gaps) = merge_efi(entities, outcomes);
 
     // Volumes sit one level below `mounts`, so their contents keep the
     // caller's depth limit.
@@ -285,14 +310,94 @@ fn scan_clone(
     };
     let mut scan = scan_target_with_budget(&mounts, true, &walk_budget)
         .map_err(|e| format!("cannot read the mounted volume: {e}"))?;
-    relabel(&mut scan, label, &entities.volumes, entities.candidates > 1);
-    let mut gaps = entities.gaps;
-    gaps.extend(vanished(&entities.volumes, is_mount_point));
+    relabel(&mut scan, label, &volumes, candidates > 1);
+    gaps.extend(vanished(&volumes, is_mount_point));
     Ok(ImageReport {
         scan,
-        volumes: entities.volumes.len(),
+        volumes: volumes.len(),
         gaps,
     })
+}
+
+/// `attached`'s volumes and gaps with the EFI mount `outcomes` (volume
+/// number, then mount point or why not) merged in, both in number order.
+fn merge_efi(
+    attached: Attached,
+    outcomes: Vec<(usize, Result<PathBuf, String>)>,
+) -> (Vec<(usize, PathBuf)>, Vec<String>) {
+    let (mut volumes, mut gaps) = (attached.volumes, attached.gaps);
+    for (n, outcome) in outcomes {
+        match outcome {
+            Ok(mp) => volumes.push((n, mp)),
+            Err(why) => gaps.push((n, format!("{}: {why}", efi_gap(n)))),
+        }
+    }
+    volumes.sort_by_key(|(n, _)| *n);
+    gaps.sort_by_key(|(n, _)| *n);
+    (volumes, gaps.into_iter().map(|(_, g)| g).collect())
+}
+
+/// Mounts EFI slice `dev` (volume `n`) at `mounts/efi.<random>` through
+/// `diskutil` (§6.2). `Ok(Ok(mount point))` once [`locked_down`];
+/// `Ok(Err(why))` if it did not mount or was unmounted again; `Err` if a
+/// rejected mount could not be removed.
+#[cfg(target_os = "macos")]
+fn mount_efi(n: usize, dev: &str, mounts: &Path) -> Result<Result<PathBuf, String>, String> {
+    let made = random_hex().map(|r| mounts.join(format!("efi.{r}")));
+    let Ok(mp) = made.and_then(|mp| {
+        std::fs::DirBuilder::new().mode(0o700).create(&mp)?;
+        Ok(mp)
+    }) else {
+        return Ok(Err("could not create its mount point".into()));
+    };
+    let args = [
+        os("mount"),
+        os("readOnly"),
+        os("-mountOptions"),
+        os("ro,nosuid,nodev,nobrowse"),
+        os("-mountPoint"),
+        mp.as_os_str(),
+        os(dev),
+    ];
+    // Killing a hung diskutil is safe: removing `mp` below stops a late
+    // mount from landing there.
+    let why = match run_capped(DISKUTIL, &args, QUERY_TIMEOUT, Some(&CANCEL)) {
+        Err(e) => format!("diskutil: {e}"),
+        Ok(o) if o.timed_out => format!("diskutil timed out after {} s", QUERY_TIMEOUT.as_secs()),
+        Ok(o) if !o.success() => format!("diskutil failed: {}", diskutil_error(&o)),
+        Ok(_) if !is_mount_point(&mp) => "diskutil reported a mount that is not there".into(),
+        Ok(_) if !locked_down(&mp) => "it was mounted without read-only, nosuid and nodev".into(),
+        Ok(_) => return Ok(Ok(mp)),
+    };
+    if is_mount_point(&mp) {
+        let unmount = [os("unmount"), os("force"), mp.as_os_str()];
+        let _ = run_capped(DISKUTIL, &unmount, QUERY_TIMEOUT, None);
+    }
+    match std::fs::remove_dir(&mp) {
+        Ok(()) => Ok(Err(why)),
+        Err(e) => Err(format!(
+            "volume {n} (EFI system partition): {why}, and could not be unmounted: {e}"
+        )),
+    }
+}
+
+/// diskutil's first non-empty line of stderr, else of stdout, where it
+/// often reports a failed mount.
+#[cfg(target_os = "macos")]
+fn diskutil_error(out: &Captured) -> String {
+    [&out.stderr, &out.stdout]
+        .iter()
+        .find_map(|b| {
+            let text = String::from_utf8_lossy(b);
+            let line = text.lines().map(str::trim).find(|l| !l.is_empty())?;
+            Some(line.to_string())
+        })
+        .unwrap_or_else(|| "no reason given".into())
+}
+
+#[cfg(not(target_os = "macos"))]
+fn mount_efi(_: usize, _: &str, _: &Path) -> Result<Result<PathBuf, String>, String> {
+    Ok(Err("not macOS".into()))
 }
 
 /// A gap for each of `volumes` no longer mounted where the attach put it.
@@ -437,7 +542,11 @@ struct Attached {
     volumes: Vec<(usize, PathBuf)>,
     /// Entities that are or should have been volumes, mounted or not.
     candidates: usize,
-    gaps: Vec<String>,
+    /// By volume number.
+    gaps: Vec<(usize, String)>,
+    /// Unmounted EFI slices of the image's disk to mount, by number and
+    /// `dev-entry`; each is a gap unless it mounts.
+    efi: Vec<(usize, String)>,
 }
 
 /// Sort key for a `dev-entry`: `(disk, slice)` for `/dev/diskN` (slice 0)
@@ -476,7 +585,9 @@ fn parse_attach(plist: &PlistValue, run: &Path) -> Attached {
         .get("system-entities")
         .and_then(PlistValue::as_array)
         .unwrap_or_default();
+    let disk = whole_disk(entities);
     for e in in_slice_order(entities) {
+        let dev = e.get("dev-entry").and_then(PlistValue::as_str);
         let mountable = e.get("potentially-mountable").and_then(PlistValue::as_bool);
         // Every candidate takes a number, mounted or not, so a failed
         // mount does not renumber the others.
@@ -486,28 +597,40 @@ fn parse_attach(plist: &PlistValue, run: &Path) -> Attached {
                 if Path::new(mp).starts_with(run) {
                     out.volumes.push((out.candidates, PathBuf::from(mp)));
                 } else {
-                    out.gaps.push(format!(
-                        "volume {} was mounted outside the scratch directory and not scanned",
-                        out.candidates
+                    let n = out.candidates;
+                    out.gaps.push((
+                        n,
+                        format!(
+                            "volume {n} was mounted outside the scratch directory and not scanned"
+                        ),
                     ));
                 }
             }
             None if mountable == Some(true) => {
                 out.candidates += 1;
-                out.gaps.push(if is_efi(e) {
-                    // `-nobrowse` never mounts it (#299).
-                    format!(
-                        "volume {} (EFI system partition) was not mounted",
-                        out.candidates
-                    )
-                } else {
-                    format!("volume {} on the image did not mount", out.candidates)
-                })
+                let n = out.candidates;
+                // `-nobrowse` never mounts an EFI slice (#299).
+                match dev.filter(|d| is_efi(e) && is_slice_of(d, disk.as_deref())) {
+                    Some(d) => out.efi.push((n, d.to_string())),
+                    None if is_efi(e) => out.gaps.push((n, efi_gap(n))),
+                    None => out
+                        .gaps
+                        .push((n, format!("volume {n} on the image did not mount"))),
+                }
             }
             None => {}
         }
     }
     out
+}
+
+fn efi_gap(n: usize) -> String {
+    format!("volume {n} (EFI system partition) was not mounted")
+}
+
+/// Whether `dev` is a slice `/dev/diskNsM` of whole disk `disk`.
+fn is_slice_of(dev: &str, disk: Option<&str>) -> bool {
+    disk_of(dev).is_some_and(|d| d != dev && Some(d.as_str()) == disk)
 }
 
 /// GPT type GUID of an EFI system partition.
@@ -614,10 +737,7 @@ fn user_temp_dir() -> io::Result<PathBuf> {
 /// mount directory, and the lock that marks it live. The run owns the
 /// directory while it holds the returned lock file.
 fn create_run_dir(root: &Path) -> io::Result<(PathBuf, File)> {
-    let mut rand = [0u8; 8];
-    File::open("/dev/urandom")?.read_exact(&mut rand)?;
-    let name = format!("{}-{:016x}", std::process::id(), u64::from_ne_bytes(rand));
-    let dir = root.join(name);
+    let dir = root.join(format!("{}-{}", std::process::id(), random_hex()?));
     std::fs::DirBuilder::new().mode(0o700).create(&dir)?;
     match lock_run_dir(&dir) {
         Ok(lock) => Ok((dir, lock)),
@@ -626,6 +746,13 @@ fn create_run_dir(root: &Path) -> io::Result<(PathBuf, File)> {
             Err(e)
         }
     }
+}
+
+/// 16 random hex digits from `/dev/urandom`.
+fn random_hex() -> io::Result<String> {
+    let mut rand = [0u8; 8];
+    File::open("/dev/urandom")?.read_exact(&mut rand)?;
+    Ok(format!("{:016x}", u64::from_ne_bytes(rand)))
 }
 
 /// Creates `dir`'s lock file, locked, and its mount directory. The lock is
@@ -1132,16 +1259,26 @@ mod tests {
         assert_eq!(got.gaps.len(), 2, "{:?}", got.gaps);
     }
 
-    /// An unmounted EFI slice is still a gap, named as such (#299).
-    #[test]
-    fn efi_slice_gap_named() {
-        let efi = |hint: (&str, &str)| {
-            let PlistValue::Dict(mut e) = entity("/dev/disk6s1", None, true) else {
-                unreachable!()
-            };
-            e.push((hint.0.into(), PlistValue::String(hint.1.into())));
-            PlistValue::Dict(e)
+    fn attach_efi(dev: &str, hint: (&str, &str)) -> Attached {
+        let PlistValue::Dict(mut efi) = entity(dev, None, true) else {
+            unreachable!()
         };
+        efi.push((hint.0.into(), PlistValue::String(hint.1.into())));
+        let plist = dict(vec![(
+            "system-entities",
+            PlistValue::Array(vec![
+                entity("/dev/disk6", None, false),
+                PlistValue::Dict(efi),
+                entity("/dev/disk6s2", Some("/s/1-ab/dmg.A"), true),
+            ]),
+        )]);
+        parse_attach(&plist, Path::new("/s/1-ab"))
+    }
+
+    /// An unmounted EFI slice of the image's disk is queued to mount and
+    /// keeps its number; its gap is added only if that fails (#300).
+    #[test]
+    fn efi_slice_queued() {
         for hint in [
             ("content-hint", "EFI"),
             (
@@ -1149,20 +1286,67 @@ mod tests {
                 "c12a7328-f81f-11d2-ba4b-00a0c93ec93b",
             ),
         ] {
-            let plist = dict(vec![(
-                "system-entities",
-                PlistValue::Array(vec![
-                    efi(hint),
-                    entity("/dev/disk7s1", Some("/s/1-ab/dmg.A"), true),
-                ]),
-            )]);
-            let got = parse_attach(&plist, Path::new("/s/1-ab"));
+            let got = attach_efi("/dev/disk6s1", hint);
+            assert_eq!(got.efi, vec![(1, "/dev/disk6s1".to_string())]);
             assert_eq!(got.volumes, vec![(2, PathBuf::from("/s/1-ab/dmg.A"))]);
-            assert_eq!(
-                got.gaps,
-                vec!["volume 1 (EFI system partition) was not mounted".to_string()]
+            assert!(got.gaps.is_empty(), "{:?}", got.gaps);
+        }
+        assert_eq!(
+            efi_gap(1),
+            "volume 1 (EFI system partition) was not mounted"
+        );
+    }
+
+    /// An EFI entity whose `dev-entry` is not a slice of the image's disk is
+    /// never handed to diskutil and stays the named gap (#299).
+    #[test]
+    fn odd_efi_dev_gap() {
+        for dev in [
+            "/dev/disk9s1",
+            "/dev/disk6",
+            "/dev/disk6s",
+            "/dev/disk6s1x",
+            "/dev/rdisk6s1",
+        ] {
+            let got = attach_efi(dev, ("content-hint", "EFI"));
+            assert!(got.efi.is_empty(), "{dev}");
+            assert_eq!(got.gaps.len(), 1, "{dev}");
+            assert!(
+                got.gaps[0]
+                    .1
+                    .ends_with("(EFI system partition) was not mounted"),
+                "{dev}: {:?}",
+                got.gaps
             );
         }
+    }
+
+    /// A mounted EFI slice joins the volumes and a failed one adds a gap with
+    /// its reason, each in volume-number order.
+    #[test]
+    fn efi_merge_ordered() {
+        let attached = Attached {
+            volumes: vec![(3, PathBuf::from("/s/c"))],
+            candidates: 4,
+            gaps: vec![(2, "volume 2 on the image did not mount".into())],
+            efi: vec![],
+        };
+        let outcomes = vec![
+            (4, Ok(PathBuf::from("/s/efi.d"))),
+            (1, Err("diskutil timed out".into())),
+        ];
+        let (volumes, gaps) = merge_efi(attached, outcomes);
+        assert_eq!(
+            volumes,
+            vec![(3, PathBuf::from("/s/c")), (4, PathBuf::from("/s/efi.d"))]
+        );
+        assert_eq!(
+            gaps,
+            vec![
+                "volume 1 (EFI system partition) was not mounted: diskutil timed out".to_string(),
+                "volume 2 on the image did not mount".to_string(),
+            ]
+        );
     }
 
     fn numbers(listing: &[PlistValue]) -> Attached {
