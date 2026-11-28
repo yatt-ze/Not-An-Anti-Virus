@@ -149,6 +149,7 @@ fn is_root() -> bool {
 struct Env {
     root: bool,
     uid: Option<u32>,
+    gid: Option<u32>,
     home: PathBuf,
     home_canon: PathBuf,
     layout: Layout,
@@ -202,44 +203,78 @@ impl Env {
     }
 }
 
-/// The user behind `sudo`: `SUDO_UID` resolved through the password database.
-fn sudo_user() -> Result<(u32, PathBuf), String> {
+/// The user behind `sudo` as (uid, gid, home): `SUDO_UID` resolved through
+/// the password database.
+fn sudo_user() -> Result<(u32, u32, PathBuf), String> {
     let uid: u32 = std::env::var("SUDO_UID")
         .ok()
         .and_then(|v| v.parse().ok())
         .filter(|u| *u != 0)
         .ok_or("SUDO_UID is missing or invalid, so NAV can't tell whose files to remove")?;
-    let dir = {
-        #[cfg(debug_assertions)]
-        let over = std::env::var_os("NAV_TEST_SUDO_HOME").map(PathBuf::from);
-        #[cfg(not(debug_assertions))]
-        let over: Option<PathBuf> = None;
-        match over {
-            Some(d) => d,
-            None => {
-                // SAFETY: getpwuid returns null or a pointer into static
-                // storage; read before any other passwd call, one thread.
-                let pw = unsafe { libc::getpwuid(uid) };
-                if pw.is_null() {
-                    return Err(format!("SUDO_UID {uid} is not a known user"));
-                }
-                // SAFETY: pw_dir of a non-null passwd is a NUL-terminated string.
-                let d = unsafe { std::ffi::CStr::from_ptr((*pw).pw_dir) };
-                PathBuf::from(std::ffi::OsStr::from_bytes(d.to_bytes()))
+    #[cfg(debug_assertions)]
+    let over = std::env::var_os("NAV_TEST_SUDO_HOME").map(PathBuf::from);
+    #[cfg(not(debug_assertions))]
+    let over: Option<PathBuf> = None;
+    let (gid, dir) = match over {
+        // SAFETY: getgid takes no arguments and never fails.
+        Some(d) => (unsafe { libc::getgid() }, d),
+        None => {
+            // SAFETY: getpwuid returns null or a pointer into static
+            // storage; read before any other passwd call, one thread.
+            let pw = unsafe { libc::getpwuid(uid) };
+            if pw.is_null() {
+                return Err(format!("SUDO_UID {uid} is not a known user"));
             }
+            // SAFETY: pw is non-null; pw_dir is a NUL-terminated string.
+            let (gid, d) = unsafe { ((*pw).pw_gid, std::ffi::CStr::from_ptr((*pw).pw_dir)) };
+            (
+                gid,
+                PathBuf::from(std::ffi::OsStr::from_bytes(d.to_bytes())),
+            )
         }
     };
     if !dir.is_absolute() {
         return Err(format!("SUDO_UID {uid} has no usable home directory"));
     }
-    Ok((uid, dir))
+    Ok((uid, gid, dir))
+}
+
+/// Under real root, permanently becomes the sudo user, so the home-directory
+/// steps can't be redirected (swapped symlinks) to anything that user
+/// couldn't already change. A no-op otherwise.
+fn drop_to_user(env: &Env, exe: &Path) -> Result<(), Failure> {
+    let (Some(uid), Some(gid)) = (env.uid, env.gid) else {
+        return Ok(());
+    };
+    if !crate::service::is_root() {
+        return Ok(());
+    }
+    // SAFETY: plain credential syscalls on a one-element array; order is
+    // groups, gid, then uid, since setuid gives up the right to the others.
+    let ok = unsafe {
+        libc::setgroups(1, &gid) == 0
+            && libc::setgid(gid) == 0
+            && libc::setuid(uid) == 0
+            && libc::geteuid() == uid
+    };
+    if ok {
+        return Ok(());
+    }
+    Err(Failure::new(
+        format!(
+            "could not switch to your user: {}",
+            std::io::Error::last_os_error()
+        ),
+        "Your files were left in place. Finish without sudo:",
+    )
+    .cmd(format!("{} uninstall", env.shell_arg(exe))))
 }
 
 fn resolve_env(exe: &Path) -> Result<Env, Failure> {
     let root = is_root();
-    let (uid, home) = if root {
+    let (uid, gid, home) = if root {
         match sudo_user() {
-            Ok((u, h)) => (Some(u), h),
+            Ok((u, g, h)) => (Some(u), Some(g), h),
             Err(m) => {
                 return Err(
                     Failure::new(m, "Run it through sudo from your own account:").cmd(format!(
@@ -251,7 +286,7 @@ fn resolve_env(exe: &Path) -> Result<Env, Failure> {
         }
     } else {
         match std::env::var_os("HOME").map(PathBuf::from) {
-            Some(h) if h.is_absolute() => (None, h),
+            Some(h) if h.is_absolute() => (None, None, h),
             _ => {
                 return Err(Failure::new(
                     "HOME is not set to an absolute path",
@@ -273,6 +308,7 @@ fn resolve_env(exe: &Path) -> Result<Env, Failure> {
     Ok(Env {
         root,
         uid,
+        gid,
         home,
         home_canon,
         layout,
@@ -527,9 +563,6 @@ fn rewrite(path: &Path, data: &[u8], meta: &fs::Metadata) -> std::io::Result<()>
             .open(&tmp)?;
         f.write_all(data)?;
         f.set_permissions(fs::Permissions::from_mode(meta.mode() & 0o7777))?;
-        if crate::service::is_root() {
-            std::os::unix::fs::chown(&tmp, Some(meta.uid()), Some(meta.gid()))?;
-        }
         f.sync_all()?;
         fs::rename(&tmp, path)
     })();
@@ -614,7 +647,7 @@ fn remove_path_block(env: &Env, ui: &Ui, r: &Receipt) -> Result<(), Failure> {
 fn path_failure(shown: &str, why: &str) -> Failure {
     Failure::new(
         format!("could not update {shown}: {}", san(why)),
-        "The install receipt was kept. Delete the NAV marker line and the line after it yourself.",
+        "navctl was removed; the install receipt was kept. Delete the NAV marker line and the line after it yourself.",
     )
 }
 
@@ -711,8 +744,12 @@ fn package_hint(env: &Env, exe: &Path) -> (String, Option<String>) {
 }
 
 fn execute(ui: &Ui) -> Result<(), Failure> {
-    let exe_raw = std::env::current_exe()
-        .map_err(|e| Failure::new(format!("cannot locate navctl: {}", san(&e.to_string())), ""))?;
+    let exe_raw = std::env::current_exe().map_err(|e| {
+        Failure::new(
+            format!("cannot locate navctl: {}", san(&e.to_string())),
+            "Nothing was removed. Rerun it by its full path.",
+        )
+    })?;
     let exe = fs::canonicalize(&exe_raw).unwrap_or(exe_raw);
     let env = resolve_env(&exe)?;
     let ops = env.ops();
@@ -743,6 +780,7 @@ fn execute(ui: &Ui) -> Result<(), Failure> {
         ui.step("Removed the navd service");
         ui.detail("Full Disk Access grant reset is best-effort; check System Settings.");
     }
+    drop_to_user(&env, &exe)?;
 
     let ReceiptState::Found(r) = &receipt else {
         return unmanaged(ui, &env, &exe, present, &receipt);
@@ -860,6 +898,24 @@ mod tests {
         };
         assert_eq!(plain.cmd("a b"), "a b");
         assert_eq!(Ui::paint(false, "1", "x"), "x");
+    }
+
+    #[test]
+    fn drop_noop_unprivileged() {
+        // SAFETY: getuid/getgid take no arguments and never fail.
+        let (uid, gid) = unsafe { (libc::getuid(), libc::getgid()) };
+        let env = Env {
+            root: true,
+            uid: Some(uid),
+            gid: Some(gid),
+            home: PathBuf::from("/h"),
+            home_canon: PathBuf::from("/h"),
+            layout: Layout::under("/nonexistent"),
+            fake_service: true,
+        };
+        if !crate::service::is_root() {
+            assert!(drop_to_user(&env, Path::new("/x/navctl")).is_ok());
+        }
     }
 
     #[test]

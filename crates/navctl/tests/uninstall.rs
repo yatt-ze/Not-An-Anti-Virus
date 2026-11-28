@@ -638,7 +638,7 @@ fn path_failure() {
         "{}",
         err(&o)
     );
-    assert!(err(&o).contains("The install receipt was kept."));
+    assert!(err(&o).contains("navctl was removed; the install receipt was kept."));
     assert!(!fx.navctl().exists() && fx.receipt().exists());
     assert!(fx.zshrc_text().contains(MARKER));
 }

@@ -5,7 +5,7 @@ for the current document map. Newest first.
 
 ---
 
-**Changelog from v1.42 (2026-11-29):** §8, §11.5: `navctl uninstall` implemented (#250). The unspecified cases are decided conservatively. With no receipt, an unreadable one, or one naming another binary, only the service is removed and the package manager's command is printed. The PATH startup file is edited only if it is a plain, user-owned `.zshrc` or `.bash_profile` inside the home, and the export line is matched after resolving symlinks in the directory it names. A failed PATH edit keeps the receipt. Deliberately keeping a PATH line exits `0`; any failure exits `4`, so no new exit code.
+**Changelog from v1.42 (2026-11-29):** §8, §11.5: `navctl uninstall` implemented (#250). The unspecified cases are decided conservatively. With no receipt, an unreadable one, or one naming another binary, only the service is removed and the package manager's command is printed. The PATH startup file is edited only if it is a plain, user-owned `.zshrc` or `.bash_profile` inside the home, and the export line is matched after resolving symlinks in the directory it names. A failed PATH edit keeps the receipt. Deliberately keeping a PATH line exits `0`; any failure exits `4`, so no new exit code. Under `sudo`, everything after the service step runs as the invoking user (setgroups, setgid, setuid), because the home is writable by anything running as that user, and root path operations there could be redirected by a swapped symlink.
 
 ---
 
