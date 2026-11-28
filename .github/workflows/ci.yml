@@ -2,8 +2,9 @@
 #   cargo fmt --all -- --check
 #   cargo clippy --workspace --all-targets -- -D warnings
 #   cargo test --workspace
-# plus a build of the nightly-only fuzz targets (crates/nav-core/fuzz is a
-# separate workspace by design, so it is not covered by --workspace), a
+# plus fmt, clippy and a build of the nightly-only fuzz targets
+# (crates/nav-core/fuzz is a separate workspace by design, so it is not
+# covered by --all/--workspace), a
 # supply-chain advisory-DB check (§11, NAV-017), and cargo xtask verify
 # --fake (install/uninstall/residue orchestration, §11.10) on both runners.
 name: CI
@@ -145,9 +146,14 @@ jobs:
         with:
           toolchain: ${{ env.FUZZ_TOOLCHAIN }}
           targets: x86_64-unknown-linux-gnu
+          components: rustfmt, clippy
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           workspaces: crates/nav-core/fuzz
+      - run: cargo fmt -- --check
+        working-directory: crates/nav-core/fuzz
+      - run: cargo clippy --all-targets --locked -- -D warnings
+        working-directory: crates/nav-core/fuzz
       - uses: taiki-e/install-action@fe3acb53a98b62c772db35de75ce0e4595e7ca8c # v2.90.8
         with:
           tool: cargo-fuzz@0.13.2
