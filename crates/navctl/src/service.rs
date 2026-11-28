@@ -27,10 +27,10 @@ pub fn run_install() -> ExitCode {
             return exit::code(exit::OPERATIONAL_ERROR);
         }
     };
-    if !navd_src.exists() {
+    if !navd_src.is_file() {
         nav_core::safe_eprintln!(
-            "navctl: no navd found at {}. This install has only the standalone navctl CLI \
-             (releases don't ship navd yet), so there is no service to install.",
+            "navctl: no navd found at {}: this install has only the standalone navctl CLI, \
+             so there is no navd service to install.",
             navd_src.display()
         );
         return exit::code(exit::OPERATIONAL_ERROR);
