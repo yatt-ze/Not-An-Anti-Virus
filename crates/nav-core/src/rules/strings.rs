@@ -786,9 +786,8 @@ fn is_comment(line: &[u8]) -> bool {
 /// `\n`/`\r`/NUL-delimited line of `bytes` until it returns `false`; a
 /// backslash before `\n` or `\r\n` joins the next line (as one blank), except
 /// after a comment. `is_first`/`is_last` say whether the window's edges are
-/// real input edges; `cut_*` mark a line edge that isn't. `comment` is decided
-/// at the line's start; a line cut by the window start takes `*carry`, which
-/// is then set for the line holding the next window's first byte.
+/// real input edges; `cut_*` mark a line edge that isn't. `carry` holds the
+/// comment state across windows (§5.2).
 fn for_each_line(
     bytes: &[u8],
     is_first: bool,

@@ -493,6 +493,14 @@
     ],
     "completeness": "complete"
   },
+  "suspicious/dropper_heredoc_comment_line.sh": {
+    "score": 13,
+    "recommendation": "no-action",
+    "rule_ids": [
+      "suspicious-strings"
+    ],
+    "completeness": "complete"
+  },
   "suspicious/dropper_in_disk_image.dmg": {
     "score": 0,
     "recommendation": "no-action",
