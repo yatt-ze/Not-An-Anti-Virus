@@ -216,8 +216,8 @@ jobs:
           VERSION: ${{ needs.plan.outputs.version }}
         run: |
           set -eu
-          if [ ! -f install.sh ]; then echo "::notice::no install.sh yet (#250); nothing tested"; exit 0; fi
           dir="$RUNNER_TEMP/nav bin"
           NAV_INSTALL_DIR="$dir" sh install.sh
           got=$("$dir/navctl" --version)
           [ "$got" = "navctl $VERSION" ] || { echo "::error::installed '$got', expected 'navctl $VERSION'"; exit 1; }
+          [ -f "$HOME/.local/share/nav/install-receipt.json" ] || { echo "::error::no install receipt written"; exit 1; }
