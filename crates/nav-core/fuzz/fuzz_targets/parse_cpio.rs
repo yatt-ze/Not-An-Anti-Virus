@@ -10,7 +10,8 @@
 //!
 //! Seed from `testdata/cpio/`: both formats, the real pkgbuild archive, the
 //! adversarial set (huge namesize/filesize, truncation at each boundary,
-//! missing trailer, non-numeric fields, many tiny entries).
+//! missing trailer, non-numeric fields, many tiny entries), plus the
+//! structural seeds from `fuzz/seeds/gen_cpio_structural.py`.
 
 use libfuzzer_sys::fuzz_target;
 use nav_core::cpio::{self, CpioLimits, CpioStream, MemberEnd, StreamEnd, StreamLimits};
