@@ -109,7 +109,7 @@ Local SQLite log contains file paths, process args (redacted by default, see §4
 
 `navctl uninstall` must fully remove the LaunchDaemon, the `navnotify` LaunchAgent (§9.2), and all local data with no orphaned processes/files. No System Extension to clean up given the packet-capture approach (§4.1), which simplifies this considerably versus a Network-Extension-based design.
 
-The first `navctl uninstall` (#250, §8) removes what exists today: the `navd` service through `service uninstall`, then a NAV-managed CLI and its install receipt (§13). It grows as `navnotify`, local data and config arrive.
+The first `navctl uninstall` (#250, §8) removes what exists today: the `navd` service through `service uninstall`, then a NAV-managed CLI, the PATH line the installer added (§13: only when nothing else is in the install directory), and its install receipt. It grows as `navnotify`, local data and config arrive.
 
 ### 11.6 Decompression-Bomb Guardrails
 

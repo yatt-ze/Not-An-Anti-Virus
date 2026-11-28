@@ -94,8 +94,15 @@ the `sh` side of the pipe, where the script runs:
 curl -fsSL https://raw.githubusercontent.com/yatt-ze/Not-An-Anti-Virus/main/install.sh | NAV_VERSION=0.23.0 sh
 ```
 
-It never needs root and never edits your shell config; it prints the `PATH`
-line to add if needed.
+It never needs root. If the install directory isn't on your `PATH`, it asks
+before adding it to `~/.zshrc` (or `~/.bash_profile` for bash), and only when
+run in a terminal. Otherwise it prints the line to add yourself.
+`NAV_MODIFY_PATH=1` adds it without asking and `NAV_MODIFY_PATH=0` never
+does:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/yatt-ze/Not-An-Anti-Virus/main/install.sh | NAV_MODIFY_PATH=1 sh
+```
 
 To build from source instead, you need Rust 1.88 or newer. macOS is the
 target platform. NAV also builds

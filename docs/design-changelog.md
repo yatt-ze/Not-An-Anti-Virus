@@ -5,6 +5,10 @@ for the current document map. Newest first.
 
 ---
 
+**Changelog from v1.41 (2026-11-28):** §13, §8, §11.5: the install script offers to put the install directory on `PATH` instead of only printing the line, replacing "never edits shell rc files". When the directory isn't on `PATH` and the shell is zsh or bash, it appends one export line under a fixed marker comment to `${ZDOTDIR:-$HOME}/.zshrc` or `~/.bash_profile`. `NAV_MODIFY_PATH=1` does it without asking, `=0` never, any other value is refused, and unset it asks only when stdout is a terminal and `/dev/tty` opens (never reading stdin, which is the script itself under `curl | sh`); fish and other shells keep the printed line. The receipt gains `path_edit` (the file appended to, or `null`), carried forward by later installs that make no new edit. `navctl uninstall` removes the marker line and its export line after the binary, only when both still match and only when nothing else is in the install directory (ignoring `.DS_Store`), since other tools share `~/.local/bin`; otherwise it keeps them and says why, and it never removes the directory. Decided by the user: ask before editing, Enter means yes, uninstall removes the line only when nothing else is in the install directory.
+
+---
+
 **Changelog from v1.40 (2026-11-28):** §13 install script (#250): `NAV_FORCE=1` is the explicit override for replacing a `navctl` the script doesn't manage, the script refuses to run as root, and it rejects an install directory or `HOME` containing a quote, backslash or control character. The install receipt is specified as `serde_json::to_string_pretty` layout (fields `schema`, `version`, `target`, `binary_path`, `binary_sha256`, trailing newline), so the shell script and `navctl update` produce identical bytes. `install.sh` itself lands in the repo root.
 
 ---

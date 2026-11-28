@@ -7,6 +7,8 @@
 #   NAV_VERSION        install X.Y.Z (no leading "v") instead of the latest release
 #   NAV_INSTALL_DIR    install directory (default: $HOME/.local/bin)
 #   NAV_FORCE=1        overwrite a navctl that this script did not install
+#   NAV_MODIFY_PATH    1: add the install dir to PATH in ~/.zshrc or ~/.bash_profile
+#                      without asking; 0: never; unset: ask when run in a terminal
 #   NO_COLOR           disable colour
 #   NAV_DOWNLOAD_BASE  tests only: replaces the release download URL (https or
 #                      file); requires NAV_VERSION
@@ -28,7 +30,11 @@ WORK=
 TMP_BIN=
 TMP_RECEIPT=
 PREV_VERSION=
+PREV_PATH_EDIT=
+PATH_EDIT=
 EXIST_NOTE=
+# Contract with `navctl uninstall` (§13): it matches this line exactly.
+PATH_MARKER="# Added by the NAV installer; navctl uninstall removes it"
 
 # Symbols and colour only on a terminal; plain ASCII otherwise.
 setup_style() {
@@ -119,6 +125,11 @@ check_path_chars() {
     esac
     _bad=$(printf '%s' "$2" | LC_ALL=C tr -d '[:print:]' | wc -c)
     [ "$_bad" -eq 0 ] || die "$1 contains a control or non-ASCII character" "Choose a path of plain ASCII characters."
+}
+
+# Like check_path_chars, but returns 1 instead of exiting.
+path_chars_ok() {
+    (check_path_chars x "$1") >/dev/null 2>&1
 }
 
 check_platform() {
@@ -227,7 +238,10 @@ check_existing() {
     [ ! -d "$1" ] || die "$1 is a directory" "Remove it or choose another NAV_INSTALL_DIR."
     if [ -f "$RECEIPT" ] && grep -Fxq "  \"binary_path\": \"$1\"," "$RECEIPT"; then
         PREV_VERSION=$(sed -n 's/^  "version": "\(.*\)",$/\1/p' "$RECEIPT")
-        _old=$(sed -n 's/^  "binary_sha256": "\(.*\)"$/\1/p' "$RECEIPT")
+        PREV_PATH_EDIT=$(sed -n 's/^  "path_edit": "\(.*\)"$/\1/p' "$RECEIPT")
+        path_chars_ok "$PREV_PATH_EDIT" || PREV_PATH_EDIT=
+        PATH_EDIT=$PREV_PATH_EDIT
+        _old=$(sed -n 's/^  "binary_sha256": "\(.*\)",$/\1/p' "$RECEIPT")
         _now=$(shasum -a 256 "$1" 2>/dev/null | awk '{ print $1 }') || _now=
         if [ -n "$_now" ] && [ "$_now" != "$_old" ]; then
             EXIST_NOTE="$(pretty "$1") was modified since it was installed; replacing it"
@@ -259,40 +273,118 @@ write_receipt() {
     TMP_RECEIPT=$(umask 077 && mktemp "$_rdir/.receipt.XXXXXX") ||
         die "navctl was installed but the receipt could not be written" "Check that $_rdir is writable, then rerun this script."
     # Same layout as serde_json::to_string_pretty, so navctl rewrites match.
-    printf '{\n  "schema": 1,\n  "version": "%s",\n  "target": "%s",\n  "binary_path": "%s",\n  "binary_sha256": "%s"\n}\n' \
-        "$1" "$2" "$3" "$4" >"$TMP_RECEIPT"
+    if [ -n "$5" ]; then _edit="\"$5\""; else _edit=null; fi
+    printf '{\n  "schema": 1,\n  "version": "%s",\n  "target": "%s",\n  "binary_path": "%s",\n  "binary_sha256": "%s",\n  "path_edit": %s\n}\n' \
+        "$1" "$2" "$3" "$4" "$_edit" >"$TMP_RECEIPT"
     mv -f "$TMP_RECEIPT" "$RECEIPT"
     TMP_RECEIPT=
 }
 
-# Prints how to put $1 (the directory as the user gave it) on PATH.
-path_hint() {
-    _default=
+# Sets PVAL to $1 (the directory as the user gave it) as it goes in a startup file.
+path_value() {
     if [ -z "${NAV_INSTALL_DIR:-}" ] || [ "$1" = "$HOME/.local/bin" ]; then
-        _default=1
-    fi
-    if [ -n "$_default" ]; then
         # Literal $HOME, for the user's startup file.
         # shellcheck disable=SC2016
-        _val='$HOME/.local/bin'
+        PVAL='$HOME/.local/bin'
     else
-        _val=$(printf '%s' "$1" | sed 's/[$`]/\\&/g')
+        PVAL=$(printf '%s' "$1" | sed 's/[$`]/\\&/g')
     fi
-    _line="export PATH=\"$_val:\$PATH\""
+}
+
+# Prints how to put $1 on PATH; "nointro" skips the "isn't on your PATH" sentence.
+path_hint() {
+    path_value "$1"
+    _line="export PATH=\"$PVAL:\$PATH\""
     _then="Then open a new terminal."
     case $(basename "${SHELL:-}") in
         zsh) _how="Add this line to ~/.zshrc:" ;;
         bash) _how="Add this line to ~/.bash_profile:" ;;
         fish)
             _how="To add it, run:"
-            _line="fish_add_path \"$_val\""
+            _line="fish_add_path \"$PVAL\""
             _then=
             ;;
         *) _how="Add this line to your shell's startup file:" ;;
     esac
-    printf "%s isn't on your PATH yet. %s\n  %s%s%s\n" "$(pretty "$1")" "$_how" "$CYN" "$_line" "$Z"
+    if [ "${2:-}" = nointro ]; then
+        printf '%s\n  %s%s%s\n' "$_how" "$CYN" "$_line" "$Z"
+    else
+        printf "%s isn't on your PATH yet. %s\n  %s%s%s\n" "$(pretty "$1")" "$_how" "$CYN" "$_line" "$Z"
+    fi
     [ -z "$_then" ] || printf '%s\n' "$_then"
     printf '\n'
+}
+
+# True if file $1 has the marker line directly followed by line $2.
+rc_has_block() {
+    grep -Fx -A1 -- "$PATH_MARKER" "$1" 2>/dev/null | grep -Fxq -- "$2"
+}
+
+# Appends the marker and line $2 to file $1, first ending an unterminated last line.
+append_block() {
+    {
+        if [ -s "$1" ] && [ -n "$(tail -c 1 "$1" 2>/dev/null)" ]; then
+            printf '\n'
+        fi
+        printf '%s\n%s\n' "$PATH_MARKER" "$2"
+    } 2>/dev/null >>"$1"
+}
+
+# Puts $1 on PATH in the user's zsh or bash startup file, after asking
+# unless NAV_MODIFY_PATH says otherwise; else prints how. Sets PATH_EDIT.
+offer_path() {
+    _mode=${NAV_MODIFY_PATH:-}
+    _rc=
+    case $(basename "${SHELL:-}") in
+        zsh) _rc=${ZDOTDIR:-$HOME}/.zshrc ;;
+        bash) _rc=$HOME/.bash_profile ;;
+    esac
+    case $_rc in
+        /*) path_chars_ok "$_rc" || _rc= ;;
+        *) _rc= ;;
+    esac
+    if [ -z "$_rc" ] || [ "$_mode" = 0 ]; then
+        path_hint "$1"
+        return
+    fi
+    path_value "$1"
+    _export="export PATH=\"$PVAL:\$PATH\""
+    if rc_has_block "$_rc" "$_export"; then
+        note "$(pretty "$1") is already added to PATH in $(pretty "$_rc")"
+        printf 'Open a new terminal to start using navctl.\n\n'
+        PATH_EDIT=$_rc
+        return
+    fi
+    _asked=
+    _yes=
+    if [ "$_mode" = 1 ]; then
+        _yes=1
+    elif [ -t 1 ] && (: </dev/tty) 2>/dev/null; then
+        # Never stdin: under curl | sh it is the script itself.
+        printf "%s%s isn't on your PATH yet. Add it to %s?%s [Y/n] " "$B" "$(pretty "$1")" "$(pretty "$_rc")" "$Z"
+        _asked=1
+        _ans=n
+        if read -r _ans 2>/dev/null </dev/tty; then
+            case $(printf '%s' "$_ans" | tr '[:upper:]' '[:lower:]') in
+                '' | y | yes) _yes=1 ;;
+            esac
+        else
+            printf '\n'
+        fi
+    else
+        path_hint "$1"
+        return
+    fi
+    if [ -z "$_yes" ]; then
+        path_hint "$1" nointro
+    elif append_block "$_rc" "$_export"; then
+        step "Added $(pretty "$1") to PATH in $(pretty "$_rc")"
+        printf 'Open a new terminal to start using navctl.\n\n'
+        PATH_EDIT=$_rc
+    else
+        note "Couldn't change $(pretty "$_rc")"
+        if [ -n "$_asked" ]; then path_hint "$1" nointro; else path_hint "$1"; fi
+    fi
 }
 
 # Warns when another navctl earlier on PATH would run instead of the one in $1.
@@ -317,6 +409,10 @@ main() {
     HOME_CANON=$(cd "$HOME" 2>/dev/null && pwd -P) || HOME_CANON=$HOME
     RECEIPT=$HOME/.local/share/nav/install-receipt.json
 
+    case ${NAV_MODIFY_PATH:-} in
+        '' | 0 | 1) ;;
+        *) die "NAV_MODIFY_PATH must be 1 or 0" "Leave it unset to be asked." ;;
+    esac
     if [ -n "${NAV_DOWNLOAD_BASE:-}" ] && [ -z "${NAV_VERSION:-}" ]; then
         die "NAV_DOWNLOAD_BASE requires NAV_VERSION" "Set NAV_VERSION as well."
     fi
@@ -367,7 +463,7 @@ main() {
     dest=$canon/navctl
     place_binary "$canon" "$dest"
     sha=$(shasum -a 256 "$dest" | awk '{ print $1 }')
-    write_receipt "$version" "$target" "$dest" "$sha"
+    write_receipt "$version" "$target" "$dest" "$sha" "$PATH_EDIT"
 
     if [ -z "$PREV_VERSION" ]; then
         result="Installed navctl $version"
@@ -381,8 +477,11 @@ main() {
     printf '%s%s%s in %s\n\n' "$B" "$result" "$Z" "$(pretty "$canon")"
     case ":${PATH:-}:" in
         *":$dir:"* | *":$canon:"*) shadow_hint "$canon" ;;
-        *) path_hint "$dir" ;;
+        *) offer_path "$dir" ;;
     esac
+    if [ "$PATH_EDIT" != "$PREV_PATH_EDIT" ]; then
+        write_receipt "$version" "$target" "$dest" "$sha" "$PATH_EDIT"
+    fi
     printf 'Get started: %snavctl scan <file or .app>%s  (%snavctl --help%s for more)\n' "$CYN" "$Z" "$CYN" "$Z"
 }
 

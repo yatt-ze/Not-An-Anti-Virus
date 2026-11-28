@@ -7,11 +7,12 @@
 use std::fs;
 use std::os::unix::fs::{symlink, PermissionsExt};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
+use std::process::{Command, Output, Stdio};
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 const ARM: &str = "aarch64-apple-darwin";
 const X86: &str = "x86_64-apple-darwin";
+const MARKER: &str = "# Added by the NAV installer; navctl uninstall removes it";
 
 /// One test's sandbox. `home`, `bin` and `tmp` contain spaces on purpose.
 struct Fx {
@@ -21,6 +22,61 @@ struct Fx {
     tmp: PathBuf,
     rel: PathBuf,
     shims: PathBuf,
+}
+
+/// Runs `cmd` on a pseudo-terminal (stdout is a TTY, `/dev/tty` opens), sends
+/// `answer` once the `[Y/n] ` prompt appears, and returns the exit status
+/// and the terminal output with CRLF folded to LF.
+fn run_pty(cmd: &mut Command, answer: &str) -> (bool, String) {
+    use std::io::{Read, Write};
+    use std::os::fd::FromRawFd;
+    use std::os::unix::process::CommandExt;
+
+    let (mut m, mut sl) = (0, 0);
+    // SAFETY: valid out-pointers; the name, termios and winsize may be null.
+    let rc = unsafe {
+        libc::openpty(
+            &mut m,
+            &mut sl,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+        )
+    };
+    assert_eq!(rc, 0);
+    // SAFETY: openpty returned two fresh descriptors that nothing else owns.
+    let (mut master, slave) = unsafe { (fs::File::from_raw_fd(m), fs::File::from_raw_fd(sl)) };
+    cmd.stdin(slave.try_clone().unwrap())
+        .stdout(slave.try_clone().unwrap())
+        .stderr(slave);
+    // SAFETY: setsid and ioctl are async-signal-safe; this makes the pty the
+    // child's controlling terminal so `/dev/tty` opens.
+    unsafe {
+        cmd.pre_exec(|| {
+            libc::setsid();
+            libc::ioctl(0, libc::TIOCSCTTY as _, 0);
+            Ok(())
+        });
+    }
+    let mut child = cmd.spawn().unwrap();
+    // Drop the parent's slave copies so the master sees EOF at exit.
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+
+    let (mut buf, mut text, mut sent) = ([0u8; 4096], String::new(), false);
+    while let Ok(n) = master.read(&mut buf) {
+        if n == 0 {
+            break;
+        }
+        text.push_str(&String::from_utf8_lossy(&buf[..n]));
+        if !sent && text.contains("[Y/n] ") {
+            master.write_all(answer.as_bytes()).unwrap();
+            sent = true;
+        }
+    }
+    let ok = child.wait().unwrap().success();
+    (ok, text.replace("\r\n", "\n"))
 }
 
 fn script(path: &Path, body: &str) {
@@ -243,7 +299,7 @@ mod macos {
 
         let canon = fs::canonicalize(&fx.bin).unwrap().join("navctl");
         let want = format!(
-            "{{\n  \"schema\": 1,\n  \"version\": \"{VERSION}\",\n  \"target\": \"{ARM}\",\n  \"binary_path\": \"{}\",\n  \"binary_sha256\": \"{}\"\n}}\n",
+            "{{\n  \"schema\": 1,\n  \"version\": \"{VERSION}\",\n  \"target\": \"{ARM}\",\n  \"binary_path\": \"{}\",\n  \"binary_sha256\": \"{}\",\n  \"path_edit\": null\n}}\n",
             canon.display(),
             sha256(&fx.installed())
         );
@@ -675,5 +731,188 @@ Get started: navctl scan <file or .app>  (navctl --help for more)
             "{log}"
         );
         assert!(fx.installed().exists());
+    }
+
+    fn zsh(fx: &Fx) -> Command {
+        let mut c = fx.cmd();
+        c.env("SHELL", "/bin/zsh");
+        c
+    }
+
+    fn block(fx: &Fx) -> String {
+        format!("{MARKER}\nexport PATH=\"{}:$PATH\"\n", fx.bin.display())
+    }
+
+    fn rc(fx: &Fx) -> PathBuf {
+        fx.home.join(".zshrc")
+    }
+
+    fn path_edit(fx: &Fx) -> String {
+        let r = fs::read_to_string(fx.receipt()).unwrap();
+        r.lines()
+            .find(|l| l.starts_with("  \"path_edit\": "))
+            .unwrap()
+            .trim_start_matches("  \"path_edit\": ")
+            .to_string()
+    }
+
+    fn rc_quoted(p: &Path) -> String {
+        format!("\"{}\"", p.display())
+    }
+
+    /// `NAV_MODIFY_PATH=1` appends the exact block and records the file; a
+    /// rerun neither duplicates it nor loses the receipt field.
+    #[test]
+    fn path_added() {
+        let fx = Fx::new("pathadd");
+        fx.release(ARM);
+        let o = run(zsh(&fx).env("NAV_MODIFY_PATH", "1"));
+        expect_ok(&o);
+        assert!(out(&o).contains("  - Added "), "{}", out(&o));
+        assert!(out(&o).contains("Open a new terminal to start using navctl.\n"));
+        assert_eq!(fs::read_to_string(rc(&fx)).unwrap(), block(&fx));
+        assert_eq!(path_edit(&fx), rc_quoted(&rc(&fx)));
+
+        let o = run(zsh(&fx).env("NAV_MODIFY_PATH", "1"));
+        expect_ok(&o);
+        assert!(
+            out(&o).contains("is already added to PATH in "),
+            "{}",
+            out(&o)
+        );
+        assert_eq!(fs::read_to_string(rc(&fx)).unwrap(), block(&fx));
+        assert_eq!(path_edit(&fx), rc_quoted(&rc(&fx)));
+
+        // Dir now on PATH, or edits switched off: the field is carried over.
+        let on_path = format!("{}:/usr/bin:/bin", fx.bin.display());
+        expect_ok(&run(zsh(&fx).env("PATH", on_path)));
+        assert_eq!(path_edit(&fx), rc_quoted(&rc(&fx)));
+        expect_ok(&run(zsh(&fx).env("NAV_MODIFY_PATH", "0")));
+        assert_eq!(path_edit(&fx), rc_quoted(&rc(&fx)));
+        assert_eq!(fs::read_to_string(rc(&fx)).unwrap(), block(&fx));
+    }
+
+    /// `NAV_MODIFY_PATH=0` touches no file and prints the hint.
+    #[test]
+    fn path_declined() {
+        let fx = Fx::new("pathoff");
+        fx.release(ARM);
+        let o = run(zsh(&fx).env("NAV_MODIFY_PATH", "0"));
+        expect_ok(&o);
+        assert!(
+            out(&o).contains("Add this line to ~/.zshrc:"),
+            "{}",
+            out(&o)
+        );
+        assert!(!rc(&fx).exists());
+        assert_eq!(path_edit(&fx), "null");
+    }
+
+    #[test]
+    fn zdotdir_used() {
+        let fx = Fx::new("zdot");
+        fx.release(ARM);
+        let z = fx.root.join("z dot");
+        fs::create_dir_all(&z).unwrap();
+        expect_ok(&run(zsh(&fx)
+            .env("NAV_MODIFY_PATH", "1")
+            .env("ZDOTDIR", &z)));
+        assert_eq!(fs::read_to_string(z.join(".zshrc")).unwrap(), block(&fx));
+        assert!(!rc(&fx).exists());
+        assert_eq!(path_edit(&fx), rc_quoted(&z.join(".zshrc")));
+    }
+
+    #[test]
+    fn bash_profile() {
+        let fx = Fx::new("bashrc");
+        fx.release(ARM);
+        expect_ok(&run(fx
+            .cmd()
+            .env("SHELL", "/bin/bash")
+            .env("NAV_MODIFY_PATH", "1")));
+        assert_eq!(
+            fs::read_to_string(fx.home.join(".bash_profile")).unwrap(),
+            block(&fx)
+        );
+    }
+
+    /// Fish keeps the printed hint even with `NAV_MODIFY_PATH=1`.
+    #[test]
+    fn fish_hint() {
+        let fx = Fx::new("fish");
+        fx.release(ARM);
+        let o = run(fx
+            .cmd()
+            .env("SHELL", "/usr/bin/fish")
+            .env("NAV_MODIFY_PATH", "1"));
+        expect_ok(&o);
+        assert!(out(&o).contains("fish_add_path"), "{}", out(&o));
+        assert_eq!(path_edit(&fx), "null");
+        assert_eq!(fs::read_dir(&fx.home).unwrap().count(), 1, "only .local");
+    }
+
+    /// An rc file that can't be written falls back to the hint, exit 0.
+    #[test]
+    fn rc_unwritable() {
+        let fx = Fx::new("rcfail");
+        fx.release(ARM);
+        fs::create_dir(rc(&fx)).unwrap();
+        let o = run(zsh(&fx).env("NAV_MODIFY_PATH", "1"));
+        expect_ok(&o);
+        assert!(out(&o).contains("Couldn't change ~/.zshrc"), "{}", out(&o));
+        assert!(
+            out(&o).contains("isn't on your PATH yet. Add this line"),
+            "{}",
+            out(&o)
+        );
+        assert_eq!(path_edit(&fx), "null");
+
+        fs::remove_dir(rc(&fx)).unwrap();
+        fs::write(rc(&fx), "keep\n").unwrap();
+        fs::set_permissions(rc(&fx), fs::Permissions::from_mode(0o444)).unwrap();
+        let o = run(zsh(&fx).env("NAV_MODIFY_PATH", "1"));
+        expect_ok(&o);
+        assert!(out(&o).contains("Couldn't change"), "{}", out(&o));
+        assert_eq!(fs::read_to_string(rc(&fx)).unwrap(), "keep\n");
+    }
+
+    #[test]
+    fn newline_added() {
+        let fx = Fx::new("nonl");
+        fx.release(ARM);
+        fs::write(rc(&fx), "export A=1").unwrap();
+        expect_ok(&run(zsh(&fx).env("NAV_MODIFY_PATH", "1")));
+        assert_eq!(
+            fs::read_to_string(rc(&fx)).unwrap(),
+            format!("export A=1\n{}", block(&fx))
+        );
+    }
+
+    #[test]
+    fn invalid_modify() {
+        let fx = Fx::new("badmod");
+        // No release on disk: the refusal must come before any download.
+        let o = run(zsh(&fx).env("NAV_MODIFY_PATH", "yes"));
+        expect_fail(&o, "NAV_MODIFY_PATH");
+        assert_eq!(out(&o), "");
+    }
+
+    /// Answering the prompt on a terminal: n leaves the file alone, Enter edits.
+    #[test]
+    fn prompt_answers() {
+        let fx = Fx::new("prompt");
+        fx.release(ARM);
+        let (ok, text) = run_pty(zsh(&fx).env("NO_COLOR", "1"), "n\n");
+        assert!(ok, "{text}");
+        assert!(text.contains("Add it to ~/.zshrc? [Y/n] n\n"), "{text}");
+        assert!(text.contains("Add this line to ~/.zshrc:"), "{text}");
+        assert!(!rc(&fx).exists());
+        assert_eq!(path_edit(&fx), "null");
+
+        let (ok, text) = run_pty(zsh(&fx).env("NO_COLOR", "1"), "\n");
+        assert!(ok, "{text}");
+        assert!(text.contains("Added "), "{text}");
+        assert_eq!(fs::read_to_string(rc(&fx)).unwrap(), block(&fx));
+        assert_eq!(path_edit(&fx), rc_quoted(&rc(&fx)));
     }
 }
