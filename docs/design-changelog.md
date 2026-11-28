@@ -5,6 +5,10 @@ for the current document map. Newest first.
 
 ---
 
+**Changelog from v1.40 (2026-11-28):** §13 install script (#250): `NAV_FORCE=1` is the explicit override for replacing a `navctl` the script doesn't manage, the script refuses to run as root, and it rejects an install directory or `HOME` containing a quote, backslash or control character. The install receipt is specified as `serde_json::to_string_pretty` layout (fields `schema`, `version`, `target`, `binary_path`, `binary_sha256`, trailing newline), so the shell script and `navctl update` produce identical bytes. `install.sh` itself lands in the repo root.
+
+---
+
 **Changelog from v1.39 (2026-11-28):** §13, §8, §11.5, §11.10: the CLI distribution and release lifecycle (#250). Releases publish automatically when `main`'s CI passes on an untagged version, building the exact tested commit for both macOS architectures, with `SHA256SUMS` and build-provenance attestations over the archives. `install.sh` in the repo root (`main`'s copy is canonical) installs `navctl` to `~/.local/bin` without root or shell-rc edits and writes an install receipt. New `navctl update [--check] [--json]`, user-initiated only. `navctl uninstall` lands ahead of Phase 3 with today's scope (service, then CLI, then receipt, so a failed step can be retried). Downloads use `/usr/bin/curl` rather than an HTTP crate. The SHA-256 check catches corruption only, so when a stable `gh` 2.102.0 or newer is available the attestation is verified with an exact `--cert-identity` (older `gh` matched `--signer-workflow` as a prefix). Decided by the user: curl, checksum plus attestation, `~/.local/bin` with no rc edits, the raw-`main` URL, automatic release on a version bump, `--check` exiting 0 either way, and service-only uninstall without a receipt. Only `navctl` ships, so §11.10's hash comparison waits until `navd` is distributed.
 
 ---
