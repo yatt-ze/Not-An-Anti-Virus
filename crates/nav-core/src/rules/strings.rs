@@ -20,6 +20,10 @@ const NAME_FLOOR_CAP: i32 = 5;
 /// and cannot reach Notify alone (§5.2, #191).
 const MACHO_PATTERN_CAP: i32 = crate::scan::MEDIUM_SCORE_THRESHOLD - 1;
 
+/// Cap on the combined score of patterns matched only on shell comment lines:
+/// with every name marker they stay below Notify (§5.2, #318).
+const COMMENT_PATTERN_CAP: i32 = crate::scan::MEDIUM_SCORE_THRESHOLD - 1 - NAME_FLOOR_CAP;
+
 /// A bare name that only corroborates intent patterns.
 struct Marker {
     needle: &'static str,
@@ -164,6 +168,7 @@ pub(super) const STREAM_OVERLAP: usize = if MAX_MARKER_LEN > PATTERN_SPAN + CONT
 struct IntentPattern {
     weight: i32,
     note: &'static str,
+    comment_note: &'static str,
 }
 
 const DOWNLOAD_TO_SHELL: usize = 0;
@@ -176,22 +181,27 @@ const PATTERNS: &[IntentPattern] = &[
     IntentPattern {
         weight: 15,
         note: "download piped to a shell",
+        comment_note: "download piped to a shell, in a comment",
     },
     IntentPattern {
         weight: 15,
         note: "decoded payload piped to a shell",
+        comment_note: "decoded payload piped to a shell, in a comment",
     },
     IntentPattern {
         weight: 15,
         note: "osascript runs a download",
+        comment_note: "osascript runs a download, in a comment",
     },
     IntentPattern {
         weight: 10,
         note: "references the TCC permissions database directly",
+        comment_note: "references the TCC permissions database directly",
     },
     IntentPattern {
         weight: 10,
         note: "curl uploads a local file",
+        comment_note: "curl uploads a local file, in a comment",
     },
 ];
 
@@ -200,6 +210,10 @@ const PATTERNS: &[IntentPattern] = &[
 pub(crate) struct Hits {
     markers: Vec<bool>,
     patterns: [bool; PATTERNS.len()],
+    /// Patterns matched on a shell comment line.
+    comment_patterns: [bool; PATTERNS.len()],
+    /// Whether the line the next window starts in is a comment.
+    comment_carry: bool,
     pub(super) phish: super::credential_phish::PhishHits,
 }
 
@@ -208,6 +222,8 @@ impl Hits {
         Hits {
             markers: vec![false; MARKERS.len()],
             patterns: [false; PATTERNS.len()],
+            comment_patterns: [false; PATTERNS.len()],
+            comment_carry: false,
             phish: Default::default(),
         }
     }
@@ -724,53 +740,93 @@ fn has_trigger(line: &[u8]) -> bool {
 /// Runs [`scan_line`] over each line of `bytes` (see [`for_each_line`]).
 /// Only lines holding a [`LINE_TRIGGERS`] word are lossy-decoded and scanned;
 /// decoding splits cleanly at ASCII bytes, so this equals decoding the whole
-/// window first.
-fn scan_patterns(bytes: &[u8], is_first: bool, is_last: bool, hits: &mut [bool; PATTERNS.len()]) {
-    if hits.iter().all(|&h| h) {
+/// window first. Comment-line matches go to `hits.comment_patterns`; the
+/// early exit looks at full-weight `hits.patterns` only.
+fn scan_patterns(bytes: &[u8], is_first: bool, is_last: bool, hits: &mut Hits) {
+    let Hits {
+        patterns,
+        comment_patterns,
+        comment_carry,
+        ..
+    } = hits;
+    if patterns.iter().all(|&h| h) {
         return;
     }
-    for_each_line(bytes, is_first, is_last, |line, cut_start, cut_end| {
-        if has_trigger(line) {
-            // Decoded, not raw: U+FFFD's width feeds the span limits.
-            scan_line(
-                String::from_utf8_lossy(line).as_bytes(),
-                cut_start,
-                cut_end,
-                hits,
-            );
-        }
-        !hits.iter().all(|&h| h)
-    });
+    for_each_line(
+        bytes,
+        is_first,
+        is_last,
+        comment_carry,
+        |line, cut_start, cut_end, comment| {
+            if has_trigger(line) {
+                let target = if comment {
+                    &mut *comment_patterns
+                } else {
+                    &mut *patterns
+                };
+                // Decoded, not raw: U+FFFD's width feeds the span limits.
+                scan_line(
+                    String::from_utf8_lossy(line).as_bytes(),
+                    cut_start,
+                    cut_end,
+                    target,
+                );
+            }
+            !patterns.iter().all(|&h| h)
+        },
+    );
 }
 
-/// Calls `f(line, cut_start, cut_end)` on each non-empty `\n`/`\r`/NUL-delimited
-/// line of `bytes` until it returns `false`; a backslash before `\n` or `\r\n`
-/// joins the next line (as one blank). `is_first`/`is_last` say whether the
-/// window's edges are real input edges; `cut_*` mark a line edge that isn't.
+/// Whether the first non-blank byte of `line` is `#`.
+fn is_comment(line: &[u8]) -> bool {
+    line.iter().find(|&&b| !is_blank(b)) == Some(&b'#')
+}
+
+/// Calls `f(line, cut_start, cut_end, comment)` on each non-empty
+/// `\n`/`\r`/NUL-delimited line of `bytes` until it returns `false`; a
+/// backslash before `\n` or `\r\n` joins the next line (as one blank), except
+/// after a comment. `is_first`/`is_last` say whether the window's edges are
+/// real input edges; `cut_*` mark a line edge that isn't. `comment` is decided
+/// at the line's start; a line cut by the window start takes `*carry`, which
+/// is then set for the line holding the next window's first byte.
 fn for_each_line(
     bytes: &[u8],
     is_first: bool,
     is_last: bool,
-    mut f: impl FnMut(&[u8], bool, bool) -> bool,
+    carry: &mut bool,
+    mut f: impl FnMut(&[u8], bool, bool, bool) -> bool,
 ) {
+    let incoming = *carry;
+    let next_window = bytes.len().saturating_sub(STREAM_OVERLAP);
     let mut joined: Vec<u8> = Vec::new();
     let mut line_start = 0;
     let mut start = 0;
+    let mut comment = false;
     while start <= bytes.len() {
         let end = bytes[start..]
             .iter()
             .position(|&b| matches!(b, b'\n' | b'\r' | 0))
             .map_or(bytes.len(), |p| start + p);
+        if joined.is_empty() {
+            comment = if line_start == 0 && !is_first {
+                incoming
+            } else {
+                is_comment(&bytes[start..end])
+            };
+        }
         let newline_len = match (bytes.get(end), bytes.get(end + 1)) {
             (Some(b'\n'), _) => 1,
             (Some(b'\r'), Some(b'\n')) => 2,
             _ => 0,
         };
-        if newline_len > 0 && end > start && bytes[end - 1] == b'\\' {
+        if !comment && newline_len > 0 && end > start && bytes[end - 1] == b'\\' {
             joined.extend_from_slice(&bytes[start..end - 1]);
             joined.push(b' ');
             start = end + newline_len;
             continue;
+        }
+        if (line_start..=end).contains(&next_window) {
+            *carry = comment;
         }
         let line = if joined.is_empty() {
             &bytes[start..end]
@@ -783,6 +839,7 @@ fn for_each_line(
                 line,
                 line_start == 0 && !is_first,
                 end == bytes.len() && !is_last,
+                comment,
             )
         {
             return;
@@ -798,11 +855,12 @@ fn for_each_line(
 /// to [`find_needles`].
 pub(super) fn scan_window(bytes: &[u8], is_first: bool, is_last: bool, hits: &mut Hits) {
     find_needles(bytes, is_last, hits);
-    scan_patterns(bytes, is_first, is_last, &mut hits.patterns);
+    scan_patterns(bytes, is_first, is_last, hits);
     super::credential_phish::scan(bytes, &mut hits.phish);
 }
 
 /// Total weight and notes (patterns first, then counted names) for `hits`.
+/// Patterns matched only on comment lines add at most [`COMMENT_PATTERN_CAP`].
 /// Patterns in a Mach-O are capped; names count only in script/text.
 fn score(hits: &Hits, ctx: &ScanContext) -> (i32, Vec<&'static str>) {
     let mut weight = 0;
@@ -815,6 +873,16 @@ fn score(hits: &Hits, ctx: &ScanContext) -> (i32, Vec<&'static str>) {
         weight += p.weight;
         notes.push(p.note);
     }
+    let mut comment_weight = 0;
+    for (p, _) in PATTERNS
+        .iter()
+        .zip(hits.comment_patterns.iter().zip(hits.patterns.iter()))
+        .filter(|(_, (&c, &full))| c && !full)
+    {
+        comment_weight += p.weight;
+        notes.push(p.comment_note);
+    }
+    weight += comment_weight.min(COMMENT_PATTERN_CAP);
     // A parsed slice, not bare magic: magic + junk + a newline still runs as a script.
     if weight > MACHO_PATTERN_CAP && !ctx.macho().images.is_empty() {
         weight = MACHO_PATTERN_CAP;
@@ -1015,14 +1083,25 @@ mod tests {
             };
         }
         hits.patterns[TCC_DATABASE] = text.contains("TCC.db");
-        let patterns = &mut hits.patterns;
+        let Hits {
+            patterns,
+            comment_patterns,
+            comment_carry,
+            ..
+        } = &mut hits;
         if !patterns.iter().all(|&h| h) {
             for_each_line(
                 text.as_bytes(),
                 is_first,
                 is_last,
-                |line, cut_start, cut_end| {
-                    scan_line(line, cut_start, cut_end, patterns);
+                comment_carry,
+                |line, cut_start, cut_end, comment| {
+                    let target = if comment {
+                        &mut *comment_patterns
+                    } else {
+                        &mut *patterns
+                    };
+                    scan_line(line, cut_start, cut_end, target);
                     !patterns.iter().all(|&h| h)
                 },
             );
@@ -1036,8 +1115,8 @@ mod tests {
             scan_window(window, is_first, is_last, &mut hits);
             let want = reference_scan(window, is_first, is_last);
             assert_eq!(
-                (hits.markers, hits.patterns),
-                (want.markers, want.patterns),
+                (hits.markers, hits.patterns, hits.comment_patterns),
+                (want.markers, want.patterns, want.comment_patterns),
                 "{window:?} first={is_first} last={is_last}"
             );
         }
@@ -1327,7 +1406,7 @@ mod tests {
         let start = std::time::Instant::now();
         assert!(none_fire(&line));
         assert!(start.elapsed() < std::time::Duration::from_secs(5));
-        let mut hits = [false; PATTERNS.len()];
+        let mut hits = Hits::new();
         scan_patterns(b"x\\", true, false, &mut hits);
         scan_patterns(b"\\\r", false, true, &mut hits);
         scan_patterns(b"\\\n", false, true, &mut hits);
@@ -1478,11 +1557,71 @@ mod tests {
 
     #[test]
     fn a_pattern_cut_by_a_non_first_window_edge_is_not_matched() {
-        let mut hits = [false; PATTERNS.len()];
+        let mut hits = Hits::new();
         scan_patterns(b"curl x | sh", false, true, &mut hits);
-        assert!(!hits[DOWNLOAD_TO_SHELL]);
+        assert!(!hits.patterns[DOWNLOAD_TO_SHELL]);
         scan_patterns(b"a; curl x | sh", false, true, &mut hits);
-        assert!(hits[DOWNLOAD_TO_SHELL]);
+        assert!(hits.patterns[DOWNLOAD_TO_SHELL]);
+    }
+
+    /// Comment lines (first non-blank byte `#`) only reach `comment_patterns`.
+    #[test]
+    fn comment_lines_corroborate() {
+        for t in [
+            "# the shell `curl ... | bash` was typed into",
+            "  # a; curl x | sh",
+        ] {
+            let mut hits = Hits::new();
+            scan_window(t.as_bytes(), true, true, &mut hits);
+            assert!(hits.comment_patterns[DOWNLOAD_TO_SHELL], "{t:?}");
+            assert!(!hits.patterns[DOWNLOAD_TO_SHELL], "{t:?}");
+        }
+    }
+
+    /// A backslash ends a comment like any line: the next line stays code.
+    #[test]
+    fn comment_ends_at_newline() {
+        assert!(fires(
+            "# a comment ends at its newline \\\ncurl x | sh",
+            DOWNLOAD_TO_SHELL
+        ));
+    }
+
+    /// A comment line spanning two stream windows stays a comment in the
+    /// second, and a code line stays code; streamed equals in-memory.
+    #[test]
+    fn comment_carries_across_windows() {
+        for (lead, comment) in [("# ", true), ("x ", false)] {
+            let full = format!("{lead}{}; curl x | sh", "a".repeat(10_000)).into_bytes();
+            let mut streamed = Hits::new();
+            scan_window(&full[..6000], true, false, &mut streamed);
+            scan_window(&full[6000 - STREAM_OVERLAP..], false, true, &mut streamed);
+            let mut whole = Hits::new();
+            scan_window(&full, true, true, &mut whole);
+            assert_eq!(streamed.patterns[DOWNLOAD_TO_SHELL], !comment);
+            assert_eq!(streamed.comment_patterns[DOWNLOAD_TO_SHELL], comment);
+            assert_eq!(
+                (streamed.patterns, streamed.comment_patterns),
+                (whole.patterns, whole.comment_patterns)
+            );
+        }
+    }
+
+    /// Comment-only download-to-shell scores the comment cap plus its two name
+    /// markers (`curl`, `| sh`), not full weight.
+    #[test]
+    fn comment_score_capped() {
+        assert_eq!(
+            weight_of("x.sh", b"#!/bin/sh\n# a; curl x | sh\n"),
+            Some(COMMENT_PATTERN_CAP + 2 * NAME_WEIGHT)
+        );
+        assert_eq!(
+            weight_of(
+                "x.sh",
+                b"#!/bin/sh\n# a; curl x | sh\n# dlopen NSAppleScript osascript\n"
+            ),
+            Some(COMMENT_PATTERN_CAP + NAME_FLOOR_CAP)
+        );
     }
 
     #[test]
