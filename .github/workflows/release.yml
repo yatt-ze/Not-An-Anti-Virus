@@ -1,8 +1,8 @@
 # Release (§13, #250): publishes navctl for both macOS targets when CI passes
-# on a push to main whose commit bumps the workspace version to an untagged
-# vX.Y.Z. It builds the exact commit CI tested (workflow_run.head_sha), never
-# the branch tip. Manual dispatch runs on main only and publishes only when
-# asked; a PR that edits this file runs the build as a dry run.
+# on a push to main whose workspace version has no vX.Y.Z tag yet. It builds
+# the exact commit CI tested (workflow_run.head_sha), never the branch tip.
+# Manual dispatch runs on main only and publishes only when asked; a PR that
+# edits this file runs the build as a dry run.
 name: Release
 
 on:
@@ -19,9 +19,17 @@ on:
   pull_request:
     paths: [.github/workflows/release.yml]
 
-# One release at a time; a queued run waits instead of cancelling this one.
+# One release at a time. GitHub keeps one pending run per group and cancels
+# an older pending one, which is safe because every run re-checks main's
+# version. Runs plan would reject get their own group, so they can't cancel.
 concurrency:
-  group: release-${{ github.event_name == 'pull_request' && github.ref || 'main' }}
+  group: >-
+    release-${{
+      ((github.event_name == 'workflow_run'
+        && github.event.workflow_run.event == 'push'
+        && github.event.workflow_run.head_repository.full_name == github.repository)
+      || (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main'))
+      && 'main' || github.run_id }}
   cancel-in-progress: false
 
 permissions:
@@ -57,7 +65,6 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ github.event.workflow_run.head_sha || github.sha }}
-          fetch-depth: 2
           persist-credentials: false
       - id: plan
         env:
@@ -72,17 +79,20 @@ jobs:
           }
           sha=$(git rev-parse HEAD)
           v=$(version HEAD)
-          echo "$v" | grep -Eqx '[0-9]+\.[0-9]+\.[0-9]+' || { echo "::error::unexpected version '$v'"; exit 1; }
+          [[ "$v" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "::error::unexpected version '$v'"; exit 1; }
           tag="v$v"
-          # ls-remote --exit-code: 0 found, 2 not found, anything else failed.
-          rc=0; git ls-remote --exit-code --tags origin "refs/tags/$tag" >/dev/null || rc=$?
-          case $rc in 0) tagged=true ;; 2) tagged=false ;; *) echo "::error::ls-remote failed ($rc)"; exit 1 ;; esac
+          # matching-refs is a prefix match (v0.2 matches v0.2.0), so compare exactly.
+          n=$(gh api "repos/$GITHUB_REPOSITORY/git/matching-refs/tags/$tag" \
+                -q "[.[] | select(.ref == \"refs/tags/$tag\")] | length")
+          if [ "$n" -gt 0 ]; then tagged=true; else tagged=false; fi
 
           build=false; publish=false
           case "$EVENT" in
             workflow_run)
-              parent=$(version HEAD^1 2>/dev/null || echo none)
-              if [ "$v" != "$parent" ] && [ "$tagged" = false ]; then build=true; publish=true; fi
+              # The attestation names GITHUB_SHA (main's tip when this run was
+              # queued), so release only when that is the commit CI tested. If
+              # main moved on, the newer commit's run releases the version.
+              if [ "$tagged" = false ] && [ "$sha" = "$GITHUB_SHA" ]; then build=true; publish=true; fi
               ;;
             workflow_dispatch)
               build=true
@@ -149,6 +159,7 @@ jobs:
       contents: write
       id-token: write
       attestations: write
+      pull-requests: read
     env:
       GH_TOKEN: ${{ github.token }}
       GH_REPO: ${{ github.repository }}
@@ -168,7 +179,7 @@ jobs:
           [ "$(ls -- *.tar.gz | wc -l)" -eq 2 ] && [ "$(wc -l < SHA256SUMS)" -eq 2 ]
       - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:
-          subject-path: dist/*.tar.gz
+          subject-path: dist/*
       - name: create the tag
         id: tag
         # Creating the ref fails if it exists, so two runs can't both publish.
@@ -178,7 +189,10 @@ jobs:
           set -eu
           # Notes: the body of the PR that merged this commit, if there is one.
           gh api "repos/$GH_REPO/commits/$SHA/pulls" -q '.[0].body // empty' > notes.md || true
-          [ -s notes.md ] || echo "navctl $VERSION" > notes.md
+          if [ ! -s notes.md ]; then
+            echo "::warning::no PR body found for $SHA; using a one-line note"
+            echo "navctl $VERSION" > notes.md
+          fi
           # Draft first, so nobody sees a release with only some assets.
           gh release create "$TAG" dist/* --verify-tag --draft --title "NAV $VERSION" --notes-file notes.md
           gh release edit "$TAG" --draft=false --latest
@@ -202,7 +216,7 @@ jobs:
           VERSION: ${{ needs.plan.outputs.version }}
         run: |
           set -eu
-          if [ ! -f install.sh ]; then echo "no install.sh yet (#250)"; exit 0; fi
+          if [ ! -f install.sh ]; then echo "::notice::no install.sh yet (#250); nothing tested"; exit 0; fi
           dir="$RUNNER_TEMP/nav bin"
           NAV_INSTALL_DIR="$dir" sh install.sh
           got=$("$dir/navctl" --version)
