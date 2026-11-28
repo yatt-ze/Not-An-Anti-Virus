@@ -20,14 +20,17 @@ const MAX_KEYWORD: usize = 79;
 /// The byte ranges of `data`'s compressed-by-design payloads (`IDAT`,
 /// `fdAT` after its sequence number, `zTXt`/`iCCP` after name and method,
 /// compressed `iTXt` text), in file order. `None` unless `data` is a
-/// well-formed PNG: verified CRCs, `IHDR` (length 13) first and only, and an
-/// empty `IEND` ending exactly at the end of `data`.
+/// well-formed PNG: verified CRCs, `IHDR` (length 13) first and only, method
+/// bytes 0, a zlib header at each stream start, and an empty `IEND` ending
+/// exactly at the end of `data`. A run of `IDAT` (or `fdAT`) chunks is one
+/// stream, so only its first chunk carries the header.
 pub fn compressed_ranges(data: &[u8]) -> Option<Vec<Range<usize>>> {
     if data.get(..8)? != SIGNATURE {
         return None;
     }
     let mut ranges = Vec::new();
     let mut pos = 8usize;
+    let mut prev = [0u8; 4];
     for index in 0..MAX_CHUNKS {
         let len = u32::from_be_bytes(data.get(pos..pos.checked_add(4)?)?.try_into().ok()?);
         if len > MAX_CHUNK_LEN {
@@ -55,8 +58,13 @@ pub fn compressed_ranges(data: &[u8]) -> Option<Vec<Range<usize>>> {
             return (len == 0 && end == data.len()).then_some(ranges);
         }
         if let Some(offset) = compressed_offset(&kind, body)? {
+            let continues = kind == prev && matches!(&kind, b"IDAT" | b"fdAT");
+            if !continues && !zlib_header(body.get(offset..)?) {
+                return None;
+            }
             ranges.push(body_start.checked_add(offset)?..body_end);
         }
+        prev = kind;
         pos = end;
     }
     None
@@ -72,13 +80,18 @@ fn compressed_offset(kind: &[u8; 4], body: &[u8]) -> Option<Option<usize>> {
         b"zTXt" | b"iCCP" => {
             // keyword NUL, compression method, compressed data
             let method = keyword_end(body)?.checked_add(1)?;
-            body.get(method)?;
+            if *body.get(method)? != 0 {
+                return None;
+            }
             Some(Some(method.checked_add(1)?))
         }
         b"iTXt" => {
             // keyword NUL, flag, method, language NUL, translated keyword NUL, text
             let flag_at = keyword_end(body)?.checked_add(1)?;
             let flag = *body.get(flag_at)?;
+            if *body.get(flag_at.checked_add(1)?)? != 0 {
+                return None;
+            }
             let lang_end = nul_after(body, flag_at.checked_add(2)?)?;
             let text = nul_after(body, lang_end.checked_add(1)?)?.checked_add(1)?;
             match flag {
@@ -89,6 +102,16 @@ fn compressed_offset(kind: &[u8; 4], body: &[u8]) -> Option<Option<usize>> {
         }
         _ => Some(None),
     }
+}
+
+/// Whether `stream` starts with a zlib header for DEFLATE (RFC 1950): CM 8,
+/// CINFO at most 7, a valid FCHECK, no preset dictionary.
+fn zlib_header(stream: &[u8]) -> bool {
+    let (Some(&cmf), Some(&flg)) = (stream.first(), stream.get(1)) else {
+        return false;
+    };
+    let check = (u16::from(cmf) << 8 | u16::from(flg)) % 31 == 0;
+    cmf & 0x0F == 8 && cmf >> 4 <= 7 && check && flg & 0x20 == 0
 }
 
 /// The index of the NUL ending a 1-79 byte keyword at the start of `body`.
@@ -118,6 +141,20 @@ pub(crate) fn chunk(kind: &[u8; 4], body: &[u8]) -> Vec<u8> {
 mod tests {
     use super::*;
 
+    /// `rest` behind a valid zlib header.
+    fn z(rest: &[u8]) -> Vec<u8> {
+        [&[0x78, 0x9c], rest].concat()
+    }
+
+    /// Two-byte headers that each break one RFC 1950 rule, plus a short one.
+    const BAD_ZLIB: [&[u8]; 5] = [
+        &[0x78, 0x9d], // FCHECK
+        &[0x79, 0x18], // CM 9
+        &[0x88, 0x1c], // CINFO 8
+        &[0x78, 0xbb], // FDICT
+        &[0x78],
+    ];
+
     fn ihdr() -> Vec<u8> {
         chunk(b"IHDR", &[0, 0, 0, 1, 0, 0, 0, 1, 8, 2, 0, 0, 0])
     }
@@ -140,11 +177,11 @@ mod tests {
 
     #[test]
     fn minimal_png_parses() {
-        let middle = [chunk(b"IDAT", b"compressed")];
+        let middle = [chunk(b"IDAT", &z(b"compressed"))];
         let start = body_at(&middle, 0);
         let ranges = compressed_ranges(&png(&middle)).unwrap();
         assert_eq!(ranges.len(), 1);
-        assert_eq!(ranges[0], start..start + 10);
+        assert_eq!(ranges[0], start..start + 12);
         assert_eq!(compressed_ranges(&png(&[])), Some(vec![]));
     }
 
@@ -152,23 +189,23 @@ mod tests {
     fn compressed_payload_offsets() {
         let middle = [
             chunk(b"tEXt", b"Comment\0plain"),
-            chunk(b"zTXt", b"Comment\0\0zzzz"),
-            chunk(b"iCCP", b"sRGB\0\0cccc"),
+            chunk(b"zTXt", b"Comment\0\0\x78\x9czz"),
+            chunk(b"iCCP", b"sRGB\0\0\x78\x9ccc"),
             chunk(b"iTXt", b"XML:com.adobe.xmp\0\0\0en\0\0<x/>"),
-            chunk(b"iTXt", b"Title\0\x01\0en\0Titel\0iiii"),
-            chunk(b"fdAT", b"\0\0\0\x01ffff"),
+            chunk(b"iTXt", b"Title\0\x01\0en\0Titel\0\x78\x9cii"),
+            chunk(b"fdAT", b"\0\0\0\x01\x78\x9cff"),
             chunk(b"stEg", b"private"),
         ];
         let c = png(&middle);
         let ranges = compressed_ranges(&c).unwrap();
         let picked: Vec<&[u8]> = ranges.iter().map(|r| &c[r.clone()]).collect();
-        assert_eq!(picked, [&b"zzzz"[..], b"cccc", b"iiii", b"ffff"]);
+        assert_eq!(picked, [&z(b"zz")[..], &z(b"cc"), &z(b"ii"), &z(b"ff")]);
         assert_eq!(ranges[0].start, body_at(&middle, 1) + 9);
     }
 
     #[test]
     fn bad_crc_rejected() {
-        let mut c = png(&[chunk(b"IDAT", b"data")]);
+        let mut c = png(&[chunk(b"IDAT", &z(b"data"))]);
         let crc_at = body_at(&[], 0) + 4;
         c[crc_at] ^= 1;
         assert_eq!(compressed_ranges(&c), None);
@@ -176,14 +213,14 @@ mod tests {
 
     #[test]
     fn trailing_data_rejected() {
-        let mut c = png(&[chunk(b"IDAT", b"data")]);
+        let mut c = png(&[chunk(b"IDAT", &z(b"data"))]);
         c.push(0);
         assert_eq!(compressed_ranges(&c), None);
     }
 
     #[test]
     fn every_truncation_rejected() {
-        let c = png(&[chunk(b"tEXt", b"k\0v"), chunk(b"IDAT", b"data")]);
+        let c = png(&[chunk(b"tEXt", b"k\0v"), chunk(b"IDAT", &z(b"data"))]);
         for len in 0..c.len() {
             assert_eq!(compressed_ranges(&c[..len]), None, "len {len}");
         }
@@ -193,7 +230,7 @@ mod tests {
     fn missing_iend_rejected() {
         let mut c = SIGNATURE.to_vec();
         c.extend(ihdr());
-        c.extend(chunk(b"IDAT", b"data"));
+        c.extend(chunk(b"IDAT", &z(b"data")));
         assert_eq!(compressed_ranges(&c), None);
     }
 
@@ -226,7 +263,7 @@ mod tests {
             nonempty_iend,
             huge,
             png(&[chunk(b"ID1T", b"data")]),
-            png(&[chunk(b"zTXt", b"\0\0zz")]),
+            png(&[chunk(b"zTXt", b"\0\0\x78\x9c")]),
             png(&[chunk(b"zTXt", &[b'k'; 80])]),
             png(&[chunk(b"zTXt", b"Comment\0")]),
             png(&[chunk(b"iTXt", b"k\0\x02\0en\0t\0x")]),
@@ -240,9 +277,56 @@ mod tests {
     #[test]
     fn keyword_length_bound() {
         let mut body = vec![b'k'; 79];
-        body.extend_from_slice(b"\0\0zz");
+        body.extend_from_slice(b"\0\0\x78\x9c");
         let ranges = compressed_ranges(&png(&[chunk(b"zTXt", &body)]));
         assert_eq!(ranges.map(|r| r.len()), Some(1));
+    }
+
+    #[test]
+    fn wrong_method_rejected() {
+        for c in [
+            chunk(b"zTXt", b"Comment\0\x01\x78\x9czz"),
+            chunk(b"iCCP", b"sRGB\0\x01\x78\x9ccc"),
+            chunk(b"iTXt", b"Title\0\x01\x01en\0Titel\0\x78\x9cii"),
+            chunk(b"iTXt", b"Title\0\0\x01en\0Titel\0plain"),
+        ] {
+            assert_eq!(compressed_ranges(&png(&[c])), None);
+        }
+    }
+
+    #[test]
+    fn idat_zlib_checked() {
+        for bad in BAD_ZLIB {
+            let c = png(&[chunk(b"IDAT", &[bad, b"data"].concat())]);
+            assert_eq!(compressed_ranges(&c), None, "{bad:x?}");
+        }
+        // only a run's first IDAT carries the header
+        let run = [chunk(b"IDAT", &z(b"da")), chunk(b"IDAT", b"ta")];
+        assert_eq!(compressed_ranges(&png(&run)).map(|r| r.len()), Some(2));
+        let split = [run[0].clone(), chunk(b"tEXt", b"k\0v"), run[1].clone()];
+        assert_eq!(compressed_ranges(&png(&split)), None);
+    }
+
+    #[test]
+    fn fdat_zlib_checked() {
+        for bad in BAD_ZLIB {
+            let c = png(&[chunk(b"fdAT", &[b"\0\0\0\x01", bad, b"ff"].concat())]);
+            assert_eq!(compressed_ranges(&c), None, "{bad:x?}");
+        }
+        // a frame split over two fdATs
+        let frame = [
+            chunk(b"fdAT", &[&b"\0\0\0\x01"[..], &z(b"ff")].concat()),
+            chunk(b"fdAT", b"\0\0\0\x02ff"),
+        ];
+        assert_eq!(compressed_ranges(&png(&frame)).map(|r| r.len()), Some(2));
+    }
+
+    #[test]
+    fn ztxt_zlib_checked() {
+        for bad in BAD_ZLIB {
+            let c = png(&[chunk(b"zTXt", &[b"Comment\0\0", bad, b"zz"].concat())]);
+            assert_eq!(compressed_ranges(&c), None, "{bad:x?}");
+        }
     }
 
     #[test]

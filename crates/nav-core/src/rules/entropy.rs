@@ -1999,8 +1999,13 @@ mod tests {
         assert_eq!(weight_of("a.png", content), Some(CONTAINER_BLOB_WEIGHT));
     }
 
-    /// A well-formed PNG: XMP `iTXt` first, then `extra`, a random `IDAT`
-    /// and `IEND`.
+    /// `len` random bytes behind a valid zlib header.
+    fn zlib_noise(len: usize) -> Vec<u8> {
+        [&[0x78, 0x9c][..], &high_entropy_blob(len)].concat()
+    }
+
+    /// A well-formed PNG: XMP `iTXt` first, then `extra`, an `IDAT` of
+    /// [`zlib_noise`] and `IEND`.
     fn xmp_png(extra: &[Vec<u8>]) -> Vec<u8> {
         let mut c = png::SIGNATURE.to_vec();
         c.extend(png::chunk(
@@ -2013,7 +2018,7 @@ mod tests {
         for e in extra {
             c.extend_from_slice(e);
         }
-        c.extend(png::chunk(b"IDAT", &high_entropy_blob(8192)));
+        c.extend(png::chunk(b"IDAT", &zlib_noise(8192)));
         c.extend(png::chunk(b"IEND", b""));
         c
     }
@@ -2047,7 +2052,8 @@ mod tests {
         let truncated = good[..good.len() - 12].to_vec();
         let mut dup_ihdr = good[..33].to_vec();
         dup_ihdr.extend_from_slice(&good[8..]);
-        for content in [trailing, bad_crc, truncated, dup_ihdr] {
+        let bad_zlib = xmp_png(&[png::chunk(b"zTXt", b"Comment\0\0\x78\x9dzz")]);
+        for content in [trailing, bad_crc, truncated, dup_ihdr, bad_zlib] {
             assert_eq!(weight_of("a.png", content), Some(CONTAINER_BLOB_WEIGHT));
         }
     }
