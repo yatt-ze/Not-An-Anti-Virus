@@ -19,12 +19,7 @@ fn is_root() -> bool {
 }
 
 pub fn run_install() -> ExitCode {
-    if !is_root() {
-        nav_core::safe_eprintln!(
-            "navctl: `service install` must run as root (try: sudo navctl service install)"
-        );
-        return exit::code(exit::OPERATIONAL_ERROR);
-    }
+    // Checked before root, so a CLI-only install never asks for sudo (§8).
     let navd_src = match navd_beside_current_exe() {
         Ok(p) => p,
         Err(e) => {
@@ -32,6 +27,20 @@ pub fn run_install() -> ExitCode {
             return exit::code(exit::OPERATIONAL_ERROR);
         }
     };
+    if !navd_src.is_file() {
+        nav_core::safe_eprintln!(
+            "navctl: no navd found at {}: this install has only the standalone navctl CLI, \
+             so there is no navd service to install.",
+            navd_src.display()
+        );
+        return exit::code(exit::OPERATIONAL_ERROR);
+    }
+    if !is_root() {
+        nav_core::safe_eprintln!(
+            "navctl: `service install` must run as root (try: sudo navctl service install)"
+        );
+        return exit::code(exit::OPERATIONAL_ERROR);
+    }
     match install(
         &Layout::system(),
         &RealSystemOps,
