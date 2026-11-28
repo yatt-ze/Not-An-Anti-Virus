@@ -1,0 +1,10 @@
+apng.png ok 99..310 364..469 485..591
+bad_crc.png malformed
+bad_zlib_header.png malformed
+iccp.png ok 47..67 79..290
+itxt_compressed.png ok 58..75 87..298
+plain.png ok 41..252
+sips.png ok 207..240
+trailing_data.png malformed
+xmp_itxt.png ok 299..1094
+ztxt.png ok 50..73 85..296

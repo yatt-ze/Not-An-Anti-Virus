@@ -337,4 +337,40 @@ mod tests {
         let over = png(&vec![filler; MAX_CHUNKS - 1]);
         assert_eq!(compressed_ranges(&over), None);
     }
+
+    /// Every file in `testdata/png/` against `expected.txt`, written by the
+    /// independent Python walker in its `generate.py`.
+    #[test]
+    fn differential_corpus() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("testdata/png");
+        let expected = std::fs::read_to_string(dir.join("expected.txt")).unwrap();
+        let mut checked = Vec::new();
+        for line in expected.lines() {
+            let mut words = line.split(' ');
+            let name = words.next().unwrap();
+            let want = match words.next() {
+                Some("malformed") => None,
+                Some("ok") => Some(
+                    words
+                        .map(|w| {
+                            let (start, end) = w.split_once("..").unwrap();
+                            start.parse().unwrap()..end.parse().unwrap()
+                        })
+                        .collect::<Vec<_>>(),
+                ),
+                other => panic!("{name}: bad verdict {other:?}"),
+            };
+            let data = std::fs::read(dir.join(name)).unwrap();
+            assert_eq!(compressed_ranges(&data), want, "{name}");
+            checked.push(name.to_owned());
+        }
+        let mut pngs: Vec<String> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().into_string().unwrap())
+            .filter(|n| n.ends_with(".png"))
+            .collect();
+        pngs.sort();
+        checked.sort();
+        assert_eq!(pngs, checked, "rerun generate.py");
+    }
 }
