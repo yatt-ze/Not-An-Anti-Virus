@@ -14,14 +14,16 @@ use clap::{Args, Subcommand};
 use super::manifest::Manifest;
 use crate::build::{git, resolve_dirs};
 use crate::vm::{
-    check_tart, copy_in, copy_out, make_bundle, map_exit, resolve_sha, tart, vm_name,
-    wait_for_agent, warn_stale_vms, TempFile, VmGuard,
+    check_tart, copy_in, make_bundle, map_exit, resolve_sha, tart, vm_name, wait_for_agent,
+    warn_stale_vms, TempFile, VmGuard,
 };
 
 const VM_PREFIX: &str = "nav-benign-run-";
 const REF_NS: &str = "xtask-benign-vm";
 /// Largest survey output accepted from the guest.
 const MAX_OUTPUT: u64 = 16 << 20;
+/// Largest compare result file accepted; JSONL over the large items is big.
+const MAX_RESULT: u64 = 256 << 20;
 
 #[derive(Subcommand)]
 pub enum VmCommand {
@@ -140,9 +142,22 @@ fn read_text(r: impl Read, max: u64) -> Result<String> {
     String::from_utf8(buf).context("output is not valid UTF-8")
 }
 
-/// Copies the guest's survey output to `dest`, only if it passes
-/// [`read_text`]; otherwise nothing is written.
-fn copy_survey(name: &str, dest: &Path) -> Result<()> {
+/// A guest file that was too big or not UTF-8; nothing was written.
+#[derive(Debug)]
+struct Rejected(String);
+
+impl std::fmt::Display for Rejected {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for Rejected {}
+
+/// Copies `$HOME/out/<file>` from the guest to `dest`, only if it passes
+/// [`read_text`] with `max`; otherwise nothing is written and a rejection
+/// is a [`Rejected`] error.
+fn copy_text(name: &str, file: &str, dest: &Path, max: u64) -> Result<()> {
     let mut child = tart()
         .args([
             "exec",
@@ -151,13 +166,13 @@ fn copy_survey(name: &str, dest: &Path) -> Result<()> {
             "-c",
             "cat \"$HOME/out/$1\"",
             "sh",
-            "survey.txt",
+            file,
         ])
         .stdout(Stdio::piped())
         .spawn()
         .context("spawning tart exec")?;
     let out = child.stdout.take().context("no stdout pipe")?;
-    let text = read_text(out, MAX_OUTPUT);
+    let text = read_text(out, max).map_err(|e| anyhow::Error::new(Rejected(format!("{e:#}"))));
     if text.is_err() {
         let _ = child.kill();
     }
@@ -165,7 +180,7 @@ fn copy_survey(name: &str, dest: &Path) -> Result<()> {
     let text = text?;
     ensure!(
         status.success(),
-        "reading survey.txt in the VM failed ({status})"
+        "reading {file} in the VM failed ({status})"
     );
     std::fs::write(dest, text).with_context(|| dest.display().to_string())
 }
@@ -261,10 +276,18 @@ fn compare(a: VmCompareArgs) -> Result<ExitCode> {
         .args(compare_args(&new, &base))
         .status()
         .context("spawning tart exec")?;
+    let mut rejected = false;
     for f in RESULT_FILES {
-        copy_out(&name, f, &out_dir);
+        if let Err(e) = copy_text(&name, f, &out_dir.join(f), MAX_RESULT) {
+            eprintln!("warning: could not copy {f} out of the VM: {e:#}");
+            rejected |= e.is::<Rejected>();
+        }
     }
     println!("results: {}", out_dir.display());
+    if rejected {
+        eprintln!("error: a result file was not text or too large and was discarded");
+        return Ok(ExitCode::from(1));
+    }
     Ok(ExitCode::from(map_exit(status.code())))
 }
 
@@ -296,7 +319,7 @@ fn survey(a: SurveyArgs) -> Result<ExitCode> {
         .context("spawning tart exec")?;
     let dest = out_dir.join("survey.txt");
     let guest = map_exit(status.code());
-    match copy_survey(&name, &dest) {
+    match copy_text(&name, "survey.txt", &dest, MAX_OUTPUT) {
         Ok(()) => {
             println!("results: {}", dest.display());
             Ok(ExitCode::from(guest))
