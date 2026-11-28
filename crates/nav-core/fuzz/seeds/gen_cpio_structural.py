@@ -48,9 +48,12 @@ def xor(blob):
     return reduce(lambda a, b: a ^ b, blob, 0)
 
 
-def with_chunk(archive, chunk):
-    """Appends one byte after the trailer so the XOR of all bytes is `chunk`."""
-    return archive + bytes([xor(archive) ^ chunk])
+def with_chunk(archive, chunk, cap=None):
+    """Appends bytes after the trailer so the XOR of all bytes is `chunk` and,
+    given `cap`, the last byte (the harness's member cap) is `cap`."""
+    if cap is None:
+        return archive + bytes([xor(archive) ^ chunk])
+    return archive + bytes([xor(archive) ^ chunk ^ cap, cap])
 
 
 def build():
@@ -95,6 +98,11 @@ def build():
     for base in ("newc_align_residues", "mixed_odc_newc", "odc_long_name"):
         for chunk in (1, 3, 6, 76, 77, 110, 111):
             s[f"{base}_chunk{chunk}"] = with_chunk(s[base], chunk)
+
+    # Member caps around the 17-byte bodies, the 11-byte trailer name, and
+    # the six magic bytes, at a mid-header split.
+    for cap in (5, 6, 10, 11, 16, 17):
+        s[f"mixed_odc_newc_cap{cap}"] = with_chunk(s["mixed_odc_newc"], 40, cap)
     return s
 
 
