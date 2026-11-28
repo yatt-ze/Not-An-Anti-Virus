@@ -1,0 +1,223 @@
+# Release (§13, #250): publishes navctl for both macOS targets when CI passes
+# on a push to main whose workspace version has no vX.Y.Z tag yet. It builds
+# the exact commit CI tested (workflow_run.head_sha), never the branch tip.
+# Manual dispatch runs on main only and publishes only when asked; a PR that
+# edits this file runs the build as a dry run.
+name: Release
+
+on:
+  workflow_run:
+    workflows: [CI]
+    types: [completed]
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: "Tag and publish (otherwise build and package only)"
+        type: boolean
+        default: false
+  pull_request:
+    paths: [.github/workflows/release.yml]
+
+# One release at a time. GitHub keeps one pending run per group and cancels
+# an older pending one, which is safe because every run re-checks main's
+# version. Runs plan would reject get their own group, so they can't cancel.
+concurrency:
+  group: >-
+    release-${{
+      ((github.event_name == 'workflow_run'
+        && github.event.workflow_run.event == 'push'
+        && github.event.workflow_run.head_repository.full_name == github.repository)
+      || (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main'))
+      && 'main' || github.run_id }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  TARGETS: aarch64-apple-darwin x86_64-apple-darwin
+
+jobs:
+  plan:
+    name: decide what to release
+    runs-on: ubuntu-latest
+    # A fork's PR from its own `main` also reports head_branch main, hence the
+    # event and repository checks.
+    if: >-
+      (github.event_name == 'workflow_run'
+        && github.event.workflow_run.conclusion == 'success'
+        && github.event.workflow_run.event == 'push'
+        && github.event.workflow_run.head_branch == 'main'
+        && github.event.workflow_run.head_repository.full_name == github.repository)
+      || (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main')
+      || github.event_name == 'pull_request'
+    permissions:
+      contents: read
+      actions: read
+    outputs:
+      sha: ${{ steps.plan.outputs.sha }}
+      version: ${{ steps.plan.outputs.version }}
+      build: ${{ steps.plan.outputs.build }}
+      publish: ${{ steps.plan.outputs.publish }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.workflow_run.head_sha || github.sha }}
+          persist-credentials: false
+      - id: plan
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EVENT: ${{ github.event_name }}
+          PUBLISH_INPUT: ${{ inputs.publish }}
+        run: |
+          set -eu
+          version() {
+            git show "$1:Cargo.toml" | python3 -c \
+              'import sys, tomllib; print(tomllib.loads(sys.stdin.read())["workspace"]["package"]["version"])'
+          }
+          sha=$(git rev-parse HEAD)
+          v=$(version HEAD)
+          [[ "$v" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "::error::unexpected version '$v'"; exit 1; }
+          tag="v$v"
+          # matching-refs is a prefix match (v0.2 matches v0.2.0), so compare exactly.
+          n=$(gh api "repos/$GITHUB_REPOSITORY/git/matching-refs/tags/$tag" \
+                -q "[.[] | select(.ref == \"refs/tags/$tag\")] | length")
+          if [ "$n" -gt 0 ]; then tagged=true; else tagged=false; fi
+
+          build=false; publish=false
+          case "$EVENT" in
+            workflow_run)
+              # The attestation names GITHUB_SHA (main's tip when this run was
+              # queued), so release only when that is the commit CI tested. If
+              # main moved on, the newer commit's run releases the version.
+              if [ "$tagged" = false ] && [ "$sha" = "$GITHUB_SHA" ]; then build=true; publish=true; fi
+              ;;
+            workflow_dispatch)
+              build=true
+              if [ "$PUBLISH_INPUT" = true ]; then
+                [ "$tagged" = false ] || { echo "::error::$tag already exists"; exit 1; }
+                ok=$(gh api "repos/$GITHUB_REPOSITORY/actions/workflows/ci.yml/runs?head_sha=$sha&event=push&branch=main&status=success" -q .total_count)
+                [ "$ok" -gt 0 ] || { echo "::error::CI has not passed on a push of $sha to main"; exit 1; }
+                publish=true
+              fi
+              ;;
+            pull_request) build=true ;;
+          esac
+          echo "$tag at $sha: tagged=$tagged build=$build publish=$publish"
+          {
+            echo "sha=$sha"; echo "version=$v"; echo "build=$build"; echo "publish=$publish"
+          } >> "$GITHUB_OUTPUT"
+
+  build:
+    name: build, sign and package
+    needs: plan
+    if: needs.plan.outputs.build == 'true'
+    runs-on: macos-26
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.plan.outputs.sha }}
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1 (2026-10-15)
+        with:
+          toolchain: stable
+          targets: aarch64-apple-darwin, x86_64-apple-darwin
+      # No rust-cache: a release builds from clean, so no cache entry can feed it.
+      - name: build
+        run: for t in $TARGETS; do cargo build --locked --release -p navctl --target "$t"; done
+      - name: sign, smoke-test and package
+        env:
+          VERSION: ${{ needs.plan.outputs.version }}
+          # bsdtar would otherwise add AppleDouble ._ files for xattrs.
+          COPYFILE_DISABLE: "1"
+        run: |
+          set -eu
+          mkdir dist
+          for t in $TARGETS; do
+            bin="target/$t/release/navctl"
+            # Ad-hoc, no Developer ID (§13); the linker signs arm64 only.
+            codesign --force --sign - "$bin"
+            case "$t" in x86_64-*) got=$(arch -x86_64 "$bin" --version) ;; *) got=$("$bin" --version) ;; esac
+            [ "$got" = "navctl $VERSION" ] || { echo "::error::$t reports '$got', expected 'navctl $VERSION'"; exit 1; }
+            tar --no-mac-metadata -czf "dist/navctl-$VERSION-$t.tar.gz" -C "target/$t/release" navctl
+          done
+          (cd dist && shasum -a 256 -- *.tar.gz > SHA256SUMS && cat SHA256SUMS)
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: dist
+          path: dist/
+          if-no-files-found: error
+
+  publish:
+    name: tag and publish
+    needs: [plan, build]
+    if: needs.plan.outputs.publish == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+      pull-requests: read
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      TAG: v${{ needs.plan.outputs.version }}
+      VERSION: ${{ needs.plan.outputs.version }}
+      SHA: ${{ needs.plan.outputs.sha }}
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: dist
+          path: dist
+      - name: check the archives against SHA256SUMS
+        run: |
+          set -eu
+          cd dist
+          sha256sum -c SHA256SUMS
+          [ "$(ls -- *.tar.gz | wc -l)" -eq 2 ] && [ "$(wc -l < SHA256SUMS)" -eq 2 ]
+      - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: dist/*
+      - name: create the tag
+        id: tag
+        # Creating the ref fails if it exists, so two runs can't both publish.
+        run: gh api "repos/$GH_REPO/git/refs" -f ref="refs/tags/$TAG" -f sha="$SHA" >/dev/null
+      - name: create the release
+        run: |
+          set -eu
+          # Notes: the body of the PR that merged this commit, if there is one.
+          gh api "repos/$GH_REPO/commits/$SHA/pulls" -q '.[0].body // empty' > notes.md || true
+          if [ ! -s notes.md ]; then
+            echo "::warning::no PR body found for $SHA; using a one-line note"
+            echo "navctl $VERSION" > notes.md
+          fi
+          # Draft first, so nobody sees a release with only some assets.
+          gh release create "$TAG" dist/* --verify-tag --draft --title "NAV $VERSION" --notes-file notes.md
+          gh release edit "$TAG" --draft=false --latest
+      - name: remove a half-made release
+        if: failure() && steps.tag.outcome == 'success'
+        run: |
+          gh release delete "$TAG" --yes || true
+          gh api -X DELETE "repos/$GH_REPO/git/refs/tags/$TAG" || true
+
+  smoke:
+    name: install the published release
+    needs: [plan, publish]
+    runs-on: macos-26
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.plan.outputs.sha }}
+          persist-credentials: false
+      - name: install.sh resolves and installs the new release
+        env:
+          VERSION: ${{ needs.plan.outputs.version }}
+        run: |
+          set -eu
+          if [ ! -f install.sh ]; then echo "::notice::no install.sh yet (#250); nothing tested"; exit 0; fi
+          dir="$RUNNER_TEMP/nav bin"
+          NAV_INSTALL_DIR="$dir" sh install.sh
+          got=$("$dir/navctl" --version)
+          [ "$got" = "navctl $VERSION" ] || { echo "::error::installed '$got', expected 'navctl $VERSION'"; exit 1; }
