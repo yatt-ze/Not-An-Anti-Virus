@@ -11,7 +11,7 @@
 //! Seed from `testdata/png/` and the PNG fixtures.
 
 use libfuzzer_sys::fuzz_target;
-use nav_core::png::{compressed_ranges, MAX_CHUNKS, SIGNATURE};
+use nav_core::png::{compressed_ranges, MAX_CHUNKS, MAX_CHUNK_LEN, SIGNATURE};
 
 fuzz_target!(|data: &[u8]| {
     check(data);
@@ -42,7 +42,7 @@ fn with_fixed_crcs(data: &[u8]) -> Vec<u8> {
             break;
         };
         let len = u32::from_be_bytes(len.try_into().unwrap());
-        if len > 0x7FFF_FFFF {
+        if len > MAX_CHUNK_LEN {
             break;
         }
         let body_end = pos + 8 + len as usize;

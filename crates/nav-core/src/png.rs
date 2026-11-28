@@ -12,7 +12,7 @@ pub const SIGNATURE: &[u8; 8] = b"\x89PNG\r\n\x1a\n";
 pub const MAX_CHUNKS: usize = 65_536;
 
 /// Largest chunk length the format allows (2^31 - 1).
-const MAX_CHUNK_LEN: u32 = 0x7FFF_FFFF;
+pub const MAX_CHUNK_LEN: u32 = 0x7FFF_FFFF;
 
 /// Longest keyword (or iCCP profile name) before its NUL terminator.
 const MAX_KEYWORD: usize = 79;
