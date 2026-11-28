@@ -124,6 +124,10 @@ fn benign_fixtures_never_alert() {
 /// least an incomplete scan.
 const SUB_THRESHOLD_ALLOWLIST: &[(&str, &str)] = &[
     (
+        "suspicious/dropper_heredoc_comment_line.sh",
+        "a `#`-led heredoc line reads as a comment and only corroborates (§5.2, #323); must still score",
+    ),
+    (
         "suspicious/dropper_in_disk_image.dmg",
         "disk image contents not inspected until #86 part 2; must scan Partial, never clean",
     ),

@@ -153,6 +153,14 @@
     "rule_ids": [],
     "completeness": "complete"
   },
+  "benign/installer_comment.sh": {
+    "score": 13,
+    "recommendation": "no-action",
+    "rule_ids": [
+      "suspicious-strings"
+    ],
+    "completeness": "complete"
+  },
   "benign/installer_distribution_js_bzip2_ordinary.pkg": {
     "score": 6,
     "recommendation": "no-action",
@@ -480,6 +488,14 @@
   "suspicious/dropper_exec_curl.js": {
     "score": 19,
     "recommendation": "notify",
+    "rule_ids": [
+      "suspicious-strings"
+    ],
+    "completeness": "complete"
+  },
+  "suspicious/dropper_heredoc_comment_line.sh": {
+    "score": 13,
+    "recommendation": "no-action",
     "rule_ids": [
       "suspicious-strings"
     ],
