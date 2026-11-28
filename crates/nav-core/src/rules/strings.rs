@@ -3,6 +3,8 @@
 //! cross-platform substring scan, streamed past the 8 MiB prefix through the
 //! scan's own file handle when truncation and file size allow it.
 
+use std::path::Path;
+
 use super::{Rule, RuleOutcome};
 use crate::context::{ScanContext, MAX_STREAM_BYTES};
 use crate::model::{MatchedSignal, SignalCategory};
@@ -20,8 +22,9 @@ const NAME_FLOOR_CAP: i32 = 5;
 /// and cannot reach Notify alone (§5.2, #191).
 const MACHO_PATTERN_CAP: i32 = crate::scan::MEDIUM_SCORE_THRESHOLD - 1;
 
-/// Cap on the combined score of patterns matched only on shell comment lines:
-/// with every name marker they stay below Notify (§5.2, #318).
+/// Cap on the combined score of patterns matched only on shell comment lines,
+/// or anywhere in documentation: with every name marker they stay below
+/// Notify (§5.2, #318, #325).
 const COMMENT_PATTERN_CAP: i32 = crate::scan::MEDIUM_SCORE_THRESHOLD - 1 - NAME_FLOOR_CAP;
 
 /// A bare name that only corroborates intent patterns.
@@ -164,11 +167,15 @@ pub(super) const STREAM_OVERLAP: usize = if MAX_MARKER_LEN > PATTERN_SPAN + CONT
     PATTERN_SPAN + CONTEXT_LOOKBACK
 };
 
+/// Extensions of documentation files, whose commands nothing runs (§5.2, #325).
+const DOC_EXTENSIONS: &[&str] = &["md", "markdown", "rst"];
+
 /// A multi-token intent (§5.2) that scores independently of the name markers.
 struct IntentPattern {
     weight: i32,
     note: &'static str,
     comment_note: &'static str,
+    doc_note: &'static str,
 }
 
 const DOWNLOAD_TO_SHELL: usize = 0;
@@ -182,26 +189,31 @@ const PATTERNS: &[IntentPattern] = &[
         weight: 15,
         note: "download piped to a shell",
         comment_note: "download piped to a shell, in a comment",
+        doc_note: "download piped to a shell, in documentation",
     },
     IntentPattern {
         weight: 15,
         note: "decoded payload piped to a shell",
         comment_note: "decoded payload piped to a shell, in a comment",
+        doc_note: "decoded payload piped to a shell, in documentation",
     },
     IntentPattern {
         weight: 15,
         note: "osascript runs a download",
         comment_note: "osascript runs a download, in a comment",
+        doc_note: "osascript runs a download, in documentation",
     },
     IntentPattern {
         weight: 10,
         note: "references the TCC permissions database directly",
         comment_note: "references the TCC permissions database directly",
+        doc_note: "references the TCC permissions database directly",
     },
     IntentPattern {
         weight: 10,
         note: "curl uploads a local file",
         comment_note: "curl uploads a local file, in a comment",
+        doc_note: "curl uploads a local file, in documentation",
     },
 ];
 
@@ -858,28 +870,48 @@ pub(super) fn scan_window(bytes: &[u8], is_first: bool, is_last: bool, hits: &mu
     super::credential_phish::scan(bytes, &mut hits.phish);
 }
 
+/// Whether `ctx` reads as documentation: a Markdown or reStructuredText
+/// extension, no shebang, and no parsed Mach-O. Unavailable content is not
+/// documentation.
+fn is_documentation(ctx: &ScanContext) -> bool {
+    has_doc_extension(&ctx.path)
+        && ctx
+            .content
+            .as_deref()
+            .is_some_and(|c| !c.starts_with(b"#!"))
+        && ctx.macho().images.is_empty()
+}
+
+fn has_doc_extension(path: &Path) -> bool {
+    path.extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| DOC_EXTENSIONS.iter().any(|d| d.eq_ignore_ascii_case(e)))
+}
+
 /// Total weight and notes (patterns first, then counted names) for `hits`.
-/// Patterns matched only on comment lines add at most [`COMMENT_PATTERN_CAP`].
+/// Patterns matched only on comment lines, or anywhere in a documentation
+/// file, add at most [`COMMENT_PATTERN_CAP`].
 /// Patterns in a Mach-O are capped; names count only in script/text.
 fn score(hits: &Hits, ctx: &ScanContext) -> (i32, Vec<&'static str>) {
+    let doc = is_documentation(ctx);
     let mut weight = 0;
     let mut notes: Vec<&'static str> = Vec::new();
     for (p, _) in PATTERNS
         .iter()
         .zip(hits.patterns.iter())
-        .filter(|(_, &hit)| hit)
+        .filter(|(_, &hit)| hit && !doc)
     {
         weight += p.weight;
         notes.push(p.note);
     }
     let mut comment_weight = 0;
-    for (p, _) in PATTERNS
+    for (p, (_, &full)) in PATTERNS
         .iter()
         .zip(hits.comment_patterns.iter().zip(hits.patterns.iter()))
-        .filter(|(_, (&c, &full))| c && !full)
+        .filter(|(_, (&c, &full))| (c && !full) || (doc && full))
     {
         comment_weight += p.weight;
-        notes.push(p.comment_note);
+        notes.push(if full { p.doc_note } else { p.comment_note });
     }
     weight += comment_weight.min(COMMENT_PATTERN_CAP);
     // A parsed slice, not bare magic: magic + junk + a newline still runs as a script.
@@ -1978,5 +2010,15 @@ mod tests {
             ..Default::default()
         };
         assert!(!SuspiciousStringsRule.covers_truncation(&ctx));
+    }
+
+    #[test]
+    fn doc_extensions() {
+        for name in ["a.md", "A.MD", "b.markdown", "c.rst"] {
+            assert!(has_doc_extension(Path::new(name)), "{name}");
+        }
+        for name in ["a.txt", "md", "a.md.sh", "a"] {
+            assert!(!has_doc_extension(Path::new(name)), "{name}");
+        }
     }
 }

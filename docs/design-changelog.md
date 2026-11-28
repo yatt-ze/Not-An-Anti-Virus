@@ -5,6 +5,10 @@ for the current document map. Newest first.
 
 ---
 
+**Changelog from v1.38 (2026-11-28):** §5.2 `suspicious-strings`: in a documentation file (`.md`, `.markdown`, `.rst`, matched case-insensitively) every intent pattern scores at comment-line weight, under the same cap of 9 (#325). Homebrew's `docs/Installation.md` reached Notify (17 = download-to-shell 15 + a name marker) from its documented `/bin/bash -c "$(curl -fsSL …/install.sh)"` command, a line READMEs and install guides commonly carry. The whole file is demoted, not only fenced code blocks: inline code and indented blocks carry the same commands, and nothing runs a Markdown file. A file with a shebang or a parsed Mach-O keeps full weight whatever its name, as does one whose content is unavailable. The cost is that a shebang-less payload saved with one of these extensions only corroborates; whatever fetches and runs it is scanned at full weight. `.txt` is not included, since droppers commonly name payloads `.txt`.
+
+---
+
 **Changelog from v1.37 (2026-11-28):** §5.2 `suspicious-strings`: an intent pattern matched only on a shell comment line scores at corroboration weight (#318). nvm's `install.sh` reached Notify (19 = download-to-shell 15 + two name markers 4) from a comment, "# The login shell that ran this script, like the one `curl ... | bash` was typed into,". A line whose first non-blank byte is `#` is a comment; patterns matched only there have a combined weight capped at 9, which with the name markers' cap of 5 stays below Notify. They are lowered, not dropped, so a payload hidden behind a leading `#` still corroborates. A backslash at a comment's end joins nothing, as in the shell, so `curl x | sh` on the next line keeps full weight. Comment state carries across stream windows (the line holding the next window's first byte), so streamed and in-memory scans agree. The TCC database reference is not a line pattern and is unchanged.
 
 ---
