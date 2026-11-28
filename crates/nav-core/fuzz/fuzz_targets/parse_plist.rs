@@ -33,8 +33,14 @@ fuzz_target!(|data: &[u8]| {
 
     while let Some((value, depth)) = stack.pop() {
         nodes += 1;
-        assert!(depth <= DEPTH_CEILING, "plist tree deeper than {DEPTH_CEILING}");
-        assert!(nodes <= NODE_CEILING, "plist tree larger than {NODE_CEILING} nodes");
+        assert!(
+            depth <= DEPTH_CEILING,
+            "plist tree deeper than {DEPTH_CEILING}"
+        );
+        assert!(
+            nodes <= NODE_CEILING,
+            "plist tree larger than {NODE_CEILING} nodes"
+        );
         // Node count alone doesn't bound memory — shared references let a
         // small file decode to a much larger tree. Charge the payload too.
         assert!(

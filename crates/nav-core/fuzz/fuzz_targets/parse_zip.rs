@@ -39,5 +39,8 @@ fuzz_target!(|data: &[u8]| {
         "members total {total} bytes against a budget of {}",
         limits.max_read_back_bytes
     );
-    assert!(cut == 0 || !result.gaps.is_empty(), "a cut member with no gap");
+    assert!(
+        cut == 0 || !result.gaps.is_empty(),
+        "a cut member with no gap"
+    );
 });

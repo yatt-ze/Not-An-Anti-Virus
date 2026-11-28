@@ -98,6 +98,10 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 ```
 
+`crates/nav-core/fuzz` is a separate nightly workspace that those commands
+skip; if you touch it, also run `cargo fmt` and
+`cargo +nightly clippy --all-targets -- -D warnings` inside it (CI does).
+
 `.githooks/pre-commit` runs the same checks on every commit once enabled
 (`git config core.hooksPath .githooks`; worktrees share it). Don't bypass
 it with `--no-verify` — fix the failure instead.
