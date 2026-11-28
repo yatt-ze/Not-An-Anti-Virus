@@ -104,20 +104,19 @@ fn nul_after(body: &[u8], from: usize) -> Option<usize> {
     from.checked_add(rest.iter().position(|&b| b == 0)?)
 }
 
+/// A chunk: big-endian length, `kind`, `body`, then the CRC-32 of both.
+#[cfg(test)]
+pub(crate) fn chunk(kind: &[u8; 4], body: &[u8]) -> Vec<u8> {
+    let mut c = u32::try_from(body.len()).unwrap().to_be_bytes().to_vec();
+    c.extend_from_slice(kind);
+    c.extend_from_slice(body);
+    c.extend_from_slice(&crate::inflate::crc32(&c[4..]).to_be_bytes());
+    c
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::inflate::crc32;
-
-    fn chunk(kind: &[u8; 4], body: &[u8]) -> Vec<u8> {
-        let mut c = u32::try_from(body.len()).unwrap().to_be_bytes().to_vec();
-        c.extend_from_slice(kind);
-        c.extend_from_slice(body);
-        let mut covered = kind.to_vec();
-        covered.extend_from_slice(body);
-        c.extend_from_slice(&crc32(&covered).to_be_bytes());
-        c
-    }
 
     fn ihdr() -> Vec<u8> {
         chunk(b"IHDR", &[0, 0, 0, 1, 0, 0, 0, 1, 8, 2, 0, 0, 0])

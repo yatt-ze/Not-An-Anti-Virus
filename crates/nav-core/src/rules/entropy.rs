@@ -1958,9 +1958,7 @@ mod tests {
         assert!(signal.is_some(), "script with embedded blob should score");
     }
 
-    /// PNG whose first 512 bytes are mostly a text chunk but include the
-    /// header's NULs, then a high-entropy body.
-    /// PNG-headed text plus noise, not a well-formed PNG (no CRCs or `IEND`).
+    /// PNG-headed text then noise, deliberately not well-formed (no CRCs or `IEND`).
     fn png_with_text_and_noise() -> Vec<u8> {
         let mut c = b"\x89PNG\r\n\x1a\n".to_vec();
         c.extend_from_slice(&[0, 0, 0, 13]);
@@ -2001,28 +1999,22 @@ mod tests {
         assert_eq!(weight_of("a.png", content), Some(CONTAINER_BLOB_WEIGHT));
     }
 
-    fn png_chunk(kind: &[u8; 4], body: &[u8]) -> Vec<u8> {
-        let mut c = u32::try_from(body.len()).unwrap().to_be_bytes().to_vec();
-        c.extend_from_slice(kind);
-        c.extend_from_slice(body);
-        let crc = crate::inflate::crc32(&c[4..]);
-        c.extend_from_slice(&crc.to_be_bytes());
-        c
-    }
-
     /// A well-formed PNG: XMP `iTXt` first, then `extra`, a random `IDAT`
     /// and `IEND`.
     fn xmp_png(extra: &[Vec<u8>]) -> Vec<u8> {
         let mut c = png::SIGNATURE.to_vec();
-        c.extend(png_chunk(b"IHDR", &[0, 0, 1, 0, 0, 0, 1, 0, 8, 2, 0, 0, 0]));
+        c.extend(png::chunk(
+            b"IHDR",
+            &[0, 0, 1, 0, 0, 0, 1, 0, 8, 2, 0, 0, 0],
+        ));
         let mut xmp = b"XML:com.adobe.xmp\0\0\0\0\0".to_vec();
         xmp.extend_from_slice("<rdf:Description about=''/>\n".repeat(20).as_bytes());
-        c.extend(png_chunk(b"iTXt", &xmp));
+        c.extend(png::chunk(b"iTXt", &xmp));
         for e in extra {
             c.extend_from_slice(e);
         }
-        c.extend(png_chunk(b"IDAT", &high_entropy_blob(8192)));
-        c.extend(png_chunk(b"IEND", b""));
+        c.extend(png::chunk(b"IDAT", &high_entropy_blob(8192)));
+        c.extend(png::chunk(b"IEND", b""));
         c
     }
 
@@ -2040,7 +2032,7 @@ mod tests {
 
     #[test]
     fn png_private_chunk_scored() {
-        let content = xmp_png(&[png_chunk(b"stEg", &high_entropy_blob(4096))]);
+        let content = xmp_png(&[png::chunk(b"stEg", &high_entropy_blob(4096))]);
         assert_eq!(weight_of("a.png", content), Some(CONTAINER_BLOB_WEIGHT));
     }
 
@@ -2073,7 +2065,7 @@ mod tests {
     fn png_base64_still_scored() {
         let mut text = b"Comment\0".to_vec();
         text.extend_from_slice(base64_encode(&high_entropy_blob(2048)).as_bytes());
-        let content = xmp_png(&[png_chunk(b"tEXt", &text)]);
+        let content = xmp_png(&[png::chunk(b"tEXt", &text)]);
         assert_eq!(weight_of("a.png", content), Some(BASE64_PAYLOAD_WEIGHT));
     }
 
