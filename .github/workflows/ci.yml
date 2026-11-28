@@ -52,6 +52,7 @@ jobs:
           toolchain: stable
           components: rustfmt
       - run: cargo fmt --all -- --check
+      - run: shellcheck install.sh
 
   test:
     name: clippy + test (${{ matrix.os }})
