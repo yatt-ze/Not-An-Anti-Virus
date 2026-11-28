@@ -215,7 +215,9 @@ jobs:
           seed bzip2 testdata/bzip2/*.in "${small}"/*.in
           # The inflate target tries raw deflate, zlib and gzip on each input.
           seed inflate testdata/inflate/*.in testdata/gzip/*.in
-          seed parse_cpio testdata/cpio/*.cpio
+          cpio=$(mktemp -d)
+          python3 -I fuzz/seeds/gen_cpio_structural.py "${cpio}"
+          seed parse_cpio testdata/cpio/*.cpio "${cpio}"/*.cpio
           seed parse_xar testdata/xar/*.xar testdata/xar/*.pkg fixtures/*/*.pkg
           seed parse_zip testdata/zip/*.zip fixtures/*/*.zip
           seed parse_png testdata/png/*.png fixtures/*/*.png

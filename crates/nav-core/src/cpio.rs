@@ -362,7 +362,8 @@ impl StreamedMember {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StreamEnd {
     /// The input is not cpio ([`parse`] would return `None`): its first
-    /// `max_member_bytes` bytes, and whether there was more.
+    /// `max_member_bytes` bytes (never fewer than the six magic bytes), and
+    /// whether there was more.
     NotCpio { raw: Vec<u8>, more: bool },
     /// As [`CpioArchive::halted`] and [`CpioArchive::cut_short`]; a cut-short
     /// member comes only with `Truncated`, with [`MemberEnd::CutShort`].

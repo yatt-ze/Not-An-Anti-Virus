@@ -10,13 +10,18 @@
 //!
 //! Seed from `testdata/cpio/`: both formats, the real pkgbuild archive, the
 //! adversarial set (huge namesize/filesize, truncation at each boundary,
-//! missing trailer, non-numeric fields, many tiny entries).
+//! missing trailer, non-numeric fields, many tiny entries), plus the
+//! structural seeds from `fuzz/seeds/gen_cpio_structural.py`.
 
 use libfuzzer_sys::fuzz_target;
 use nav_core::cpio::{self, CpioLimits, CpioStream, MemberEnd, StreamEnd, StreamLimits};
 
 fuzz_target!(|data: &[u8]| {
-    check_stream(data);
+    // XOR of the bytes: a single byte won't do, since a valid archive starts
+    // with `0` and usually ends in NUL.
+    let chunk = usize::from(data.iter().fold(0, |sum, b| sum ^ b)).max(1);
+    check_stream(data, chunk);
+    check_capped_stream(data, chunk);
     let limits = CpioLimits {
         max_entries: 64,
         max_total_bytes: 1 << 20,
@@ -60,11 +65,9 @@ fuzz_target!(|data: &[u8]| {
     }
 });
 
-/// `CpioStream` over `data` in pieces sized by the XOR of its bytes agrees
-/// with `parse` with no byte ceiling. A single byte won't do: a valid archive
-/// starts with `0` and usually ends in NUL.
-fn check_stream(data: &[u8]) {
-    let chunk = usize::from(data.iter().fold(0, |sum, b| sum ^ b)).max(1);
+/// `CpioStream` over `data` in `chunk`-byte pieces agrees with `parse` with no
+/// byte ceiling.
+fn check_stream(data: &[u8], chunk: usize) {
     let max_entries = 64;
     let mut walk = CpioStream::new(StreamLimits {
         max_entries,
@@ -111,5 +114,66 @@ fn check_stream(data: &[u8]) {
             .cut_short
             .map(|e| (e.name, e.data.to_vec(), MemberEnd::CutShort)),
         "cut-short member differs"
+    );
+}
+
+/// `CpioStream` capped at the input's last byte keeps each body's first `cap`
+/// bytes and otherwise walks as `parse` does, until a name past the cap halts
+/// it with `ByteLimit`.
+fn check_capped_stream(data: &[u8], chunk: usize) {
+    let cap = usize::from(data.last().copied().unwrap_or(0));
+    let max_entries = 64;
+    let mut walk = CpioStream::new(StreamLimits {
+        max_entries,
+        max_member_bytes: cap,
+    });
+    let mut members = Vec::new();
+    for piece in data.chunks(chunk) {
+        members.extend(walk.push(piece));
+    }
+    let (last, end) = walk.finish();
+    members.extend(last);
+
+    let capped = |d: &[u8]| d.get(..cap).unwrap_or(d).to_vec();
+    let limits = CpioLimits {
+        max_entries,
+        max_total_bytes: usize::MAX,
+    };
+    let Some(archive) = cpio::parse(data, &limits) else {
+        // The six magic bytes are buffered whatever the cap.
+        let keep = data.len().min(cap.max(6));
+        let raw = data[..keep].to_vec();
+        let more = data.len() > keep;
+        assert_eq!(end, StreamEnd::NotCpio { raw, more }, "capped non-cpio");
+        return;
+    };
+    assert!(
+        members.len() <= archive.entries.len(),
+        "extra capped member"
+    );
+    for (m, e) in members.iter().zip(&archive.entries) {
+        let end = if e.data.len() > cap {
+            MemberEnd::OverCap
+        } else {
+            MemberEnd::Whole
+        };
+        assert_eq!(
+            (&m.name, m.mode, m.data.clone(), m.end),
+            (&e.name, e.mode, capped(e.data), end),
+            "capped member differs"
+        );
+    }
+    let StreamEnd::Archive { halted, cut_short } = end else {
+        panic!("capped stream saw no cpio");
+    };
+    if halted == Some(cpio::CpioHalt::ByteLimit) {
+        return;
+    }
+    assert_eq!(members.len(), archive.entries.len(), "capped member count");
+    assert_eq!(halted, archive.halted, "capped halt differs");
+    assert_eq!(
+        cut_short.map(|m| m.data),
+        archive.cut_short.map(|e| capped(e.data)),
+        "capped cut-short differs"
     );
 }
