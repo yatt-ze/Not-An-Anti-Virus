@@ -813,6 +813,31 @@ Get started: navctl scan <file or .app>  (navctl --help for more)
         assert!(!fx.receipt().exists());
     }
 
+    /// What install.sh wrote (receipt, PATH block) is what `uninstall` removes.
+    #[cfg(debug_assertions)]
+    #[test]
+    fn install_then_uninstall() {
+        let fx = Fx::new("roundtrip");
+        fx.release(ARM);
+        expect_ok(&run(zsh(&fx).env("NAV_MODIFY_PATH", "1")));
+        assert_eq!(fs::read_to_string(rc(&fx)).unwrap(), block(&fx));
+
+        let o = run(Command::new(fx.installed())
+            .arg("uninstall")
+            .env_clear()
+            .env("HOME", &fx.home)
+            .env("NAV_TEST_SERVICE_ROOT", fx.root.join("no-service")));
+        assert!(o.status.success(), "{}{}", out(&o), err(&o));
+        assert!(
+            out(&o).contains("Removed the PATH line from ~/.zshrc"),
+            "{}",
+            out(&o)
+        );
+        assert_eq!(fs::read_to_string(rc(&fx)).unwrap(), "");
+        assert!(!fx.installed().exists() && !fx.receipt().exists());
+        assert!(fx.bin.is_dir());
+    }
+
     /// `NAV_MODIFY_PATH=0` touches no file and prints the hint.
     #[test]
     fn path_declined() {

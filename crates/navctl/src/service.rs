@@ -13,7 +13,7 @@ use nav_service::{
 use crate::exit;
 
 /// True when running with effective uid 0.
-fn is_root() -> bool {
+pub(crate) fn is_root() -> bool {
     // SAFETY: geteuid takes no arguments, has no preconditions, and never fails.
     unsafe { libc::geteuid() == 0 }
 }

@@ -325,13 +325,12 @@ impl ResidueReport {
     }
 }
 
-/// Assert-clean check the verify runner calls. Reports rather than mutates.
-pub fn residue(layout: &Layout, ops: &dyn SystemOps) -> Result<ResidueReport> {
-    let mut report = ResidueReport::default();
-    let manifest = layout.manifest();
+/// Manifest paths still present (a `SharedDir` only if we created it, and it
+/// is present and empty).
+fn fs_leftovers(layout: &Layout) -> Result<Vec<PathBuf>> {
     let helper_dir_ours = layout.helper_dir_marker().is_file();
-
-    for artifact in &manifest.fs {
+    let mut found = Vec::new();
+    for artifact in layout.manifest().fs {
         let leftover = match artifact.kind {
             // `symlink_metadata` doesn't follow symlinks, so it also catches a
             // dangling one — `exists()` would miss it, but `remove_file_if_present`
@@ -342,17 +341,18 @@ pub fn residue(layout: &Layout, ops: &dyn SystemOps) -> Result<ResidueReport> {
             }
         };
         if leftover {
-            report.fs_residue.push(artifact.path.clone());
+            found.push(artifact.path);
         }
     }
+    Ok(found)
+}
 
-    report.launchd_loaded = ops.is_loaded(LABEL)?;
-    let record = ops.disable_record(LABEL)?;
-    report.launchd_disabled = record == Some(true);
-    report.launchd_enabled_record = record == Some(false);
-
+/// `navd`-named entries in our parent dirs that the manifest doesn't list.
+fn stray_entries(layout: &Layout) -> Result<Vec<PathBuf>> {
+    let manifest = layout.manifest();
     let managed: std::collections::HashSet<&PathBuf> =
         manifest.fs.iter().map(|a| &a.path).collect();
+    let mut found = Vec::new();
     for dir in sweep_dirs(layout) {
         if !dir.is_dir() {
             continue;
@@ -361,11 +361,32 @@ pub fn residue(layout: &Layout, ops: &dyn SystemOps) -> Result<ResidueReport> {
             let path = entry?.path();
             let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
             if is_our_namespace(name) && !managed.contains(&path) {
-                report.swept_extras.push(path);
+                found.push(path);
             }
         }
     }
+    Ok(found)
+}
 
+/// Every filesystem leftover of an install, manifest or stray, without
+/// asking launchd; so it works without root. Empty means none.
+pub fn on_disk(layout: &Layout) -> Result<Vec<PathBuf>> {
+    let mut found = fs_leftovers(layout)?;
+    found.extend(stray_entries(layout)?);
+    Ok(found)
+}
+
+/// Assert-clean check the verify runner calls. Reports rather than mutates.
+pub fn residue(layout: &Layout, ops: &dyn SystemOps) -> Result<ResidueReport> {
+    let mut report = ResidueReport {
+        fs_residue: fs_leftovers(layout)?,
+        ..ResidueReport::default()
+    };
+    report.launchd_loaded = ops.is_loaded(LABEL)?;
+    let record = ops.disable_record(LABEL)?;
+    report.launchd_disabled = record == Some(true);
+    report.launchd_enabled_record = record == Some(false);
+    report.swept_extras = stray_entries(layout)?;
     Ok(report)
 }
 
@@ -716,6 +737,22 @@ mod tests {
         assert!(residue(&layout, &ops).unwrap().is_clean());
         // The empty shared helper dir we created was reclaimed.
         assert!(!layout.helper_dir().exists());
+    }
+
+    #[test]
+    fn on_disk_without_launchd() {
+        let tp = TempPrefix::new();
+        let layout = tp.layout();
+        assert!(on_disk(&layout).unwrap().is_empty());
+        let ops = FakeSystemOps::new();
+        install(&layout, &ops, &fake_navd(&tp), &[me()]).unwrap();
+        assert!(on_disk(&layout).unwrap().contains(&layout.plist_path()));
+        uninstall(&layout, &ops);
+        assert!(on_disk(&layout).unwrap().is_empty());
+        fs::create_dir_all(layout.state_dir().parent().unwrap()).unwrap();
+        let stray = layout.state_dir().with_file_name("navd.out.log");
+        fs::write(&stray, "x").unwrap();
+        assert_eq!(on_disk(&layout).unwrap(), vec![stray]);
     }
 
     #[test]

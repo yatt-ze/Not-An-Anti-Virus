@@ -9,6 +9,7 @@ mod diskimage;
 mod exit;
 mod output;
 mod service;
+mod uninstall;
 
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -112,7 +113,7 @@ enum Command {
     },
     /// Enable/disable/inspect navnotify delivery. Requires navd (Phase 0b/3).
     Notify { action: Option<String> },
-    /// Fully remove NAV. Requires navd (Phase 3).
+    /// Remove the navd service and a NAV-managed navctl (§8, §11.5). The service needs root.
     Uninstall,
 }
 
@@ -230,6 +231,6 @@ fn main() -> ExitCode {
         Command::Config { .. } => not_yet_implemented("config", "Phase 3"),
         Command::Logs { .. } => not_yet_implemented("logs", "Phase 3"),
         Command::Notify { .. } => not_yet_implemented("notify", "Phase 0b/3"),
-        Command::Uninstall => not_yet_implemented("uninstall", "Phase 3"),
+        Command::Uninstall => uninstall::run(),
     }
 }
