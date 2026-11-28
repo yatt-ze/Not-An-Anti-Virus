@@ -1,0 +1,31 @@
+# Benign survey set (§11.1b): software a candidate rule could hit but the
+# real-machine corpus does not hold. Maintainer-only; never fetched on the host.
+#
+# One [[item]] per entry. `category`: admin-scripts, dev-tools, drm,
+# credentials, messaging, security-agent, remote-access, installer.
+# `kind`: dmg, pkg, zip, tar, app (a zipped .app), script, git.
+# A url item records `sha256` and `bytes`; a git item pins a full `commit`.
+# New items are added without hashes, then recorded inside the VM with
+# `cargo xtask benign fetch --record` and the rewritten file committed.
+# `benign vm survey` refuses to run while any url item is unrecorded, so do
+# this first: boot the golden image, record there, commit, then survey.
+# To refresh a pinned item, delete its cached blob in the golden first.
+
+[[item]]
+id = "installomator-repo"
+category = "admin-scripts"
+kind = "git"
+repo = "Installomator/Installomator"
+commit = "6013fa5e6ef57fc599ba1cb7f727dd8fea963c90"
+
+[[item]]
+id = "installomator-pkg"
+category = "installer"
+kind = "pkg"
+url = "https://github.com/Installomator/Installomator/releases/download/v10.10/Installomator-10.10.pkg"
+
+[[item]]
+id = "lulu-dmg"
+category = "security-agent"
+kind = "dmg"
+url = "https://github.com/objective-see/LuLu/releases/download/v4.6.0/LuLu_4.6.0.dmg"

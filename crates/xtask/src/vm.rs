@@ -13,6 +13,35 @@ use crate::build::git;
 const PROBE_TIMEOUT: Duration = Duration::from_secs(15);
 const AGENT_TIMEOUT: Duration = Duration::from_secs(180);
 
+/// Refuses to run outside a VM so fetched bytes never touch the host; `section`
+/// is the design section cited in the error.
+pub fn ensure_vm(section: &str) -> Result<()> {
+    #[cfg(target_os = "macos")]
+    {
+        let mut val: libc::c_int = 0;
+        let mut len = std::mem::size_of::<libc::c_int>();
+        // SAFETY: the name is NUL-terminated and `val`/`len` describe a valid
+        // c_int buffer.
+        let rc = unsafe {
+            libc::sysctlbyname(
+                c"kern.hv_vmm_present".as_ptr(),
+                (&mut val as *mut libc::c_int).cast(),
+                &mut len,
+                std::ptr::null_mut(),
+                0,
+            )
+        };
+        if rc != 0 || val != 1 {
+            bail!(
+                "this command only runs inside the macOS benchmark VM (kern.hv_vmm_present != 1), {section}"
+            );
+        }
+        Ok(())
+    }
+    #[cfg(not(target_os = "macos"))]
+    bail!("this command only runs inside the macOS benchmark VM, {section}")
+}
+
 /// Accepts exactly 40 lowercase hex digits.
 pub fn validate_sha(s: &str) -> Result<()> {
     if s.len() == 40 && s.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')) {
@@ -22,7 +51,7 @@ pub fn validate_sha(s: &str) -> Result<()> {
     }
 }
 
-/// `<prefix><secs>`; `prefix` also drives the stale-VM check.
+/// The run's VM name, `<prefix><secs>`.
 pub fn vm_name(prefix: &str, secs: u64) -> String {
     format!("{prefix}{secs}")
 }
@@ -158,7 +187,8 @@ impl Drop for TempFile {
     }
 }
 
-/// Stops and (unless `keep`) deletes the VM on drop.
+/// Stops and (unless `keep`) deletes the VM on drop. `child`, when set, must
+/// be the `tart run` process so [`wait_for_agent`] can detect an early exit.
 pub struct VmGuard {
     pub name: String,
     pub keep: bool,
