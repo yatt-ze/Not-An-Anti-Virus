@@ -2,7 +2,7 @@
 //! `uname`, `id`, `sysctl` and `gh` (§13, #250). No network, no real `gh`.
 
 #![cfg(unix)]
-#![cfg_attr(not(target_os = "macos"), allow(dead_code))]
+#![cfg_attr(not(target_os = "macos"), allow(dead_code, unused_imports))]
 
 use std::fs;
 use std::os::unix::fs::{symlink, PermissionsExt};

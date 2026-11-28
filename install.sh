@@ -39,17 +39,17 @@ PATH_MARKER="# Added by the NAV installer; navctl uninstall removes it"
 # Symbols and colour only on a terminal; plain ASCII otherwise.
 setup_style() {
     TICK=- DOT=- ARROW='->'
-    B= DIM= CYN= Z= GRN= YEL= ERR= ECY= ERZ=
+    B='' DIM='' CYN='' Z='' GRN='' YEL='' ERR='' ECY='' ERZ=''
     if [ -t 1 ]; then
         TICK='✓' DOT='·' ARROW='→'
         if [ -z "${NO_COLOR:-}" ]; then
             esc=$(printf '\033')
-            B="$esc[1m" DIM="$esc[2m" CYN="$esc[36m" Z="$esc[0m" GRN="$esc[32m" YEL="$esc[33m"
+            B="${esc}[1m" DIM="${esc}[2m" CYN="${esc}[36m" Z="${esc}[0m" GRN="${esc}[32m" YEL="${esc}[33m"
         fi
     fi
     if [ -t 2 ] && [ -z "${NO_COLOR:-}" ]; then
         esc=$(printf '\033')
-        ERR="$esc[1m$esc[31m" ECY="$esc[36m" ERZ="$esc[0m"
+        ERR="${esc}[1m${esc}[31m" ECY="${esc}[36m" ERZ="${esc}[0m"
     fi
 }
 
@@ -193,7 +193,7 @@ verify_attestation() {
         _why="install gh $MIN_GH+ to enable it"
     else
         _line=$(gh --version 2>/dev/null | sed -n 1p) || _line=
-        _g= _v= _ghver= _rest=
+        _g='' _v='' _ghver='' _rest=''
         read -r _g _v _ghver _rest <<EOT || true
 $_line
 EOT
@@ -329,12 +329,12 @@ rc_has_block() {
 
 # Appends the marker and line $2 to file $1, first ending an unterminated last line.
 append_block() {
-    {
-        if [ -s "$1" ] && [ -n "$(tail -c 1 "$1" 2>/dev/null)" ]; then
-            printf '\n'
-        fi
-        printf '%s\n%s\n' "$PATH_MARKER" "$2"
-    } 2>/dev/null >>"$1"
+    _sep=
+    if [ -s "$1" ] && [ -n "$(tail -c 1 "$1" 2>/dev/null)" ]; then
+        _sep='
+'
+    fi
+    printf '%s%s\n%s\n' "$_sep" "$PATH_MARKER" "$2" 2>/dev/null >>"$1"
 }
 
 # Puts $1 on PATH in the user's zsh or bash startup file, after asking
