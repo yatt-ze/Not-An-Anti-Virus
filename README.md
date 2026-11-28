@@ -53,7 +53,7 @@ macOS's built-in defences turned on.
 
 ## Status
 
-NAV is in **early development** (v0.21.0).
+NAV is in **early development** (v0.22.0).
 
 - [x] `navctl scan`: a verdict for a file, a folder or a `.app` bundle
 - [x] `navctl rules test`: the full signal-by-signal breakdown, as text or JSON
@@ -262,7 +262,7 @@ throwaway macOS VM; contributing never needs it. See §11.1a in
 
 ### Fuzzing
 
-The parsers in `nav-core` (Mach-O, xar / `.pkg`, cpio, ZIP, property lists,
+The parsers in `nav-core` (Mach-O, xar / `.pkg`, cpio, ZIP, PNG, property lists,
 DEFLATE, bzip2) have libFuzzer targets under `crates/nav-core/fuzz/`. That is
 a separate workspace and needs a nightly toolchain plus
 `cargo install cargo-fuzz`:

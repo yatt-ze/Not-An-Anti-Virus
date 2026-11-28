@@ -1,0 +1,395 @@
+# Benign survey set (§11.1b): software a candidate rule could hit but the
+# real-machine corpus does not hold. Maintainer-only; never fetched on the host.
+#
+# One [[item]] per entry. `category`: admin-scripts, dev-tools, drm,
+# credentials, messaging, security-agent, remote-access, installer.
+# `kind`: dmg, pkg, zip, tar, app (a zipped .app), script, git.
+# A url item records `sha256` and `bytes`; a git item pins a full `commit`.
+# New items are added without hashes, then recorded inside the VM with
+# `cargo xtask benign fetch --record` and the rewritten file committed.
+# `benign vm survey` refuses to run while any url item is unrecorded, so do
+# this first: boot the golden image, record there, commit, then survey.
+# To refresh a pinned item, delete its cached blob in the golden first.
+
+[[item]]
+id = "installomator-repo"
+category = "admin-scripts"
+kind = "git"
+repo = "Installomator/Installomator"
+commit = "6013fa5e6ef57fc599ba1cb7f727dd8fea963c90"
+
+[[item]]
+id = "installomator-pkg"
+category = "installer"
+kind = "pkg"
+url = "https://github.com/Installomator/Installomator/releases/download/v10.10/Installomator-10.10.pkg"
+sha256 = "d2250bb935b787ba3c0bad46858c7799c1f00b7db014d31ea07d8df573215ed2"
+bytes = 159078
+
+[[item]]
+id = "lulu-dmg"
+category = "security-agent"
+kind = "dmg"
+url = "https://github.com/objective-see/LuLu/releases/download/v4.6.0/LuLu_4.6.0.dmg"
+sha256 = "dae17df4829c0974376cba7d4340a6d69f0d54ab02e7f763cac81ba3f735c6f9"
+bytes = 6737625
+
+[[item]]
+id = "frida-devkit"
+category = "dev-tools"
+kind = "tar"
+url = "https://github.com/frida/frida/releases/download/17.28.0/frida-core-devkit-17.28.0-macos-arm64.tar.xz"
+sha256 = "c83c044e793a4918f43b79db3c2b9ca7d9f0bdb10640b5f080d9f7edad3e59c5"
+bytes = 67588936
+
+[[item]]
+id = "ghidra"
+category = "dev-tools"
+kind = "zip"
+url = "https://github.com/NationalSecurityAgency/ghidra/releases/download/Ghidra_12.2_build/ghidra_12.2_PUBLIC_20261016.zip"
+sha256 = "2c2cd776db3c1f6a097ba418922378ac3649cadd5e844a6f5f088ae628a7be67"
+bytes = 569712708
+
+[[item]]
+id = "jetbrains-idea"
+category = "drm"
+kind = "dmg"
+url = "https://download.jetbrains.com/idea/idea-2026.3.0.1-aarch64.dmg"
+sha256 = "b855345099ee8402e2e6c529d69467d1581dd90a65477e7a76b0b119f21fda4e"
+bytes = 1564580844
+
+[[item]]
+id = "steam"
+category = "drm"
+kind = "dmg"
+url = "https://cdn.cloudflare.steamstatic.com/client/installer/steam.dmg"
+sha256 = "e1abfbaaa7be3e0f48a0e0d4c313233e05861b1d26af32830ddc838be88f2691"
+bytes = 3471749
+
+[[item]]
+id = "ms-office"
+category = "drm"
+kind = "pkg"
+url = "https://go.microsoft.com/fwlink/?linkid=525133"
+sha256 = "901d5b0027b7c45f3b70e7f98060acaa8367b381de4fe262054faa713246b30b"
+bytes = 2957489209
+
+[[item]]
+id = "keepassxc"
+category = "credentials"
+kind = "dmg"
+url = "https://github.com/keepassxreboot/keepassxc/releases/download/2.8.0/KeePassXC-2.8.0-arm64.dmg"
+sha256 = "223d5c71ae6c11d48192c69fd582fd5f10047e91ebcebc014de33a42539b9519"
+bytes = 47298038
+
+[[item]]
+id = "bitwarden"
+category = "credentials"
+kind = "dmg"
+url = "https://github.com/bitwarden/clients/releases/download/desktop-v2026.11.0/bit-Bitwarden-2026.11.0-universal.dmg"
+sha256 = "c6d90fe5054874736fb0b59967340f3b911e60cfd502b82d9196c50568bf2bd3"
+bytes = 310104975
+
+[[item]]
+id = "bitwarden-cli"
+category = "credentials"
+kind = "zip"
+url = "https://github.com/bitwarden/clients/releases/download/cli-v2026.11.1/bw-bit-macos-arm64-2026.11.1.zip"
+sha256 = "0447a5c94b5893deb3fbe4f4ac02e8d811e2f9815c27d567d08b4fc70486cff1"
+bytes = 46010837
+
+[[item]]
+id = "1password"
+category = "credentials"
+kind = "app"
+url = "https://downloads.1password.com/mac/1Password.zip"
+sha256 = "da298cd5daacc36774616cd968b0429b1b33c62d02520b94d701f0cf818f2c13"
+bytes = 21451454
+
+[[item]]
+id = "electrum"
+category = "credentials"
+kind = "dmg"
+url = "https://download.electrum.org/4.7.0/electrum-4.7.0.dmg"
+sha256 = "7f7923abf8cac06ee33bc6f5c7c8aa2593cf211f098243dbd680aab45064fdc9"
+bytes = 68747946
+
+[[item]]
+id = "ledger-live"
+category = "credentials"
+kind = "dmg"
+url = "https://download.live.ledger.com/latest/mac"
+sha256 = "ca44e3c150664aafa62e57965fa22d9d399f6b44e8d70c9530428e3702c329e7"
+bytes = 289210264
+
+[[item]]
+id = "signal"
+category = "messaging"
+kind = "dmg"
+url = "https://updates.signal.org/desktop/signal-desktop-mac-universal-8.36.0.dmg"
+sha256 = "452c1c39ca0bada168e738e8022e682cafbbfd5be3cdf56f6c9d4bce4aef249c"
+bytes = 269303849
+
+[[item]]
+id = "telegram"
+category = "messaging"
+kind = "dmg"
+url = "https://github.com/telegramdesktop/tdesktop/releases/download/v7.4.7/td-setup-mac-7.4.7.dmg"
+sha256 = "7191d6edf41637f890ccf4f7170d3b9584e19c36eb5f413894be446af6c3c90b"
+bytes = 186626802
+
+[[item]]
+id = "slack"
+category = "messaging"
+kind = "dmg"
+url = "https://slack.com/ssb/download-osx-universal"
+sha256 = "7aee40a8b27208f1c3fedde1c1fe71a7497a49039f4f5be53bd4f0437a2c023f"
+bytes = 215096334
+
+[[item]]
+id = "discord"
+category = "messaging"
+kind = "dmg"
+url = "https://discord.com/api/download?platform=osx"
+sha256 = "38617824808249eecce6377d6e467936bf695f62662dbcf372e95c930a7b7e4d"
+bytes = 234017026
+
+[[item]]
+id = "zoom"
+category = "messaging"
+kind = "pkg"
+url = "https://zoom.us/client/latest/Zoom.pkg"
+sha256 = "d820a734376faf54016c52022b2369af5cd8d1dbeb55bc9c1dc84558e5cb99ec"
+bytes = 43929356
+
+[[item]]
+id = "blockblock"
+category = "security-agent"
+kind = "app"
+url = "https://github.com/objective-see/BlockBlock/releases/download/v2.5.2/BlockBlock_2.5.2.zip"
+sha256 = "7e5a332a4da6a22e8b494418c3cac241d24b43176c8bfc4bb2ef8bdc640bd4c7"
+bytes = 5206901
+
+[[item]]
+id = "knockknock"
+category = "security-agent"
+kind = "app"
+url = "https://github.com/objective-see/KnockKnock/releases/download/v4.1.0/KnockKnock_4.1.0.zip"
+sha256 = "98eae6cda5a7e122e6c7e68622617c00d6533a909f505f002c93dd90941a3f9e"
+bytes = 2552206
+
+[[item]]
+id = "santa"
+category = "security-agent"
+kind = "pkg"
+url = "https://github.com/northpolesec/santa/releases/download/2026.10/santa-2026.10.pkg"
+sha256 = "9e400e1b91ddaaa62a1ca33c4972a9b2afce870ced90f6df5b591c73a2405ebf"
+bytes = 55482233
+
+[[item]]
+id = "osquery"
+category = "security-agent"
+kind = "pkg"
+url = "https://github.com/osquery/osquery/releases/download/5.24.1/osquery-5.24.1.pkg"
+sha256 = "950cc119f68c4d292f3e9407171205633e7174e13fc14ab593f48c75d907bd4f"
+bytes = 16877491
+
+[[item]]
+id = "wazuh-agent"
+category = "security-agent"
+kind = "pkg"
+url = "https://packages.wazuh.com/4.x/macos/wazuh-agent-4.14.1-1.arm64.pkg"
+sha256 = "e50859b303e246f19fad3eeb59b33f1b11855b70e89f7d80e17dbfe68f527786"
+bytes = 7563132
+
+[[item]]
+id = "malwarebytes"
+category = "security-agent"
+kind = "pkg"
+url = "https://data-cdn.mbamupdates.com/web/mb5_mac/Malwarebytes-Mac-5.30.0.4351.pkg"
+sha256 = "2e1503ed234d751767bc37de017c758b8a9951babd358d54ff9237ddf3d8b4ec"
+bytes = 126228781
+
+[[item]]
+id = "little-snitch"
+category = "security-agent"
+kind = "dmg"
+url = "https://www.obdev.at/downloads/littlesnitch/LittleSnitch-6.5.dmg"
+sha256 = "a83763bbf416676231bcd9c414b16a36c31cc85c14aa0de43cabaf1ef97fa8ba"
+bytes = 38377961
+
+[[item]]
+id = "tailscale"
+category = "remote-access"
+kind = "pkg"
+url = "https://pkgs.tailscale.com/stable/Tailscale-latest-macos.pkg"
+sha256 = "0ecab60e098d31f9cbd334867474293dc08978154665da75c3f3fe1f8215d6e7"
+bytes = 22369022
+
+[[item]]
+id = "mullvad"
+category = "remote-access"
+kind = "pkg"
+url = "https://mullvad.net/download/app/pkg/latest"
+sha256 = "c8c7dffed9d7f95d348dde3583d3264df683b22b7f3331d436a52a90807d93e6"
+bytes = 254050413
+
+[[item]]
+id = "protonvpn"
+category = "remote-access"
+kind = "dmg"
+url = "https://protonvpn.com/download/ProtonVPN.dmg"
+sha256 = "4a58c8711eeb026cb654d1c96501156ad5fbbe71b28ef7c52f0acfecac484d76"
+bytes = 93130622
+
+[[item]]
+id = "teamviewer"
+category = "remote-access"
+kind = "dmg"
+url = "https://download.teamviewer.com/download/TeamViewer.dmg"
+sha256 = "0f49728d2bca846f8a61e1444f3709cbe9f491499270efc6332f76b9ab22acd0"
+bytes = 140405367
+
+[[item]]
+id = "anydesk"
+category = "remote-access"
+kind = "dmg"
+url = "https://download.anydesk.com/anydesk.dmg"
+sha256 = "b2ce747fc441e4d4331c26c0d0b562b22090d6fd08fa86db6d086dc8b5197db1"
+bytes = 26675637
+
+[[item]]
+id = "chrome-stub"
+category = "installer"
+kind = "dmg"
+url = "https://dl.google.com/chrome/mac/universal/stable/GGRO/googlechrome.dmg"
+sha256 = "b7b8c9169275631c1065b865ba2e64bf0f620fa4e507b72c1b5abb5383d2b0f1"
+bytes = 289260301
+
+[[item]]
+id = "homebrew-install"
+category = "installer"
+kind = "script"
+url = "https://raw.githubusercontent.com/Homebrew/install/e09ddecb4d4f4a3e776c00c62e010276133d1eed/install.sh"
+sha256 = "34090c61925f5d5c4caca7f1f7089efac33056b1603b4d62b4671d8d22f28fb3"
+bytes = 35670
+
+[[item]]
+id = "nvm-install"
+category = "installer"
+kind = "script"
+url = "https://raw.githubusercontent.com/nvm-sh/nvm/eb0c8b95c89f20acc6008b406c71bed1c478641e/install.sh"
+sha256 = "9d0eee01037eb3c0aff11d3504ae5267e8f9950ebb40b718657b8ba53c2ad186"
+bytes = 21980
+
+[[item]]
+id = "ohmyzsh-install"
+category = "installer"
+kind = "script"
+url = "https://raw.githubusercontent.com/ohmyzsh/ohmyzsh/507561c236b4c5723cbbc12939e26ce7712f0b6c/tools/install.sh"
+sha256 = "3f9f1b6269deddc51cdcab2a689f54821e6e62c24401f970de4bfafad328b2ef"
+bytes = 20530
+
+[[item]]
+id = "ollama-install"
+category = "installer"
+kind = "script"
+url = "https://raw.githubusercontent.com/ollama/ollama/d227b7e210b569e9e01c6b4b0c40748e73dcd01a/scripts/install.sh"
+sha256 = "17659c2456c9e65a3b11056b76da51774911cb822f47bf44f7f3ecc0c40528a8"
+bytes = 15993
+
+[[item]]
+id = "rustup-init"
+category = "installer"
+kind = "script"
+url = "https://raw.githubusercontent.com/rust-lang/rustup/2bf84a1e73ad03daa0023fa625dc1e6363ee9a82/rustup-init.sh"
+sha256 = "b29d1c46eb82164b68c9ee7aea8a2d4fa4d4f648a13721eefa8c77327aac2f27"
+bytes = 30102
+
+[[item]]
+id = "deno-install"
+category = "installer"
+kind = "script"
+url = "https://raw.githubusercontent.com/denoland/deno_install/41d4676f8677ec16449b9e2303e7bd52ed81f03b/install.sh"
+sha256 = "9c1a4a0ab8ec6c7e81ec7e4d82465693dc197e65632fec646d703a096b981778"
+bytes = 3881
+
+[[item]]
+id = "bun-install"
+category = "installer"
+kind = "script"
+url = "https://bun.sh/install"
+sha256 = "04882bf41679d49d9af108657a1e5515bf04fdf2940d12c0d0b1e5d79dc53be8"
+bytes = 7631
+
+[[item]]
+id = "uv-installer"
+category = "installer"
+kind = "script"
+url = "https://github.com/astral-sh/uv/releases/download/0.13.10/uv-installer.sh"
+sha256 = "51781aafe6950cc659f79873e1bdca55fbb9da6e0ef650bf98093a0f0aaaf453"
+bytes = 71308
+
+[[item]]
+id = "nix-installer"
+category = "installer"
+kind = "script"
+url = "https://github.com/DeterminateSystems/nix-installer/releases/download/v3.24.3/nix-installer.sh"
+sha256 = "d6f7c9e04543742acfef67bf0e33ab2fcfa457166a3c9e5e642734f341c1b18b"
+bytes = 19299
+
+[[item]]
+id = "rtrouton-scripts"
+category = "admin-scripts"
+kind = "git"
+repo = "rtrouton/rtrouton_scripts"
+commit = "aa27142136a32cf0b5b6c88c2f8d79bb0859f77c"
+
+[[item]]
+id = "munki"
+category = "admin-scripts"
+kind = "git"
+repo = "munki/munki"
+commit = "2a7262965862c665cffbcdbd15cc4f6169529d01"
+
+[[item]]
+id = "outset"
+category = "admin-scripts"
+kind = "git"
+repo = "macadmins/outset"
+commit = "71e4ffcf39b3282be5d858bb12c2105b2243d4c6"
+
+[[item]]
+id = "dockutil"
+category = "admin-scripts"
+kind = "git"
+repo = "kcrawford/dockutil"
+commit = "7238012dc414eed1604f0ce8791937c493e1f914"
+
+[[item]]
+id = "nudge"
+category = "admin-scripts"
+kind = "git"
+repo = "macadmins/nudge"
+commit = "fec66c62c92d46b862c67b26a7e8d7ba20bce7ad"
+
+[[item]]
+id = "mscp"
+category = "admin-scripts"
+kind = "git"
+repo = "usnistgov/macos_security"
+commit = "cc1cc8c857fab06877e7fc5cb52ae217efdea1fc"
+
+[[item]]
+id = "kandji-support"
+category = "admin-scripts"
+kind = "git"
+repo = "kandji-inc/support"
+commit = "5765a2090ff8fb53cb52af4421337f1ee3362b8c"
+
+[[item]]
+id = "delve"
+category = "dev-tools"
+kind = "git"
+repo = "go-delve/delve"
+commit = "29f07287b9373351ca9bbb6391bdd8a85968f20f"

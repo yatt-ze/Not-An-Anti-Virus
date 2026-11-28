@@ -4,9 +4,11 @@
 //! under sudo. Both modes exercise one code path so they can't drift apart.
 //! `corpus` scans real files with two navctl builds and diffs the verdicts.
 
+mod benign;
 mod build;
 mod corpus;
 mod malware;
+mod vm;
 
 use std::process::ExitCode;
 
@@ -44,6 +46,9 @@ enum Command {
     /// Real-world malware benchmark: fetch, verify, scan and compare the sample store; `vm` runs it in Tart (§11.1a).
     #[command(subcommand)]
     Malware(malware::MalwareCommand),
+    /// Benign survey set for rule research: fetch, verify, prepare; `vm survey` and `vm compare` run it in Tart (§11.1b).
+    #[command(subcommand)]
+    Benign(benign::BenignCommand),
 }
 
 fn main() -> Result<ExitCode> {
@@ -59,6 +64,7 @@ fn main() -> Result<ExitCode> {
         }
         Command::Corpus(cmd) => corpus::run(cmd),
         Command::Malware(cmd) => malware::run(cmd),
+        Command::Benign(cmd) => benign::run(cmd),
     }
 }
 

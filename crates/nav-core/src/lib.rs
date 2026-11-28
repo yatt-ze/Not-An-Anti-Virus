@@ -30,6 +30,7 @@ pub mod inflate;
 pub mod macho;
 pub mod model;
 pub mod plist;
+pub mod png;
 pub mod presentation;
 pub mod process;
 pub mod rules;

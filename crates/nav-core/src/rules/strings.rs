@@ -361,6 +361,20 @@ fn is_alternation(line: &[u8], pipe: usize) -> bool {
     }
 }
 
+/// Whether a command word ending at `e` can have arguments: something other
+/// than a list or table delimiter follows it, after an optional closing quote.
+/// `curl|`, `"curl",` and `(nuhk|curl)` are words in a list (#317); `curl x`,
+/// `curl${IFS}x` and `curl"$u"` are commands.
+fn takes_args(line: &[u8], e: usize) -> bool {
+    let i = e + usize::from(matches!(line.get(e), Some(b'"' | b'\'')));
+    line.get(i).is_some_and(|&b| {
+        !matches!(
+            b,
+            b'|' | b',' | b')' | b'}' | b']' | b';' | b':' | b'=' | b'&'
+        )
+    })
+}
+
 /// Whether the token at `s` sits directly inside `<(` or `$(`.
 fn directly_in_substitution(line: &[u8], s: usize) -> bool {
     let j = trimmed_before(line, s);
@@ -602,6 +616,7 @@ fn scan_line(line: &[u8], cut_start: bool, cut_end: bool, hits: &mut [bool; PATT
 
         if let Some(cs) = head {
             match word {
+                b"curl" | b"wget" if !takes_args(line, e) => {}
                 b"curl" | b"wget" => {
                     st.downloader = Some(cs);
                     if word == b"curl" {
@@ -668,7 +683,7 @@ fn scan_line(line: &[u8], cut_start: bool, cut_end: bool, hits: &mut [bool; PATT
                 st.osascript.get_or_insert(s);
                 st.osascript_runs_shell = true;
             }
-            b"curl" | b"wget" => {
+            b"curl" | b"wget" if takes_args(line, e) => {
                 if let Some(o) = st.osascript {
                     if st.osascript_runs_shell && within_span(o, e) {
                         hits[OSASCRIPT_DOWNLOAD] = true;
@@ -1141,6 +1156,11 @@ mod tests {
             "exec(\"curl -s x | sh\")",
             "cd /tmp && curl x | bash",
             "echo hi; sudo curl x | bash -s",
+            "'curl' -s x | sh",
+            "curl\tx | sh",
+            "curl${IFS}-fsSL${IFS}x | sh",
+            "curl\"$u\" | sh",
+            "curl'' x | sh",
         ] {
             assert!(fires(t, DOWNLOAD_TO_SHELL), "{t}");
         }
@@ -1163,6 +1183,10 @@ mod tests {
             "echo <(curl x)",
             "curl x\n| sh",
             "curl x\nsh -c foo | sh",
+            "|csplit|curl|cut|date|bash|bc|",
+            "(nuhk|curl|Googlebot) x | sh",
+            "{key:\"curl\",title:\"curl\"} x | sh",
+            "curl",
         ] {
             assert!(none_fire(t), "{t}");
         }
@@ -1371,6 +1395,7 @@ mod tests {
         ));
         assert!(none_fire("osascript -e 'do shell script \"ls\"'"));
         assert!(none_fire("osascript -e 'display dialog \"curl\"'"));
+        assert!(none_fire("do shell script x {ls|curl|wget}"));
         assert!(none_fire(
             "curl x -o f; osascript -e 'do shell script \"ls\"'"
         ));
