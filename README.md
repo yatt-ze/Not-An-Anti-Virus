@@ -79,7 +79,20 @@ that they're unavailable rather than pretending to work.
 
 ## Install
 
-Requires Rust 1.88 or newer. macOS is the target platform. NAV also builds
+On macOS, the install script downloads a released `navctl`, checks it, and
+puts it in `~/.local/bin` (it works from the first published release):
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/yatt-ze/Not-An-Anti-Virus/main/install.sh | sh
+```
+
+`NAV_VERSION=X.Y.Z` pins a version, `NAV_INSTALL_DIR` changes the directory,
+and `NAV_FORCE=1` replaces a `navctl` the script didn't install. It never
+needs root and never edits your shell config; it prints the `PATH` line to
+add if needed.
+
+To build from source instead, you need Rust 1.88 or newer. macOS is the
+target platform. NAV also builds
 and runs on Linux, but the macOS-only checks (code signing, notarization, the
 quarantine attribute) are skipped there, so results are marked `Partial`.
 
@@ -89,8 +102,7 @@ cd Not-An-Anti-Virus
 cargo install --locked --path crates/navctl
 ```
 
-This puts `navctl` in `~/.cargo/bin`. An install script and a Homebrew tap
-are planned.
+This puts `navctl` in `~/.cargo/bin`. A Homebrew tap is planned.
 
 ## Usage
 
