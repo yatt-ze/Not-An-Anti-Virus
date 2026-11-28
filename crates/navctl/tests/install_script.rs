@@ -792,6 +792,27 @@ Get started: navctl scan <file or .app>  (navctl --help for more)
         assert_eq!(fs::read_to_string(rc(&fx)).unwrap(), block(&fx));
     }
 
+    /// A deleted navctl doesn't lose `path_edit`: that line keeps the dir on PATH.
+    #[test]
+    fn path_edit_kept() {
+        let fx = Fx::new("pathkeep");
+        fx.release(ARM);
+        expect_ok(&run(zsh(&fx).env("NAV_MODIFY_PATH", "1")));
+        fs::remove_file(fx.installed()).unwrap();
+        let on_path = format!("{}:/usr/bin:/bin", fx.bin.display());
+        expect_ok(&run(zsh(&fx).env("PATH", on_path)));
+        assert_eq!(path_edit(&fx), rc_quoted(&rc(&fx)));
+    }
+
+    /// A relative install dir is refused before anything is written.
+    #[test]
+    fn relative_dir() {
+        let fx = Fx::new("reldir");
+        fx.release(ARM);
+        expect_fail(&run(fx.cmd().env("NAV_INSTALL_DIR", "bin")), "absolute");
+        assert!(!fx.receipt().exists());
+    }
+
     /// `NAV_MODIFY_PATH=0` touches no file and prints the hint.
     #[test]
     fn path_declined() {

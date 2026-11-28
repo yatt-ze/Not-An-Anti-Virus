@@ -144,6 +144,16 @@ jobs:
             tar --no-mac-metadata -czf "dist/navctl-$VERSION-$t.tar.gz" -C "target/$t/release" navctl
           done
           (cd dist && shasum -a 256 -- *.tar.gz > SHA256SUMS && cat SHA256SUMS)
+      - name: install.sh installs the packaged archive
+        # Catches script/asset drift before publishing; the smoke job only runs after.
+        env:
+          VERSION: ${{ needs.plan.outputs.version }}
+        run: |
+          set -eu
+          dir="$RUNNER_TEMP/pre bin"
+          NAV_VERSION="$VERSION" NAV_DOWNLOAD_BASE="file://$PWD/dist" NAV_INSTALL_DIR="$dir" NAV_MODIFY_PATH=0 sh install.sh
+          got=$("$dir/navctl" --version)
+          [ "$got" = "navctl $VERSION" ] || { echo "::error::installed '$got', expected 'navctl $VERSION'"; exit 1; }
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: dist

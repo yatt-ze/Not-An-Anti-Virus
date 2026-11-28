@@ -238,9 +238,6 @@ check_existing() {
     [ ! -d "$1" ] || die "$1 is a directory" "Remove it or choose another NAV_INSTALL_DIR."
     if [ -f "$RECEIPT" ] && grep -Fxq "  \"binary_path\": \"$1\"," "$RECEIPT"; then
         PREV_VERSION=$(sed -n 's/^  "version": "\(.*\)",$/\1/p' "$RECEIPT")
-        PREV_PATH_EDIT=$(sed -n 's/^  "path_edit": "\(.*\)"$/\1/p' "$RECEIPT")
-        path_chars_ok "$PREV_PATH_EDIT" || PREV_PATH_EDIT=
-        PATH_EDIT=$PREV_PATH_EDIT
         _old=$(sed -n 's/^  "binary_sha256": "\(.*\)",$/\1/p' "$RECEIPT")
         _now=$(shasum -a 256 "$1" 2>/dev/null | awk '{ print $1 }') || _now=
         if [ -n "$_now" ] && [ "$_now" != "$_old" ]; then
@@ -251,6 +248,16 @@ check_existing() {
     else
         die "$(pretty "$1") already exists and wasn't installed by this script" "Remove it, or replace it with:
   ${ECY}curl -fsSL $SCRIPT_URL | NAV_FORCE=1 sh$ERZ"
+    fi
+}
+
+# Keeps the receipt's path_edit for install path $1, even if navctl itself was
+# deleted: the PATH line it names may be what keeps the dir on PATH.
+carry_path_edit() {
+    if [ -f "$RECEIPT" ] && grep -Fxq "  \"binary_path\": \"$1\"," "$RECEIPT"; then
+        PREV_PATH_EDIT=$(sed -n 's/^  "path_edit": "\(.*\)"$/\1/p' "$RECEIPT")
+        path_chars_ok "$PREV_PATH_EDIT" || PREV_PATH_EDIT=
+        PATH_EDIT=$PREV_PATH_EDIT
     fi
 }
 
@@ -405,6 +412,10 @@ main() {
     check_platform
     HOME=${HOME:-}
     [ -n "$HOME" ] || die "HOME is not set" "Set HOME to your home directory and rerun."
+    case $HOME in
+        /*) ;;
+        *) die "HOME must be an absolute path (got $HOME)" "Set HOME to your home directory and rerun." ;;
+    esac
     check_path_chars HOME "$HOME"
     HOME_CANON=$(cd "$HOME" 2>/dev/null && pwd -P) || HOME_CANON=$HOME
     RECEIPT=$HOME/.local/share/nav/install-receipt.json
@@ -418,6 +429,11 @@ main() {
     fi
     target=$(detect_target)
     dir=${NAV_INSTALL_DIR:-$HOME/.local/bin}
+    case $dir in
+        /*) ;;
+        # A relative dir would put a cwd-dependent entry on PATH.
+        *) die "NAV_INSTALL_DIR must be an absolute path (got $dir)" "Use a full path, such as \$HOME/bin." ;;
+    esac
     check_path_chars NAV_INSTALL_DIR "$dir"
     # Refuse an unmanaged navctl before any network traffic.
     if [ -d "$dir" ]; then
@@ -461,6 +477,7 @@ main() {
     canon=$(cd "$dir" && pwd -P) || die "cannot enter $dir" "Check its permissions."
     check_path_chars "install path" "$canon"
     dest=$canon/navctl
+    carry_path_edit "$dest"
     place_binary "$canon" "$dest"
     sha=$(shasum -a 256 "$dest" | awk '{ print $1 }')
     write_receipt "$version" "$target" "$dest" "$sha" "$PATH_EDIT"
