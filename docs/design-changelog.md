@@ -5,6 +5,10 @@ for the current document map. Newest first.
 
 ---
 
+**Changelog from v1.35 (2026-11-28):** §5.2 download-to-shell and `osascript` download: `curl`/`wget` followed by a line end or a list delimiter (`|` `,` `)` `}` `]` `;` `:` `=` `&`), after an optional closing quote, is not a downloader (#317). The benign survey set's first compare had 6 Notify false positives from shell-command word lists in syntax highlighters, telemetry tables and a user-agent regex (Telegram, IntelliJ, Ledger Live): `|curl|` sat at command position after a pipe and a later `|bash|` read as a pipe to a shell, beyond the 256-byte reach of the `(a|b|c)` alternation check. A `curl` followed by one of those downloads nothing, so no real dropper is lost; obfuscated argument forms (`curl${IFS}-s`, `curl"$u"`) still match.
+
+---
+
 **Changelog from v1.34 (2026-11-28):** §11.1b updated to match the built tooling (#311, #315, #316). `benign prepare` and its layout (`mnt/`, `pkg/`, `files/`, `repo/`, `index.tsv`) are named; `benign vm compare` stages downloads under their published names, runs a warm-up pass like `malware compare` (#150), and text-checks what it copies back (256 MiB cap); a survey refuses to start with unrecorded items. The 0-Notify baseline was wrong: the first compare over the 49-item set had 8 Notify files across IntelliJ, Ledger Live, Telegram, KnockKnock and nvm (#317), so the gate is regressions-only against base.
 
 ---

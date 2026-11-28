@@ -342,6 +342,12 @@
     "rule_ids": [],
     "completeness": "complete"
   },
+  "benign/shell_word_list.js": {
+    "score": 0,
+    "recommendation": "no-action",
+    "rule_ids": [],
+    "completeness": "complete"
+  },
   "benign/tiny_hello_arm64": {
     "score": 0,
     "recommendation": "no-action",
