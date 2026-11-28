@@ -17,20 +17,23 @@ use crate::malware::fetch::{unique_name, Cleanup};
 use crate::malware::Problem;
 
 /// File name an item is staged under: the URL's last segment, with the
-/// kind's extension added when it has none, so navctl sees a recognisable name.
+/// kind's extension appended unless the name already ends with it (a tar may
+/// end in `.tar`, `.tar.gz`, `.tgz`, `.tar.xz` or `.tar.bz2`), so navctl sees
+/// a recognisable name.
 pub fn published_name(item: &Item) -> String {
     let name = super::prepare::script_name(item.url.as_deref().unwrap_or_default());
-    let ext = match item.kind {
-        Kind::Dmg => ".dmg",
-        Kind::Pkg => ".pkg",
-        Kind::Zip | Kind::App => ".zip",
-        Kind::Tar => ".tar",
+    let (exts, add): (&[&str], &str) = match item.kind {
+        Kind::Dmg => (&[".dmg"], ".dmg"),
+        Kind::Pkg => (&[".pkg"], ".pkg"),
+        Kind::Zip | Kind::App => (&[".zip"], ".zip"),
+        Kind::Tar => (&[".tar", ".tar.gz", ".tgz", ".tar.xz", ".tar.bz2"], ".tar"),
         Kind::Script | Kind::Git => return name,
     };
-    if name.contains('.') {
+    let lower = name.to_ascii_lowercase();
+    if exts.iter().any(|e| lower.ends_with(e)) {
         name
     } else {
-        format!("{name}{ext}")
+        format!("{name}{add}")
     }
 }
 
@@ -240,6 +243,24 @@ mod tests {
             "download.dmg"
         );
         assert_eq!(published_name(&item("app", "https://e.com/get")), "get.zip");
+        assert_eq!(
+            published_name(&item("app", "https://e.com/App-2.1")),
+            "App-2.1.zip"
+        );
+        assert_eq!(
+            published_name(&item("pkg", "https://e.com/dl.php")),
+            "dl.php.pkg"
+        );
+        assert_eq!(published_name(&item("dmg", "https://e.com/A.DMG")), "A.DMG");
+        assert_eq!(
+            published_name(&item("tar", "https://e.com/x.tar.xz")),
+            "x.tar.xz"
+        );
+        assert_eq!(published_name(&item("tar", "https://e.com/x.tgz")), "x.tgz");
+        assert_eq!(
+            published_name(&item("tar", "https://e.com/x.gz")),
+            "x.gz.tar"
+        );
         assert_eq!(
             published_name(&item("script", "https://e.com/install")),
             "install"
