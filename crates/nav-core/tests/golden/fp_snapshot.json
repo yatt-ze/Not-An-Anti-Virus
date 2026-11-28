@@ -313,11 +313,9 @@
     "completeness": "complete"
   },
   "benign/png_with_text_metadata.png": {
-    "score": 5,
+    "score": 0,
     "recommendation": "no-action",
-    "rule_ids": [
-      "high-entropy-content"
-    ],
+    "rule_ids": [],
     "completeness": "complete"
   },
   "benign/postinstall_dialogs.sh": {

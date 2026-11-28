@@ -162,7 +162,7 @@ jobs:
     name: bounded fuzz run (nightly)
     # Off the PR path by design (NAV-014) — scheduled, or manually via
     # workflow_dispatch. Priority order per the issue: xml/plist, xar, cpio,
-    # inflate, bzip2, then macho; zip was added after.
+    # inflate, bzip2, then macho; zip and png were added after.
     if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     timeout-minutes: 60
@@ -218,6 +218,7 @@ jobs:
           seed parse_cpio testdata/cpio/*.cpio
           seed parse_xar testdata/xar/*.xar testdata/xar/*.pkg fixtures/*/*.pkg
           seed parse_zip testdata/zip/*.zip fixtures/*/*.zip
+          seed parse_png testdata/png/*.png fixtures/*/*.png
           plists=()
           while IFS= read -r -d '' f; do plists+=("$f"); done \
             < <(find fixtures -name '*.plist' -print0)
@@ -242,7 +243,7 @@ jobs:
       - name: build fuzz targets
         working-directory: crates/nav-core
         run: cargo fuzz build --target x86_64-unknown-linux-gnu
-      # About 7.5 minutes of fuzzing, as four parallel lanes on the 4-core
+      # About 9 minutes of fuzzing, as four parallel lanes on the 4-core
       # runner: the slow decoders get a lane (and core) each, the targets
       # whose coverage plateaus early share the fourth. Every target runs
       # even if another crashes; the step fails at the end if any did.
@@ -264,6 +265,7 @@ jobs:
           parse_cpio   4   110  16384   cpio.dict   >64 small entries, past the harness entry cap
           parse_macho  4   110  65536   -           load commands, a 2-slice fat file, a signature
           parse_zip    4   110  66560   zip.dict    a 65535-byte comment + EOCD/ZIP64 records
+          parse_png    4   110  8192    png.dict    many small chunks; the whole fixture PNG
           '
           logs=$(mktemp -d)
           echo "fuzzing on $(nproc) cores"
@@ -323,6 +325,10 @@ jobs:
         run: |
           set -euo pipefail
           for target in $(cargo fuzz list); do
+            if [[ ! -d fuzz/corpus/${target} ]]; then
+              echo "${target}: no corpus, skipped"
+              continue
+            fi
             before=$(find "fuzz/corpus/${target}" -type f | wc -l)
             echo "::group::cmin ${target}"
             cargo fuzz cmin --target x86_64-unknown-linux-gnu "${target}" -- \

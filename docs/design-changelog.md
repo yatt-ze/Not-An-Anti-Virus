@@ -5,6 +5,10 @@ for the current document map. Newest first.
 
 ---
 
+**Changelog from v1.36 (2026-11-28):** §5.2 `high-entropy-content`: in a well-formed PNG the raw embedded-blob check measures only the bytes outside chunk payloads that are compressed by design (#320). KnockKnock's zip in the benign survey set held 18 icons with XMP metadata first, 5 each as a text-headed binary container, which with the binary's `TCC.db` reached Notify (#317). A new bounded, dependency-free walker (`nav_core::png`) verifies every CRC, requires `IHDR` first and only, compression-method bytes 0, a valid zlib header at each compressed stream's start and an empty `IEND` exactly at end of file, caps chunks at 65,536, and returns the `IDAT`, `fdAT`, `zTXt`, `iCCP` and compressed `iTXt` payload ranges. The signature, headers, CRCs, plain text and private chunks are still measured, so a high-entropy private chunk keeps 5. A malformed or truncated PNG keeps 5, the walk runs only on the demoted path (never for shebang or script-extension files), and the base64 check and `suspicious-strings` still read the whole file. ImageIO decodes PNGs this walk rejects (bad CRC, trailing data, no `IEND`, cut-off `IDAT`, bad zlib check value), which is the safe direction since only the well-formed verdict lowers a score; acceptance is structural plus the zlib header check, not proof the image decodes.
+
+---
+
 **Changelog from v1.35 (2026-11-28):** §5.2 download-to-shell and `osascript` download: `curl`/`wget` followed by a line end or a list delimiter (`|` `,` `)` `}` `]` `;` `:` `=` `&`), after an optional closing quote, is not a downloader (#317). The benign survey set's first compare had 6 Notify false positives from shell-command word lists in syntax highlighters, telemetry tables and a user-agent regex (Telegram, IntelliJ, Ledger Live): `|curl|` sat at command position after a pipe and a later `|bash|` read as a pipe to a shell, beyond the 256-byte reach of the `(a|b|c)` alternation check. A `curl` followed by one of those downloads nothing, so no real dropper is lost; obfuscated argument forms (`curl${IFS}-s`, `curl"$u"`) still match.
 
 ---
