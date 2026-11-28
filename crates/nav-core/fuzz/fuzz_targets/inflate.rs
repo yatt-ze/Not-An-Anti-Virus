@@ -44,8 +44,14 @@ fuzz_target!(|data: &[u8]| {
         );
     }
     for (name, (out, _)) in [
-        ("zlib partial", nav_core::inflate::zlib_decompress_partial(data, BUDGET)),
-        ("gzip partial", nav_core::inflate::gzip_decompress_partial(data, BUDGET)),
+        (
+            "zlib partial",
+            nav_core::inflate::zlib_decompress_partial(data, BUDGET),
+        ),
+        (
+            "gzip partial",
+            nav_core::inflate::gzip_decompress_partial(data, BUDGET),
+        ),
     ] {
         assert!(
             out.len() <= BUDGET,
@@ -129,19 +135,23 @@ fuzz_target!(|data: &[u8]| {
     }
 
     // A zero budget must never yield output — the clamp-to-budget boundary.
-    for r in [
+    for out in [
         nav_core::inflate::inflate(data, 0),
         nav_core::inflate::zlib_decompress(data, 0),
         nav_core::inflate::gzip_decompress(data, 0),
-    ] {
-        if let Ok(out) = r {
-            assert!(out.is_empty(), "produced output under a zero budget");
-        }
+    ]
+    .into_iter()
+    .flatten()
+    {
+        assert!(out.is_empty(), "produced output under a zero budget");
     }
     for (out, _) in [
         nav_core::inflate::zlib_decompress_partial(data, 0),
         nav_core::inflate::gzip_decompress_partial(data, 0),
     ] {
-        assert!(out.is_empty(), "partial produced output under a zero budget");
+        assert!(
+            out.is_empty(),
+            "partial produced output under a zero budget"
+        );
     }
 });
