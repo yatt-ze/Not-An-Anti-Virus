@@ -260,16 +260,19 @@ mod macos {
         fx.release(ARM);
         let o = run(fx.cmd().env("SHELL", "/bin/zsh"));
         expect_ok(&o);
-        let canon = fs::canonicalize(&fx.bin).unwrap().join("navctl");
+        let canon = fs::canonicalize(&fx.bin).unwrap();
+        let archive = fx.rel.join(format!("navctl-{VERSION}-{ARM}.tar.gz"));
+        let mb = fs::metadata(archive).unwrap().len() as f64 / 1e6;
         let want = format!(
             "Installing navctl {VERSION} for Apple silicon ({ARM})
-  - Downloaded navctl-{VERSION}-{ARM}.tar.gz
-  - SHA-256 matches SHA256SUMS
-  - Checked the checksum only; install gh 2.102.0+ and run `gh auth login` to also verify the build attestation
-Installed navctl to {canon}
+  - Downloaded ({mb:.1} MB)
+  - Verified SHA-256 checksum
+  - Skipped build attestation check (install gh 2.102.0+ to enable it)
+Installed navctl {VERSION} in {canon}
 
-{dir} isn't on your PATH. To add it, put this line in ~/.zshrc:
+{dir} isn't on your PATH yet. Add this line to ~/.zshrc:
   export PATH=\"{dir}:$PATH\"
+Then open a new terminal.
 
 Get started: navctl scan <file or .app>  (navctl --help for more)
 ",
@@ -287,10 +290,10 @@ Get started: navctl scan <file or .app>  (navctl --help for more)
         fx.release(ARM);
         expect_ok(&fx.install());
         let o = fx.install();
-        let canon = fs::canonicalize(&fx.bin).unwrap().join("navctl");
+        let canon = fs::canonicalize(&fx.bin).unwrap();
         assert!(
             out(&o).contains(&format!(
-                "Reinstalled navctl {VERSION} ({})\n",
+                "Reinstalled navctl {VERSION} in {}\n",
                 canon.display()
             )),
             "{}",
@@ -306,7 +309,7 @@ Get started: navctl scan <file or .app>  (navctl --help for more)
         let o = fx.install();
         assert!(
             out(&o).contains(&format!(
-                "Updated navctl 0.0.1 -> {VERSION} ({})\n",
+                "Updated navctl 0.0.1 -> {VERSION} in {}\n",
                 canon.display()
             )),
             "{}",
@@ -328,10 +331,43 @@ Get started: navctl scan <file or .app>  (navctl --help for more)
         assert_eq!(
             err(&o),
             format!(
-                "error: {} already exists and wasn't installed by this script\nRemove it, or rerun with NAV_FORCE=1 to replace it.\n",
+                "error: {} already exists and wasn't installed by this script\nRemove it, or replace it with:\n  curl -fsSL https://raw.githubusercontent.com/yatt-ze/Not-An-Anti-Virus/main/install.sh | NAV_FORCE=1 sh\n",
                 canon.display()
             )
         );
+    }
+
+    /// A different navctl earlier on PATH is pointed out; ours first is not.
+    #[test]
+    fn shadowed_navctl() {
+        let fx = Fx::new("shadow");
+        fx.release(ARM);
+        let other = fx.root.join("other");
+        fs::create_dir_all(&other).unwrap();
+        script(&other.join("navctl"), "exit 0");
+        let path = |first: &Path, second: &Path| {
+            format!(
+                "{}:{}:{}:/usr/bin:/bin",
+                first.display(),
+                second.display(),
+                fx.shims.display()
+            )
+        };
+        let o = run(fx.cmd().env("PATH", path(&other, &fx.bin)));
+        expect_ok(&o);
+        assert!(out(&o).contains("comes first on your PATH"), "{}", out(&o));
+        assert!(!out(&o).contains("isn't on your PATH"), "{}", out(&o));
+        assert!(!out(&o).contains("cargo uninstall"), "{}", out(&o));
+        let o = run(fx.cmd().env("PATH", path(&fx.bin, &other)));
+        expect_ok(&o);
+        assert!(!out(&o).contains("comes first"), "{}", out(&o));
+
+        let cargo = fx.root.join(".cargo/bin");
+        fs::create_dir_all(&cargo).unwrap();
+        script(&cargo.join("navctl"), "exit 0");
+        let o = run(fx.cmd().env("PATH", path(&cargo, &fx.bin)));
+        expect_ok(&o);
+        assert!(out(&o).contains("cargo uninstall navctl"), "{}", out(&o));
     }
 
     /// A symlinked install dir is recorded by its canonical path.
@@ -587,7 +623,7 @@ Get started: navctl scan <file or .app>  (navctl --help for more)
         let (fx, o) = with_gh("gh101", "2.101.0", |_, _| {});
         expect_ok(&o);
         assert!(
-            out(&o).contains("checksum only") && out(&o).contains("too old"),
+            out(&o).contains("Skipped build attestation") && out(&o).contains("older than 2.102.0"),
             "{}",
             out(&o)
         );
@@ -598,7 +634,7 @@ Get started: navctl scan <file or .app>  (navctl --help for more)
     fn gh_prerelease() {
         let (_fx, o) = with_gh("ghrc", "2.102.0-rc.1", |_, _| {});
         expect_ok(&o);
-        assert!(out(&o).contains("can't use this gh"), "{}", out(&o));
+        assert!(out(&o).contains("needs a stable gh"), "{}", out(&o));
     }
 
     #[test]
@@ -628,7 +664,7 @@ Get started: navctl scan <file or .app>  (navctl --help for more)
         let (fx, o) = with_gh("ghok", "2.102.0", |_, _| {});
         expect_ok(&o);
         assert!(
-            out(&o).contains("Build attestation verified"),
+            out(&o).contains("Verified build attestation"),
             "{}",
             out(&o)
         );

@@ -87,9 +87,15 @@ curl -fsSL https://raw.githubusercontent.com/yatt-ze/Not-An-Anti-Virus/main/inst
 ```
 
 `NAV_VERSION=X.Y.Z` pins a version, `NAV_INSTALL_DIR` changes the directory,
-and `NAV_FORCE=1` replaces a `navctl` the script didn't install. It never
-needs root and never edits your shell config; it prints the `PATH` line to
-add if needed.
+and `NAV_FORCE=1` replaces a `navctl` the script didn't install. Set them on
+the `sh` side of the pipe, where the script runs:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/yatt-ze/Not-An-Anti-Virus/main/install.sh | NAV_VERSION=0.23.0 sh
+```
+
+It never needs root and never edits your shell config; it prints the `PATH`
+line to add if needed.
 
 To build from source instead, you need Rust 1.88 or newer. macOS is the
 target platform. NAV also builds

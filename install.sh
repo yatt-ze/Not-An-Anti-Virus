@@ -11,6 +11,8 @@
 #   NAV_DOWNLOAD_BASE  tests only: replaces the release download URL (https or
 #                      file); requires NAV_VERSION
 #
+# Variables go on the sh side of the pipe: curl -fsSL … | NAV_VERSION=1.2.3 sh
+#
 # All logic lives in functions and main runs on the last line, so a truncated
 # download executes nothing.
 
@@ -18,6 +20,8 @@ set -eu
 
 REPO=yatt-ze/Not-An-Anti-Virus
 SIGNER="https://github.com/$REPO/.github/workflows/release.yml@refs/heads/main"
+SCRIPT_URL="https://raw.githubusercontent.com/$REPO/main/install.sh"
+REPORT_URL="https://github.com/$REPO/security/advisories/new"
 MIN_GH="2.102.0"
 
 WORK=
@@ -29,7 +33,7 @@ EXIST_NOTE=
 # Symbols and colour only on a terminal; plain ASCII otherwise.
 setup_style() {
     TICK=- DOT=- ARROW='->'
-    B= DIM= CYN= Z= GRN= YEL= ERR= ERZ=
+    B= DIM= CYN= Z= GRN= YEL= ERR= ECY= ERZ=
     if [ -t 1 ]; then
         TICK='✓' DOT='·' ARROW='→'
         if [ -z "${NO_COLOR:-}" ]; then
@@ -39,7 +43,7 @@ setup_style() {
     fi
     if [ -t 2 ] && [ -z "${NO_COLOR:-}" ]; then
         esc=$(printf '\033')
-        ERR="$esc[1m$esc[31m" ERZ="$esc[0m"
+        ERR="$esc[1m$esc[31m" ECY="$esc[36m" ERZ="$esc[0m"
     fi
 }
 
@@ -50,12 +54,29 @@ die() {
     exit 1
 }
 
+# bad_download MESSAGE [ADVICE]: the release failed a check; says where to report it.
+bad_download() {
+    _advice="Don't use this download; please report it at:"
+    [ -z "${2:-}" ] || _advice=$2
+    die "$1" "Nothing was changed. $_advice
+  $ECY$REPORT_URL$ERZ"
+}
+
 step() {
     printf '  %s%s%s %s\n' "$GRN" "$TICK" "$Z" "$1"
 }
 
 note() {
     printf '  %s%s%s %s\n' "$YEL" "$DOT" "$Z" "$1"
+}
+
+# Prints $1 with a leading home directory shown as ~.
+pretty() {
+    case $1 in
+        "$HOME"/*) printf '%s/%s' '~' "${1#"$HOME"/}" ;;
+        "$HOME_CANON"/*) printf '%s/%s' '~' "${1#"$HOME_CANON"/}" ;;
+        *) printf '%s' "$1" ;;
+    esac
 }
 
 cleanup() {
@@ -129,10 +150,11 @@ resolve_version() {
     fi
     _url=$(curl --proto '=https' --tlsv1.2 -fsSLI -o /dev/null -w '%{url_effective}' \
         "https://github.com/$REPO/releases/latest" 2>/dev/null) ||
-        die "could not look up the latest release" "Check your connection, or pin a version with NAV_VERSION=X.Y.Z."
+        die "could not look up the latest release" "Check your connection and try again."
     _tag=${_url##*/}
     valid_version "${_tag#v}" ||
-        die "unexpected latest-release URL" "Pin a version with NAV_VERSION=X.Y.Z."
+        die "unexpected latest-release URL" "Pin a version instead:
+  ${ECY}curl -fsSL $SCRIPT_URL | NAV_VERSION=X.Y.Z sh$ERZ"
     echo "${_tag#v}"
 }
 
@@ -145,18 +167,19 @@ fetch() {
 verify_checksum() {
     _count=$(awk -v a="$1" 'NF == 2 && $2 == a' "$WORK/SHA256SUMS" | wc -l)
     [ "$_count" -eq 1 ] ||
-        die "SHA256SUMS must list $1 exactly once" "Nothing was changed. Do not use this download."
+        bad_download "SHA256SUMS must list $1 exactly once"
     _want=$(awk -v a="$1" 'NF == 2 && $2 == a { print $1 }' "$WORK/SHA256SUMS")
     _got=$(shasum -a 256 "$WORK/$1" | awk '{ print $1 }')
-    [ -n "$_got" ] && [ "$_want" = "$_got" ] ||
-        die "checksum mismatch for $1" "Nothing was changed. Try again; if it keeps happening, do not install this release."
-    step "SHA-256 matches SHA256SUMS"
+    if [ -z "$_got" ] || [ "$_want" != "$_got" ]; then
+        bad_download "checksum mismatch for $1" "Try again, and if it keeps happening, report it at:"
+    fi
+    step "Verified SHA-256 checksum"
 }
 
 verify_attestation() {
     _why=
     if ! command -v gh >/dev/null 2>&1; then
-        _why="install gh $MIN_GH+ and run \`gh auth login\` to also verify the build attestation"
+        _why="install gh $MIN_GH+ to enable it"
     else
         _line=$(gh --version 2>/dev/null | sed -n 1p) || _line=
         _g= _v= _ghver= _rest=
@@ -164,36 +187,37 @@ verify_attestation() {
 $_line
 EOT
         if [ "$_g" != gh ] || [ "$_v" != version ] || ! valid_version "$_ghver"; then
-            _why="can't use this gh version (need a stable $MIN_GH+) to verify the build attestation"
+            _why="needs a stable gh $MIN_GH+"
         elif ! version_ge "$_ghver" "$MIN_GH"; then
-            _why="gh $_ghver is too old (need $MIN_GH+) to verify the build attestation"
+            _why="gh $_ghver is older than $MIN_GH"
         elif ! gh auth status >/dev/null 2>&1; then
-            _why="run \`gh auth login\` to also verify the build attestation"
+            _why="run gh auth login to enable it"
         fi
     fi
     if [ -n "$_why" ]; then
-        note "Checked the checksum only; $_why"
+        note "Skipped build attestation check ($_why)"
         return
     fi
     gh attestation verify "$WORK/$1" --repo "$REPO" --cert-identity "$SIGNER" >/dev/null 2>&1 ||
-        die "build attestation verification failed for $1" "Nothing was changed. Do not use this download."
-    step "Build attestation verified (gh)"
+        bad_download "build attestation verification failed for $1"
+    step "Verified build attestation"
 }
 
 # Unpacks navctl into $WORK/stage and checks that it reports version $1.
 extract_and_check() {
     [ "$(tar -tzf "$WORK/$2" 2>/dev/null)" = navctl ] ||
-        die "unexpected contents in $2" "Nothing was changed. Do not use this download."
+        bad_download "unexpected contents in $2"
     mkdir "$WORK/stage"
     tar -xzf "$WORK/$2" -C "$WORK/stage" navctl 2>/dev/null ||
         die "could not extract $2" "Nothing was changed."
-    [ -f "$WORK/stage/navctl" ] && [ ! -L "$WORK/stage/navctl" ] ||
-        die "navctl in $2 is not a regular file" "Nothing was changed. Do not use this download."
+    if [ ! -f "$WORK/stage/navctl" ] || [ -L "$WORK/stage/navctl" ]; then
+        bad_download "navctl in $2 is not a regular file"
+    fi
     chmod 755 "$WORK/stage/navctl"
     _got=$("$WORK/stage/navctl" --version 2>/dev/null) ||
         die "the downloaded navctl does not run" "Nothing was changed."
     [ "$_got" = "navctl $1" ] ||
-        die "downloaded navctl reports '$_got', expected 'navctl $1'" "Nothing was changed. Do not use this download."
+        bad_download "downloaded navctl reports '$_got', expected 'navctl $1'"
 }
 
 # Refuses to replace a navctl this script did not install, unless NAV_FORCE=1.
@@ -206,12 +230,13 @@ check_existing() {
         _old=$(sed -n 's/^  "binary_sha256": "\(.*\)"$/\1/p' "$RECEIPT")
         _now=$(shasum -a 256 "$1" 2>/dev/null | awk '{ print $1 }') || _now=
         if [ -n "$_now" ] && [ "$_now" != "$_old" ]; then
-            EXIST_NOTE="$1 was modified since it was installed; replacing it"
+            EXIST_NOTE="$(pretty "$1") was modified since it was installed; replacing it"
         fi
     elif [ "${NAV_FORCE:-}" = 1 ]; then
         EXIST_NOTE="Replacing a navctl this script didn't install (NAV_FORCE=1)"
     else
-        die "$1 already exists and wasn't installed by this script" "Remove it, or rerun with NAV_FORCE=1 to replace it."
+        die "$(pretty "$1") already exists and wasn't installed by this script" "Remove it, or replace it with:
+  ${ECY}curl -fsSL $SCRIPT_URL | NAV_FORCE=1 sh$ERZ"
     fi
 }
 
@@ -247,31 +272,40 @@ path_hint() {
         _default=1
     fi
     if [ -n "$_default" ]; then
-        _show='~/.local/bin'
+        # Literal $HOME, for the user's startup file.
+        # shellcheck disable=SC2016
         _val='$HOME/.local/bin'
     else
-        _show=$1
         _val=$(printf '%s' "$1" | sed 's/[$`]/\\&/g')
     fi
+    _line="export PATH=\"$_val:\$PATH\""
+    _then="Then open a new terminal."
     case $(basename "${SHELL:-}") in
-        zsh)
-            _how="To add it, put this line in ~/.zshrc:"
-            _line="export PATH=\"$_val:\$PATH\""
-            ;;
-        bash)
-            _how="To add it, put this line in ~/.bash_profile:"
-            _line="export PATH=\"$_val:\$PATH\""
-            ;;
+        zsh) _how="Add this line to ~/.zshrc:" ;;
+        bash) _how="Add this line to ~/.bash_profile:" ;;
         fish)
             _how="To add it, run:"
             _line="fish_add_path \"$_val\""
+            _then=
             ;;
-        *)
-            _how="To add it, put this line in your shell's startup file:"
-            _line="export PATH=\"$_val:\$PATH\""
-            ;;
+        *) _how="Add this line to your shell's startup file:" ;;
     esac
-    printf "%s isn't on your PATH. %s\n  %s%s%s\n\n" "$_show" "$_how" "$CYN" "$_line" "$Z"
+    printf "%s isn't on your PATH yet. %s\n  %s%s%s\n" "$(pretty "$1")" "$_how" "$CYN" "$_line" "$Z"
+    [ -z "$_then" ] || printf '%s\n' "$_then"
+    printf '\n'
+}
+
+# Warns when another navctl earlier on PATH would run instead of the one in $1.
+shadow_hint() {
+    _first=$(command -v navctl 2>/dev/null) || return 0
+    _fdir=$(cd "$(dirname "$_first")" 2>/dev/null && pwd -P) || return 0
+    [ "$_fdir" != "$1" ] || return 0
+    case $_fdir in
+        */.cargo/bin | "${CARGO_HOME:-$HOME/.cargo}/bin") _fix="Remove it with ${CYN}cargo uninstall navctl${Z}, or" ;;
+        *) _fix="Remove it, or" ;;
+    esac
+    printf '%s!%s %s comes first on your PATH, so it runs instead.\n' "$YEL" "$Z" "$(pretty "$_fdir/navctl")"
+    printf '  %s put %s earlier in your PATH.\n\n' "$_fix" "$(pretty "$1")"
 }
 
 main() {
@@ -280,6 +314,7 @@ main() {
     HOME=${HOME:-}
     [ -n "$HOME" ] || die "HOME is not set" "Set HOME to your home directory and rerun."
     check_path_chars HOME "$HOME"
+    HOME_CANON=$(cd "$HOME" 2>/dev/null && pwd -P) || HOME_CANON=$HOME
     RECEIPT=$HOME/.local/share/nav/install-receipt.json
 
     if [ -n "${NAV_DOWNLOAD_BASE:-}" ] && [ -z "${NAV_VERSION:-}" ]; then
@@ -319,7 +354,8 @@ main() {
     asset=navctl-$version-$target.tar.gz
     fetch "$asset" "$WORK/$asset"
     fetch SHA256SUMS "$WORK/SHA256SUMS"
-    step "Downloaded ${DIM}$asset${Z}"
+    _size=$(wc -c <"$WORK/$asset" | awk '{ printf "%.1f MB", $1 / 1000000 }')
+    step "Downloaded ${DIM}($_size)${Z}"
     verify_checksum "$asset"
     verify_attestation "$asset"
     extract_and_check "$version" "$asset"
@@ -334,17 +370,17 @@ main() {
     write_receipt "$version" "$target" "$dest" "$sha"
 
     if [ -z "$PREV_VERSION" ]; then
-        printf '%sInstalled navctl%s to %s\n' "$B" "$Z" "$dest"
+        result="Installed navctl $version"
     elif [ "$PREV_VERSION" = "$version" ]; then
-        printf '%sReinstalled navctl %s%s (%s)\n' "$B" "$version" "$Z" "$dest"
+        result="Reinstalled navctl $version"
     elif valid_version "$PREV_VERSION" && version_ge "$PREV_VERSION" "$version"; then
-        printf '%sDowngraded navctl %s %s %s%s (%s)\n' "$B" "$PREV_VERSION" "$ARROW" "$version" "$Z" "$dest"
+        result="Downgraded navctl $PREV_VERSION $ARROW $version"
     else
-        printf '%sUpdated navctl %s %s %s%s (%s)\n' "$B" "$PREV_VERSION" "$ARROW" "$version" "$Z" "$dest"
+        result="Updated navctl $PREV_VERSION $ARROW $version"
     fi
-    printf '\n'
+    printf '%s%s%s in %s\n\n' "$B" "$result" "$Z" "$(pretty "$canon")"
     case ":${PATH:-}:" in
-        *":$dir:"* | *":$canon:"*) ;;
+        *":$dir:"* | *":$canon:"*) shadow_hint "$canon" ;;
         *) path_hint "$dir" ;;
     esac
     printf 'Get started: %snavctl scan <file or .app>%s  (%snavctl --help%s for more)\n' "$CYN" "$Z" "$CYN" "$Z"
