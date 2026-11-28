@@ -253,6 +253,87 @@ mod macos {
         fx.assert_clean();
     }
 
+    /// The exact plain-text output of a fresh install off PATH, checksum only.
+    #[test]
+    fn fresh_output() {
+        let fx = Fx::new("fresh-out");
+        fx.release(ARM);
+        let o = run(fx.cmd().env("SHELL", "/bin/zsh"));
+        expect_ok(&o);
+        let canon = fs::canonicalize(&fx.bin).unwrap().join("navctl");
+        let want = format!(
+            "Installing navctl {VERSION} for Apple silicon ({ARM})
+  - Downloaded navctl-{VERSION}-{ARM}.tar.gz
+  - SHA-256 matches SHA256SUMS
+  - Checked the checksum only; install gh 2.102.0+ and run `gh auth login` to also verify the build attestation
+Installed navctl to {canon}
+
+{dir} isn't on your PATH. To add it, put this line in ~/.zshrc:
+  export PATH=\"{dir}:$PATH\"
+
+Get started: navctl scan <file or .app>  (navctl --help for more)
+",
+            canon = canon.display(),
+            dir = fx.bin.display()
+        );
+        assert_eq!(out(&o), want);
+        assert_eq!(err(&o), "");
+    }
+
+    /// Reinstall and version-change wording, from the receipt's version.
+    #[test]
+    fn reinstall_wording() {
+        let fx = Fx::new("wording");
+        fx.release(ARM);
+        expect_ok(&fx.install());
+        let o = fx.install();
+        let canon = fs::canonicalize(&fx.bin).unwrap().join("navctl");
+        assert!(
+            out(&o).contains(&format!(
+                "Reinstalled navctl {VERSION} ({})\n",
+                canon.display()
+            )),
+            "{}",
+            out(&o)
+        );
+
+        let r = fs::read_to_string(fx.receipt()).unwrap();
+        let old = r.replace(
+            &format!("\"version\": \"{VERSION}\""),
+            "\"version\": \"0.0.1\"",
+        );
+        fs::write(fx.receipt(), old).unwrap();
+        let o = fx.install();
+        assert!(
+            out(&o).contains(&format!(
+                "Updated navctl 0.0.1 -> {VERSION} ({})\n",
+                canon.display()
+            )),
+            "{}",
+            out(&o)
+        );
+    }
+
+    /// The exact refusal for an unmanaged navctl: nothing on stdout.
+    #[test]
+    fn refusal_output() {
+        let fx = Fx::new("refuse-out");
+        fx.release(ARM);
+        fs::create_dir_all(&fx.bin).unwrap();
+        fs::write(fx.installed(), "old").unwrap();
+        let o = fx.install();
+        let canon = fs::canonicalize(&fx.bin).unwrap().join("navctl");
+        assert!(!o.status.success());
+        assert_eq!(out(&o), "");
+        assert_eq!(
+            err(&o),
+            format!(
+                "error: {} already exists and wasn't installed by this script\nRemove it, or rerun with NAV_FORCE=1 to replace it.\n",
+                canon.display()
+            )
+        );
+    }
+
     /// A symlinked install dir is recorded by its canonical path.
     #[test]
     fn symlinked_dir() {
@@ -277,14 +358,14 @@ mod macos {
         expect_ok(&fx.install());
         let o = fx.install();
         expect_ok(&o);
-        assert!(!out(&o).contains("no longer matches"), "{}", out(&o));
+        assert!(!out(&o).contains("was modified since"), "{}", out(&o));
 
         let mut b = fs::read(fx.installed()).unwrap();
         b.extend_from_slice(b"drift");
         fs::write(fx.installed(), b).unwrap();
         let o = fx.install();
         expect_ok(&o);
-        assert!(out(&o).contains("no longer matches"), "{}", out(&o));
+        assert!(out(&o).contains("was modified since"), "{}", out(&o));
         assert!(fs::read_to_string(fx.receipt())
             .unwrap()
             .contains(&sha256(&fx.installed())));
@@ -376,14 +457,14 @@ mod macos {
 
     #[test]
     fn missing_archive() {
-        refuses("noarch", "download failed", |fx| {
+        refuses("noarch", "could not download", |fx| {
             fs::remove_file(fx.rel.join(format!("navctl-{VERSION}-{ARM}.tar.gz"))).unwrap();
         });
     }
 
     #[test]
     fn extra_member() {
-        refuses_fresh("extra", "only navctl", |fx| {
+        refuses_fresh("extra", "unexpected contents", |fx| {
             fx.release_with(
                 ARM,
                 |d| {
@@ -506,7 +587,7 @@ mod macos {
         let (fx, o) = with_gh("gh101", "2.101.0", |_, _| {});
         expect_ok(&o);
         assert!(
-            out(&o).contains("SHA-256 only") && out(&o).contains("older"),
+            out(&o).contains("checksum only") && out(&o).contains("too old"),
             "{}",
             out(&o)
         );
@@ -517,7 +598,7 @@ mod macos {
     fn gh_prerelease() {
         let (_fx, o) = with_gh("ghrc", "2.102.0-rc.1", |_, _| {});
         expect_ok(&o);
-        assert!(out(&o).contains("unusable"), "{}", out(&o));
+        assert!(out(&o).contains("can't use this gh"), "{}", out(&o));
     }
 
     #[test]
@@ -526,7 +607,7 @@ mod macos {
             c.env("FAKE_GH_AUTH", "1");
         });
         expect_ok(&o);
-        assert!(out(&o).contains("not logged in"), "{}", out(&o));
+        assert!(out(&o).contains("gh auth login"), "{}", out(&o));
         assert!(!fx.root.join("gh.log").exists());
     }
 
@@ -546,7 +627,11 @@ mod macos {
     fn attestation_passes() {
         let (fx, o) = with_gh("ghok", "2.102.0", |_, _| {});
         expect_ok(&o);
-        assert!(out(&o).contains("build attestation"), "{}", out(&o));
+        assert!(
+            out(&o).contains("Build attestation verified"),
+            "{}",
+            out(&o)
+        );
         let log = fs::read_to_string(fx.root.join("gh.log")).unwrap();
         assert!(log.contains("--repo yatt-ze/Not-An-Anti-Virus"), "{log}");
         assert!(
