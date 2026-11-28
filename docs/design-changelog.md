@@ -5,6 +5,10 @@ for the current document map. Newest first.
 
 ---
 
+**Changelog from v1.34 (2026-11-28):** §11.1b updated to match the built tooling (#311, #315, #316). `benign prepare` and its layout (`mnt/`, `pkg/`, `files/`, `repo/`, `index.tsv`) are named; `benign vm compare` stages downloads under their published names, runs a warm-up pass like `malware compare` (#150), and text-checks what it copies back (256 MiB cap); a survey refuses to start with unrecorded items. The 0-Notify baseline was wrong: the first compare over the 49-item set had 8 Notify files across IntelliJ, Ledger Live, Telegram, KnockKnock and nvm (#317), so the gate is regressions-only against base.
+
+---
+
 **Changelog from v1.33 (2026-11-28):** New §11.1b, the benign survey set (#311). Every #245 rule lead stalled because its false-positive risk on benign software outside this Mac's corpus could not be measured. The set is a pinned manifest (`fixtures/real-world/benign.toml`: a URL with recorded SHA-256 and size, or a git commit) across admin scripts, dev tools, DRM'd apps, credential apps, messaging, security agents, remote access and installers, large items included. Like §11.1a it is fetched and scanned only inside a throwaway clone of the golden Tart image, whose disk was grown to 128 GB to hold the cache; nothing is executed. Vendor drift is a refresh notice, not a failure. `benign vm survey` runs a maintainer's trait script over the prepared set (optionally with the malware store) and returns only UTF-8 text capped at 16 MiB; `benign vm compare` scans the downloads as published with base and branch navctl and gates with `corpus diff`'s benign rules. Decided by the user: one golden image for both sets, large items in, all tooling now.
 
 ---

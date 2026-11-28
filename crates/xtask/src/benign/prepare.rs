@@ -16,7 +16,7 @@ use super::manifest::{Item, Kind};
 use crate::malware::{Problem, Report};
 
 /// `url`'s last path segment cut to `[A-Za-z0-9._-]`, or `script`.
-fn script_name(url: &str) -> String {
+pub(super) fn script_name(url: &str) -> String {
     let path = url.split(['?', '#']).next().unwrap_or_default();
     let last = path.rsplit('/').next().unwrap_or_default();
     let clean: String = last

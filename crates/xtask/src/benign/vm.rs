@@ -1,6 +1,6 @@
-//! `benign vm survey`: prepares the survey set in a throwaway clone of the
-//! golden Tart VM and runs the maintainer's script over it, from the host
-//! (§11.1b). Only the script's UTF-8 text output crosses back.
+//! `benign vm survey` and `benign vm compare`: run the survey set in a
+//! throwaway clone of the golden Tart VM, from the host (§11.1b). Only
+//! commits go in; only UTF-8 text results come back.
 
 use std::fs::File;
 use std::io::Read;
@@ -22,11 +22,58 @@ const VM_PREFIX: &str = "nav-benign-run-";
 const REF_NS: &str = "xtask-benign-vm";
 /// Largest survey output accepted from the guest.
 const MAX_OUTPUT: u64 = 16 << 20;
+/// Largest compare result file accepted; JSONL over the large items is big.
+const MAX_RESULT: u64 = 256 << 20;
 
 #[derive(Subcommand)]
 pub enum VmCommand {
     /// Prepare the set in a clone of the golden VM and run a script over it (host side).
     Survey(SurveyArgs),
+    /// Fetch, then build base and new navctl and diff their scans of the set (host side).
+    Compare(VmCompareArgs),
+}
+
+#[derive(Args)]
+pub struct VmCompareArgs {
+    /// Revision under test.
+    #[arg(long, default_value = "HEAD")]
+    branch: String,
+    /// Base revision (`origin/*` is fetched first).
+    #[arg(long, default_value = "origin/main")]
+    base: String,
+    /// Keep the cloned VM instead of deleting it.
+    #[arg(long)]
+    keep: bool,
+    /// Golden Tart VM to clone.
+    #[arg(long, default_value = "nav-bench-golden")]
+    golden: String,
+}
+
+const RESULT_FILES: [&str; 3] = ["report.txt", "base.jsonl", "new.jsonl"];
+
+/// Guest script for `compare`. Positionals: new commit, base commit, bundle
+/// ref namespace. `fetch` exiting 2 does not stop the run: `compare` reports
+/// every item it could not stage.
+const COMPARE_SCRIPT: &str = r#"set -eu
+if [ -f "$HOME/.cargo/env" ]; then . "$HOME/.cargo/env"; fi
+cd "$HOME"
+new=$1; base=$2; ns=$3
+rm -rf nav out
+git init --quiet nav
+cd nav
+git fetch --quiet ../nav.bundle "refs/$ns/*:refs/$ns/*"
+git checkout --quiet --detach "$new"
+st=0
+cargo xtask benign fetch || st=$?
+case $st in 0|2) ;; *) exit 1 ;; esac
+st=0
+cargo xtask benign compare --base "$base" --out-dir "$HOME/out" || st=$?
+exit $st
+"#;
+
+/// Positional args for [`COMPARE_SCRIPT`] after the `zsh` argv0.
+fn compare_args(new: &str, base: &str) -> Vec<String> {
+    vec![new.to_string(), base.to_string(), REF_NS.to_string()]
 }
 
 #[derive(Args)]
@@ -95,9 +142,22 @@ fn read_text(r: impl Read, max: u64) -> Result<String> {
     String::from_utf8(buf).context("output is not valid UTF-8")
 }
 
-/// Copies the guest's survey output to `dest`, only if it passes
-/// [`read_text`]; otherwise nothing is written.
-fn copy_survey(name: &str, dest: &Path) -> Result<()> {
+/// A guest file that was too big or not UTF-8; nothing was written.
+#[derive(Debug)]
+struct Rejected(String);
+
+impl std::fmt::Display for Rejected {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for Rejected {}
+
+/// Copies `$HOME/out/<file>` from the guest to `dest`, only if it passes
+/// [`read_text`] with `max`; otherwise nothing is written and a rejection
+/// is a [`Rejected`] error.
+fn copy_text(name: &str, file: &str, dest: &Path, max: u64) -> Result<()> {
     let mut child = tart()
         .args([
             "exec",
@@ -106,13 +166,13 @@ fn copy_survey(name: &str, dest: &Path) -> Result<()> {
             "-c",
             "cat \"$HOME/out/$1\"",
             "sh",
-            "survey.txt",
+            file,
         ])
         .stdout(Stdio::piped())
         .spawn()
         .context("spawning tart exec")?;
     let out = child.stdout.take().context("no stdout pipe")?;
-    let text = read_text(out, MAX_OUTPUT);
+    let text = read_text(out, max).map_err(|e| anyhow::Error::new(Rejected(format!("{e:#}"))));
     if text.is_err() {
         let _ = child.kill();
     }
@@ -120,7 +180,7 @@ fn copy_survey(name: &str, dest: &Path) -> Result<()> {
     let text = text?;
     ensure!(
         status.success(),
-        "reading survey.txt in the VM failed ({status})"
+        "reading {file} in the VM failed ({status})"
     );
     std::fs::write(dest, text).with_context(|| dest.display().to_string())
 }
@@ -147,39 +207,31 @@ fn check_recorded(repo: &Path) -> Result<()> {
 pub fn run(cmd: VmCommand) -> Result<ExitCode> {
     match cmd {
         VmCommand::Survey(a) => survey(a),
+        VmCommand::Compare(a) => compare(a),
     }
 }
 
-fn survey(a: SurveyArgs) -> Result<ExitCode> {
-    check_tart()?;
-    ensure!(a.script.is_file(), "{} is not a file", a.script.display());
+/// Rejects a golden VM name that `tart` would read as a flag.
+fn check_golden(golden: &str) -> Result<()> {
     ensure!(
-        !a.golden.starts_with('-'),
-        "--golden {:?} looks like a flag",
-        a.golden
+        !golden.starts_with('-'),
+        "--golden {golden:?} looks like a flag"
     );
-    let repo = PathBuf::from(git(Path::new("."), &["rev-parse", "--show-toplevel"])?);
-    let secs = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
-    let commit = resolve_sha(&repo, "HEAD")?;
-    check_recorded(&repo)?;
-    println!("commit: HEAD ({commit})");
-    if !git(&repo, &["status", "--porcelain"])?.is_empty() {
-        println!("note: working tree is dirty; uncommitted changes are NOT in the VM run");
-    }
-    let (_, out_dir) = resolve_dirs(&repo, None, REF_NS)?;
-    let bundle = out_dir.join("src.bundle");
-    let _bundle_file = TempFile(bundle.clone());
-    make_bundle(&repo, REF_NS, &commit, &commit, &bundle, secs)?;
+    Ok(())
+}
 
+/// Clones `golden` as `nav-benign-run-<secs>`, boots it headless (log in
+/// `out_dir/tart-run.log`) and waits for the guest agent.
+fn boot(golden: &str, secs: u64, keep: bool, out_dir: &Path) -> Result<VmGuard> {
     let name = vm_name(VM_PREFIX, secs);
     warn_stale_vms(VM_PREFIX, &name);
-    let st = tart().args(["clone", &a.golden, &name]).status()?;
+    let st = tart().args(["clone", golden, &name]).status()?;
     if !st.success() {
-        bail!("`tart clone {} {name}` failed ({st})", a.golden);
+        bail!("`tart clone {golden} {name}` failed ({st})");
     }
     let mut guard = VmGuard {
         name: name.clone(),
-        keep: a.keep,
+        keep,
         child: None,
     };
     let log = File::create(out_dir.join("tart-run.log"))?;
@@ -193,7 +245,71 @@ fn survey(a: SurveyArgs) -> Result<ExitCode> {
             .context("spawning tart run")?,
     );
     wait_for_agent(&mut guard)?;
+    Ok(guard)
+}
 
+fn compare(a: VmCompareArgs) -> Result<ExitCode> {
+    check_tart()?;
+    check_golden(&a.golden)?;
+    let repo = PathBuf::from(git(Path::new("."), &["rev-parse", "--show-toplevel"])?);
+    if a.base.starts_with("origin/") {
+        git(&repo, &["fetch", "origin"])?;
+    }
+    let secs = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
+    let new = resolve_sha(&repo, &a.branch)?;
+    let base = resolve_sha(&repo, &a.base)?;
+    println!("new: {} ({new})\nbase: {} ({base})", a.branch, a.base);
+    let dirty = !git(&repo, &["status", "--porcelain"])?.is_empty();
+    if dirty && new == resolve_sha(&repo, "HEAD")? {
+        println!("note: working tree is dirty; uncommitted changes are NOT in the VM run");
+    }
+    let (_, out_dir) = resolve_dirs(&repo, None, REF_NS)?;
+    let bundle = out_dir.join("src.bundle");
+    let _bundle_file = TempFile(bundle.clone());
+    make_bundle(&repo, REF_NS, &new, &base, &bundle, secs)?;
+
+    let guard = boot(&a.golden, secs, a.keep, &out_dir)?;
+    let name = guard.name.clone();
+    copy_in(&name, &bundle, "nav.bundle")?;
+    let status = tart()
+        .args(["exec", &name, "/bin/zsh", "-c", COMPARE_SCRIPT, "zsh"])
+        .args(compare_args(&new, &base))
+        .status()
+        .context("spawning tart exec")?;
+    let mut rejected = false;
+    for f in RESULT_FILES {
+        if let Err(e) = copy_text(&name, f, &out_dir.join(f), MAX_RESULT) {
+            eprintln!("warning: could not copy {f} out of the VM: {e:#}");
+            rejected |= e.is::<Rejected>();
+        }
+    }
+    println!("results: {}", out_dir.display());
+    if rejected {
+        eprintln!("error: a result file was not text or too large and was discarded");
+        return Ok(ExitCode::from(1));
+    }
+    Ok(ExitCode::from(map_exit(status.code())))
+}
+
+fn survey(a: SurveyArgs) -> Result<ExitCode> {
+    check_tart()?;
+    ensure!(a.script.is_file(), "{} is not a file", a.script.display());
+    check_golden(&a.golden)?;
+    let repo = PathBuf::from(git(Path::new("."), &["rev-parse", "--show-toplevel"])?);
+    let secs = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
+    let commit = resolve_sha(&repo, "HEAD")?;
+    check_recorded(&repo)?;
+    println!("commit: HEAD ({commit})");
+    if !git(&repo, &["status", "--porcelain"])?.is_empty() {
+        println!("note: working tree is dirty; uncommitted changes are NOT in the VM run");
+    }
+    let (_, out_dir) = resolve_dirs(&repo, None, REF_NS)?;
+    let bundle = out_dir.join("src.bundle");
+    let _bundle_file = TempFile(bundle.clone());
+    make_bundle(&repo, REF_NS, &commit, &commit, &bundle, secs)?;
+
+    let guard = boot(&a.golden, secs, a.keep, &out_dir)?;
+    let name = guard.name.clone();
     copy_in(&name, &bundle, "nav.bundle")?;
     copy_in(&name, &a.script, "survey-script")?;
     let status = tart()
@@ -203,7 +319,7 @@ fn survey(a: SurveyArgs) -> Result<ExitCode> {
         .context("spawning tart exec")?;
     let dest = out_dir.join("survey.txt");
     let guest = map_exit(status.code());
-    match copy_survey(&name, &dest) {
+    match copy_text(&name, "survey.txt", &dest, MAX_OUTPUT) {
         Ok(()) => {
             println!("results: {}", dest.display());
             Ok(ExitCode::from(guest))
@@ -223,12 +339,25 @@ mod tests {
     use super::*;
 
     #[test]
+    fn golden_flag_rejected() {
+        assert!(check_golden("nav-bench-golden").is_ok());
+        assert!(check_golden("--help").is_err());
+    }
+
+    #[test]
     fn guest_args_are_fixed() {
         let v = guest_args(&"a".repeat(40), true);
         assert_eq!(v, ["a".repeat(40), REF_NS.to_string(), "yes".to_string()]);
         assert_eq!(guest_args("c", false)[2], "no");
         // User input (script path, golden name) never reaches the guest argv or script text.
         assert!(!GUEST_SCRIPT.contains("xtask-benign-vm"));
+    }
+
+    #[test]
+    fn compare_args_are_fixed() {
+        let (n, b) = ("n".repeat(40), "b".repeat(40));
+        assert_eq!(compare_args(&n, &b), [n, b, REF_NS.to_string()]);
+        assert!(!COMPARE_SCRIPT.contains(REF_NS));
     }
 
     #[test]

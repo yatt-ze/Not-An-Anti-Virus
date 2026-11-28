@@ -451,8 +451,10 @@ mod tests {
         assert_eq!(v.report.failed, 1);
     }
 
+    /// A changed URL without `--record` prints a refresh line and leaves
+    /// the item out; it is neither ok nor failed, and the manifest is untouched.
     #[test]
-    fn drift_is_refresh_not_failure() {
+    fn drift_refreshes() {
         let t = TempDir::new("benign-drift");
         let text = recorded(b"old");
         let (s, calls, mpath) = run(&t, &text, b"new bytes", false);
